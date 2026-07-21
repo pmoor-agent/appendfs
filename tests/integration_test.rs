@@ -3,24 +3,19 @@ use std::thread;
 use std::time::Duration;
 use std::process::Command;
 use std::os::unix::fs::MetadataExt;
-use std::sync::Mutex;
-
-static TEST_MUTEX: Mutex<()> = Mutex::new(());
+use serial_test::serial;
 
 #[test]
+#[serial]
 fn test_fuse_filesystem() {
-    // 1. Enforce sequential execution of tests that run global FUSE mounts
-    let _guard = TEST_MUTEX.lock().unwrap();
-
-    // 2. Instantiate a fresh filesystem state for this session
     let fs = appendfs_fuse::InMemoryFS::new();
 
-    // 3. Create a unique temporary directory under /tmp
+    // Create a unique temporary directory under /tmp
     let temp_dir = tempfile::tempdir().unwrap();
     let mount_path = temp_dir.path().to_path_buf();
     let mount_path_str = mount_path.to_str().unwrap().to_string();
 
-    // 4. Spawn FUSE mounting in a background thread
+    // Spawn FUSE mounting in a background thread
     let mount_path_clone = mount_path.clone();
     let handle = thread::spawn(move || {
         let args = vec![
@@ -31,7 +26,7 @@ fn test_fuse_filesystem() {
         let _ = appendfs_fuse::mount(args, fs);
     });
 
-    // 5. Wait for FUSE to be mounted by monitoring the device ID change
+    // Wait for FUSE to be mounted by monitoring the device ID change
     let parent_dev = fs::metadata(std::env::temp_dir()).unwrap().dev();
     let mut mounted = false;
     for _ in 0..100 {
@@ -45,14 +40,14 @@ fn test_fuse_filesystem() {
     }
     assert!(mounted, "FUSE mount timed out or device ID did not change");
 
-    // 6. Perform directory listing verification (should be empty initially)
+    // Perform directory listing verification (should be empty initially)
     let entries: Vec<String> = fs::read_dir(&mount_path)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
         .collect();
     assert!(entries.is_empty(), "Expected directory to be empty, got: {:?}", entries);
 
-    // 7. Create a new file (hello.txt)
+    // Create a new file (hello.txt)
     let file_hello = mount_path.join("hello.txt");
     assert!(!file_hello.exists());
     
@@ -63,13 +58,13 @@ fn test_fuse_filesystem() {
     let read_content = fs::read_to_string(&file_hello).unwrap();
     assert_eq!(read_content, content);
 
-    // 8. Write/Overwrite verification (with truncation)
+    // Write/Overwrite verification (with truncation)
     let new_content = "Integration test overwrite!";
     fs::write(&file_hello, new_content).unwrap();
     let content_after_write = fs::read_to_string(&file_hello).unwrap();
     assert_eq!(content_after_write, new_content);
 
-    // 9. Append verification
+    // Append verification
     let append_content = "\nAppended line.";
     let mut file = fs::OpenOptions::new()
         .append(true)
@@ -85,7 +80,7 @@ fn test_fuse_filesystem() {
         format!("{}{}", new_content, append_content)
     );
 
-    // 10. Symlink verification
+    // Symlink verification
     let file_link = mount_path.join("hello_link.txt");
     std::os::unix::fs::symlink("hello.txt", &file_link).unwrap();
     assert!(file_link.exists());
@@ -102,13 +97,13 @@ fn test_fuse_filesystem() {
     fs::remove_file(&file_link).unwrap();
     assert!(!file_link.exists());
 
-    // 11. Rename and Relocate verification
-    // 11a. Create a subdirectory rename_dir
+    // Rename and Relocate verification
+    // Create a subdirectory rename_dir
     let rename_dir = mount_path.join("rename_dir");
     fs::create_dir(&rename_dir).unwrap();
     assert!(rename_dir.is_dir());
 
-    // 11b. Local rename: move hello.txt to rename_dir/test_rename.txt
+    // Local rename: move hello.txt to rename_dir/test_rename.txt
     let test_rename = rename_dir.join("test_rename.txt");
     fs::rename(&file_hello, &test_rename).unwrap();
     assert!(!file_hello.exists());
@@ -116,7 +111,7 @@ fn test_fuse_filesystem() {
     let renamed_content = fs::read_to_string(&test_rename).unwrap();
     assert_eq!(renamed_content, format!("{}{}", new_content, append_content));
 
-    // 11c. Move across directories: move rename_dir/test_rename.txt to root/test_moved.txt
+    // Move across directories: move rename_dir/test_rename.txt to root/test_moved.txt
     let test_moved = mount_path.join("test_moved.txt");
     fs::rename(&test_rename, &test_moved).unwrap();
     assert!(!test_rename.exists());
@@ -133,7 +128,7 @@ fn test_fuse_filesystem() {
     let file_hello = mount_path.join("hello.txt");
     fs::write(&file_hello, "Hello, Hard Link!").unwrap();
 
-    // 12b. Create hard link hello_hard.txt
+    // Create hard link hello_hard.txt
     let file_hard = mount_path.join("hello_hard.txt");
     fs::hard_link(&file_hello, &file_hard).unwrap();
     assert!(file_hard.exists());
@@ -180,7 +175,7 @@ fn test_fuse_filesystem() {
         .collect();
     assert!(entries_after.is_empty(), "Expected directory to be empty after deletion, got: {:?}", entries_after);
 
-    // 13. Clean up: unmount using fusermount3 -u
+    // Clean up: unmount using fusermount3 -u
     let status = Command::new("fusermount3")
         .arg("-u")
         .arg(&mount_path_str)
@@ -188,24 +183,21 @@ fn test_fuse_filesystem() {
         .unwrap();
     assert!(status.success(), "Failed to unmount FUSE mount");
 
-    // 14. Wait for the background mount thread to exit
+    // Wait for the background mount thread to exit
     handle.join().unwrap();
 }
 
 #[test]
+#[serial]
 fn test_fuse_stress() {
-    // 1. Enforce sequential execution of tests that run global FUSE mounts
-    let _guard = TEST_MUTEX.lock().unwrap();
-
-    // 2. Instantiate a fresh filesystem state for this session
     let fs = appendfs_fuse::InMemoryFS::new();
 
-    // 3. Create a unique temporary directory under /tmp
+    // Create a unique temporary directory under /tmp
     let temp_dir = tempfile::tempdir().unwrap();
     let mount_path = temp_dir.path().to_path_buf();
     let mount_path_str = mount_path.to_str().unwrap().to_string();
 
-    // 4. Spawn FUSE mounting in a background thread
+    // Spawn FUSE mounting in a background thread
     let mount_path_clone = mount_path.clone();
     let handle = thread::spawn(move || {
         let args = vec![
@@ -216,7 +208,7 @@ fn test_fuse_stress() {
         let _ = appendfs_fuse::mount(args, fs);
     });
 
-    // 5. Wait for FUSE to be mounted by monitoring the device ID change
+    // Wait for FUSE to be mounted by monitoring the device ID change
     let parent_dev = fs::metadata(std::env::temp_dir()).unwrap().dev();
     let mut mounted = false;
     for _ in 0..100 {
@@ -230,14 +222,14 @@ fn test_fuse_stress() {
     }
     assert!(mounted, "FUSE mount timed out or device ID did not change");
 
-    // 6. Create 4 subdirectories for the threads
+    // Create 4 subdirectories for the threads
     for i in 0..4 {
         let subdir = mount_path.join(format!("dir_{}", i));
         fs::create_dir(&subdir).unwrap();
         assert!(subdir.is_dir());
     }
 
-    // 7. Spawn 4 writer threads
+    // Spawn 4 writer threads
     let mut threads = Vec::new();
     for thread_idx in 0..4 {
         let mount_path_clone = mount_path.clone();
@@ -262,7 +254,7 @@ fn test_fuse_stress() {
         threads.push(writer);
     }
 
-    // 8. Spawn a 5th reader thread that lists directories concurrently
+    // Spawn a 5th reader thread that lists directories concurrently
     let mount_path_clone = mount_path.clone();
     let reader = thread::spawn(move || {
         for iter_idx in 0..20 {
@@ -285,12 +277,12 @@ fn test_fuse_stress() {
     });
     threads.push(reader);
 
-    // 9. Wait for all threads to finish
+    // Wait for all threads to finish
     for t in threads {
         t.join().unwrap();
     }
 
-    // 10. Clean up: remove subdirectories and assert empty
+    // Clean up: remove subdirectories and assert empty
     for i in 0..4 {
         let subdir = mount_path.join(format!("dir_{}", i));
         
@@ -306,7 +298,7 @@ fn test_fuse_stress() {
         assert!(!subdir.exists());
     }
 
-    // 11. Clean up FUSE: unmount using fusermount3 -u
+    // Clean up FUSE: unmount using fusermount3 -u
     let status = Command::new("fusermount3")
         .arg("-u")
         .arg(&mount_path_str)
@@ -314,6 +306,6 @@ fn test_fuse_stress() {
         .unwrap();
     assert!(status.success(), "Failed to unmount FUSE mount");
 
-    // 12. Wait for the background mount thread to exit
+    // Wait for the background mount thread to exit
     handle.join().unwrap();
 }
