@@ -166,6 +166,23 @@ fn test_fuse_filesystem() {
         file.sync_all().unwrap();
     }
 
+    // Verify fsyncdir support using opendir/dirfd/fsync (the only way to trigger FUSE fsyncdir)
+    {
+        use std::ffi::CString;
+        let dir_path = CString::new(mount_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let dirp = libc::opendir(dir_path.as_ptr());
+            assert!(!dirp.is_null(), "opendir failed");
+            let fd = libc::dirfd(dirp);
+            assert!(fd >= 0, "dirfd failed");
+            let rc = libc::fsync(fd);
+            assert_eq!(rc, 0, "fsync on dir fd failed: {}", std::io::Error::last_os_error());
+            let rc = libc::fdatasync(fd);
+            assert_eq!(rc, 0, "fdatasync on dir fd failed: {}", std::io::Error::last_os_error());
+            libc::closedir(dirp);
+        }
+    }
+
     // Cleanup hello_hard.txt
     fs::remove_file(&file_hard).unwrap();
     assert!(!file_hard.exists());
