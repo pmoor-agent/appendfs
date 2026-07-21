@@ -162,6 +162,7 @@ fn test_fuse_filesystem() {
     {
         use std::fs::OpenOptions;
         let file = OpenOptions::new().write(true).open(&file_hard).unwrap();
+        file.sync_data().unwrap();
         file.sync_all().unwrap();
     }
 
