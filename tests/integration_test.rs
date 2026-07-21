@@ -13,7 +13,7 @@ fn test_fuse_filesystem() {
     let _guard = TEST_MUTEX.lock().unwrap();
 
     // 2. Instantiate a fresh filesystem state for this session
-    let fs = agy_fuse::InMemoryFS::new();
+    let fs = appendfs_fuse::InMemoryFS::new();
 
     // 3. Create a unique temporary directory under /tmp
     let temp_dir = tempfile::tempdir().unwrap();
@@ -28,7 +28,7 @@ fn test_fuse_filesystem() {
             mount_path_clone.to_str().unwrap().to_string(),
             "-f".to_string(), // foreground
         ];
-        let _ = agy_fuse::mount(args, fs);
+        let _ = appendfs_fuse::mount(args, fs);
     });
 
     // 5. Wait for FUSE to be mounted by monitoring the device ID change
@@ -198,7 +198,7 @@ fn test_fuse_stress() {
     let _guard = TEST_MUTEX.lock().unwrap();
 
     // 2. Instantiate a fresh filesystem state for this session
-    let fs = agy_fuse::InMemoryFS::new();
+    let fs = appendfs_fuse::InMemoryFS::new();
 
     // 3. Create a unique temporary directory under /tmp
     let temp_dir = tempfile::tempdir().unwrap();
@@ -213,7 +213,7 @@ fn test_fuse_stress() {
             mount_path_clone.to_str().unwrap().to_string(),
             "-f".to_string(), // foreground
         ];
-        let _ = agy_fuse::mount(args, fs);
+        let _ = appendfs_fuse::mount(args, fs);
     });
 
     // 5. Wait for FUSE to be mounted by monitoring the device ID change
