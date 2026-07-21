@@ -210,7 +210,7 @@ fn get_fs_lock() -> &'static std::sync::RwLock<Option<Box<dyn Filesystem + Send 
 }
 
 // Private raw FFI functions linked from the C++ shim
-extern "C" {
+unsafe extern "C" {
     fn run_fuse_ll(
         argc: c_int,
         argv: *const *const c_char,
@@ -262,7 +262,7 @@ struct RustLowlevelOps {
 }
 
 // C-to-Rust bridge callback for lookup
-unsafe extern "C" fn lookup_bridge(req: *mut c_void, parent: u64, name: *const c_char) {
+unsafe extern "C" fn lookup_bridge(req: *mut c_void, parent: u64, name: *const c_char) { unsafe {
     let name_str = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => {
@@ -277,7 +277,7 @@ unsafe extern "C" fn lookup_bridge(req: *mut c_void, parent: u64, name: *const c
     } else {
         Request(req).reply_err(libc::ENODEV);
     }
-}
+}}
 
 // C-to-Rust bridge callback for getattr
 unsafe extern "C" fn getattr_bridge(req: *mut c_void, ino: u64) {
@@ -320,7 +320,7 @@ unsafe extern "C" fn open_bridge(req: *mut c_void, ino: u64, flags: u32) {
 }
 
 // C-to-Rust bridge callback for write
-unsafe extern "C" fn write_bridge(req: *mut c_void, ino: u64, buf: *const c_char, size: usize, offset: i64) {
+unsafe extern "C" fn write_bridge(req: *mut c_void, ino: u64, buf: *const c_char, size: usize, offset: i64) { unsafe {
     let fs_opt = get_fs_lock().read().unwrap();
     if let Some(fs) = fs_opt.as_ref() {
         let src_buf = std::slice::from_raw_parts(buf as *const u8, size);
@@ -328,7 +328,7 @@ unsafe extern "C" fn write_bridge(req: *mut c_void, ino: u64, buf: *const c_char
     } else {
         Request(req).reply_err(libc::ENODEV);
     }
-}
+}}
 
 // C-to-Rust bridge callback for setattr
 unsafe extern "C" fn setattr_bridge(req: *mut c_void, ino: u64, size: i64, to_set: u32) {
@@ -341,7 +341,7 @@ unsafe extern "C" fn setattr_bridge(req: *mut c_void, ino: u64, size: i64, to_se
 }
 
 // C-to-Rust bridge callback for create
-unsafe extern "C" fn create_bridge(req: *mut c_void, parent: u64, name: *const c_char, mode: u32, flags: u32) {
+unsafe extern "C" fn create_bridge(req: *mut c_void, parent: u64, name: *const c_char, mode: u32, flags: u32) { unsafe {
     let name_str = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => {
@@ -355,10 +355,10 @@ unsafe extern "C" fn create_bridge(req: *mut c_void, parent: u64, name: *const c
     } else {
         Request(req).reply_err(libc::ENODEV);
     }
-}
+}}
 
 // C-to-Rust bridge callback for unlink
-unsafe extern "C" fn unlink_bridge(req: *mut c_void, parent: u64, name: *const c_char) {
+unsafe extern "C" fn unlink_bridge(req: *mut c_void, parent: u64, name: *const c_char) { unsafe {
     let name_str = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => {
@@ -372,10 +372,10 @@ unsafe extern "C" fn unlink_bridge(req: *mut c_void, parent: u64, name: *const c
     } else {
         Request(req).reply_err(libc::ENODEV);
     }
-}
+}}
 
 // C-to-Rust bridge callback for mkdir
-unsafe extern "C" fn mkdir_bridge(req: *mut c_void, parent: u64, name: *const c_char, mode: u32) {
+unsafe extern "C" fn mkdir_bridge(req: *mut c_void, parent: u64, name: *const c_char, mode: u32) { unsafe {
     let name_str = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => {
@@ -389,10 +389,10 @@ unsafe extern "C" fn mkdir_bridge(req: *mut c_void, parent: u64, name: *const c_
     } else {
         Request(req).reply_err(libc::ENODEV);
     }
-}
+}}
 
 // C-to-Rust bridge callback for rmdir
-unsafe extern "C" fn rmdir_bridge(req: *mut c_void, parent: u64, name: *const c_char) {
+unsafe extern "C" fn rmdir_bridge(req: *mut c_void, parent: u64, name: *const c_char) { unsafe {
     let name_str = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => {
@@ -406,10 +406,10 @@ unsafe extern "C" fn rmdir_bridge(req: *mut c_void, parent: u64, name: *const c_
     } else {
         Request(req).reply_err(libc::ENODEV);
     }
-}
+}}
 
 // C-to-Rust bridge callback for symlink
-unsafe extern "C" fn symlink_bridge(req: *mut c_void, link: *const c_char, parent: u64, name: *const c_char) {
+unsafe extern "C" fn symlink_bridge(req: *mut c_void, link: *const c_char, parent: u64, name: *const c_char) { unsafe {
     let link_str = match CStr::from_ptr(link).to_str() {
         Ok(s) => s,
         Err(_) => {
@@ -430,7 +430,7 @@ unsafe extern "C" fn symlink_bridge(req: *mut c_void, link: *const c_char, paren
     } else {
         Request(req).reply_err(libc::ENODEV);
     }
-}
+}}
 
 // C-to-Rust bridge callback for readlink
 unsafe extern "C" fn readlink_bridge(req: *mut c_void, ino: u64) {
@@ -443,7 +443,7 @@ unsafe extern "C" fn readlink_bridge(req: *mut c_void, ino: u64) {
 }
 
 // C-to-Rust bridge callback for rename
-unsafe extern "C" fn rename_bridge(req: *mut c_void, parent: u64, name: *const c_char, newparent: u64, newname: *const c_char) {
+unsafe extern "C" fn rename_bridge(req: *mut c_void, parent: u64, name: *const c_char, newparent: u64, newname: *const c_char) { unsafe {
     let name_str = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => {
@@ -464,10 +464,10 @@ unsafe extern "C" fn rename_bridge(req: *mut c_void, parent: u64, name: *const c
     } else {
         Request(req).reply_err(libc::ENODEV);
     }
-}
+}}
 
 // C-to-Rust bridge callback for link
-unsafe extern "C" fn link_bridge(req: *mut c_void, ino: u64, newparent: u64, newname: *const c_char) {
+unsafe extern "C" fn link_bridge(req: *mut c_void, ino: u64, newparent: u64, newname: *const c_char) { unsafe {
     let newname_str = match CStr::from_ptr(newname).to_str() {
         Ok(s) => s,
         Err(_) => {
@@ -481,7 +481,7 @@ unsafe extern "C" fn link_bridge(req: *mut c_void, ino: u64, newparent: u64, new
     } else {
         Request(req).reply_err(libc::ENODEV);
     }
-}
+}}
 
 // C-to-Rust bridge callback for fsync
 unsafe extern "C" fn fsync_bridge(req: *mut c_void, ino: u64, datasync: c_int) {

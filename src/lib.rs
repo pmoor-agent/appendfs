@@ -36,14 +36,14 @@ impl SyncNode {
     }
 
     // Safety: Caller must hold the read (or write) lock for this node's bucket in the LockPool.
-    unsafe fn read(&self) -> &Node {
+    unsafe fn read(&self) -> &Node { unsafe {
         &*self.0.get()
-    }
+    }}
 
     // Safety: Caller must hold the write lock for this node's bucket in the LockPool.
-    unsafe fn write(&self) -> &mut Node {
+    unsafe fn write(&self) -> &mut Node { unsafe {
         &mut *self.0.get()
-    }
+    }}
 }
 
 // Centralized fixed-size lock pool using striped locks.
