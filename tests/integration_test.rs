@@ -12,6 +12,9 @@ fn test_fuse_filesystem() {
     let mount_path = temp_dir.path().to_path_buf();
     let mount_path_str = mount_path.to_str().unwrap().to_string();
 
+    // Record initial device ID of mount_path BEFORE spawning mount thread
+    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
+
     // Spawn FUSE mounting in a background thread
     let mount_path_clone = mount_path.clone();
     let handle = thread::spawn(move || {
@@ -24,11 +27,10 @@ fn test_fuse_filesystem() {
     });
 
     // Wait for FUSE to be mounted by monitoring the device ID change
-    let parent_dev = fs::metadata(std::env::temp_dir()).unwrap().dev();
     let mut mounted = false;
     for _ in 0..100 {
         if let Ok(meta) = fs::metadata(&mount_path) {
-            if meta.dev() != parent_dev {
+            if meta.dev() != initial_dev {
                 mounted = true;
                 break;
             }
@@ -238,6 +240,9 @@ fn test_fuse_stress() {
     let mount_path = temp_dir.path().to_path_buf();
     let mount_path_str = mount_path.to_str().unwrap().to_string();
 
+    // Record initial device ID of mount_path BEFORE spawning mount thread
+    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
+
     // Spawn FUSE mounting in a background thread
     let mount_path_clone = mount_path.clone();
     let handle = thread::spawn(move || {
@@ -250,11 +255,10 @@ fn test_fuse_stress() {
     });
 
     // Wait for FUSE to be mounted by monitoring the device ID change
-    let parent_dev = fs::metadata(std::env::temp_dir()).unwrap().dev();
     let mut mounted = false;
     for _ in 0..100 {
         if let Ok(meta) = fs::metadata(&mount_path) {
-            if meta.dev() != parent_dev {
+            if meta.dev() != initial_dev {
                 mounted = true;
                 break;
             }
