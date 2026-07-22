@@ -15,25 +15,25 @@ extern "C" {
     };
 
     // Callback signatures that Rust will implement for low-level FUSE
-    typedef void (*rust_lookup_t)(shim_req_t req, uint64_t parent, const char *name);
-    typedef void (*rust_getattr_t)(shim_req_t req, uint64_t ino);
-    typedef void (*rust_readdir_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off);
-    typedef void (*rust_read_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off);
-    typedef void (*rust_open_t)(shim_req_t req, uint64_t ino, uint32_t flags);
-    typedef void (*rust_write_t)(shim_req_t req, uint64_t ino, const char *buf, size_t size, int64_t off);
-    typedef void (*rust_setattr_t)(shim_req_t req, uint64_t ino, int64_t size, uint32_t to_set);
-    typedef void (*rust_create_t)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, uint32_t flags);
-    typedef void (*rust_unlink_t)(shim_req_t req, uint64_t parent, const char *name);
-    typedef void (*rust_mkdir_t)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode);
-    typedef void (*rust_rmdir_t)(shim_req_t req, uint64_t parent, const char *name);
-    typedef void (*rust_symlink_t)(shim_req_t req, const char *link, uint64_t parent, const char *name);
-    typedef void (*rust_readlink_t)(shim_req_t req, uint64_t ino);
-    typedef void (*rust_rename_t)(shim_req_t req, uint64_t parent, const char *name, uint64_t newparent, const char *newname);
-    typedef void (*rust_link_t)(shim_req_t req, uint64_t ino, uint64_t newparent, const char *newname);
-    typedef void (*rust_fsync_t)(shim_req_t req, uint64_t ino, int datasync);
-    typedef void (*rust_release_t)(shim_req_t req, uint64_t ino);
-    typedef void (*rust_releasedir_t)(shim_req_t req, uint64_t ino);
-    typedef void (*rust_fsyncdir_t)(shim_req_t req, uint64_t ino, int datasync);
+    typedef void (*rust_lookup_t)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
+    typedef void (*rust_getattr_t)(shim_req_t req, uint64_t ino, void *userdata);
+    typedef void (*rust_readdir_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
+    typedef void (*rust_read_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
+    typedef void (*rust_open_t)(shim_req_t req, uint64_t ino, uint32_t flags, void *userdata);
+    typedef void (*rust_write_t)(shim_req_t req, uint64_t ino, const char *buf, size_t size, int64_t off, void *userdata);
+    typedef void (*rust_setattr_t)(shim_req_t req, uint64_t ino, int64_t size, uint32_t to_set, void *userdata);
+    typedef void (*rust_create_t)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, uint32_t flags, void *userdata);
+    typedef void (*rust_unlink_t)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
+    typedef void (*rust_mkdir_t)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, void *userdata);
+    typedef void (*rust_rmdir_t)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
+    typedef void (*rust_symlink_t)(shim_req_t req, const char *link, uint64_t parent, const char *name, void *userdata);
+    typedef void (*rust_readlink_t)(shim_req_t req, uint64_t ino, void *userdata);
+    typedef void (*rust_rename_t)(shim_req_t req, uint64_t parent, const char *name, uint64_t newparent, const char *newname, void *userdata);
+    typedef void (*rust_link_t)(shim_req_t req, uint64_t ino, uint64_t newparent, const char *newname, void *userdata);
+    typedef void (*rust_fsync_t)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
+    typedef void (*rust_release_t)(shim_req_t req, uint64_t ino, void *userdata);
+    typedef void (*rust_releasedir_t)(shim_req_t req, uint64_t ino, void *userdata);
+    typedef void (*rust_fsyncdir_t)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
 
     struct rust_lowlevel_ops {
         rust_lookup_t lookup;
@@ -58,7 +58,7 @@ extern "C" {
     };
 
     // Entrypoint to mount and run FUSE low-level loop
-    int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops);
+    int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops, void *userdata);
 
     // FUSE reply wrappers exposed to Rust
     int shim_reply_err(shim_req_t req, int err);

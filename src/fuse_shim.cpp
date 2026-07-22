@@ -6,11 +6,15 @@
 #include <cstdlib>
 #include <cstdio>
 
-static rust_lowlevel_ops g_ops;
+struct shim_session_ctx {
+    rust_lowlevel_ops ops;
+    void *user_fs;
+};
 
 static void ll_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
-    if (g_ops.lookup) {
-        g_ops.lookup(static_cast<shim_req_t>(req), parent, name);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.lookup) {
+        ctx->ops.lookup(static_cast<shim_req_t>(req), parent, name, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -18,8 +22,9 @@ static void ll_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
 
 static void ll_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
     (void) fi;
-    if (g_ops.getattr) {
-        g_ops.getattr(static_cast<shim_req_t>(req), ino);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.getattr) {
+        ctx->ops.getattr(static_cast<shim_req_t>(req), ino, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -28,8 +33,9 @@ static void ll_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 static void ll_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                        struct fuse_file_info *fi) {
     (void) fi;
-    if (g_ops.readdir) {
-        g_ops.readdir(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off));
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.readdir) {
+        ctx->ops.readdir(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -38,16 +44,18 @@ static void ll_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 static void ll_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                     struct fuse_file_info *fi) {
     (void) fi;
-    if (g_ops.read) {
-        g_ops.read(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off));
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.read) {
+        ctx->ops.read(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
 }
 
 static void ll_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
-    if (g_ops.open) {
-        g_ops.open(static_cast<shim_req_t>(req), ino, fi->flags);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.open) {
+        ctx->ops.open(static_cast<shim_req_t>(req), ino, fi->flags, ctx->user_fs);
     } else {
         struct fuse_file_info default_fi = {};
         fuse_reply_open(req, &default_fi);
@@ -57,8 +65,9 @@ static void ll_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 static void ll_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size,
                      off_t off, struct fuse_file_info *fi) {
     (void) fi;
-    if (g_ops.write) {
-        g_ops.write(static_cast<shim_req_t>(req), ino, buf, size, static_cast<int64_t>(off));
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.write) {
+        ctx->ops.write(static_cast<shim_req_t>(req), ino, buf, size, static_cast<int64_t>(off), ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -67,8 +76,9 @@ static void ll_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t siz
 static void ll_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set,
                        struct fuse_file_info *fi) {
     (void) fi;
-    if (g_ops.setattr) {
-        g_ops.setattr(static_cast<shim_req_t>(req), ino, static_cast<int64_t>(attr->st_size), static_cast<uint32_t>(to_set));
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.setattr) {
+        ctx->ops.setattr(static_cast<shim_req_t>(req), ino, static_cast<int64_t>(attr->st_size), static_cast<uint32_t>(to_set), ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -76,48 +86,54 @@ static void ll_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
 
 static void ll_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode,
                       struct fuse_file_info *fi) {
-    if (g_ops.create) {
-        g_ops.create(static_cast<shim_req_t>(req), parent, name, static_cast<uint32_t>(mode), fi->flags);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.create) {
+        ctx->ops.create(static_cast<shim_req_t>(req), parent, name, static_cast<uint32_t>(mode), fi->flags, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
 }
 
 static void ll_unlink(fuse_req_t req, fuse_ino_t parent, const char *name) {
-    if (g_ops.unlink) {
-        g_ops.unlink(static_cast<shim_req_t>(req), parent, name);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.unlink) {
+        ctx->ops.unlink(static_cast<shim_req_t>(req), parent, name, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
 }
 
 static void ll_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode) {
-    if (g_ops.mkdir) {
-        g_ops.mkdir(static_cast<shim_req_t>(req), parent, name, static_cast<uint32_t>(mode));
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.mkdir) {
+        ctx->ops.mkdir(static_cast<shim_req_t>(req), parent, name, static_cast<uint32_t>(mode), ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
 }
 
 static void ll_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name) {
-    if (g_ops.rmdir) {
-        g_ops.rmdir(static_cast<shim_req_t>(req), parent, name);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.rmdir) {
+        ctx->ops.rmdir(static_cast<shim_req_t>(req), parent, name, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
 }
 
 static void ll_symlink(fuse_req_t req, const char *link, fuse_ino_t parent, const char *name) {
-    if (g_ops.symlink) {
-        g_ops.symlink(static_cast<shim_req_t>(req), link, parent, name);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.symlink) {
+        ctx->ops.symlink(static_cast<shim_req_t>(req), link, parent, name, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
 }
 
 static void ll_readlink(fuse_req_t req, fuse_ino_t ino) {
-    if (g_ops.readlink) {
-        g_ops.readlink(static_cast<shim_req_t>(req), ino);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.readlink) {
+        ctx->ops.readlink(static_cast<shim_req_t>(req), ino, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -126,16 +142,18 @@ static void ll_readlink(fuse_req_t req, fuse_ino_t ino) {
 static void ll_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
                       fuse_ino_t newparent, const char *newname, unsigned int flags) {
     (void) flags;
-    if (g_ops.rename) {
-        g_ops.rename(static_cast<shim_req_t>(req), parent, name, newparent, newname);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.rename) {
+        ctx->ops.rename(static_cast<shim_req_t>(req), parent, name, newparent, newname, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
 }
 
 static void ll_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newname) {
-    if (g_ops.link) {
-        g_ops.link(static_cast<shim_req_t>(req), ino, newparent, newname);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.link) {
+        ctx->ops.link(static_cast<shim_req_t>(req), ino, newparent, newname, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -143,8 +161,9 @@ static void ll_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const 
 
 static void ll_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi) {
     (void) fi;
-    if (g_ops.fsync) {
-        g_ops.fsync(static_cast<shim_req_t>(req), ino, datasync);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.fsync) {
+        ctx->ops.fsync(static_cast<shim_req_t>(req), ino, datasync, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -152,8 +171,9 @@ static void ll_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_f
 
 static void ll_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
     (void) fi;
-    if (g_ops.release) {
-        g_ops.release(static_cast<shim_req_t>(req), ino);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.release) {
+        ctx->ops.release(static_cast<shim_req_t>(req), ino, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -161,8 +181,9 @@ static void ll_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 
 static void ll_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
     (void) fi;
-    if (g_ops.releasedir) {
-        g_ops.releasedir(static_cast<shim_req_t>(req), ino);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.releasedir) {
+        ctx->ops.releasedir(static_cast<shim_req_t>(req), ino, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -170,8 +191,9 @@ static void ll_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
 
 static void ll_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi) {
     (void) fi;
-    if (g_ops.fsyncdir) {
-        g_ops.fsyncdir(static_cast<shim_req_t>(req), ino, datasync);
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.fsyncdir) {
+        ctx->ops.fsyncdir(static_cast<shim_req_t>(req), ino, datasync, ctx->user_fs);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -179,9 +201,9 @@ static void ll_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fus
 
 extern "C" {
 
-int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops) {
+int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops, void *userdata) {
     if (!ops) return -1;
-    g_ops = *ops;
+    shim_session_ctx ctx = { *ops, userdata };
 
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
     struct fuse_session *se = nullptr;
@@ -232,17 +254,13 @@ int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops) {
     ll_ops.releasedir = ll_releasedir;
     ll_ops.fsyncdir = ll_fsyncdir;
 
-    se = fuse_session_new(&args, &ll_ops, sizeof(ll_ops), nullptr);
+    se = fuse_session_new(&args, &ll_ops, sizeof(ll_ops), &ctx);
     if (se == nullptr) {
         goto err_out1;
     }
 
-    if (fuse_set_signal_handlers(se) != 0) {
-        goto err_out2;
-    }
-
     if (fuse_session_mount(se, opts.mountpoint) != 0) {
-        goto err_out3;
+        goto err_out2;
     }
 
     fuse_daemonize(opts.foreground);
@@ -254,8 +272,6 @@ int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops) {
     }
 
     fuse_session_unmount(se);
-err_out3:
-    fuse_remove_signal_handlers(se);
 err_out2:
     fuse_session_destroy(se);
 err_out1:

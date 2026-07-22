@@ -1,10 +1,10 @@
 pub mod shim;
 
 use shim::{FileAttr, FileType, Filesystem, Request};
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 // Structure representing an in-memory node (file, directory, or symlink)
 pub enum Node {
@@ -36,14 +36,14 @@ impl SyncNode {
     }
 
     // Safety: Caller must hold the read (or write) lock for this node's bucket in the LockPool.
-    unsafe fn read(&self) -> &Node { unsafe {
-        &*self.0.get()
-    }}
+    unsafe fn read(&self) -> &Node {
+        unsafe { &*self.0.get() }
+    }
 
     // Safety: Caller must hold the write lock for this node's bucket in the LockPool.
-    unsafe fn write(&self) -> &mut Node { unsafe {
-        &mut *self.0.get()
-    }}
+    unsafe fn write(&self) -> &mut Node {
+        unsafe { &mut *self.0.get() }
+    }
 }
 
 // Centralized fixed-size lock pool using striped locks.
@@ -75,7 +75,14 @@ impl LockPool {
 
     // Acquires write locks for two inodes in a deadlock-safe manner.
     // Handles bucket collisions gracefully by only locking once.
-    fn write_two(&self, ino1: u64, ino2: u64) -> (std::sync::RwLockWriteGuard<'_, ()>, Option<std::sync::RwLockWriteGuard<'_, ()>>) {
+    fn write_two(
+        &self,
+        ino1: u64,
+        ino2: u64,
+    ) -> (
+        std::sync::RwLockWriteGuard<'_, ()>,
+        Option<std::sync::RwLockWriteGuard<'_, ()>>,
+    ) {
         let idx1 = (ino1 % BUCKET_COUNT as u64) as usize;
         let idx2 = (ino2 % BUCKET_COUNT as u64) as usize;
 
@@ -168,7 +175,11 @@ impl Filesystem for InMemoryFS {
                     1.0,
                 );
             }
-            Node::File { content, perm, nlink } => {
+            Node::File {
+                content,
+                perm,
+                nlink,
+            } => {
                 req.reply_attr(
                     &FileAttr {
                         ino,
@@ -257,7 +268,11 @@ impl Filesystem for InMemoryFS {
                     1.0,
                 );
             }
-            Node::File { content, perm, nlink } => {
+            Node::File {
+                content,
+                perm,
+                nlink,
+            } => {
                 req.reply_entry(
                     &FileAttr {
                         ino: child_ino,
@@ -287,7 +302,10 @@ impl Filesystem for InMemoryFS {
     }
 
     fn readdir(&self, req: Request, ino: u64, size: usize, offset: i64) {
-        println!("TRACE: readdir(ino={}, size={}, offset={})", ino, size, offset);
+        println!(
+            "TRACE: readdir(ino={}, size={}, offset={})",
+            ino, size, offset
+        );
         let entries = {
             let node_arc = {
                 let map = self.inodes.read().unwrap();
@@ -394,7 +412,12 @@ impl Filesystem for InMemoryFS {
     }
 
     fn write(&self, req: Request, ino: u64, buf: &[u8], offset: i64) {
-        println!("TRACE: write(ino={}, len={}, offset={})", ino, buf.len(), offset);
+        println!(
+            "TRACE: write(ino={}, len={}, offset={})",
+            ino,
+            buf.len(),
+            offset
+        );
         let node_arc = {
             let map = self.inodes.read().unwrap();
             match map.get(&ino) {
@@ -428,7 +451,10 @@ impl Filesystem for InMemoryFS {
     }
 
     fn setattr(&self, req: Request, ino: u64, size: i64, to_set: u32) {
-        println!("TRACE: setattr(ino={}, size={}, to_set={})", ino, size, to_set);
+        println!(
+            "TRACE: setattr(ino={}, size={}, to_set={})",
+            ino, size, to_set
+        );
         let node_arc = {
             let map = self.inodes.read().unwrap();
             match map.get(&ino) {
@@ -445,7 +471,11 @@ impl Filesystem for InMemoryFS {
         let _guard = self.lock_pool.write(ino);
         let node = unsafe { node_arc.write() };
         match node {
-            Node::File { content, perm, nlink } => {
+            Node::File {
+                content,
+                perm,
+                nlink,
+            } => {
                 if (to_set & FUSE_SET_ATTR_SIZE) != 0 {
                     println!("TRACE: truncating file to {}", size);
                     content.resize(size as usize, 0);
@@ -489,7 +519,10 @@ impl Filesystem for InMemoryFS {
     }
 
     fn create(&self, req: Request, parent: u64, name: &str, mode: u32, flags: u32) {
-        println!("TRACE: create(parent={}, name={}, mode=0o{:o}, flags=0x{:x})", parent, name, mode, flags);
+        println!(
+            "TRACE: create(parent={}, name={}, mode=0o{:o}, flags=0x{:x})",
+            parent, name, mode, flags
+        );
         let parent_node_arc = {
             let map = self.inodes.read().unwrap();
             match map.get(&parent) {
@@ -563,9 +596,12 @@ impl Filesystem for InMemoryFS {
             let parent_node = unsafe { parent_node_arc.write() };
             match parent_node {
                 Node::Directory { entries, .. } => {
-                    if let Some(pos) = entries.iter().position(|(entry_name, _)| entry_name == name) {
+                    if let Some(pos) = entries
+                        .iter()
+                        .position(|(entry_name, _)| entry_name == name)
+                    {
                         let (_, child_ino) = entries.remove(pos);
-                        
+
                         let map = self.inodes.read().unwrap();
                         let n_opt = map.get(&child_ino).map(Arc::clone);
                         (Some(child_ino), n_opt)
@@ -623,7 +659,10 @@ impl Filesystem for InMemoryFS {
     }
 
     fn mkdir(&self, req: Request, parent: u64, name: &str, mode: u32) {
-        println!("TRACE: mkdir(parent={}, name={}, mode=0o{:o})", parent, name, mode);
+        println!(
+            "TRACE: mkdir(parent={}, name={}, mode=0o{:o})",
+            parent, name, mode
+        );
         let parent_node_arc = {
             let map = self.inodes.read().unwrap();
             match map.get(&parent) {
@@ -696,7 +735,10 @@ impl Filesystem for InMemoryFS {
             let parent_node = unsafe { parent_node_arc.write() };
             match parent_node {
                 Node::Directory { entries, .. } => {
-                    if let Some(pos) = entries.iter().position(|(entry_name, _)| entry_name == name) {
+                    if let Some(pos) = entries
+                        .iter()
+                        .position(|(entry_name, _)| entry_name == name)
+                    {
                         let (_, child_ino) = entries[pos];
 
                         let child_node_arc = {
@@ -714,7 +756,10 @@ impl Filesystem for InMemoryFS {
                             let _child_guard = self.lock_pool.read(child_ino);
                             let child_node = unsafe { child_node_arc.read() };
                             match child_node {
-                                Node::Directory { entries: child_entries, .. } => {
+                                Node::Directory {
+                                    entries: child_entries,
+                                    ..
+                                } => {
                                     if !child_entries.is_empty() {
                                         req.reply_err(libc::ENOTEMPTY);
                                         return;
@@ -750,7 +795,10 @@ impl Filesystem for InMemoryFS {
     }
 
     fn symlink(&self, req: Request, link: &str, parent: u64, name: &str) {
-        println!("TRACE: symlink(parent={}, name={}, link={})", parent, name, link);
+        println!(
+            "TRACE: symlink(parent={}, name={}, link={})",
+            parent, name, link
+        );
         let parent_node_arc = {
             let map = self.inodes.read().unwrap();
             match map.get(&parent) {
@@ -830,8 +878,11 @@ impl Filesystem for InMemoryFS {
     }
 
     fn rename(&self, req: Request, parent: u64, name: &str, newparent: u64, newname: &str) {
-        println!("TRACE: rename(parent={}, name={}, newparent={}, newname={})", parent, name, newparent, newname);
-        
+        println!(
+            "TRACE: rename(parent={}, name={}, newparent={}, newname={})",
+            parent, name, newparent, newname
+        );
+
         // Retrieve inodes map read lock to check source type and perform loop check
         {
             let map = self.inodes.read().unwrap();
@@ -933,11 +984,11 @@ impl Filesystem for InMemoryFS {
                     // Check if destination entry exists
                     if let Some(dest_pos) = entries.iter().position(|(n, _)| n == newname) {
                         let (_, dest_ino) = entries[dest_pos];
-                        
+
                         let map = self.inodes.read().unwrap();
                         let src_node_arc = map.get(&src_ino).unwrap();
                         let dest_node_arc = map.get(&dest_ino).unwrap();
-                        
+
                         let src_is_dir = {
                             let _g = self.lock_pool.read(src_ino);
                             matches!(unsafe { src_node_arc.read() }, Node::Directory { .. })
@@ -946,7 +997,7 @@ impl Filesystem for InMemoryFS {
                             let _g = self.lock_pool.read(dest_ino);
                             matches!(unsafe { dest_node_arc.read() }, Node::Directory { .. })
                         };
-                        
+
                         if src_is_dir != dest_is_dir {
                             if src_is_dir {
                                 req.reply_err(libc::ENOTDIR);
@@ -957,7 +1008,11 @@ impl Filesystem for InMemoryFS {
                         }
                         if dest_is_dir {
                             let _g = self.lock_pool.read(dest_ino);
-                            if let Node::Directory { entries: dest_entries, .. } = unsafe { dest_node_arc.read() } {
+                            if let Node::Directory {
+                                entries: dest_entries,
+                                ..
+                            } = unsafe { dest_node_arc.read() }
+                            {
                                 if !dest_entries.is_empty() {
                                     req.reply_err(libc::ENOTEMPTY);
                                     return;
@@ -965,7 +1020,7 @@ impl Filesystem for InMemoryFS {
                             }
                         }
                         overwritten_ino = Some(dest_ino);
-                        
+
                         // Perform overwrite by removing dest and updating src entry name
                         entries.remove(dest_pos);
                         let new_src_pos = entries.iter().position(|(n, _)| n == name).unwrap();
@@ -980,7 +1035,16 @@ impl Filesystem for InMemoryFS {
                 }
             } else {
                 match (parent_node, newparent_node) {
-                    (Node::Directory { entries: src_entries, .. }, Node::Directory { entries: dest_entries, .. }) => {
+                    (
+                        Node::Directory {
+                            entries: src_entries,
+                            ..
+                        },
+                        Node::Directory {
+                            entries: dest_entries,
+                            ..
+                        },
+                    ) => {
                         let src_pos = match src_entries.iter().position(|(n, _)| n == name) {
                             Some(pos) => pos,
                             None => {
@@ -990,12 +1054,13 @@ impl Filesystem for InMemoryFS {
                         };
                         let (_, src_ino) = src_entries[src_pos];
 
-                        if let Some(dest_pos) = dest_entries.iter().position(|(n, _)| n == newname) {
+                        if let Some(dest_pos) = dest_entries.iter().position(|(n, _)| n == newname)
+                        {
                             let (_, dest_ino) = dest_entries[dest_pos];
                             let map = self.inodes.read().unwrap();
                             let src_node_arc = map.get(&src_ino).unwrap();
                             let dest_node_arc = map.get(&dest_ino).unwrap();
-                            
+
                             let src_is_dir = {
                                 let _g = self.lock_pool.read(src_ino);
                                 matches!(unsafe { src_node_arc.read() }, Node::Directory { .. })
@@ -1004,7 +1069,7 @@ impl Filesystem for InMemoryFS {
                                 let _g = self.lock_pool.read(dest_ino);
                                 matches!(unsafe { dest_node_arc.read() }, Node::Directory { .. })
                             };
-                            
+
                             if src_is_dir != dest_is_dir {
                                 if src_is_dir {
                                     req.reply_err(libc::ENOTDIR);
@@ -1015,7 +1080,11 @@ impl Filesystem for InMemoryFS {
                             }
                             if dest_is_dir {
                                 let _g = self.lock_pool.read(dest_ino);
-                                if let Node::Directory { entries: dest_subentries, .. } = unsafe { dest_node_arc.read() } {
+                                if let Node::Directory {
+                                    entries: dest_subentries,
+                                    ..
+                                } = unsafe { dest_node_arc.read() }
+                                {
                                     if !dest_subentries.is_empty() {
                                         req.reply_err(libc::ENOTEMPTY);
                                         return;
@@ -1085,7 +1154,10 @@ impl Filesystem for InMemoryFS {
     }
 
     fn link(&self, req: Request, ino: u64, newparent: u64, newname: &str) {
-        println!("TRACE: link(ino={}, newparent={}, newname={})", ino, newparent, newname);
+        println!(
+            "TRACE: link(ino={}, newparent={}, newname={})",
+            ino, newparent, newname
+        );
         let map = self.inodes.read().unwrap();
         let node_arc = match map.get(&ino) {
             Some(n) => Arc::clone(n),

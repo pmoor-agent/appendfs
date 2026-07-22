@@ -1,12 +1,9 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
-use std::process::Command;
-use std::os::unix::fs::MetadataExt;
-use serial_test::serial;
-
 #[test]
-#[serial]
 fn test_fuse_filesystem() {
     let fs = appendfs_fuse::InMemoryFS::new();
 
@@ -45,12 +42,16 @@ fn test_fuse_filesystem() {
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
         .collect();
-    assert!(entries.is_empty(), "Expected directory to be empty, got: {:?}", entries);
+    assert!(
+        entries.is_empty(),
+        "Expected directory to be empty, got: {:?}",
+        entries
+    );
 
     // Create a new file (hello.txt)
     let file_hello = mount_path.join("hello.txt");
     assert!(!file_hello.exists());
-    
+
     let content = "Hello world from dynamic FUSE!\n";
     fs::write(&file_hello, content).unwrap();
     assert!(file_hello.exists());
@@ -109,7 +110,10 @@ fn test_fuse_filesystem() {
     assert!(!file_hello.exists());
     assert!(test_rename.exists());
     let renamed_content = fs::read_to_string(&test_rename).unwrap();
-    assert_eq!(renamed_content, format!("{}{}", new_content, append_content));
+    assert_eq!(
+        renamed_content,
+        format!("{}{}", new_content, append_content)
+    );
 
     // Move across directories: move rename_dir/test_rename.txt to root/test_moved.txt
     let test_moved = mount_path.join("test_moved.txt");
@@ -146,7 +150,10 @@ fn test_fuse_filesystem() {
 
     // Modify through the hard link and assert changes reflect in original
     fs::write(&file_hard, "Modified via link!").unwrap();
-    assert_eq!(fs::read_to_string(&file_hello).unwrap(), "Modified via link!");
+    assert_eq!(
+        fs::read_to_string(&file_hello).unwrap(),
+        "Modified via link!"
+    );
 
     // Unlink original hello.txt
     fs::remove_file(&file_hello).unwrap();
@@ -156,7 +163,10 @@ fn test_fuse_filesystem() {
     assert!(file_hard.exists());
     let meta_hard = fs::metadata(&file_hard).unwrap();
     assert_eq!(meta_hard.nlink(), 1);
-    assert_eq!(fs::read_to_string(&file_hard).unwrap(), "Modified via link!");
+    assert_eq!(
+        fs::read_to_string(&file_hard).unwrap(),
+        "Modified via link!"
+    );
 
     // Verify fsync support by calling sync_all on a file handle
     {
@@ -176,9 +186,19 @@ fn test_fuse_filesystem() {
             let fd = libc::dirfd(dirp);
             assert!(fd >= 0, "dirfd failed");
             let rc = libc::fsync(fd);
-            assert_eq!(rc, 0, "fsync on dir fd failed: {}", std::io::Error::last_os_error());
+            assert_eq!(
+                rc,
+                0,
+                "fsync on dir fd failed: {}",
+                std::io::Error::last_os_error()
+            );
             let rc = libc::fdatasync(fd);
-            assert_eq!(rc, 0, "fdatasync on dir fd failed: {}", std::io::Error::last_os_error());
+            assert_eq!(
+                rc,
+                0,
+                "fdatasync on dir fd failed: {}",
+                std::io::Error::last_os_error()
+            );
             libc::closedir(dirp);
         }
     }
@@ -191,7 +211,11 @@ fn test_fuse_filesystem() {
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
         .collect();
-    assert!(entries_after.is_empty(), "Expected directory to be empty after deletion, got: {:?}", entries_after);
+    assert!(
+        entries_after.is_empty(),
+        "Expected directory to be empty after deletion, got: {:?}",
+        entries_after
+    );
 
     // Clean up: unmount using fusermount3 -u
     let status = Command::new("fusermount3")
@@ -206,7 +230,6 @@ fn test_fuse_filesystem() {
 }
 
 #[test]
-#[serial]
 fn test_fuse_stress() {
     let fs = appendfs_fuse::InMemoryFS::new();
 
@@ -256,14 +279,14 @@ fn test_fuse_stress() {
             for iter_idx in 0..50 {
                 let file_path = subdir.join(format!("file_{}.txt", iter_idx));
                 let expected_content = format!("thread {} iteration {}", thread_idx, iter_idx);
-                
+
                 // Write the file
                 fs::write(&file_path, &expected_content).unwrap();
-                
+
                 // Read and verify
                 let read_content = fs::read_to_string(&file_path).unwrap();
                 assert_eq!(read_content, expected_content);
-                
+
                 // Delete the file
                 fs::remove_file(&file_path).unwrap();
                 assert!(!file_path.exists());
@@ -303,14 +326,19 @@ fn test_fuse_stress() {
     // Clean up: remove subdirectories and assert empty
     for i in 0..4 {
         let subdir = mount_path.join(format!("dir_{}", i));
-        
+
         // Assert directory is empty
         let entries: Vec<String> = fs::read_dir(&subdir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
             .collect();
-        assert!(entries.is_empty(), "Expected directory dir_{} to be empty, got: {:?}", i, entries);
-        
+        assert!(
+            entries.is_empty(),
+            "Expected directory dir_{} to be empty, got: {:?}",
+            i,
+            entries
+        );
+
         // Remove directory
         fs::remove_dir(&subdir).unwrap();
         assert!(!subdir.exists());
