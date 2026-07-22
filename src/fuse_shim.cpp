@@ -199,6 +199,11 @@ static void ll_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fus
     }
 }
 
+#include <mutex>
+#include <getopt.h>
+
+static std::mutex g_mount_mutex;
+
 extern "C" {
 
 int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops, void *userdata) {
@@ -211,6 +216,8 @@ int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops, void *user
     struct fuse_lowlevel_ops ll_ops = {};
     int ret = -1;
 
+    std::unique_lock<std::mutex> mount_lock(g_mount_mutex);
+    optind = 1;
     if (fuse_parse_cmdline(&args, &opts) != 0) {
         return -1;
     }
@@ -262,6 +269,7 @@ int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops, void *user
     if (fuse_session_mount(se, opts.mountpoint) != 0) {
         goto err_out2;
     }
+    mount_lock.unlock();
 
     fuse_daemonize(opts.foreground);
 

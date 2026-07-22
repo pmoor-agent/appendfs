@@ -1,16 +1,20 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+
 #[test]
 fn test_fuse_filesystem() {
     let fs = appendfs_fuse::InMemoryFS::new();
 
     // Create a unique temporary directory under /tmp
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempfile::Builder::new().prefix("appendfs_test_").tempdir().unwrap();
     let mount_path = temp_dir.path().to_path_buf();
     let mount_path_str = mount_path.to_str().unwrap().to_string();
+
+    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     // Record initial device ID of mount_path BEFORE spawning mount thread
     let initial_dev = fs::metadata(&mount_path).unwrap().dev();
@@ -23,17 +27,22 @@ fn test_fuse_filesystem() {
             mount_path_clone.to_str().unwrap().to_string(),
             "-f".to_string(), // foreground
         ];
-        let _ = appendfs_fuse::mount(args, fs);
+        if let Err(e) = appendfs_fuse::mount(args, fs) {
+            eprintln!("FUSE mount error: {}", e);
+        }
     });
 
     // Wait for FUSE to be mounted by monitoring the device ID change
     let mut mounted = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         if let Ok(meta) = fs::metadata(&mount_path) {
             if meta.dev() != initial_dev {
                 mounted = true;
                 break;
             }
+        }
+        if handle.is_finished() {
+            break;
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -236,9 +245,11 @@ fn test_fuse_stress() {
     let fs = appendfs_fuse::InMemoryFS::new();
 
     // Create a unique temporary directory under /tmp
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempfile::Builder::new().prefix("appendfs_test_").tempdir().unwrap();
     let mount_path = temp_dir.path().to_path_buf();
     let mount_path_str = mount_path.to_str().unwrap().to_string();
+
+    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     // Record initial device ID of mount_path BEFORE spawning mount thread
     let initial_dev = fs::metadata(&mount_path).unwrap().dev();
@@ -251,17 +262,22 @@ fn test_fuse_stress() {
             mount_path_clone.to_str().unwrap().to_string(),
             "-f".to_string(), // foreground
         ];
-        let _ = appendfs_fuse::mount(args, fs);
+        if let Err(e) = appendfs_fuse::mount(args, fs) {
+            eprintln!("FUSE mount error: {}", e);
+        }
     });
 
     // Wait for FUSE to be mounted by monitoring the device ID change
     let mut mounted = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         if let Ok(meta) = fs::metadata(&mount_path) {
             if meta.dev() != initial_dev {
                 mounted = true;
                 break;
             }
+        }
+        if handle.is_finished() {
+            break;
         }
         thread::sleep(Duration::from_millis(50));
     }
