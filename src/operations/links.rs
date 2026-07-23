@@ -84,9 +84,12 @@ pub fn unlink(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
 }
 
 pub fn symlink(fs: &InMemoryFS, req: Request, link: &str, parent: u64, name: &str) {
+    let uid = req.uid();
+    let gid = req.gid();
+    let now = fs.clock.now();
     println!(
-        "TRACE: symlink(parent={}, name={}, link={})",
-        parent, name, link
+        "TRACE: symlink(parent={}, name={}, link={}, uid={}, gid={})",
+        parent, name, link, uid, gid
     );
     let parent_node_arc = {
         let map = fs.inodes.read().unwrap();
@@ -122,6 +125,11 @@ pub fn symlink(fs: &InMemoryFS, req: Request, link: &str, parent: u64, name: &st
     let new_node = Arc::new(SyncNode::new(Node::Symlink {
         target: link.to_string(),
         nlink: 1,
+        uid,
+        gid,
+        atime: now,
+        mtime: now,
+        ctime: now,
     }));
 
     let mut map = fs.inodes.write().unwrap();
@@ -134,7 +142,12 @@ pub fn symlink(fs: &InMemoryFS, req: Request, link: &str, parent: u64, name: &st
             file_type: FileType::Symlink,
             perm: 0o777,
             nlink: 1,
+            uid,
+            gid,
             size: link.len() as i64,
+            atime: now,
+            mtime: now,
+            ctime: now,
         },
         1.0,
         1.0,
@@ -527,13 +540,48 @@ pub fn link(fs: &InMemoryFS, req: Request, ino: u64, newparent: u64, newname: &s
         _ => unreachable!(),
     };
 
+    let uid = match node {
+        Node::File { uid, .. } => *uid,
+        Node::Symlink { uid, .. } => *uid,
+        _ => unreachable!(),
+    };
+
+    let gid = match node {
+        Node::File { gid, .. } => *gid,
+        Node::Symlink { gid, .. } => *gid,
+        _ => unreachable!(),
+    };
+
+    let atime = match node {
+        Node::File { atime, .. } => *atime,
+        Node::Symlink { atime, .. } => *atime,
+        _ => unreachable!(),
+    };
+
+    let mtime = match node {
+        Node::File { mtime, .. } => *mtime,
+        Node::Symlink { mtime, .. } => *mtime,
+        _ => unreachable!(),
+    };
+
+    let ctime = match node {
+        Node::File { ctime, .. } => *ctime,
+        Node::Symlink { ctime, .. } => *ctime,
+        _ => unreachable!(),
+    };
+
     req.reply_entry(
         &FileAttr {
             ino,
             file_type,
             perm,
             nlink,
+            uid,
+            gid,
             size,
+            atime,
+            mtime,
+            ctime,
         },
         1.0,
         1.0,

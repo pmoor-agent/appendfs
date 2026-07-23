@@ -1,9 +1,11 @@
+pub mod clock;
 pub mod fs;
 pub mod lock_pool;
 pub mod node;
 pub mod operations;
 pub mod shim;
 
+pub use clock::{Clock, SystemClock};
 pub use fs::InMemoryFS;
 pub use node::{Node, SyncNode};
 

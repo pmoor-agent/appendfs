@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::time::SystemTime;
 
 // Structure representing an in-memory node (file, directory, or symlink)
 pub enum Node {
@@ -6,15 +7,30 @@ pub enum Node {
         entries: Vec<(String, u64)>,
         perm: u32,
         nlink: u32,
+        uid: u32,
+        gid: u32,
+        atime: SystemTime,
+        mtime: SystemTime,
+        ctime: SystemTime,
     },
     File {
         content: Vec<u8>,
         perm: u32,
         nlink: u32,
+        uid: u32,
+        gid: u32,
+        atime: SystemTime,
+        mtime: SystemTime,
+        ctime: SystemTime,
     },
     Symlink {
         target: String,
         nlink: u32,
+        uid: u32,
+        gid: u32,
+        atime: SystemTime,
+        mtime: SystemTime,
+        ctime: SystemTime,
     },
 }
 

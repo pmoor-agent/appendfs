@@ -1,3 +1,4 @@
+use crate::clock::{Clock, SystemClock};
 use crate::lock_pool::LockPool;
 use crate::node::{Node, SyncNode};
 use std::collections::HashMap;
@@ -8,11 +9,20 @@ pub struct InMemoryFS {
     pub(crate) inodes: RwLock<HashMap<u64, Arc<SyncNode>>>,
     pub(crate) next_inode: AtomicU64,
     pub(crate) lock_pool: LockPool,
+    pub(crate) clock: Arc<dyn Clock>,
 }
 
 impl InMemoryFS {
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         let mut map = HashMap::new();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let now = clock.now();
+
         // Start with only the root directory (Inode 1), which is empty, nlink is 2 (parent entry and '.' link)
         map.insert(
             1,
@@ -20,17 +30,29 @@ impl InMemoryFS {
                 entries: Vec::new(),
                 perm: 0o755,
                 nlink: 2,
+                uid,
+                gid,
+                atime: now,
+                mtime: now,
+                ctime: now,
             })),
         );
         Self {
             inodes: RwLock::new(map),
             next_inode: AtomicU64::new(2),
             lock_pool: LockPool::new(),
+            clock,
         }
     }
 
     pub(crate) fn allocate_inode(&self) -> u64 {
         self.next_inode.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+impl Default for InMemoryFS {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

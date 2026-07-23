@@ -1,5 +1,7 @@
+use crate::clock::system_time_to_unix;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::os::raw::c_void;
+use std::time::SystemTime;
 
 // High-level safe representation of file types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,7 +17,23 @@ pub struct FileAttr {
     pub file_type: FileType,
     pub perm: u32,
     pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
     pub size: i64,
+    pub atime: SystemTime,
+    pub mtime: SystemTime,
+    pub ctime: SystemTime,
+}
+
+// High-level safe representation of filesystem statistics
+pub struct StatfsAttr {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub bsize: u32,
+    pub namelen: u32,
 }
 
 // Custom layout-stable representation for FFI communication
@@ -24,7 +42,26 @@ struct ShimFileAttr {
     ino: u64,
     mode: u32,
     nlink: u32,
+    uid: u32,
+    gid: u32,
     size: i64,
+    atime_sec: i64,
+    atime_nsec: u32,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+    ctime_sec: i64,
+    ctime_nsec: u32,
+}
+
+#[repr(C)]
+struct ShimStatfsAttr {
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    bsize: u32,
+    namelen: u32,
 }
 
 impl ShimFileAttr {
@@ -34,11 +71,23 @@ impl ShimFileAttr {
             FileType::RegularFile => libc::S_IFREG,
             FileType::Symlink => libc::S_IFLNK,
         };
+        let (atime_sec, atime_nsec) = system_time_to_unix(attr.atime);
+        let (mtime_sec, mtime_nsec) = system_time_to_unix(attr.mtime);
+        let (ctime_sec, ctime_nsec) = system_time_to_unix(attr.ctime);
+
         Self {
             ino: attr.ino,
             mode: (mode_flag | (attr.perm & 0o777)) as u32,
             nlink: attr.nlink,
+            uid: attr.uid,
+            gid: attr.gid,
             size: attr.size,
+            atime_sec,
+            atime_nsec,
+            mtime_sec,
+            mtime_nsec,
+            ctime_sec,
+            ctime_nsec,
         }
     }
 }
@@ -48,6 +97,14 @@ impl ShimFileAttr {
 pub struct Request(*mut c_void);
 
 impl Request {
+    pub fn uid(self) -> u32 {
+        unsafe { shim_req_uid(self.0) }
+    }
+
+    pub fn gid(self) -> u32 {
+        unsafe { shim_req_gid(self.0) }
+    }
+
     pub fn reply_err(self, err: i32) -> i32 {
         unsafe { shim_reply_err(self.0, err) }
     }
@@ -88,6 +145,19 @@ impl Request {
     pub fn reply_readlink(self, target: &str) -> i32 {
         let c_str = CString::new(target).expect("Link target contained a null byte");
         unsafe { shim_reply_readlink(self.0, c_str.as_ptr()) }
+    }
+
+    pub fn reply_statfs(self, attr: &StatfsAttr) -> i32 {
+        let shim_attr = ShimStatfsAttr {
+            blocks: attr.blocks,
+            bfree: attr.bfree,
+            bavail: attr.bavail,
+            files: attr.files,
+            ffree: attr.ffree,
+            bsize: attr.bsize,
+            namelen: attr.namelen,
+        };
+        unsafe { shim_reply_statfs(self.0, &shim_attr) }
     }
 }
 
@@ -175,7 +245,18 @@ pub trait Filesystem {
     fn write(&self, req: Request, _ino: u64, _buf: &[u8], _offset: i64) {
         req.reply_err(libc::ENOSYS);
     }
-    fn setattr(&self, req: Request, _ino: u64, _size: i64, _to_set: u32) {
+    fn setattr(
+        &self,
+        req: Request,
+        _ino: u64,
+        _mode: u32,
+        _uid: u32,
+        _gid: u32,
+        _size: i64,
+        _atime: SystemTime,
+        _mtime: SystemTime,
+        _to_set: u32,
+    ) {
         req.reply_err(libc::ENOSYS);
     }
     fn create(&self, req: Request, _parent: u64, _name: &str, _mode: u32, _flags: u32) {
@@ -214,6 +295,9 @@ pub trait Filesystem {
     fn fsyncdir(&self, req: Request, _ino: u64, _datasync: bool) {
         req.reply_err(0);
     }
+    fn statfs(&self, req: Request, _ino: u64) {
+        req.reply_err(libc::ENOSYS);
+    }
 }
 
 // Private raw FFI functions linked from the C++ shim
@@ -224,6 +308,9 @@ unsafe extern "C" {
         ops: *const RustLowlevelOps,
         userdata: *mut c_void,
     ) -> c_int;
+
+    fn shim_req_uid(req: *mut c_void) -> u32;
+    fn shim_req_gid(req: *mut c_void) -> u32;
 
     fn shim_reply_err(req: *mut c_void, err: c_int) -> c_int;
     fn shim_reply_attr(req: *mut c_void, attr: *const ShimFileAttr, attr_timeout: f64) -> c_int;
@@ -244,6 +331,7 @@ unsafe extern "C" {
         fh: u64,
     ) -> c_int;
     fn shim_reply_readlink(req: *mut c_void, link: *const c_char) -> c_int;
+    fn shim_reply_statfs(req: *mut c_void, attr: *const ShimStatfsAttr) -> c_int;
 
     fn shim_add_direntry(
         req: *mut c_void,
@@ -302,7 +390,14 @@ struct RustLowlevelOps {
         unsafe extern "C" fn(
             req: *mut c_void,
             ino: u64,
+            mode: u32,
+            uid: u32,
+            gid: u32,
             size: i64,
+            atime_sec: i64,
+            atime_nsec: u32,
+            mtime_sec: i64,
+            mtime_nsec: u32,
             to_set: u32,
             userdata: *mut c_void,
         ),
@@ -379,6 +474,7 @@ struct RustLowlevelOps {
     fsyncdir: Option<
         unsafe extern "C" fn(req: *mut c_void, ino: u64, datasync: c_int, userdata: *mut c_void),
     >,
+    statfs: Option<unsafe extern "C" fn(req: *mut c_void, ino: u64, userdata: *mut c_void)>,
 }
 
 #[inline]
@@ -458,12 +554,31 @@ unsafe extern "C" fn write_bridge(
 unsafe extern "C" fn setattr_bridge(
     req: *mut c_void,
     ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
     size: i64,
+    atime_sec: i64,
+    atime_nsec: u32,
+    mtime_sec: i64,
+    mtime_nsec: u32,
     to_set: u32,
     userdata: *mut c_void,
 ) {
+    let atime = crate::clock::unix_to_system_time(atime_sec, atime_nsec);
+    let mtime = crate::clock::unix_to_system_time(mtime_sec, mtime_nsec);
     let fs = get_fs(userdata);
-    fs.setattr(Request(req), ino, size, to_set);
+    fs.setattr(
+        Request(req),
+        ino,
+        mode,
+        uid,
+        gid,
+        size,
+        atime,
+        mtime,
+        to_set,
+    );
 }
 
 // C-to-Rust bridge callback for create
@@ -653,6 +768,12 @@ unsafe extern "C" fn fsyncdir_bridge(
     fs.fsyncdir(Request(req), ino, datasync != 0);
 }
 
+// C-to-Rust bridge callback for statfs
+unsafe extern "C" fn statfs_bridge(req: *mut c_void, ino: u64, userdata: *mut c_void) {
+    let fs = get_fs(userdata);
+    fs.statfs(Request(req), ino);
+}
+
 // Public entrypoint to mount and run the filesystem
 pub fn mount<F>(args: Vec<String>, fs: F) -> Result<(), i32>
 where
@@ -690,6 +811,7 @@ where
         release: Some(release_bridge),
         releasedir: Some(releasedir_bridge),
         fsyncdir: Some(fsyncdir_bridge),
+        statfs: Some(statfs_bridge),
     };
 
     let code = unsafe { run_fuse_ll(c_args.len() as c_int, c_args.as_ptr(), &ops, raw_userdata) };

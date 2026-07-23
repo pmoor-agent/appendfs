@@ -5,6 +5,8 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstdio>
+#include <mutex>
+#include <getopt.h>
 
 struct shim_session_ctx {
     rust_lowlevel_ops ops;
@@ -78,7 +80,20 @@ static void ll_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
     (void) fi;
     auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
     if (ctx && ctx->ops.setattr) {
-        ctx->ops.setattr(static_cast<shim_req_t>(req), ino, static_cast<int64_t>(attr->st_size), static_cast<uint32_t>(to_set), ctx->user_fs);
+        ctx->ops.setattr(
+            static_cast<shim_req_t>(req),
+            ino,
+            static_cast<uint32_t>(attr->st_mode),
+            static_cast<uint32_t>(attr->st_uid),
+            static_cast<uint32_t>(attr->st_gid),
+            static_cast<int64_t>(attr->st_size),
+            static_cast<int64_t>(attr->st_atim.tv_sec),
+            static_cast<uint32_t>(attr->st_atim.tv_nsec),
+            static_cast<int64_t>(attr->st_mtim.tv_sec),
+            static_cast<uint32_t>(attr->st_mtim.tv_nsec),
+            static_cast<uint32_t>(to_set),
+            ctx->user_fs
+        );
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -199,8 +214,14 @@ static void ll_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fus
     }
 }
 
-#include <mutex>
-#include <getopt.h>
+static void ll_statfs(fuse_req_t req, fuse_ino_t ino) {
+    auto *ctx = static_cast<shim_session_ctx*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.statfs) {
+        ctx->ops.statfs(static_cast<shim_req_t>(req), ino, ctx->user_fs);
+    } else {
+        fuse_reply_err(req, ENOSYS);
+    }
+}
 
 static std::mutex g_mount_mutex;
 
@@ -260,6 +281,7 @@ int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops, void *user
     ll_ops.release = ll_release;
     ll_ops.releasedir = ll_releasedir;
     ll_ops.fsyncdir = ll_fsyncdir;
+    ll_ops.statfs = ll_statfs;
 
     se = fuse_session_new(&args, &ll_ops, sizeof(ll_ops), &ctx);
     if (se == nullptr) {
@@ -289,6 +311,16 @@ err_out1:
     return ret;
 }
 
+uint32_t shim_req_uid(shim_req_t req) {
+    const struct fuse_ctx *ctx = fuse_req_ctx(static_cast<fuse_req_t>(req));
+    return ctx ? ctx->uid : 0;
+}
+
+uint32_t shim_req_gid(shim_req_t req) {
+    const struct fuse_ctx *ctx = fuse_req_ctx(static_cast<fuse_req_t>(req));
+    return ctx ? ctx->gid : 0;
+}
+
 int shim_reply_err(shim_req_t req, int err) {
     return fuse_reply_err(static_cast<fuse_req_t>(req), err);
 }
@@ -299,7 +331,15 @@ int shim_reply_attr(shim_req_t req, const shim_file_attr *attr, double attr_time
         stbuf.st_ino = attr->ino;
         stbuf.st_mode = attr->mode;
         stbuf.st_nlink = attr->nlink;
+        stbuf.st_uid = attr->uid;
+        stbuf.st_gid = attr->gid;
         stbuf.st_size = attr->size;
+        stbuf.st_atim.tv_sec = attr->atime_sec;
+        stbuf.st_atim.tv_nsec = attr->atime_nsec;
+        stbuf.st_mtim.tv_sec = attr->mtime_sec;
+        stbuf.st_mtim.tv_nsec = attr->mtime_nsec;
+        stbuf.st_ctim.tv_sec = attr->ctime_sec;
+        stbuf.st_ctim.tv_nsec = attr->ctime_nsec;
     }
     return fuse_reply_attr(static_cast<fuse_req_t>(req), &stbuf, attr_timeout);
 }
@@ -312,7 +352,15 @@ int shim_reply_entry(shim_req_t req, const shim_file_attr *attr, double attr_tim
         e.attr.st_ino = attr->ino;
         e.attr.st_mode = attr->mode;
         e.attr.st_nlink = attr->nlink;
+        e.attr.st_uid = attr->uid;
+        e.attr.st_gid = attr->gid;
         e.attr.st_size = attr->size;
+        e.attr.st_atim.tv_sec = attr->atime_sec;
+        e.attr.st_atim.tv_nsec = attr->atime_nsec;
+        e.attr.st_mtim.tv_sec = attr->mtime_sec;
+        e.attr.st_mtim.tv_nsec = attr->mtime_nsec;
+        e.attr.st_ctim.tv_sec = attr->ctime_sec;
+        e.attr.st_ctim.tv_nsec = attr->ctime_nsec;
     }
     e.attr_timeout = attr_timeout;
     e.entry_timeout = entry_timeout;
@@ -341,7 +389,15 @@ int shim_reply_create(shim_req_t req, const shim_file_attr *attr, double attr_ti
         e.attr.st_ino = attr->ino;
         e.attr.st_mode = attr->mode;
         e.attr.st_nlink = attr->nlink;
+        e.attr.st_uid = attr->uid;
+        e.attr.st_gid = attr->gid;
         e.attr.st_size = attr->size;
+        e.attr.st_atim.tv_sec = attr->atime_sec;
+        e.attr.st_atim.tv_nsec = attr->atime_nsec;
+        e.attr.st_mtim.tv_sec = attr->mtime_sec;
+        e.attr.st_mtim.tv_nsec = attr->mtime_nsec;
+        e.attr.st_ctim.tv_sec = attr->ctime_sec;
+        e.attr.st_ctim.tv_nsec = attr->ctime_nsec;
     }
     e.attr_timeout = attr_timeout;
     e.entry_timeout = entry_timeout;
@@ -352,6 +408,22 @@ int shim_reply_create(shim_req_t req, const shim_file_attr *attr, double attr_ti
 
 int shim_reply_readlink(shim_req_t req, const char *link) {
     return fuse_reply_readlink(static_cast<fuse_req_t>(req), link);
+}
+
+int shim_reply_statfs(shim_req_t req, const shim_statfs_attr *attr) {
+    struct statvfs stbuf = {};
+    if (attr) {
+        stbuf.f_bsize = attr->bsize;
+        stbuf.f_frsize = attr->bsize;
+        stbuf.f_blocks = attr->blocks;
+        stbuf.f_bfree = attr->bfree;
+        stbuf.f_bavail = attr->bavail;
+        stbuf.f_files = attr->files;
+        stbuf.f_ffree = attr->ffree;
+        stbuf.f_favail = attr->ffree;
+        stbuf.f_namemax = attr->namelen;
+    }
+    return fuse_reply_statfs(static_cast<fuse_req_t>(req), &stbuf);
 }
 
 size_t shim_add_direntry(shim_req_t req, char *buf, size_t bufsize, const char *name, uint64_t ino, uint32_t mode, int64_t off) {

@@ -1,9 +1,11 @@
 pub mod dir;
 pub mod links;
 pub mod read_write;
+pub mod statfs;
 
 use crate::fs::InMemoryFS;
 use crate::shim::{Filesystem, Request};
+use std::time::SystemTime;
 
 impl Filesystem for InMemoryFS {
     fn lookup(&self, req: Request, parent: u64, name: &str) {
@@ -30,8 +32,19 @@ impl Filesystem for InMemoryFS {
         read_write::write(self, req, ino, buf, offset);
     }
 
-    fn setattr(&self, req: Request, ino: u64, size: i64, to_set: u32) {
-        read_write::setattr(self, req, ino, size, to_set);
+    fn setattr(
+        &self,
+        req: Request,
+        ino: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        size: i64,
+        atime: SystemTime,
+        mtime: SystemTime,
+        to_set: u32,
+    ) {
+        read_write::setattr(self, req, ino, mode, uid, gid, size, atime, mtime, to_set);
     }
 
     fn create(&self, req: Request, parent: u64, name: &str, mode: u32, flags: u32) {
@@ -80,5 +93,9 @@ impl Filesystem for InMemoryFS {
 
     fn fsyncdir(&self, req: Request, ino: u64, datasync: bool) {
         dir::fsyncdir(self, req, ino, datasync);
+    }
+
+    fn statfs(&self, req: Request, ino: u64) {
+        statfs::statfs(self, req, ino);
     }
 }

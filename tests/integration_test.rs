@@ -62,6 +62,13 @@ fn test_fuse_filesystem() {
         entries
     );
 
+    // Verify statfs / statvfs reports root inode count (1)
+    let path_c = std::ffi::CString::new(mount_path_str.as_str()).unwrap();
+    let mut statvfs_buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::statvfs(path_c.as_ptr(), &mut statvfs_buf) };
+    assert_eq!(res, 0);
+    assert_eq!(statvfs_buf.f_files, 1);
+
     // Create a new file (hello.txt)
     let file_hello = mount_path.join("hello.txt");
     assert!(!file_hello.exists());
@@ -72,6 +79,33 @@ fn test_fuse_filesystem() {
 
     let read_content = fs::read_to_string(&file_hello).unwrap();
     assert_eq!(read_content, content);
+
+    // Verify file ownership (UID/GID) and initial permissions
+    let meta = fs::metadata(&file_hello).unwrap();
+    assert_eq!(meta.uid(), unsafe { libc::getuid() });
+    assert_eq!(meta.gid(), unsafe { libc::getgid() });
+    assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+
+    // Verify chmod (setattr mode)
+    fs::set_permissions(&file_hello, fs::Permissions::from_mode(0o600)).unwrap();
+    let updated_meta = fs::metadata(&file_hello).unwrap();
+    assert_eq!(updated_meta.permissions().mode() & 0o777, 0o600);
+
+    // Verify initial timestamps and custom timestamp update (setattr mtime/atime)
+    let mtime_1 = meta.modified().unwrap();
+    assert!(mtime_1 >= std::time::UNIX_EPOCH);
+
+    let custom_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .open(&file_hello)
+        .unwrap();
+    let times = fs::FileTimes::new().set_modified(custom_time);
+    f.set_times(times).unwrap();
+    drop(f);
+
+    let meta_touched = fs::metadata(&file_hello).unwrap();
+    assert_eq!(meta_touched.modified().unwrap(), custom_time);
 
     // Write/Overwrite verification (with truncation)
     let new_content = "Integration test overwrite!";
