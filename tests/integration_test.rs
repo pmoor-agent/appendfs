@@ -10,7 +10,10 @@ fn test_fuse_filesystem() {
     let fs = appendfs_fuse::InMemoryFS::new();
 
     // Create a unique temporary directory under /tmp
-    let temp_dir = tempfile::Builder::new().prefix("appendfs_test_").tempdir().unwrap();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("appendfs_test_")
+        .tempdir()
+        .unwrap();
     let mount_path = temp_dir.path().to_path_buf();
     let mount_path_str = mount_path.to_str().unwrap().to_string();
 
@@ -245,7 +248,10 @@ fn test_fuse_stress() {
     let fs = appendfs_fuse::InMemoryFS::new();
 
     // Create a unique temporary directory under /tmp
-    let temp_dir = tempfile::Builder::new().prefix("appendfs_test_").tempdir().unwrap();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("appendfs_test_")
+        .tempdir()
+        .unwrap();
     let mount_path = temp_dir.path().to_path_buf();
     let mount_path_str = mount_path.to_str().unwrap().to_string();
 
