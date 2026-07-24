@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary & Core Philosophy
 
-`appendfs` is a high-performance, log-structured in-memory FUSE filesystem designed around an **append-only backing store**. 
+`appendfs` is a high-performance, log-structured in-memory FUSE filesystem designed around an **append-only backing store** for personal archival storage.
 
 Rather than mutating data in-place on disk, `appendfs` records all filesystem mutations (file writes, metadata changes, directory creations, deletions, renames) as an append-only stream of log files ordered by a **monotonic generation sequence number**.
 
@@ -11,7 +11,8 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 - **In-Memory Staging & Deferred Flushing:** Writes are staged in memory and flushed to disk periodically or when requested by `fsync()` / POSIX sync semantics.
 - **Complete Reconstructability & Time-Travel:** The full filesystem state (or any past point-in-time state) can be deterministically rebuilt by replaying logs up to a target sequence number.
 - **Copy-On-Write Branching (Forking):** New read-write instances can fork from historical checkpoints, sharing ancestor logs while appending new mutations to a divergent branch sequence.
-- **Zero-Trust Security & Cloud Readiness:** Log payloads are compressed and encrypted at rest before hitting physical storage, making closed log segments instantly ready for untrusted cloud object storage (e.g. S3, GCS) backup.
+- **Zero-Trust Security & Multi-Cloud Archival:** Log payloads are compressed and encrypted at rest locally before fan-out replication to multiple S3-compatible cloud providers (e.g., AWS S3, Google Cloud Storage, Backblaze B2).
+- **Bitrot Resistance & Disaster Recovery:** All records contain AEAD authentication tags and BLAKE3 checksums, enabling standalone disaster recovery from raw cloud buckets using a master passphrase.
 
 ---
 
@@ -36,17 +37,25 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 │                 Log Engine & Data Protection Layer                      │
 │  ┌─────────────────────────┐           ┌─────────────────────────────┐  │
 │  │  Payload Compression    │           │  Authenticated Encryption   │  │
-│  │  (e.g., zstd / lz4)     │           │  (e.g., ChaCha20-Poly1305)  │  │
+│  │  (zstd / lz4)           │           │  (ChaCha20-Poly1305/Argon2) │  │
 │  └─────────────────────────┘           └─────────────────────────────┘  │
 └────────────────────────────────────┬────────────────────────────────────┘
                                      │ Monotonic Generation Append
 ┌────────────────────────────────────▼────────────────────────────────────┐
-│                           Physical Log Store                            │
+│                    Local Storage & Tiered Cache                         │
 │  ┌───────────────────┐    ┌───────────────────┐    ┌─────────────────┐  │
 │  │ 000001_init.log   │    │ 000002_active.log │    │ 000002.summary  │  │
-│  │ (Sealed/Cloud-ready)│  │ (Active Generation)│   │ (Checkpoint)    │  │
-│  └───────────────────┘    └───────────────────┘    └─────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────┘
+│  │ (Sealed/Evictable)│    │ (Active Generation)│   │ (Checkpoint)    │  │
+│  └─────────┬─────────┘    └───────────────────┘    └─────────────────┘  │
+└────────────┼────────────────────────────────────────────────────────────┘
+             │ Multi-Cloud Fan-Out Replication Worker
+             ├──────────────────────────────────────┐
+┌────────────▼──────────────────────────┐  ┌────────▼──────────────────────────┐
+│      Primary Cloud: AWS S3            │  │     Secondary Cloud: GCS / B2    │
+│  ┌─────────────────────────────────┐  │  │  ┌──────────────────────────────┐ │
+│  │ 000001_init.log (Encrypted)     │  │  │  │ 000001_init.log (Encrypted)  │ │
+│  └─────────────────────────────────┘  │  │  └──────────────────────────────┘ │
+└───────────────────────────────────────┘  └──────────────────────────────────┘
 ```
 
 ---
@@ -101,27 +110,39 @@ Each entry in the log file consists of a header and an optional compressed/encry
 
 ---
 
-## 5. Data Protection Layer (Compression & Encryption)
+## 5. Multi-Cloud Replication & Data Protection
 
-All data flushed to physical log files passes through the Data Protection Pipeline:
+### 5.1 Zero-Trust Data Protection Pipeline
+All data flushed to physical log files passes through the Data Protection Pipeline before hitting disk or cloud:
 
 ```
-[Staged Mutation Payload] ──► [Compress (zstd)] ──► [Encrypt (ChaCha20-Poly1305 / AES-GCM)] ──► [Write to .log]
+[Staged Mutation Payload] ──► [Compress (zstd)] ──► [Encrypt (ChaCha20-Poly1305 / Argon2id)] ──► [Write Local Log]
 ```
 
-- **Compression:** Reduces disk footprint and bandwidth requirements using fast block compression (e.g. `zstd` / `lz4`).
-- **Encryption:** Authenticated Encryption with Associated Data (AEAD) ensures confidentiality and tamper detection.
-- **Cloud Security:** Because data payloads are encrypted locally before hitting disk, sealed log files can be backed up to zero-trust remote cloud storage (AWS S3, Google Cloud Storage, Cloudflare R2) without exposing plaintext data.
+- **Compression:** Reduces disk footprint and bandwidth requirements using fast block compression (`zstd` / `lz4`).
+- **AEAD Encryption:** Authenticated Encryption with Associated Data ensures 100% confidentiality and tamper prevention.
+- **Key Derivation:** Master key is derived using `Argon2id` / `HKDF` from a user master passphrase or keyfile.
+
+### 5.2 Multi-Cloud Fan-Out Engine
+- **Least-Common-Denominator S3 Support:** Standard S3 API (`PutObject`, `GetObject`, `HeadObject`, `ListObjectsV2`) ensures out-of-the-box compatibility with AWS S3, Google Cloud Storage (S3 Interoperability API), Backblaze B2, Cloudflare R2, MinIO, and Wasabi.
+- **Fan-Out Sync Worker:** When a generation log file is sealed, a background replication worker uploads the encrypted log file concurrently to all configured cloud targets (`[backends.aws_s3]`, `[backends.gcs]`).
+- **Read Failover:** If one cloud provider is unreachable or throttled during a cache-miss read, `appendfs` transparently retries the read from an alternate configured cloud backend.
+
+### 5.3 Local Cache Eviction & S3 Range Reads
+- Sealed log files remain cached on local disk until a configurable storage threshold (e.g. 85% disk usage) is reached.
+- Once confirmed uploaded to all cloud backends, local sealed log payloads can be purged to reclaim local disk space.
+- On a read cache-miss, `appendfs` issues a targeted S3 HTTP Range Request (`Range: bytes=offset-(offset+len)`) to fetch only the required extent payload from the cloud into memory.
 
 ---
 
-## 6. Future Roadmap & Cloud Archival
+## 6. Maintenance, Integrity & Disaster Recovery
 
-1. **Sealed Generation Lifecycle:**
-   - Active log files remain local during a mount session.
-   - Closed generation logs are marked as **Sealed** (read-only).
-2. **Cloud Synchronization:**
-   - Background workers sync sealed generation log files to cloud storage.
-   - Local disk space can be reclaimed by purging local copies of sealed log files, reading missing extents on-demand from the cloud via range requests.
-3. **Live Log Streaming:**
-   - Optional streaming transport layer to stream mutation records to remote endpoints for real-time replication.
+### 6.1 Log Compaction & Garbage Collection (`appendfs compact`)
+- `appendfs` monitors the ratio of live (active) vs. dead (overwritten/deleted) extents inside sealed log files.
+- When a sealed log file's live extent ratio drops below a threshold (e.g. < 30%), a compaction background job rewrites surviving live extents into a new compacted generation log and issues deletion calls for the dead log across all local and cloud backends.
+
+### 6.2 Bitrot Protection & Scrubbing (`appendfs scrub`)
+- A periodic background scrubbing job (or manual CLI command `appendfs scrub`) scans local and remote cloud logs, verifying BLAKE3 checksums and AEAD authentication tags to detect silent data corruption or bitrot before data loss occurs.
+
+### 6.3 Standalone Disaster Recovery (`appendfs-recover`)
+- If the local machine and state database are completely destroyed, the user can download a standalone binary (`appendfs-recover`), input their master passphrase, point it at their S3/GCS bucket, and **rebuild 100% of the filesystem state from scratch** anywhere in the world.
