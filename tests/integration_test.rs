@@ -7,7 +7,7 @@ use std::time::Duration;
 
 #[test]
 fn test_fuse_filesystem() {
-    let fs = appendfs_fuse::InMemoryFS::new();
+    let fs = appendfs::InMemoryFS::new();
 
     // Create a unique temporary directory under /tmp
     let temp_dir = tempfile::Builder::new()
@@ -30,7 +30,7 @@ fn test_fuse_filesystem() {
             mount_path_clone.to_str().unwrap().to_string(),
             "-f".to_string(), // foreground
         ];
-        if let Err(e) = appendfs_fuse::mount(args, fs) {
+        if let Err(e) = appendfs::mount(args, fs) {
             eprintln!("FUSE mount error: {}", e);
         }
     });
@@ -279,7 +279,7 @@ fn test_fuse_filesystem() {
 
 #[test]
 fn test_fuse_stress() {
-    let fs = appendfs_fuse::InMemoryFS::new();
+    let fs = appendfs::InMemoryFS::new();
 
     // Create a unique temporary directory under /tmp
     let temp_dir = tempfile::Builder::new()
@@ -302,7 +302,7 @@ fn test_fuse_stress() {
             mount_path_clone.to_str().unwrap().to_string(),
             "-f".to_string(), // foreground
         ];
-        if let Err(e) = appendfs_fuse::mount(args, fs) {
+        if let Err(e) = appendfs::mount(args, fs) {
             eprintln!("FUSE mount error: {}", e);
         }
     });
