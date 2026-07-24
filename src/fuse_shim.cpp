@@ -262,6 +262,13 @@ int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops, void *user
         goto err_out1;
     }
 
+    // Always enforce kernel-side permission checks (uid/gid/mode) regardless
+    // of what mount options the caller passed on the command line.
+    if (fuse_opt_add_arg(&args, "-odefault_permissions") != 0) {
+        ret = -1;
+        goto err_out1;
+    }
+
     ll_ops.lookup = ll_lookup;
     ll_ops.getattr = ll_getattr;
     ll_ops.readdir = ll_readdir;
