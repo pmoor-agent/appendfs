@@ -4,7 +4,7 @@
 
 `appendfs` is a high-performance, log-structured in-memory FUSE filesystem designed around an **append-only backing store** for personal archival storage.
 
-Rather than mutating data in-place on disk, `appendfs` records all filesystem mutations (file writes, metadata changes, directory creations, deletions, renames) as an append-only stream of log files ordered by a **monotonic generation sequence number**.
+Rather than mutating data in-place on disk, `appendfs` records all filesystem mutations (file writes, metadata changes, directory creations, deletions, renames, extended attributes) as an append-only stream of log files ordered by a **monotonic generation sequence number**.
 
 ### Core Guarantees:
 - **Append-Only Backing Store:** Physical disk writes are 100% sequential and immutable. Old log files are never modified in-place.
@@ -12,6 +12,7 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 - **Complete Reconstructability & Time-Travel:** The full filesystem state (or any past point-in-time state) can be deterministically rebuilt by replaying logs up to a target sequence number.
 - **Copy-On-Write Branching (Forking):** New read-write instances can fork from historical checkpoints, sharing ancestor logs while appending new mutations to a divergent branch sequence.
 - **Zero-Trust Security & Multi-Cloud Archival:** Log payloads are compressed and encrypted at rest locally before fan-out replication to multiple S3-compatible cloud providers (e.g., AWS S3, Google Cloud Storage, Backblaze B2).
+- **Deduplication & FastCDC:** Content-Defined Chunking de-duplicates identical blocks across files and generations.
 - **Bitrot Resistance & Disaster Recovery:** All records contain AEAD authentication tags and BLAKE3 checksums, enabling standalone disaster recovery from raw cloud buckets using a master passphrase.
 
 ---
@@ -22,7 +23,7 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                              FUSE Kernel Interface                      │
 └────────────────────────────────────┬────────────────────────────────────┘
-                                     │ FUSE Low-Level Ops
+                                     │ FUSE Low-Level Ops & xattrs
 ┌────────────────────────────────────▼────────────────────────────────────┐
 │                             InMemoryFS Engine                           │
 │  ┌─────────────────────────────────┐   ┌─────────────────────────────┐  │
@@ -32,7 +33,7 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 │  │            In-Memory Mutation & Write Staging Buffer              │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 └────────────────────────────────────┬────────────────────────────────────┘
-                                     │ Staged Flush (fsync / periodic)
+                                     │ FastCDC & Staged Flush
 ┌────────────────────────────────────▼────────────────────────────────────┐
 │                 Log Engine & Data Protection Layer                      │
 │  ┌─────────────────────────┐           ┌─────────────────────────────┐  │
@@ -48,7 +49,7 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 │  │ (Sealed/Evictable)│    │ (Active Generation)│   │ (Checkpoint)    │  │
 │  └─────────┬─────────┘    └───────────────────┘    └─────────────────┘  │
 └────────────┼────────────────────────────────────────────────────────────┘
-             │ Multi-Cloud Fan-Out Replication Worker
+             │ Multi-Cloud Fan-Out Replication Worker (Throttled)
              ├──────────────────────────────────────┐
 ┌────────────▼──────────────────────────┐  ┌────────▼──────────────────────────┐
 │      Primary Cloud: AWS S3            │  │     Secondary Cloud: GCS / B2    │
@@ -73,11 +74,11 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
   2. **Periodic Timer:** A background worker flushes staged data periodically (e.g., every 2–5 seconds).
   3. **Buffer Threshold:** Staged buffer size reaches a configured memory threshold (e.g., 4MB or 16MB).
 
-### 3.3 Log Record Types
+### 3.3 Log Record Types & Extended Attributes (`xattrs`)
 Each entry in the log file consists of a header and an optional compressed/encrypted payload:
-- **`RecordHeader`:** Transaction ID, Operation Type (`WRITE`, `CREATE`, `MKDIR`, `UNLINK`, `RENAME`, `SETATTR`), Inode ID, Payload Length, Uncompressed Length, Encryption Nonce, and Checksum.
-- **`WritePayload`:** Compressed & encrypted byte sequence belonging to a file write.
-- **`MetadataPayload`:** Serialized metadata update (permissions, UID/GID, target link paths, timestamps).
+- **`RecordHeader`:** Transaction ID, Operation Type (`WRITE`, `CREATE`, `MKDIR`, `UNLINK`, `RENAME`, `SETATTR`, `SETXATTR`, `REMOVEXATTR`), Inode ID, Payload Length, Uncompressed Length, Encryption Nonce, and Checksum.
+- **`WritePayload`:** Compressed & encrypted byte sequence belonging to a file write (optionally deduplicated via FastCDC).
+- **`MetadataPayload`:** Serialized metadata update (permissions, UID/GID, target link paths, timestamps, extended attribute key-values).
 
 ### 3.4 In-Memory Index & Fragment Tracking (`RangeMap<V>`)
 - Filesystem content is tracked using the `RangeMap<V>` data structure.
@@ -88,12 +89,9 @@ Each entry in the log file consists of a header and an optional compressed/encry
 
 ## 4. State Recovery, Point-in-Time Mounts & Forking
 
-### 4.1 Summary Checkpoints (`.summary`)
+### 4.1 Summary Checkpoints & Snapshot Manifests
 - When `appendfs` is unmounted cleanly (or upon reaching a periodic checkpoint threshold), `appendfs` writes out a `.summary` snapshot file named with the matching generation sequence (e.g. `000002.summary`).
-- The summary file contains:
-  - The latest active Inode lookup table.
-  - The complete `RangeMap` extent index mapping logical file ranges to physical log file locations.
-  - The last applied generation sequence ID.
+- **Snapshot Manifest Export (`manifest.json.gz`):** Alongside the summary, a human-readable JSON manifest is generated containing `path` $\rightarrow$ `BLAKE3 hash` $\rightarrow$ `size` $\rightarrow$ `mtime`. This enables offline file browsing and diffing without mounting FUSE.
 
 ### 4.2 Replay & Boot Pipeline
 1. **Fast Path:** Locate the latest valid `.summary` snapshot file, deserialize it into memory, and determine `last_summary_generation`.
@@ -116,16 +114,18 @@ Each entry in the log file consists of a header and an optional compressed/encry
 All data flushed to physical log files passes through the Data Protection Pipeline before hitting disk or cloud:
 
 ```
-[Staged Mutation Payload] ──► [Compress (zstd)] ──► [Encrypt (ChaCha20-Poly1305 / Argon2id)] ──► [Write Local Log]
+[Staged Payload] ──► [FastCDC / Dedup] ──► [Compress (zstd)] ──► [Encrypt (ChaCha20-Poly1305)] ──► [Write Local Log]
 ```
 
+- **Content-Defined Deduplication (FastCDC):** Splits large payloads into content-defined chunks (1MB–4MB). Identical chunks across files/generations reuse existing block IDs.
 - **Compression:** Reduces disk footprint and bandwidth requirements using fast block compression (`zstd` / `lz4`).
 - **AEAD Encryption:** Authenticated Encryption with Associated Data ensures 100% confidentiality and tamper prevention.
 - **Key Derivation:** Master key is derived using `Argon2id` / `HKDF` from a user master passphrase or keyfile.
 
-### 5.2 Multi-Cloud Fan-Out Engine
+### 5.2 Multi-Cloud Fan-Out Engine & Bandwidth Control
 - **Least-Common-Denominator S3 Support:** Standard S3 API (`PutObject`, `GetObject`, `HeadObject`, `ListObjectsV2`) ensures out-of-the-box compatibility with AWS S3, Google Cloud Storage (S3 Interoperability API), Backblaze B2, Cloudflare R2, MinIO, and Wasabi.
 - **Fan-Out Sync Worker:** When a generation log file is sealed, a background replication worker uploads the encrypted log file concurrently to all configured cloud targets (`[backends.aws_s3]`, `[backends.gcs]`).
+- **Bandwidth Metering & Scheduling:** Support for `max_upload_mbps` throttling and time-window scheduling (e.g. upload only between 02:00 and 06:00).
 - **Read Failover:** If one cloud provider is unreachable or throttled during a cache-miss read, `appendfs` transparently retries the read from an alternate configured cloud backend.
 
 ### 5.3 Local Cache Eviction & S3 Range Reads
