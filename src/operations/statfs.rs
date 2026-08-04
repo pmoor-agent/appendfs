@@ -2,7 +2,7 @@ use crate::fs::InMemoryFS;
 use crate::shim::{Request, StatfsAttr};
 
 pub fn statfs(fs: &InMemoryFS, req: Request, ino: u64) {
-    println!("TRACE: statfs(ino={})", ino);
+    log::trace!("statfs(ino={})", ino);
     let active_inodes = {
         let map = fs.inodes.read().unwrap();
         map.len() as u64

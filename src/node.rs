@@ -1,7 +1,12 @@
+use crate::log::SharedExtentState;
+use crate::range_map::RangeMap;
 use std::cell::UnsafeCell;
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
+
 // Structure representing an in-memory node (file, directory, or symlink)
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Node {
     Directory {
         entries: Vec<(String, u64)>,
@@ -14,7 +19,8 @@ pub enum Node {
         ctime: SystemTime,
     },
     File {
-        content: Vec<u8>,
+        range_map: RangeMap<SharedExtentState>,
+        size: u64,
         perm: u32,
         nlink: u32,
         uid: u32,

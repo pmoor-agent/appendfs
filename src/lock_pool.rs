@@ -50,4 +50,23 @@ impl LockPool {
             (guard1, Some(guard2))
         }
     }
+
+    // Acquires a read lock for `ino`'s bucket, unless that bucket is already covered by a
+    // lock the caller holds for one of `already_locked` (e.g. from `write_two`, or an outer
+    // `read`/`write` guard still in scope), in which case returns `None`. Buckets are striped
+    // (ino % BUCKET_COUNT), so an unrelated inode can collide with an already-locked bucket,
+    // and re-acquiring the same std::sync::RwLock from the same thread — even read-after-read,
+    // and especially read-after-write — is not guaranteed deadlock-free. Any lock already held
+    // on that bucket gives at least read-level protection, so skipping is sound, not just safe.
+    pub fn read_or_reuse(
+        &self,
+        ino: u64,
+        already_locked: &[u64],
+    ) -> Option<RwLockReadGuard<'_, ()>> {
+        let idx = (ino % BUCKET_COUNT as u64) as usize;
+        let collides = already_locked
+            .iter()
+            .any(|&held| (held % BUCKET_COUNT as u64) as usize == idx);
+        if collides { None } else { Some(self.read(ino)) }
+    }
 }
