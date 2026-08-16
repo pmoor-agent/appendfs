@@ -7,6 +7,10 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
     let now = fs.clock.now();
     log::trace!("unlink(parent={}, name={})", parent, name);
 
+    if name.len() > 255 {
+        return Err(libc::ENAMETOOLONG);
+    }
+
     let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
     if parent_attr.file_type != FileType::Directory {
         return Err(libc::ENOTDIR);
@@ -63,6 +67,10 @@ pub fn symlink_core(
         uid,
         gid
     );
+
+    if name.len() > 255 {
+        return Err(libc::ENAMETOOLONG);
+    }
 
     let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
     if parent_attr.file_type != FileType::Directory {
@@ -142,6 +150,10 @@ pub fn rename_core(
         newname
     );
 
+    if name.len() > 255 || newname.len() > 255 {
+        return Err(libc::ENAMETOOLONG);
+    }
+
     let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
     if parent_attr.file_type != FileType::Directory {
         return Err(libc::ENOTDIR);
@@ -172,10 +184,10 @@ pub fn rename_core(
         return Ok(());
     }
 
+    let src_is_dir = source_attr.file_type == FileType::Directory;
+
     if let Some(dest_ino) = fs.lookup_child(newparent, newname) {
         let dest_attr = fs.get_attr(dest_ino).ok_or(libc::ENOENT)?;
-
-        let src_is_dir = source_attr.file_type == FileType::Directory;
         let dest_is_dir = dest_attr.file_type == FileType::Directory;
 
         if src_is_dir != dest_is_dir {
@@ -244,6 +256,10 @@ pub fn link_core(
         newparent,
         newname
     );
+
+    if newname.len() > 255 {
+        return Err(libc::ENAMETOOLONG);
+    }
 
     let target_attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
     if target_attr.file_type == FileType::Directory {

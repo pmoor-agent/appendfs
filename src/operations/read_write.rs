@@ -235,6 +235,10 @@ pub fn create_core(
         gid
     );
 
+    if name.len() > 255 {
+        return Err(libc::ENAMETOOLONG);
+    }
+
     let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
     if parent_attr.file_type != FileType::Directory {
         return Err(libc::ENOTDIR);

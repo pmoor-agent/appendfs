@@ -5,6 +5,10 @@ use std::collections::HashMap;
 
 pub fn lookup(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
     log::trace!("lookup(parent={}, name={})", parent, name);
+    if name.len() > 255 {
+        req.reply_err(libc::ENAMETOOLONG);
+        return;
+    }
     let parent_attr = match fs.get_attr(parent) {
         Some(attr) => attr,
         None => {
@@ -81,6 +85,10 @@ pub fn mkdir_core(
         gid
     );
 
+    if name.len() > 255 {
+        return Err(libc::ENAMETOOLONG);
+    }
+
     let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
     if parent_attr.file_type != FileType::Directory {
         return Err(libc::ENOTDIR);
@@ -135,6 +143,10 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
     let _dir_guard = fs.dir_lock.lock().unwrap();
     let now = fs.clock.now();
     log::trace!("rmdir(parent={}, name={})", parent, name);
+
+    if name.len() > 255 {
+        return Err(libc::ENAMETOOLONG);
+    }
 
     let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
     if parent_attr.file_type != FileType::Directory {
