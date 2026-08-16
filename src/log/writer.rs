@@ -92,14 +92,13 @@ impl LogWriter {
     /// written up to its current offset, would exceed `max_log_size` upon receiving
     /// at least `estimated_additional_bytes` more.
     ///
-    /// Must be called at most once per `LogBuffer` flush batch, *before* writing any
+    /// Must be called at most once per flush batch, *before* writing any
     /// of that batch's records - never mid-batch. `append_record` itself never rolls,
     /// so a whole batch (its records plus its `BatchCommit` trailer) always lands in
     /// exactly one generation file, which is what lets recovery treat "buffer records
     /// since the last commit" as a purely per-file operation, never needing to carry
     /// state across a generation boundary. The tradeoff: a single large batch can push
-    /// a generation file somewhat past `max_log_size` - bounded by `LogBuffer`'s own
-    /// backpressure ceiling, so not unbounded.
+    /// a generation file somewhat past `max_log_size`.
     pub fn roll_if_needed(
         &self,
         estimated_additional_bytes: u64,

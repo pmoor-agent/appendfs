@@ -1,4 +1,3 @@
-pub mod buffer;
 pub mod cache;
 pub mod extent;
 pub mod flusher;
@@ -8,7 +7,6 @@ pub mod recovery;
 pub mod summary;
 pub mod writer;
 
-pub use buffer::{LogBuffer, StagedMutation};
 pub use cache::LogFileCache;
 pub use extent::{ExtentState, SharedExtentState};
 pub use flusher::BackgroundFlusher;

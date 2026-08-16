@@ -84,7 +84,7 @@ pub enum OpCode {
     Rename = 7,
     Setattr = 8,
     Link = 9,
-    /// Trailer written once, after every other record belonging to one `LogBuffer`
+    /// Trailer written once, after every other record belonging to one
     /// flush batch. Confirms that batch is complete and safe to replay - see
     /// `BatchCommitPayload`.
     BatchCommit = 10,
@@ -150,7 +150,7 @@ impl RecordHeader {
     }
 }
 
-/// Payload for the `OpCode::BatchCommit` trailer written once per `LogBuffer` flush
+/// Payload for the `OpCode::BatchCommit` trailer written once per flush
 /// batch, after all of that batch's other records.
 ///
 /// Recovery buffers records as it reads them and only replays them into filesystem

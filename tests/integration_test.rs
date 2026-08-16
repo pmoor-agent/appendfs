@@ -361,7 +361,7 @@ fn test_fuse_with_log_writer() {
     let read_back = fs::read_to_string(&file_path).unwrap();
     assert_eq!(read_back, content);
 
-    // Call sync to trigger LogBuffer flush to LogWriter disk file
+    // Call sync to trigger log flush to LogWriter disk file
     let file = fs::OpenOptions::new().write(true).open(&file_path).unwrap();
     file.sync_data().unwrap();
     drop(file);

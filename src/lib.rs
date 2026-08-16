@@ -12,7 +12,7 @@ pub use cli::{CliArgs, find_latest_generation};
 pub use clock::{AdvancingClock, Clock, MockClock, SystemClock};
 pub use fs::InMemoryFS;
 pub use log::{
-    BackgroundFlusher, ExtentState, LogBuffer, LogFileCache, LogReader, LogRecord, LogWriter,
+    BackgroundFlusher, ExtentState, LogFileCache, LogReader, LogRecord, LogWriter,
     SharedExtentState, SummaryFooter, SummaryHeader, SummaryReader, export_summary, recover_fs,
     recover_fs_with_clock,
 };

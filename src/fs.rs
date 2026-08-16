@@ -1,7 +1,7 @@
 use crate::clock::{Clock, SystemClock};
 use crate::lock_pool::LockPool;
 use crate::log::{
-    CreatePayload, ExtentState, LinkPayload, LogBuffer, LogFileCache, LogWriter, MkdirPayload,
+    CreatePayload, ExtentState, LinkPayload, LogFileCache, LogWriter, MkdirPayload,
     OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload, SetattrPayload, SharedExtentState,
     SymlinkPayload, UnlinkPayload, WriteMeta,
 };
@@ -36,7 +36,6 @@ pub struct InMemoryFS {
     pub lock_pool: LockPool,
     pub clock: Arc<dyn Clock>,
     pub log_writer: Option<Arc<LogWriter>>,
-    pub log_buffer: Arc<LogBuffer>,
     pub log_cache: Option<Arc<LogFileCache>>,
     pub staged_bytes: AtomicUsize,
     pub max_buffer_size: usize,
@@ -96,7 +95,6 @@ impl InMemoryFS {
             lock_pool: LockPool::new(),
             clock,
             log_writer,
-            log_buffer: Arc::new(LogBuffer::new()),
             log_cache,
             staged_bytes: AtomicUsize::new(0),
             max_buffer_size: 16 * 1024 * 1024,

@@ -152,9 +152,8 @@ impl<V> RangeMap<V> {
                 );
             } else {
                 // Case 4: Fully enclosed (new_start <= start && end <= new_end). Removing
-                // the map entry alone isn't enough: something else (e.g. a not-yet-flushed
-                // StagedMutation) may still hold this same value, so mark it explicitly
-                // empty to signal "fully superseded" to any such holder.
+                // the map entry alone isn't enough: something else (e.g. another extent reference)
+                // may still hold this same value, so mark it explicitly empty.
                 let mut val = entry.value;
                 val.trim_right(0);
                 self.map.remove(&start);
