@@ -332,7 +332,13 @@ impl Request {
     }
 
     pub fn reply_readlink(self, link: &str) {
-        let c_link = CString::new(link).unwrap();
+        let c_link = match CString::new(link) {
+            Ok(c) => c,
+            Err(_) => {
+                self.reply_err(libc::EIO);
+                return;
+            }
+        };
         unsafe {
             shim_reply_readlink(self.req, c_link.as_ptr());
         }
@@ -402,7 +408,10 @@ impl DirectoryBuffer {
             FileType::Symlink => libc::S_IFLNK,
         };
 
-        let c_name = CString::new(name).unwrap();
+        let c_name = match CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
         let old_size = self.buf.len();
 
         // 256 bytes for dirent structure buffer space
@@ -477,7 +486,13 @@ extern "C" fn lookup_bridge(
     userdata: *mut c_void,
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::ENOENT);
+            return;
+        }
+    };
     fs.lookup(Request { req }, parent, name_str);
 }
 
@@ -559,7 +574,13 @@ extern "C" fn create_bridge(
     userdata: *mut c_void,
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::EINVAL);
+            return;
+        }
+    };
     fs.create(Request { req }, parent, name_str, mode, flags);
 }
 
@@ -570,7 +591,13 @@ extern "C" fn unlink_bridge(
     userdata: *mut c_void,
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::ENOENT);
+            return;
+        }
+    };
     fs.unlink(Request { req }, parent, name_str);
 }
 
@@ -582,7 +609,13 @@ extern "C" fn mkdir_bridge(
     userdata: *mut c_void,
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::EINVAL);
+            return;
+        }
+    };
     fs.mkdir(Request { req }, parent, name_str, mode);
 }
 
@@ -593,7 +626,13 @@ extern "C" fn rmdir_bridge(
     userdata: *mut c_void,
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::ENOENT);
+            return;
+        }
+    };
     fs.rmdir(Request { req }, parent, name_str);
 }
 
@@ -605,8 +644,20 @@ extern "C" fn symlink_bridge(
     userdata: *mut c_void,
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let link_str = unsafe { CStr::from_ptr(link) }.to_str().unwrap();
-    let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
+    let link_str = match unsafe { CStr::from_ptr(link) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::EINVAL);
+            return;
+        }
+    };
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::EINVAL);
+            return;
+        }
+    };
     fs.symlink(Request { req }, link_str, parent, name_str);
 }
 
@@ -624,8 +675,20 @@ extern "C" fn rename_bridge(
     userdata: *mut c_void,
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
-    let newname_str = unsafe { CStr::from_ptr(newname) }.to_str().unwrap();
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::ENOENT);
+            return;
+        }
+    };
+    let newname_str = match unsafe { CStr::from_ptr(newname) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::EINVAL);
+            return;
+        }
+    };
     fs.rename(Request { req }, parent, name_str, newparent, newname_str);
 }
 
@@ -637,7 +700,13 @@ extern "C" fn link_bridge(
     userdata: *mut c_void,
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let newname_str = unsafe { CStr::from_ptr(newname) }.to_str().unwrap();
+    let newname_str = match unsafe { CStr::from_ptr(newname) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::EINVAL);
+            return;
+        }
+    };
     fs.link(Request { req }, ino, newparent, newname_str);
 }
 

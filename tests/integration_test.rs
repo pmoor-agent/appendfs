@@ -297,6 +297,23 @@ fn test_fuse_filesystem() {
         entries_after
     );
 
+    // Verify non-UTF8 filename lookup returns ENOENT without panicking
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let mut non_utf8_path = mount_path.as_os_str().as_bytes().to_vec();
+        non_utf8_path.push(b'/');
+        non_utf8_path.extend_from_slice(b"bad_\xff\xfe_file.txt");
+        let c_path = CString::new(non_utf8_path).unwrap();
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let res = unsafe { libc::stat(c_path.as_ptr(), st.as_mut_ptr()) };
+        assert_eq!(res, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+    }
+
     // Clean up: unmount using fusermount3
     unmount_fuse(&mount_path_str);
     handle.join().unwrap();
