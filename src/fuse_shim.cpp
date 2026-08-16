@@ -409,6 +409,8 @@ int shim_reply_entry(shim_req_t req, const shim_file_attr *attr, double attr_tim
         e.attr.st_uid = attr->uid;
         e.attr.st_gid = attr->gid;
         e.attr.st_size = attr->size;
+        e.attr.st_blocks = (attr->size > 0) ? ((attr->size + 511) / 512) : 0;
+        e.attr.st_blksize = 4096;
         e.attr.st_atim.tv_sec = attr->atime_sec;
         e.attr.st_atim.tv_nsec = attr->atime_nsec;
         e.attr.st_mtim.tv_sec = attr->mtime_sec;
@@ -430,6 +432,8 @@ int shim_reply_attr(shim_req_t req, const shim_file_attr *attr, double attr_time
         stbuf.st_uid = attr->uid;
         stbuf.st_gid = attr->gid;
         stbuf.st_size = attr->size;
+        stbuf.st_blocks = (attr->size > 0) ? ((attr->size + 511) / 512) : 0;
+        stbuf.st_blksize = 4096;
         stbuf.st_atim.tv_sec = attr->atime_sec;
         stbuf.st_atim.tv_nsec = attr->atime_nsec;
         stbuf.st_mtim.tv_sec = attr->mtime_sec;
@@ -465,6 +469,8 @@ int shim_reply_create(shim_req_t req, const shim_file_attr *attr, double attr_ti
         e.attr.st_uid = attr->uid;
         e.attr.st_gid = attr->gid;
         e.attr.st_size = attr->size;
+        e.attr.st_blocks = (attr->size > 0) ? ((attr->size + 511) / 512) : 0;
+        e.attr.st_blksize = 4096;
         e.attr.st_atim.tv_sec = attr->atime_sec;
         e.attr.st_atim.tv_nsec = attr->atime_nsec;
         e.attr.st_mtim.tv_sec = attr->mtime_sec;
