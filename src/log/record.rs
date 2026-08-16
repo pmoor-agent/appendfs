@@ -216,6 +216,8 @@ pub struct MkdirPayload {
 pub struct UnlinkPayload {
     pub parent: u64,
     pub name: String,
+    #[serde(default)]
+    pub op_time: (i64, u32),
 }
 
 /// Structured metadata payload for directory rmdir operations (`OP_RMDIR`).
@@ -223,6 +225,8 @@ pub struct UnlinkPayload {
 pub struct RmdirPayload {
     pub parent: u64,
     pub name: String,
+    #[serde(default)]
+    pub op_time: (i64, u32),
 }
 
 /// Structured metadata payload for symlink creation operations (`OP_SYMLINK`).
@@ -246,6 +250,8 @@ pub struct RenamePayload {
     pub name: String,
     pub new_parent: u64,
     pub new_name: String,
+    #[serde(default)]
+    pub op_time: (i64, u32),
 }
 
 /// Structured metadata payload for setattr operations (`OP_SETATTR`).
@@ -280,6 +286,8 @@ pub struct LinkPayload {
     pub ino: u64,
     pub new_parent: u64,
     pub new_name: String,
+    #[serde(default)]
+    pub op_time: (i64, u32),
 }
 
 #[cfg(test)]

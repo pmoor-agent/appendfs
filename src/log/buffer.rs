@@ -329,7 +329,11 @@ impl LogBuffer {
                     if current_hash != ingest_checksum {
                         panic!(
                             "in-memory corruption detected before flush: staged write for inode {} at offset {} (len {}) no longer matches its ingestion-time checksum (expected {}, computed {})",
-                            inode, file_offset, data.len(), ingest_checksum, current_hash
+                            inode,
+                            file_offset,
+                            data.len(),
+                            ingest_checksum,
+                            current_hash
                         );
                     }
 
@@ -431,7 +435,15 @@ mod tests {
         let checksum = blake3::hash(&data);
 
         // Staging 150 bytes should cross the 100 byte threshold and trigger auto-flush
-        buffer.stage_write(10, 0, shared_state.clone(), data, checksum, (0, 0), Some(&writer));
+        buffer.stage_write(
+            10,
+            0,
+            shared_state.clone(),
+            data,
+            checksum,
+            (0, 0),
+            Some(&writer),
+        );
 
         // State should automatically transition to Disk
         assert!(matches!(

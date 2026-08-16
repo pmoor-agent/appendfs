@@ -1,61 +1,42 @@
 use crate::clock::{Clock, SystemClock};
 use crate::lock_pool::LockPool;
-use crate::log::{LogBuffer, LogFileCache, LogWriter, export_summary};
-use crate::node::{Node, SyncNode};
-use std::collections::HashMap;
+use crate::log::{ExtentState, LogBuffer, LogFileCache, LogWriter, SharedExtentState};
+use crate::node::{
+    AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SymlinkDelta, SyncNode,
+};
+use crate::range_map::RangeMap;
+use crate::shim::{FileAttr, FileType};
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime};
+
+/// Returned by `InMemoryFS::begin_flush` when a previous flush hasn't folded yet.
+#[derive(Debug)]
+pub struct FlushInProgress;
 
 pub struct InMemoryFS {
-    pub inodes: RwLock<HashMap<u64, Arc<SyncNode>>>,
+    /// Resting consolidated state loaded from `.summary` at mount, folded forward over
+    /// time by `fold_flush`. Never holds a `Tombstone`.
+    pub base: RwLock<HashMap<u64, Arc<SyncNode>>>,
+    /// Immutable frozen snapshot currently being written/flushed to disk in the background.
+    pub flushing: RwLock<Option<HashMap<u64, EntryDelta>>>,
+    /// Current generation's active mutable delta layer receiving live operations.
+    pub live: RwLock<HashMap<u64, EntryDelta>>,
+    /// Active open file descriptor reference counts per inode for POSIX unlinking semantics.
+    pub open_handles: RwLock<HashMap<u64, u32>>,
     pub next_inode: AtomicU64,
     pub last_tx_id: AtomicU64,
     pub lock_pool: LockPool,
     pub clock: Arc<dyn Clock>,
-    pub snapshot_rwlock: Arc<RwLock<()>>,
     pub log_writer: Option<Arc<LogWriter>>,
     pub log_buffer: Arc<LogBuffer>,
     pub log_cache: Option<Arc<LogFileCache>>,
-    /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to
-    /// true to match real filesystem behavior. Reads are never logged (logging every
-    /// read would defeat the point of an append-only log), so an atime bumped only by
-    /// reads can never be reconstructed by replay; disabling this makes atime fully
-    /// log-derived, which in turn makes exported `.summary` snapshots byte-for-byte
-    /// reproducible from the log alone - see `log::summary::export_summary`.
+    /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to true.
     pub track_atime: bool,
-    /// Serializes every directory-structure mutation (mkdir/create/symlink/unlink/
-    /// rmdir/rename/link) - held for each call's entire duration, with the resulting
-    /// log record staged while still holding it. Two things this buys, together:
-    ///
-    /// 1. **Log order matches memory order.** Each of those ops mutates its
-    ///    directory `entries` (and any affected `nlink`) under fine-grained per-inode
-    ///    locks, but used to stage its log record only after releasing them - so two
-    ///    concurrent ops could commit their in-memory effects in one order but append
-    ///    their log records in the other. For commutative ops that just silently
-    ///    diverges `entries` Vec ordering between live state and a post-crash replay;
-    ///    for genuinely conflicting ops (two renames racing to overwrite the same
-    ///    destination name), replay can pick a different winner than what actually
-    ///    happened live - a crash-recovered filesystem showing different content than
-    ///    what was there right before the crash. Staging the record before releasing
-    ///    this lock makes that structurally impossible: only one directory op's
-    ///    memory-mutation-then-log-append sequence can be "in flight" at a time.
-    ///
-    /// 2. **No cross-op lock ordering to get right.** Rename in particular needs to
-    ///    lock a dynamically-discovered second or third inode (an overwrite target, an
-    ///    ancestor during the loop-prevention check) whose bucket isn't known until
-    ///    after the first lock is already held, which can't be reconciled with a
-    ///    fixed global bucket-acquisition order another concurrent op might also be
-    ///    using - the deadlock and cycle-formation bugs this project hit while relying
-    ///    solely on the striped `lock_pool` for that. With only one directory op ever
-    ///    in flight, there's no *other* directory op to race against for these locks
-    ///    in the first place.
-    ///
-    /// File-content operations (read/write/setattr) deliberately don't take this -
-    /// they only ever need one inode's `lock_pool` bucket, so they stay fully
-    /// concurrent with each other and with whichever directory op currently holds
-    /// this lock, which is what actually matters for throughput in an archival
-    /// workload (many files read/written in parallel; directory churn is rare).
+    /// Serializes every directory-structure mutation (mkdir/create/symlink/unlink/rmdir/rename/link).
     pub dir_lock: Mutex<()>,
 }
 
@@ -99,12 +80,14 @@ impl InMemoryFS {
         });
 
         Self {
-            inodes: RwLock::new(map),
+            base: RwLock::new(map),
+            flushing: RwLock::new(None),
+            live: RwLock::new(HashMap::new()),
+            open_handles: RwLock::new(HashMap::new()),
             next_inode: AtomicU64::new(2),
             last_tx_id: AtomicU64::new(0),
             lock_pool: LockPool::new(),
             clock,
-            snapshot_rwlock: Arc::new(RwLock::new(())),
             log_writer,
             log_buffer: Arc::new(LogBuffer::new()),
             log_cache,
@@ -121,7 +104,630 @@ impl InMemoryFS {
         self.next_inode.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Flushes staged log buffer data to OS file buffers.
+    // --- POSIX Open File Descriptor Tracking ---
+
+    pub fn open_handle(&self, ino: u64) {
+        let mut handles = self.open_handles.write().unwrap();
+        *handles.entry(ino).or_insert(0) += 1;
+    }
+
+    pub fn release_handle(&self, ino: u64) {
+        let mut handles = self.open_handles.write().unwrap();
+        if let Some(count) = handles.get_mut(&ino) {
+            *count = count.saturating_sub(1);
+        }
+        if handles.get(&ino) == Some(&0) {
+            handles.remove(&ino);
+        }
+        let remaining = handles.get(&ino).copied().unwrap_or(0);
+        if remaining == 0 {
+            if let Some(attr) = self.get_attr(ino) {
+                if attr.nlink == 0 {
+                    self.tombstone(ino);
+                }
+            }
+        }
+    }
+
+    pub fn open_count(&self, ino: u64) -> u32 {
+        self.open_handles
+            .read()
+            .unwrap()
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    // --- In-Memory Delta Layer Mutations ---
+
+    pub fn insert_new_node(&self, ino: u64, delta: NodeDelta) {
+        self.live
+            .write()
+            .unwrap()
+            .insert(ino, EntryDelta::Node(delta));
+    }
+
+    pub fn remove_new(&self, ino: u64) {
+        self.live.write().unwrap().remove(&ino);
+    }
+
+    pub fn tombstone(&self, ino: u64) {
+        self.live
+            .write()
+            .unwrap()
+            .insert(ino, EntryDelta::Tombstone);
+    }
+
+    pub fn add_dir_entry(&self, parent: u64, name: &str, child_ino: u64, now: SystemTime) {
+        let mut live = self.live.write().unwrap();
+        let entry = live
+            .entry(parent)
+            .or_insert_with(|| EntryDelta::Node(NodeDelta::Directory(DirectoryDelta::default())));
+        if let EntryDelta::Node(NodeDelta::Directory(d)) = entry {
+            d.removed.remove(name);
+            d.added.insert(name.to_string(), child_ino);
+            d.attr_delta.mtime = Some(now);
+            d.attr_delta.ctime = Some(now);
+        }
+    }
+
+    pub fn remove_dir_entry(&self, parent: u64, name: &str, now: SystemTime) {
+        let mut live = self.live.write().unwrap();
+        let entry = live
+            .entry(parent)
+            .or_insert_with(|| EntryDelta::Node(NodeDelta::Directory(DirectoryDelta::default())));
+        if let EntryDelta::Node(NodeDelta::Directory(d)) = entry {
+            d.added.remove(name);
+            d.removed.insert(name.to_string());
+            d.attr_delta.mtime = Some(now);
+            d.attr_delta.ctime = Some(now);
+        }
+    }
+
+    pub fn update_attr_delta(&self, ino: u64, delta: AttrDelta) {
+        let mut live = self.live.write().unwrap();
+        if let Some(EntryDelta::Node(node_delta)) = live.get_mut(&ino) {
+            match node_delta {
+                NodeDelta::Directory(d) => merge_attr_delta(&mut d.attr_delta, &delta),
+                NodeDelta::File(f) => merge_attr_delta(&mut f.attr_delta, &delta),
+                NodeDelta::Symlink(s) => merge_attr_delta(&mut s.attr_delta, &delta),
+            }
+            return;
+        }
+
+        // Inode not in live yet - query existing type from lower layers without re-acquiring live lock
+        let file_type = if let Some(flushing) = self.flushing.read().unwrap().as_ref() {
+            if let Some(entry) = flushing.get(&ino) {
+                match entry {
+                    EntryDelta::Tombstone => None,
+                    EntryDelta::Node(NodeDelta::Directory(_)) => Some(FileType::Directory),
+                    EntryDelta::Node(NodeDelta::File(_)) => Some(FileType::RegularFile),
+                    EntryDelta::Node(NodeDelta::Symlink(_)) => Some(FileType::Symlink),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+        .or_else(|| {
+            self.base.read().unwrap().get(&ino).map(|arc| {
+                let node = unsafe { arc.read() };
+                match node {
+                    Node::Directory { .. } => FileType::Directory,
+                    Node::File { .. } => FileType::RegularFile,
+                    Node::Symlink { .. } => FileType::Symlink,
+                }
+            })
+        });
+
+        match file_type {
+            Some(FileType::Directory) => {
+                live.insert(
+                    ino,
+                    EntryDelta::Node(NodeDelta::Directory(DirectoryDelta {
+                        added: HashMap::new(),
+                        removed: HashSet::new(),
+                        attr_delta: delta,
+                    })),
+                );
+            }
+            Some(FileType::RegularFile) => {
+                live.insert(
+                    ino,
+                    EntryDelta::Node(NodeDelta::File(FileDelta {
+                        extents: RangeMap::new(),
+                        size: None,
+                        truncate_mask: None,
+                        attr_delta: delta,
+                    })),
+                );
+            }
+            Some(FileType::Symlink) => {
+                live.insert(
+                    ino,
+                    EntryDelta::Node(NodeDelta::Symlink(SymlinkDelta {
+                        target: None,
+                        attr_delta: delta,
+                    })),
+                );
+            }
+            None => {}
+        }
+    }
+
+    // --- Overlay Query & Resolution Methods ---
+
+    /// Resolves full `FileAttr` for an inode across `live` -> `flushing` -> `base`.
+    pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
+        let live_entry = self.live.read().unwrap().get(&ino).cloned();
+        if let Some(EntryDelta::Tombstone) = live_entry {
+            return None;
+        }
+
+        let flushing_entry = self
+            .flushing
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|f| f.get(&ino).cloned());
+        if let Some(EntryDelta::Tombstone) = flushing_entry {
+            if live_entry.is_none() {
+                return None;
+            }
+        }
+
+        let base_node = self.base.read().unwrap().get(&ino).map(|arc| {
+            let n = unsafe { arc.read() };
+            n.clone()
+        });
+
+        let mut attr = if let Some(ref node) = base_node {
+            node_to_attr(ino, node)
+        } else if let Some(EntryDelta::Node(ref delta)) = flushing_entry {
+            delta_to_initial_attr(ino, delta)
+        } else if let Some(EntryDelta::Node(ref delta)) = live_entry {
+            delta_to_initial_attr(ino, delta)
+        } else {
+            return None;
+        };
+
+        if let Some(EntryDelta::Node(ref delta)) = flushing_entry {
+            apply_node_delta(&mut attr, delta);
+        }
+        if let Some(EntryDelta::Node(ref delta)) = live_entry {
+            apply_node_delta(&mut attr, delta);
+        }
+
+        Some(attr)
+    }
+
+    /// Looks up a child entry by `name` inside `parent` directory across layers.
+    pub fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
+        if let Some(entry) = self.live.read().unwrap().get(&parent) {
+            match entry {
+                EntryDelta::Tombstone => return None,
+                EntryDelta::Node(NodeDelta::Directory(d)) => {
+                    if d.removed.contains(name) {
+                        return None;
+                    }
+                    if let Some(&ino) = d.added.get(name) {
+                        return Some(ino);
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        if let Some(flushing) = self.flushing.read().unwrap().as_ref() {
+            if let Some(entry) = flushing.get(&parent) {
+                match entry {
+                    EntryDelta::Tombstone => return None,
+                    EntryDelta::Node(NodeDelta::Directory(d)) => {
+                        if d.removed.contains(name) {
+                            return None;
+                        }
+                        if let Some(&ino) = d.added.get(name) {
+                            return Some(ino);
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        if let Some(arc) = self.base.read().unwrap().get(&parent) {
+            let node = unsafe { arc.read() };
+            if let Node::Directory { entries, .. } = node {
+                if let Some((_, ino)) = entries.iter().find(|(entry_name, _)| entry_name == name) {
+                    return Some(*ino);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Lists all consolidated entries of directory `parent` across layers.
+    pub fn list_directory(&self, parent: u64) -> Option<Vec<(String, u64)>> {
+        let attr = self.get_attr(parent)?;
+        if attr.file_type != FileType::Directory {
+            return None;
+        }
+
+        let mut map: HashMap<String, u64> = HashMap::new();
+
+        if let Some(arc) = self.base.read().unwrap().get(&parent) {
+            let node = unsafe { arc.read() };
+            if let Node::Directory { entries, .. } = node {
+                for (name, child_ino) in entries {
+                    map.insert(name.clone(), *child_ino);
+                }
+            }
+        }
+
+        if let Some(flushing) = self.flushing.read().unwrap().as_ref() {
+            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = flushing.get(&parent) {
+                for name in &d.removed {
+                    map.remove(name);
+                }
+                for (name, child_ino) in &d.added {
+                    map.insert(name.clone(), *child_ino);
+                }
+            }
+        }
+
+        if let Some(EntryDelta::Node(NodeDelta::Directory(d))) =
+            self.live.read().unwrap().get(&parent)
+        {
+            for name in &d.removed {
+                map.remove(name);
+            }
+            for (name, child_ino) in &d.added {
+                map.insert(name.clone(), *child_ino);
+            }
+        }
+
+        let mut list: Vec<(String, u64)> = map.into_iter().collect();
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(list)
+    }
+
+    /// Reads target of a symlink across layers.
+    pub fn read_link(&self, ino: u64) -> Option<String> {
+        if let Some(entry) = self.live.read().unwrap().get(&ino) {
+            match entry {
+                EntryDelta::Tombstone => return None,
+                EntryDelta::Node(NodeDelta::Symlink(s)) => {
+                    if let Some(ref t) = s.target {
+                        return Some(t.clone());
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        if let Some(flushing) = self.flushing.read().unwrap().as_ref() {
+            if let Some(entry) = flushing.get(&ino) {
+                match entry {
+                    EntryDelta::Tombstone => return None,
+                    EntryDelta::Node(NodeDelta::Symlink(s)) => {
+                        if let Some(ref t) = s.target {
+                            return Some(t.clone());
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        if let Some(arc) = self.base.read().unwrap().get(&ino) {
+            let node = unsafe { arc.read() };
+            if let Node::Symlink { target, .. } = node {
+                return Some(target.clone());
+            }
+        }
+
+        None
+    }
+
+    /// Reads file data at `[offset, offset + size)` resolving extents across layers.
+    pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+        let attr = self.get_attr(ino).ok_or(libc::ENOENT)?;
+        if attr.file_type != FileType::RegularFile {
+            return Err(libc::EISDIR);
+        }
+
+        let file_size = attr.size as u64;
+        if offset >= file_size {
+            return Ok(Vec::new());
+        }
+
+        let read_len = std::cmp::min(size as u64, file_size - offset);
+        let mut read_buf = vec![0u8; read_len as usize];
+
+        let truncate_mask = self
+            .live
+            .read()
+            .unwrap()
+            .get(&ino)
+            .and_then(|e| match e {
+                EntryDelta::Node(NodeDelta::File(f)) => f.truncate_mask,
+                _ => None,
+            })
+            .or_else(|| {
+                self.flushing
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|f| f.get(&ino))
+                    .and_then(|e| match e {
+                        EntryDelta::Node(NodeDelta::File(f)) => f.truncate_mask,
+                        _ => None,
+                    })
+            })
+            .unwrap_or(u64::MAX);
+
+        let live_extents = if let Some(EntryDelta::Node(NodeDelta::File(f))) =
+            self.live.read().unwrap().get(&ino)
+        {
+            f.extents.query(offset, read_len)
+        } else {
+            Vec::new()
+        };
+
+        let mut filled = vec![false; read_len as usize];
+
+        for (ext_start, ext_len, shared_state) in live_extents {
+            self.copy_extent_data(
+                &mut read_buf,
+                &mut filled,
+                offset,
+                read_len,
+                ext_start,
+                ext_len,
+                &shared_state,
+            );
+        }
+
+        // Query flushing layer for gaps
+        if let Some(flushing) = self.flushing.read().unwrap().as_ref() {
+            if let Some(EntryDelta::Node(NodeDelta::File(f))) = flushing.get(&ino) {
+                let max_flushing_read =
+                    std::cmp::min(read_len, truncate_mask.saturating_sub(offset));
+                if max_flushing_read > 0 {
+                    for (ext_start, ext_len, shared_state) in
+                        f.extents.query(offset, max_flushing_read)
+                    {
+                        self.copy_extent_data(
+                            &mut read_buf,
+                            &mut filled,
+                            offset,
+                            read_len,
+                            ext_start,
+                            ext_len,
+                            &shared_state,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Query base layer for remaining gaps
+        if let Some(arc) = self.base.read().unwrap().get(&ino) {
+            let node = unsafe { arc.read() };
+            if let Node::File { range_map, .. } = node {
+                let max_base_read = std::cmp::min(read_len, truncate_mask.saturating_sub(offset));
+                if max_base_read > 0 {
+                    for (ext_start, ext_len, shared_state) in range_map.query(offset, max_base_read)
+                    {
+                        self.copy_extent_data(
+                            &mut read_buf,
+                            &mut filled,
+                            offset,
+                            read_len,
+                            ext_start,
+                            ext_len,
+                            &shared_state,
+                        );
+                    }
+                }
+            }
+        }
+
+        if self.track_atime {
+            let now = self.clock.now();
+            self.update_attr_delta(
+                ino,
+                AttrDelta {
+                    atime: Some(now),
+                    ..Default::default()
+                },
+            );
+        }
+
+        Ok(read_buf)
+    }
+
+    fn copy_extent_data(
+        &self,
+        dst_buf: &mut [u8],
+        filled: &mut [bool],
+        read_start: u64,
+        read_len: u64,
+        ext_start: u64,
+        ext_len: u64,
+        shared_state: &SharedExtentState,
+    ) {
+        let seg_start = std::cmp::max(read_start, ext_start);
+        let seg_end = std::cmp::min(read_start + read_len, ext_start + ext_len);
+        if seg_start >= seg_end {
+            return;
+        }
+
+        let seg_len = (seg_end - seg_start) as usize;
+        let dst_offset = (seg_start - read_start) as usize;
+        let slice_inner_offset = (seg_start - ext_start) as usize;
+
+        if filled[dst_offset..dst_offset + seg_len].iter().all(|&b| b) {
+            return;
+        }
+
+        let mut temp_buf = vec![0u8; seg_len];
+        let mut bytes_read = 0usize;
+
+        let state = shared_state.read_state();
+        match state {
+            ExtentState::Staged {
+                data,
+                payload_offset,
+                length: _,
+            } => {
+                let src_start = payload_offset as usize + slice_inner_offset;
+                let src_end = std::cmp::min(src_start + seg_len, data.len());
+                let actual_len = std::cmp::min(seg_len, src_end.saturating_sub(src_start));
+                if actual_len > 0 && src_start < data.len() {
+                    temp_buf[..actual_len]
+                        .copy_from_slice(&data[src_start..src_start + actual_len]);
+                    bytes_read = actual_len;
+                }
+            }
+            ExtentState::Disk {
+                generation,
+                record_log_offset,
+                payload_offset,
+                length: _,
+            } => {
+                if let Some(ref cache) = self.log_cache {
+                    if let Ok(file_arc) = cache.get_or_open(generation) {
+                        let mut f = file_arc.lock().unwrap();
+                        let disk_seek_pos = record_log_offset
+                            + crate::log::RECORD_HEADER_SIZE as u64
+                            + payload_offset as u64
+                            + slice_inner_offset as u64;
+                        if f.seek(SeekFrom::Start(disk_seek_pos)).is_ok() {
+                            if f.read_exact(&mut temp_buf).is_ok() {
+                                bytes_read = seg_len;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for i in 0..bytes_read {
+            if !filled[dst_offset + i] {
+                dst_buf[dst_offset + i] = temp_buf[i];
+                filled[dst_offset + i] = true;
+            }
+        }
+    }
+
+    /// Merges all three layers into a consolidated snapshot map.
+    pub fn snapshot_all(&self) -> HashMap<u64, Arc<SyncNode>> {
+        let mut result: HashMap<u64, Arc<SyncNode>> = self.base.read().unwrap().clone();
+
+        if let Some(flushing) = self.flushing.read().unwrap().as_ref() {
+            for (ino, entry) in flushing {
+                match entry {
+                    EntryDelta::Tombstone => {
+                        result.remove(ino);
+                    }
+                    EntryDelta::Node(delta) => {
+                        if let Some(existing_arc) = result.get(ino).cloned() {
+                            let mut node_clone = unsafe { existing_arc.read() }.clone();
+                            apply_delta_to_node(&mut node_clone, delta);
+                            result.insert(*ino, Arc::new(SyncNode::new(node_clone)));
+                        } else {
+                            result.insert(*ino, Arc::new(SyncNode::new(delta_to_node(delta))));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (ino, entry) in self.live.read().unwrap().iter() {
+            match entry {
+                EntryDelta::Tombstone => {
+                    result.remove(ino);
+                }
+                EntryDelta::Node(delta) => {
+                    if let Some(existing_arc) = result.get(ino).cloned() {
+                        let mut node_clone = unsafe { existing_arc.read() }.clone();
+                        apply_delta_to_node(&mut node_clone, delta);
+                        result.insert(*ino, Arc::new(SyncNode::new(node_clone)));
+                    } else {
+                        result.insert(*ino, Arc::new(SyncNode::new(delta_to_node(delta))));
+                    }
+                }
+            }
+        }
+
+        result.retain(|_ino, arc| {
+            let node = unsafe { arc.read() };
+            match node {
+                Node::File { nlink, .. } | Node::Symlink { nlink, .. } => *nlink > 0,
+                Node::Directory { .. } => true,
+            }
+        });
+
+        result
+    }
+
+    // --- Flush & Fold Pipelines ---
+
+    /// Freezes `live` into `flushing` and returns a copy of the frozen deltas.
+    pub fn begin_flush(&self) -> Result<HashMap<u64, EntryDelta>, FlushInProgress> {
+        let _dir_guard = self.dir_lock.lock().unwrap();
+        let _bucket_guards = self.lock_pool.write_all();
+
+        let mut flushing_guard = self.flushing.write().unwrap();
+        if flushing_guard.is_some() {
+            return Err(FlushInProgress);
+        }
+        let frozen = std::mem::take(&mut *self.live.write().unwrap());
+        *flushing_guard = Some(frozen.clone());
+        Ok(frozen)
+    }
+
+    pub fn begin_flush_blocking(&self) -> HashMap<u64, EntryDelta> {
+        loop {
+            match self.begin_flush() {
+                Ok(frozen) => return frozen,
+                Err(FlushInProgress) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    pub fn current_flushing(&self) -> Option<HashMap<u64, EntryDelta>> {
+        self.flushing.read().unwrap().clone()
+    }
+
+    /// Merges `flushing` into `base` and resets `flushing = None`.
+    pub fn fold_flush(&self) {
+        let mut flushing_guard = self.flushing.write().unwrap();
+        let Some(flushed) = flushing_guard.take() else {
+            return;
+        };
+        let mut base = self.base.write().unwrap();
+        for (ino, entry) in flushed {
+            match entry {
+                EntryDelta::Tombstone => {
+                    base.remove(&ino);
+                }
+                EntryDelta::Node(delta) => {
+                    if let Some(existing_arc) = base.get(&ino).cloned() {
+                        let mut node_clone = unsafe { existing_arc.read() }.clone();
+                        apply_delta_to_node(&mut node_clone, &delta);
+                        base.insert(ino, Arc::new(SyncNode::new(node_clone)));
+                    } else {
+                        base.insert(ino, Arc::new(SyncNode::new(delta_to_node(&delta))));
+                    }
+                }
+            }
+        }
+    }
+
     pub fn flush_log(&self) -> std::io::Result<()> {
         if let Some(ref writer) = self.log_writer {
             self.log_buffer.flush(writer)?;
@@ -129,7 +735,6 @@ impl InMemoryFS {
         Ok(())
     }
 
-    /// Performs an explicit physical hardware disk sync (called by FUSE `fsync` / `fsyncdir` or unmount).
     pub fn sync_log(&self) -> std::io::Result<()> {
         if let Some(ref writer) = self.log_writer {
             self.log_buffer.flush(writer)?;
@@ -141,15 +746,16 @@ impl InMemoryFS {
     /// Exports a single-file summary snapshot of the current in-memory filesystem state.
     pub fn export_summary(&self, log_dir: impl AsRef<Path>) -> std::io::Result<PathBuf> {
         self.sync_log()?;
+        let snapshot = self.snapshot_all();
         let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
         let last_tx_id = self.log_writer.as_ref().map_or_else(
             || self.last_tx_id.load(Ordering::SeqCst),
             |w| w.last_tx_id(),
         );
-        export_summary(self, log_dir, generation, last_tx_id)
+        let next_inode = self.next_inode.load(Ordering::SeqCst);
+        crate::log::export_summary(&snapshot, log_dir, generation, last_tx_id, next_inode)
     }
 
-    /// Automatically flushes logs, syncs disk, and exports a single-file summary snapshot on unmount.
     pub fn sync_and_export_summary(&self) -> std::io::Result<Option<PathBuf>> {
         self.sync_log()?;
         if let Some(ref writer) = self.log_writer {
@@ -179,24 +785,433 @@ impl Default for InMemoryFS {
     }
 }
 
-// Helper to trace parent inodes upwards to scan for parent directories. Takes its own
-// brief snapshot of the inode map (cloning the `Arc`s) rather than borrowing a
-// caller-held guard, and never holds `fs.inodes`'s lock while acquiring a `lock_pool`
-// bucket - see the deadlock explanation at rename_core's call site in
-// `operations/links.rs`, which is the only caller.
-pub(crate) fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
-    let snapshot: Vec<(u64, Arc<SyncNode>)> = {
-        let map = fs.inodes.read().unwrap();
-        map.iter().map(|(ino, arc)| (*ino, Arc::clone(arc))).collect()
-    };
-    for (parent_ino, node_arc) in snapshot {
-        let _guard = fs.lock_pool.read(parent_ino);
-        let node = unsafe { node_arc.read() };
-        if let Node::Directory { entries, .. } = node {
-            if entries.iter().any(|(_, ino)| *ino == child_ino) {
-                return Some(parent_ino);
+// --- Helper Functions ---
+
+fn node_to_attr(ino: u64, node: &Node) -> FileAttr {
+    match node {
+        Node::Directory {
+            perm,
+            nlink,
+            uid,
+            gid,
+            atime,
+            mtime,
+            ctime,
+            ..
+        } => FileAttr {
+            ino,
+            file_type: FileType::Directory,
+            perm: *perm,
+            nlink: *nlink,
+            uid: *uid,
+            gid: *gid,
+            size: 0,
+            atime: *atime,
+            mtime: *mtime,
+            ctime: *ctime,
+        },
+        Node::File {
+            size,
+            perm,
+            nlink,
+            uid,
+            gid,
+            atime,
+            mtime,
+            ctime,
+            ..
+        } => FileAttr {
+            ino,
+            file_type: FileType::RegularFile,
+            perm: *perm,
+            nlink: *nlink,
+            uid: *uid,
+            gid: *gid,
+            size: *size as i64,
+            atime: *atime,
+            mtime: *mtime,
+            ctime: *ctime,
+        },
+        Node::Symlink {
+            target,
+            nlink,
+            uid,
+            gid,
+            atime,
+            mtime,
+            ctime,
+        } => FileAttr {
+            ino,
+            file_type: FileType::Symlink,
+            perm: 0o777,
+            nlink: *nlink,
+            uid: *uid,
+            gid: *gid,
+            size: target.len() as i64,
+            atime: *atime,
+            mtime: *mtime,
+            ctime: *ctime,
+        },
+    }
+}
+
+fn delta_to_initial_attr(ino: u64, delta: &NodeDelta) -> FileAttr {
+    match delta {
+        NodeDelta::Directory(d) => {
+            let mut attr = FileAttr {
+                ino,
+                file_type: FileType::Directory,
+                perm: d.attr_delta.mode.unwrap_or(0o755),
+                nlink: d.attr_delta.nlink.unwrap_or(2),
+                uid: d.attr_delta.uid.unwrap_or(0),
+                gid: d.attr_delta.gid.unwrap_or(0),
+                size: 0,
+                atime: d.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: d.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: d.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            apply_attr_delta(&mut attr, &d.attr_delta);
+            attr
+        }
+        NodeDelta::File(f) => {
+            let mut attr = FileAttr {
+                ino,
+                file_type: FileType::RegularFile,
+                perm: f.attr_delta.mode.unwrap_or(0o644),
+                nlink: f.attr_delta.nlink.unwrap_or(1),
+                uid: f.attr_delta.uid.unwrap_or(0),
+                gid: f.attr_delta.gid.unwrap_or(0),
+                size: f.size.unwrap_or(0) as i64,
+                atime: f.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: f.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: f.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            apply_attr_delta(&mut attr, &f.attr_delta);
+            attr
+        }
+        NodeDelta::Symlink(s) => {
+            let mut attr = FileAttr {
+                ino,
+                file_type: FileType::Symlink,
+                perm: 0o777,
+                nlink: s.attr_delta.nlink.unwrap_or(1),
+                uid: s.attr_delta.uid.unwrap_or(0),
+                gid: s.attr_delta.gid.unwrap_or(0),
+                size: s.target.as_ref().map_or(0, |t| t.len() as i64),
+                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            apply_attr_delta(&mut attr, &s.attr_delta);
+            attr
+        }
+    }
+}
+
+fn apply_node_delta(attr: &mut FileAttr, delta: &NodeDelta) {
+    match delta {
+        NodeDelta::Directory(d) => apply_attr_delta(attr, &d.attr_delta),
+        NodeDelta::File(f) => {
+            if let Some(s) = f.size {
+                attr.size = s as i64;
+            }
+            apply_attr_delta(attr, &f.attr_delta);
+        }
+        NodeDelta::Symlink(s) => {
+            if let Some(ref t) = s.target {
+                attr.size = t.len() as i64;
+            }
+            apply_attr_delta(attr, &s.attr_delta);
+        }
+    }
+}
+
+fn apply_attr_delta(attr: &mut FileAttr, delta: &AttrDelta) {
+    if let Some(m) = delta.mode {
+        attr.perm = m & 0o777;
+    }
+    if let Some(u) = delta.uid {
+        attr.uid = u;
+    }
+    if let Some(g) = delta.gid {
+        attr.gid = g;
+    }
+    if let Some(n) = delta.nlink {
+        attr.nlink = n;
+    }
+    if let Some(a) = delta.atime {
+        attr.atime = a;
+    }
+    if let Some(m) = delta.mtime {
+        attr.mtime = m;
+    }
+    if let Some(c) = delta.ctime {
+        attr.ctime = c;
+    }
+}
+
+fn merge_attr_delta(target: &mut AttrDelta, incoming: &AttrDelta) {
+    if incoming.mode.is_some() {
+        target.mode = incoming.mode;
+    }
+    if incoming.uid.is_some() {
+        target.uid = incoming.uid;
+    }
+    if incoming.gid.is_some() {
+        target.gid = incoming.gid;
+    }
+    if incoming.nlink.is_some() {
+        target.nlink = incoming.nlink;
+    }
+    if incoming.atime.is_some() {
+        target.atime = incoming.atime;
+    }
+    if incoming.mtime.is_some() {
+        target.mtime = incoming.mtime;
+    }
+    if incoming.ctime.is_some() {
+        target.ctime = incoming.ctime;
+    }
+}
+
+fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
+    match (node, delta) {
+        (
+            Node::Directory {
+                entries,
+                perm,
+                nlink,
+                uid,
+                gid,
+                atime,
+                mtime,
+                ctime,
+            },
+            NodeDelta::Directory(d),
+        ) => {
+            for rem in &d.removed {
+                entries.retain(|(name, _)| name != rem);
+            }
+            for (name, child_ino) in &d.added {
+                entries.retain(|(existing_name, _)| existing_name != name);
+                entries.push((name.clone(), *child_ino));
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some(m) = d.attr_delta.mode {
+                *perm = m & 0o777;
+            }
+            if let Some(n) = d.attr_delta.nlink {
+                *nlink = n;
+            }
+            if let Some(u) = d.attr_delta.uid {
+                *uid = u;
+            }
+            if let Some(g) = d.attr_delta.gid {
+                *gid = g;
+            }
+            if let Some(a) = d.attr_delta.atime {
+                *atime = a;
+            }
+            if let Some(m) = d.attr_delta.mtime {
+                *mtime = m;
+            }
+            if let Some(c) = d.attr_delta.ctime {
+                *ctime = c;
+            }
+        }
+        (
+            Node::File {
+                range_map,
+                size,
+                perm,
+                nlink,
+                uid,
+                gid,
+                atime,
+                mtime,
+                ctime,
+            },
+            NodeDelta::File(f),
+        ) => {
+            if let Some(mask) = f.truncate_mask {
+                range_map.truncate(mask);
+            }
+            for (start, entry) in f.extents.iter() {
+                range_map.insert(*start, entry.length, entry.value.clone());
+            }
+            if let Some(s) = f.size {
+                *size = s;
+            }
+            if let Some(m) = f.attr_delta.mode {
+                *perm = m & 0o777;
+            }
+            if let Some(n) = f.attr_delta.nlink {
+                *nlink = n;
+            }
+            if let Some(u) = f.attr_delta.uid {
+                *uid = u;
+            }
+            if let Some(g) = f.attr_delta.gid {
+                *gid = g;
+            }
+            if let Some(a) = f.attr_delta.atime {
+                *atime = a;
+            }
+            if let Some(m) = f.attr_delta.mtime {
+                *mtime = m;
+            }
+            if let Some(c) = f.attr_delta.ctime {
+                *ctime = c;
+            }
+        }
+        (
+            Node::Symlink {
+                target,
+                nlink,
+                uid,
+                gid,
+                atime,
+                mtime,
+                ctime,
+            },
+            NodeDelta::Symlink(s),
+        ) => {
+            if let Some(ref t) = s.target {
+                *target = t.clone();
+            }
+            if let Some(n) = s.attr_delta.nlink {
+                *nlink = n;
+            }
+            if let Some(u) = s.attr_delta.uid {
+                *uid = u;
+            }
+            if let Some(g) = s.attr_delta.gid {
+                *gid = g;
+            }
+            if let Some(a) = s.attr_delta.atime {
+                *atime = a;
+            }
+            if let Some(m) = s.attr_delta.mtime {
+                *mtime = m;
+            }
+            if let Some(c) = s.attr_delta.ctime {
+                *ctime = c;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn delta_to_node(delta: &NodeDelta) -> Node {
+    match delta {
+        NodeDelta::Directory(d) => {
+            let mut entries: Vec<(String, u64)> =
+                d.added.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Node::Directory {
+                entries,
+                perm: d.attr_delta.mode.unwrap_or(0o755),
+                nlink: d.attr_delta.nlink.unwrap_or(2),
+                uid: d.attr_delta.uid.unwrap_or(0),
+                gid: d.attr_delta.gid.unwrap_or(0),
+                atime: d.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: d.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: d.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            }
+        }
+        NodeDelta::File(f) => {
+            let mut range_map = RangeMap::new();
+            for (start, entry) in f.extents.iter() {
+                range_map.insert(*start, entry.length, entry.value.clone());
+            }
+            Node::File {
+                range_map,
+                size: f.size.unwrap_or(0),
+                perm: f.attr_delta.mode.unwrap_or(0o644),
+                nlink: f.attr_delta.nlink.unwrap_or(1),
+                uid: f.attr_delta.uid.unwrap_or(0),
+                gid: f.attr_delta.gid.unwrap_or(0),
+                atime: f.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: f.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: f.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            }
+        }
+        NodeDelta::Symlink(s) => Node::Symlink {
+            target: s.target.clone().unwrap_or_default(),
+            nlink: s.attr_delta.nlink.unwrap_or(1),
+            uid: s.attr_delta.uid.unwrap_or(0),
+            gid: s.attr_delta.gid.unwrap_or(0),
+            atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+            mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+            ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+        },
+    }
+}
+
+pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
+    // 1. Check live delta directory additions
+    {
+        let live = fs.live.read().unwrap();
+        for (parent_ino, entry) in live.iter() {
+            if let EntryDelta::Node(NodeDelta::Directory(d)) = entry {
+                if d.added.values().any(|&c| c == child_ino) {
+                    return Some(*parent_ino);
+                }
             }
         }
     }
+
+    // 2. Check flushing delta directory additions
+    {
+        let flushing = fs.flushing.read().unwrap();
+        if let Some(map) = flushing.as_ref() {
+            for (parent_ino, entry) in map.iter() {
+                if let EntryDelta::Node(NodeDelta::Directory(d)) = entry {
+                    if d.added.values().any(|&c| c == child_ino) {
+                        return Some(*parent_ino);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Check base directory entries, respecting removes in flushing and live
+    {
+        let live = fs.live.read().unwrap();
+        let flushing = fs.flushing.read().unwrap();
+        let base = fs.base.read().unwrap();
+        for (parent_ino, node_arc) in base.iter() {
+            let node = unsafe { node_arc.read() };
+            if let Node::Directory { entries, .. } = &*node {
+                for (name, c_ino) in entries {
+                    if *c_ino == child_ino {
+                        let mut removed = false;
+                        if let Some(EntryDelta::Node(NodeDelta::Directory(d))) =
+                            live.get(parent_ino)
+                        {
+                            if d.removed.contains(name) {
+                                removed = true;
+                            }
+                        }
+                        if !removed {
+                            if let Some(flush_map) = flushing.as_ref() {
+                                if let Some(EntryDelta::Node(NodeDelta::Directory(d))) =
+                                    flush_map.get(parent_ino)
+                                {
+                                    if d.removed.contains(name) {
+                                        removed = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !removed {
+                            return Some(*parent_ino);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     None
 }

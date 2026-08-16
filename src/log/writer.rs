@@ -100,7 +100,11 @@ impl LogWriter {
     /// state across a generation boundary. The tradeoff: a single large batch can push
     /// a generation file somewhat past `max_log_size` - bounded by `LogBuffer`'s own
     /// backpressure ceiling, so not unbounded.
-    pub fn roll_if_needed(&self, estimated_additional_bytes: u64, clock: &dyn Clock) -> io::Result<()> {
+    pub fn roll_if_needed(
+        &self,
+        estimated_additional_bytes: u64,
+        clock: &dyn Clock,
+    ) -> io::Result<()> {
         let mut active = match self.active_file.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -294,7 +298,9 @@ mod tests {
         let clock = SystemClock;
         let writer = LogWriter::create_with_max_size(dir.path(), 1, &clock, 60).unwrap();
 
-        writer.append_record(OpCode::Create, 1, b"0123456789").unwrap();
+        writer
+            .append_record(OpCode::Create, 1, b"0123456789")
+            .unwrap();
         assert_eq!(writer.generation(), 1);
 
         // Estimate for the next batch would exceed max_log_size - rolls now, before

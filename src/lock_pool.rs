@@ -69,4 +69,13 @@ impl LockPool {
             .any(|&held| (held % BUCKET_COUNT as u64) as usize == idx);
         if collides { None } else { Some(self.read(ino)) }
     }
+
+    // Acquires every bucket's write lock, in ascending index order (the same order
+    // `write_two` already uses for its two locks), so this can never deadlock against
+    // any other multi-bucket acquisition in this codebase. Used only for the brief
+    // live->flushing swap during a flush - the guards are dropped immediately after
+    // the swap, never held across any I/O.
+    pub fn write_all(&self) -> Vec<RwLockWriteGuard<'_, ()>> {
+        self.locks.iter().map(|l| l.write().unwrap()).collect()
+    }
 }

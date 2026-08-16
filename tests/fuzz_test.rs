@@ -1,8 +1,8 @@
 use appendfs::InMemoryFS;
 use appendfs::LogWriter;
 use appendfs::clock::{AdvancingClock, Clock, MockClock, SystemClock};
-use appendfs::log::{CreatePayload, MkdirPayload, OpCode, export_summary, recover_fs};
-use appendfs::node::{Node, SyncNode};
+use appendfs::log::{CreatePayload, MkdirPayload, OpCode, recover_fs};
+use appendfs::node::Node;
 use appendfs::shim::{FileAttr, FileType};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,20 +36,6 @@ impl SimpleRng {
         }
         min + (self.next_u64() as usize % (max - min + 1))
     }
-}
-
-// Mirrors the private helper in src/fs.rs (pub(crate), not reachable from this integration test).
-// Assumes the inodes map read lock is already held.
-fn find_parent_inode(inodes: &HashMap<u64, Arc<SyncNode>>, child_ino: u64) -> Option<u64> {
-    for (parent_ino, node_arc) in inodes {
-        let node = unsafe { node_arc.read() };
-        if let Node::Directory { entries, .. } = node {
-            if entries.iter().any(|(_, ino)| *ino == child_ino) {
-                return Some(*parent_ino);
-            }
-        }
-    }
-    None
 }
 
 pub struct TestFS {
@@ -437,23 +423,18 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let idx = prng.gen_range(0, active_files.len() - 1);
                         let ino = active_files[idx];
                         // Unlink requires parent & name. Find name in root/dirs.
-                        let mut name_to_unlink = None;
-                        let mut parent_to_unlink = 1u64;
-
-                        let map = fs_baseline.fs.inodes.read().unwrap();
-                        for (p_ino, p_node_arc) in map.iter() {
-                            let node = unsafe { p_node_arc.read() };
-                            if let Node::Directory { entries, .. } = node {
-                                if let Some((n, _)) =
-                                    entries.iter().find(|(_, child)| *child == ino)
-                                {
-                                    parent_to_unlink = *p_ino;
-                                    name_to_unlink = Some(n.clone());
-                                    break;
-                                }
+                        let (parent_to_unlink, name_to_unlink) = {
+                            if let Some(p) = appendfs::fs::find_parent_inode(&fs_baseline.fs, ino) {
+                                let entries = fs_baseline.fs.list_directory(p).unwrap_or_default();
+                                let name = entries
+                                    .into_iter()
+                                    .find(|(_, child)| *child == ino)
+                                    .map(|(n, _)| n);
+                                (p, name)
+                            } else {
+                                (1u64, None)
                             }
-                        }
-                        drop(map);
+                        };
 
                         if let Some(name) = name_to_unlink {
                             let res1 = fs_baseline.unlink(parent_to_unlink, &name);
@@ -466,13 +447,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             assert_eq!(res1, res4);
 
                             if res1.is_ok() {
-                                // Only stop tracking this inode if it's actually gone -
-                                // if link() gave it a second name, it survives this
-                                // unlink (nlink > 0) and stays reachable/mutable
-                                // through that other name, so it should stay covered
-                                // by future write/read/setattr/unlink ops too.
-                                let still_alive =
-                                    fs_baseline.fs.inodes.read().unwrap().contains_key(&ino);
+                                let still_alive = fs_baseline.fs.get_attr(ino).is_some();
                                 if !still_alive {
                                     active_files.remove(idx);
                                 }
@@ -493,19 +468,17 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let src_ino = renameable[prng.gen_range(0, renameable.len() - 1)];
 
                         let src_loc = {
-                            let map = fs_baseline.fs.inodes.read().unwrap();
-                            find_parent_inode(&map, src_ino).and_then(|p| {
-                                let parent_arc = map.get(&p)?;
-                                let parent_node = unsafe { parent_arc.read() };
-                                if let Node::Directory { entries, .. } = parent_node {
-                                    entries
-                                        .iter()
-                                        .find(|(_, c)| *c == src_ino)
-                                        .map(|(n, _)| (p, n.clone()))
-                                } else {
-                                    None
-                                }
-                            })
+                            if let Some(p) =
+                                appendfs::fs::find_parent_inode(&fs_baseline.fs, src_ino)
+                            {
+                                let entries = fs_baseline.fs.list_directory(p).unwrap_or_default();
+                                entries
+                                    .into_iter()
+                                    .find(|(_, child)| *child == src_ino)
+                                    .map(|(n, _)| (p, n))
+                            } else {
+                                None
+                            }
                         };
 
                         if let Some((src_parent, src_name)) = src_loc {
@@ -515,20 +488,16 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             // dest_parent == src_parent and this picks the source's own entry,
                             // that exercises the literal self-rename (name == newname) no-op path.
                             let existing_name = {
-                                let map = fs_baseline.fs.inodes.read().unwrap();
-                                map.get(&dest_parent).and_then(|arc| {
-                                    let node = unsafe { arc.read() };
-                                    if let Node::Directory { entries, .. } = node {
-                                        if entries.is_empty() {
-                                            None
-                                        } else {
-                                            let idx = prng.gen_range(0, entries.len() - 1);
-                                            Some(entries[idx].0.clone())
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                })
+                                let entries = fs_baseline
+                                    .fs
+                                    .list_directory(dest_parent)
+                                    .unwrap_or_default();
+                                if entries.is_empty() {
+                                    None
+                                } else {
+                                    let idx = prng.gen_range(0, entries.len() - 1);
+                                    Some(entries[idx].0.clone())
+                                }
                             };
 
                             let dest_name = if prng.gen_range(0, 1) == 0 {
@@ -563,19 +532,15 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let ino = candidates[idx];
 
                         let loc = {
-                            let map = fs_baseline.fs.inodes.read().unwrap();
-                            find_parent_inode(&map, ino).and_then(|p| {
-                                let parent_arc = map.get(&p)?;
-                                let parent_node = unsafe { parent_arc.read() };
-                                if let Node::Directory { entries, .. } = parent_node {
-                                    entries
-                                        .iter()
-                                        .find(|(_, c)| *c == ino)
-                                        .map(|(n, _)| (p, n.clone()))
-                                } else {
-                                    None
-                                }
-                            })
+                            if let Some(p) = appendfs::fs::find_parent_inode(&fs_baseline.fs, ino) {
+                                let entries = fs_baseline.fs.list_directory(p).unwrap_or_default();
+                                entries
+                                    .into_iter()
+                                    .find(|(_, child)| *child == ino)
+                                    .map(|(n, _)| (p, n))
+                            } else {
+                                None
+                            }
                         };
 
                         if let Some((parent, name)) = loc {
@@ -1028,7 +993,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     drop(writer);
 
     let recovered = recover_fs(dir.path()).unwrap();
-    let map = recovered.inodes.read().unwrap();
+    let map = recovered.snapshot_all();
 
     let root = map.get(&1).unwrap();
     let entries = match unsafe { root.read() } {
@@ -1111,14 +1076,18 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
 
     // Sanity check: recovery succeeds and sees the file before any corruption.
     let recovered = recover_fs(dir.path()).unwrap();
-    assert!(recovered.inodes.read().unwrap().contains_key(&2));
+    assert!(recovered.get_attr(2).is_some());
     drop(recovered);
 
     // Flip one bit inside the Create record's payload region, well past the file
     // header (24B) and this record's header (25B) - simulating a bitrotted byte in
     // otherwise-intact, previously-committed data.
     use std::io::{Read, Seek, SeekFrom, Write};
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
     let corrupt_offset = 24 + 25 + 2; // a few bytes into the CreatePayload
     file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
     let mut byte = [0u8; 1];
@@ -1146,13 +1115,13 @@ fn test_truncate_shrink_then_grow_repro() {
 
     let full: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
     fs.write(ino, 0, &full).unwrap();
-    fs.setattr(ino, None, None, None, Some(50), None, None).unwrap();
+    fs.setattr(ino, None, None, None, Some(50), None, None)
+        .unwrap();
     fs.write(ino, 0, b"XY").unwrap();
     fs.setattr(ino, None, None, None, Some(80), None, None)
         .unwrap(); // grow back past the shrink point at 50
 
     let content = fs.read(ino, 0, 80).unwrap();
-    println!("content[48..60] = {:?}", &content[48..60]);
     // Bytes [50..80) were "deleted" by the truncate to 50 and never rewritten -
     // POSIX says they must read as zero.
     assert!(
@@ -1175,10 +1144,12 @@ fn test_partial_overwrite_read_repro() {
     fs.write(ino, 0, b"XY").unwrap();
 
     let content = fs.read(ino, 0, 100).unwrap();
-    println!("content[0..10]  = {:?}", &content[0..10]);
-    println!("expected[0..10] = {:?}", &full[0..10]);
     assert_eq!(&content[0..2], b"XY");
-    assert_eq!(&content[2..100], &full[2..100], "tail bytes after partial overwrite changed unexpectedly");
+    assert_eq!(
+        &content[2..100],
+        &full[2..100],
+        "tail bytes after partial overwrite changed unexpectedly"
+    );
 }
 
 #[test]
@@ -1218,20 +1189,28 @@ fn test_setattr_times_survive_crash_recovery() {
 
     let fs = TestFS::new_temp_with_clock(None, clock);
     let ino = fs.create(1, "f.txt", 0o644).unwrap();
-    fs.setattr(ino, None, None, None, None, Some(fixed_atime), Some(fixed_mtime))
-        .unwrap();
+    fs.setattr(
+        ino,
+        None,
+        None,
+        None,
+        None,
+        Some(fixed_atime),
+        Some(fixed_mtime),
+    )
+    .unwrap();
 
     let fs = fs.unclean_crash();
 
-    let map = fs.fs.inodes.read().unwrap();
-    let node = map.get(&ino).unwrap();
-    match unsafe { node.read() } {
-        Node::File { atime, mtime, .. } => {
-            assert_eq!(*atime, fixed_atime, "atime did not survive crash recovery");
-            assert_eq!(*mtime, fixed_mtime, "mtime did not survive crash recovery");
-        }
-        _ => panic!("expected a file"),
-    }
+    let attr = fs.fs.get_attr(ino).unwrap();
+    assert_eq!(
+        attr.atime, fixed_atime,
+        "atime did not survive crash recovery"
+    );
+    assert_eq!(
+        attr.mtime, fixed_mtime,
+        "mtime did not survive crash recovery"
+    );
 }
 
 #[test]
@@ -1257,15 +1236,15 @@ fn test_write_mtime_survives_crash_recovery() {
 
     let fs = fs.unclean_crash();
 
-    let map = fs.fs.inodes.read().unwrap();
-    let node = map.get(&ino).unwrap();
-    match unsafe { node.read() } {
-        Node::File { mtime, ctime, .. } => {
-            assert_eq!(*mtime, expected_mtime, "mtime did not survive crash recovery");
-            assert_eq!(*ctime, expected_ctime, "ctime did not survive crash recovery");
-        }
-        _ => panic!("expected a file"),
-    }
+    let attr = fs.fs.get_attr(ino).unwrap();
+    assert_eq!(
+        attr.mtime, expected_mtime,
+        "mtime did not survive crash recovery"
+    );
+    assert_eq!(
+        attr.ctime, expected_ctime,
+        "ctime did not survive crash recovery"
+    );
 }
 
 #[test]
@@ -1296,19 +1275,16 @@ fn test_setattr_size_change_updates_mtime_and_survives_crash_recovery() {
 
     let fs = fs.unclean_crash();
 
-    let map = fs.fs.inodes.read().unwrap();
-    let node = map.get(&ino).unwrap();
-    match unsafe { node.read() } {
-        Node::File { mtime, ctime, size, .. } => {
-            assert_eq!(*size, 5, "size did not survive crash recovery");
-            assert_eq!(
-                *mtime, expected_mtime,
-                "mtime should reflect the truncate, not create/write time"
-            );
-            assert_eq!(*ctime, expected_ctime, "ctime did not survive crash recovery");
-        }
-        _ => panic!("expected a file"),
-    }
+    let attr = fs.fs.get_attr(ino).unwrap();
+    assert_eq!(attr.size, 5, "size did not survive crash recovery");
+    assert_eq!(
+        attr.mtime, expected_mtime,
+        "mtime should reflect the truncate, not create/write time"
+    );
+    assert_eq!(
+        attr.ctime, expected_ctime,
+        "ctime did not survive crash recovery"
+    );
 }
 
 /// One tracked (parent, name, inode) entry, for `test_summary_export_is_deterministic`'s
@@ -1377,8 +1353,7 @@ fn test_summary_export_is_deterministic() {
                         let ino = files[prng.gen_range(0, files.len() - 1)];
                         let offset = (prng.gen_range(0, 10) * 16) as u64;
                         let len = prng.gen_range(16, 128);
-                        let payload: Vec<u8> =
-                            (0..len).map(|i| ((step + i) % 256) as u8).collect();
+                        let payload: Vec<u8> = (0..len).map(|i| ((step + i) % 256) as u8).collect();
                         let _ = fs.write(ino, offset, &payload);
                     }
                 }
@@ -1431,8 +1406,9 @@ fn test_summary_export_is_deterministic() {
                     }
                 }
                 7 => {
-                    let candidates: Vec<usize> =
-                        (0..entries.len()).filter(|&i| entries[i].ino != 1).collect();
+                    let candidates: Vec<usize> = (0..entries.len())
+                        .filter(|&i| entries[i].ino != 1)
+                        .collect();
                     if !candidates.is_empty() {
                         let idx = candidates[prng.gen_range(0, candidates.len() - 1)];
                         let newparent = dirs[prng.gen_range(0, dirs.len() - 1)];
@@ -1456,7 +1432,7 @@ fn test_summary_export_is_deterministic() {
         // Export a summary from the live instance - InMemoryFS::export_summary flushes
         // first, so every extent is guaranteed Disk-backed (SharedExtentState refuses to
         // serialize a still-Staged one) before either summary below gets written.
-        let generation = fs.fs.log_writer.as_ref().unwrap().generation();
+        let _generation = fs.fs.log_writer.as_ref().unwrap().generation();
         let written_path = fs
             .fs
             .export_summary(&fs.log_dir)
@@ -1476,18 +1452,15 @@ fn test_summary_export_is_deterministic() {
         }
         let mut replayed = recover_fs(replay_dir.path()).expect("recover_fs failed on replay");
         replayed.track_atime = false;
-        let regenerated_path = export_summary(
-            &replayed,
-            replay_dir.path(),
-            generation,
-            replayed.last_tx_id.load(Ordering::SeqCst),
-        )
-        .expect("export_summary failed on the replayed instance");
+        let regenerated_path = replayed
+            .export_summary(replay_dir.path())
+            .expect("export_summary failed on the replayed instance");
 
         let written_bytes = std::fs::read(&written_path).unwrap();
         let regenerated_bytes = std::fs::read(&regenerated_path).unwrap();
         assert_eq!(
-            written_bytes, regenerated_bytes,
+            written_bytes,
+            regenerated_bytes,
             "summary export is not byte-for-byte deterministic for seed {} \
              (written {} bytes, regenerated {} bytes)",
             seed,

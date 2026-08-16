@@ -61,3 +61,48 @@ impl SyncNode {
         unsafe { &mut *self.0.get() }
     }
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttrDelta {
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub nlink: Option<u32>,
+    pub atime: Option<SystemTime>,
+    pub mtime: Option<SystemTime>,
+    pub ctime: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DirectoryDelta {
+    pub added: std::collections::HashMap<String, u64>,
+    pub removed: std::collections::HashSet<String>,
+    pub attr_delta: AttrDelta,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FileDelta {
+    pub extents: RangeMap<SharedExtentState>,
+    pub size: Option<u64>,
+    pub truncate_mask: Option<u64>,
+    pub attr_delta: AttrDelta,
+}
+
+#[derive(Debug, Clone)]
+pub struct SymlinkDelta {
+    pub target: Option<String>,
+    pub attr_delta: AttrDelta,
+}
+
+#[derive(Debug, Clone)]
+pub enum NodeDelta {
+    Directory(DirectoryDelta),
+    File(FileDelta),
+    Symlink(SymlinkDelta),
+}
+
+#[derive(Debug, Clone)]
+pub enum EntryDelta {
+    Node(NodeDelta),
+    Tombstone,
+}

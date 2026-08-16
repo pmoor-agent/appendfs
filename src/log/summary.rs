@@ -121,43 +121,21 @@ impl SummaryIndexEntry {
     }
 }
 
-/// Exports a single-file summary snapshot of `InMemoryFS` into `log_dir`.
+/// Exports a single-file summary snapshot of an inodes snapshot map into `log_dir`.
 pub fn export_summary(
-    fs: &InMemoryFS,
+    snapshot: &HashMap<u64, Arc<SyncNode>>,
     log_dir: impl AsRef<Path>,
     generation: u64,
     last_tx_id: u64,
+    next_inode: u64,
 ) -> io::Result<PathBuf> {
     let log_dir = log_dir.as_ref();
 
-    // 1. Acquire snapshot write lock for full duration of summary creation
-    let _snap_guard = match fs.snapshot_rwlock.write() {
-        Ok(g) => g,
-        Err(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Snapshot lock poisoned",
-            ));
-        }
-    };
-
-    let (mut inodes_snapshot, next_inode) = {
-        let map = match fs.inodes.read() {
-            Ok(m) => m,
-            Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Inodes lock poisoned")),
-        };
-        let snapshot: Vec<(u64, Arc<SyncNode>)> =
-            map.iter().map(|(ino, arc)| (*ino, Arc::clone(arc))).collect();
-        let next_ino = fs.next_inode.load(Ordering::SeqCst);
-        (snapshot, next_ino)
-    };
-    // fs.inodes is a HashMap - its iteration order depends on a randomly-seeded hasher
-    // that differs between independently-constructed instances (e.g. a live filesystem
-    // vs one freshly rebuilt by replaying the same log from scratch), so without this
-    // sort, two summaries capturing byte-identical filesystem state could still come out
-    // with their inode records in a different physical order. Sorting by inode makes the
-    // data section's layout a pure function of content, matching the index section below
-    // (which already sorts the same way).
+    let mut inodes_snapshot: Vec<(u64, Arc<SyncNode>)> = snapshot
+        .iter()
+        .map(|(ino, arc)| (*ino, Arc::clone(arc)))
+        .collect();
+    // Sort by inode so physical serialization order is deterministic
     inodes_snapshot.sort_by_key(|(ino, _)| *ino);
 
     let filename = format!("{:06}.summary", generation);
@@ -174,7 +152,7 @@ pub fn export_summary(
     // read doesn't need a second full pass over the file.
     let mut hasher = blake3::Hasher::new();
 
-    // 2. Write SummaryHeader at offset 0
+    // 1. Write SummaryHeader at offset 0
     let header = SummaryHeader::new(generation, last_tx_id, next_inode);
     let header_bytes = header.to_bytes();
     file.write_all(&header_bytes)?;
@@ -183,12 +161,17 @@ pub fn export_summary(
     let mut current_offset = header_bytes.len() as u64;
     let mut index_entries = Vec::with_capacity(inodes_snapshot.len());
 
-    // 3. Serialize all inode nodes into data payload body
+    // 2. Serialize all inode nodes into data payload body
     for (inode, sync_node_arc) in &inodes_snapshot {
-        // SAFETY: snapshot_rwlock write guard (_snap_guard) is held for the full duration of summary export,
-        // guaranteeing zero concurrent FUSE mutations on any SyncNode cell.
         let node = unsafe { sync_node_arc.read() };
-        let payload = bincode::serialize(&*node)
+        let mut node_to_serialize = node.clone();
+        if let Node::Directory {
+            ref mut entries, ..
+        } = node_to_serialize
+        {
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        let payload = bincode::serialize(&node_to_serialize)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         index_entries.push(SummaryIndexEntry {
@@ -209,10 +192,10 @@ pub fn export_summary(
         current_offset += 8 + 4 + payload.len() as u64;
     }
 
-    // 4. Sort index entries by inode ascending
+    // 3. Sort index entries by inode ascending
     index_entries.sort_by_key(|entry| entry.inode);
 
-    // 5. Append index entries
+    // 4. Append index entries
     let index_offset = current_offset;
     for entry in &index_entries {
         let entry_bytes = entry.to_bytes();
@@ -220,7 +203,7 @@ pub fn export_summary(
         hasher.update(&entry_bytes);
     }
 
-    // 6. Append SummaryFooter at EOF
+    // 5. Append SummaryFooter at EOF
     let checksum: [u8; 32] = *hasher.finalize().as_bytes();
     let footer = SummaryFooter::new(index_offset, index_entries.len() as u64, checksum);
     file.write_all(&footer.to_bytes())?;
@@ -229,7 +212,7 @@ pub fn export_summary(
     file.sync_data()?;
     drop(file);
 
-    // 7. Atomically rename .tmp -> .summary
+    // 6. Atomically rename .tmp -> .summary
     rename(&tmp_path, &final_path)?;
 
     log::info!(
@@ -241,6 +224,17 @@ pub fn export_summary(
     );
 
     Ok(final_path)
+}
+
+pub fn export_fs_summary(
+    fs: &InMemoryFS,
+    log_dir: impl AsRef<Path>,
+    generation: u64,
+    last_tx_id: u64,
+) -> io::Result<PathBuf> {
+    let snapshot = fs.snapshot_all();
+    let next_inode = fs.next_inode.load(Ordering::SeqCst);
+    export_summary(&snapshot, log_dir, generation, last_tx_id, next_inode)
 }
 
 /// Reader for single-file `{:06}.summary` snapshot files.
@@ -405,7 +399,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let fs = InMemoryFS::new();
 
-        let path = export_summary(&fs, dir.path(), 1, 10).unwrap();
+        let path = export_fs_summary(&fs, dir.path(), 1, 10).unwrap();
         assert!(path.exists());
 
         let mut reader = SummaryReader::open(&path).unwrap();
@@ -426,7 +420,7 @@ mod tests {
     fn test_bitrot_in_summary_body_is_detected() {
         let dir = tempdir().unwrap();
         let fs = InMemoryFS::new();
-        let path = export_summary(&fs, dir.path(), 1, 10).unwrap();
+        let path = export_fs_summary(&fs, dir.path(), 1, 10).unwrap();
 
         // Flip one bit inside the body (header + inode records + index), well before
         // the footer - simulating bitrot in previously-valid, already-exported data.

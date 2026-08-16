@@ -98,11 +98,9 @@ pub fn recover_fs_with_clock(
     if latest_summary.is_none() {
         if let Some((_, oldest_path)) = log_files.first() {
             if let Ok(oldest_reader) = LogReader::open(oldest_path) {
-                let created = crate::clock::unix_to_system_time(
-                    oldest_reader.file_header().created_at,
-                    0,
-                );
-                if let Some(root_arc) = fs_instance.inodes.read().unwrap().get(&1) {
+                let created =
+                    crate::clock::unix_to_system_time(oldest_reader.file_header().created_at, 0);
+                if let Some(root_arc) = fs_instance.base.read().unwrap().get(&1) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let root_node = unsafe { root_arc.write() };
                     if let Node::Directory {
@@ -136,7 +134,7 @@ pub fn recover_fs_with_clock(
         let next_ino = reader.header.next_inode;
         last_tx_id = reader.header.last_tx_id;
 
-        *fs_instance.inodes.write().unwrap() = inodes_map;
+        *fs_instance.base.write().unwrap() = inodes_map;
         fs_instance.next_inode.store(next_ino, Ordering::SeqCst);
         min_log_gen = summary_gen;
     }
@@ -184,11 +182,14 @@ pub fn recover_fs_with_clock(
             }
 
             if header.op_code == OpCode::BatchCommit {
-                let commit = bincode::deserialize::<BatchCommitPayload>(&record.payload)
-                    .map_err(|e| {
+                let commit =
+                    bincode::deserialize::<BatchCommitPayload>(&record.payload).map_err(|e| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("malformed BatchCommit payload in generation {}: {}", gen_num, e),
+                            format!(
+                                "malformed BatchCommit payload in generation {}: {}",
+                                gen_num, e
+                            ),
                         )
                     })?;
 
@@ -231,6 +232,14 @@ pub fn recover_fs_with_clock(
             .next_inode
             .store(max_inode + 1, Ordering::SeqCst);
     }
+    fs_instance.base.write().unwrap().retain(|_ino, arc| {
+        // SAFETY: Single-threaded post-recovery cleanup; no concurrent LockPool access.
+        let node = unsafe { arc.read() };
+        match node {
+            Node::File { nlink, .. } | Node::Symlink { nlink, .. } => *nlink > 0,
+            Node::Directory { .. } => true,
+        }
+    });
     fs_instance.last_tx_id.store(last_tx_id, Ordering::SeqCst);
 
     Ok(fs_instance)
@@ -260,22 +269,29 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     ctime: now,
                 }));
 
-                let mut map = fs_instance.inodes.write().unwrap();
+                let mut map = fs_instance.base.write().unwrap();
                 map.insert(target_ino, new_node);
 
                 if let Some(parent_node_arc) = map.get(&create.parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let parent_node = unsafe { parent_node_arc.write() };
-                    if let Node::Directory { entries, .. } = parent_node {
+                    if let Node::Directory {
+                        entries,
+                        mtime,
+                        ctime,
+                        ..
+                    } = parent_node
+                    {
                         entries.push((create.name, target_ino));
+                        *mtime = now;
+                        *ctime = now;
                     }
                 }
             }
         }
         OpCode::Mkdir => {
             if let Ok(mkdir) = bincode::deserialize::<MkdirPayload>(&record.payload) {
-                let now =
-                    crate::clock::unix_to_system_time(mkdir.created_at.0, mkdir.created_at.1);
+                let now = crate::clock::unix_to_system_time(mkdir.created_at.0, mkdir.created_at.1);
                 let new_node = Arc::new(SyncNode::new(Node::Directory {
                     entries: Vec::new(),
                     perm: mkdir.mode & 0o777,
@@ -287,13 +303,21 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     ctime: now,
                 }));
 
-                let mut map = fs_instance.inodes.write().unwrap();
+                let mut map = fs_instance.base.write().unwrap();
                 map.insert(target_ino, new_node);
 
                 if let Some(parent_node_arc) = map.get(&mkdir.parent) {
                     let parent_node = unsafe { parent_node_arc.write() };
-                    if let Node::Directory { entries, .. } = parent_node {
+                    if let Node::Directory {
+                        entries,
+                        mtime,
+                        ctime,
+                        ..
+                    } = parent_node
+                    {
                         entries.push((mkdir.name, target_ino));
+                        *mtime = now;
+                        *ctime = now;
                     }
                 }
             }
@@ -312,7 +336,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     write_data_len,
                 );
 
-                let map = fs_instance.inodes.read().unwrap();
+                let map = fs_instance.base.read().unwrap();
                 if let Some(node_arc) = map.get(&target_ino) {
                     let node = unsafe { node_arc.write() };
                     if let Node::File {
@@ -333,19 +357,32 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         );
                         *mtime = now;
                         *ctime = now;
-                        range_map.insert(write_meta.file_offset, write_data_len as u64, shared_state);
+                        range_map.insert(
+                            write_meta.file_offset,
+                            write_data_len as u64,
+                            shared_state,
+                        );
                     }
                 }
             }
         }
         OpCode::Unlink => {
             if let Ok(unlink) = bincode::deserialize::<UnlinkPayload>(&record.payload) {
-                let mut map = fs_instance.inodes.write().unwrap();
+                let now = crate::clock::unix_to_system_time(unlink.op_time.0, unlink.op_time.1);
+                let mut map = fs_instance.base.write().unwrap();
                 if let Some(parent_node_arc) = map.get(&unlink.parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let parent_node = unsafe { parent_node_arc.write() };
-                    if let Node::Directory { entries, .. } = parent_node {
+                    if let Node::Directory {
+                        entries,
+                        mtime,
+                        ctime,
+                        ..
+                    } = parent_node
+                    {
                         entries.retain(|(name, _)| name != &unlink.name);
+                        *mtime = now;
+                        *ctime = now;
                     }
                 }
 
@@ -354,9 +391,10 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let child_node = unsafe { child_node_arc.write() };
                     match child_node {
-                        Node::File { nlink, .. } | Node::Symlink { nlink, .. } => {
+                        Node::File { nlink, ctime, .. } | Node::Symlink { nlink, ctime, .. } => {
                             if *nlink > 0 {
                                 *nlink -= 1;
+                                *ctime = now;
                             }
                             if *nlink == 0 {
                                 should_delete = true;
@@ -378,12 +416,21 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         OpCode::Rmdir => {
             if let Ok(rmdir) = bincode::deserialize::<RmdirPayload>(&record.payload) {
-                let mut map = fs_instance.inodes.write().unwrap();
+                let now = crate::clock::unix_to_system_time(rmdir.op_time.0, rmdir.op_time.1);
+                let mut map = fs_instance.base.write().unwrap();
                 if let Some(parent_node_arc) = map.get(&rmdir.parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let parent_node = unsafe { parent_node_arc.write() };
-                    if let Node::Directory { entries, .. } = parent_node {
+                    if let Node::Directory {
+                        entries,
+                        mtime,
+                        ctime,
+                        ..
+                    } = parent_node
+                    {
                         entries.retain(|(name, _)| name != &rmdir.name);
+                        *mtime = now;
+                        *ctime = now;
                     }
                 }
                 map.remove(&target_ino);
@@ -391,10 +438,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         OpCode::Symlink => {
             if let Ok(symlink) = bincode::deserialize::<SymlinkPayload>(&record.payload) {
-                let now = crate::clock::unix_to_system_time(
-                    symlink.created_at.0,
-                    symlink.created_at.1,
-                );
+                let now =
+                    crate::clock::unix_to_system_time(symlink.created_at.0, symlink.created_at.1);
                 let new_node = Arc::new(SyncNode::new(Node::Symlink {
                     target: symlink.target,
                     nlink: 1,
@@ -405,21 +450,30 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     ctime: now,
                 }));
 
-                let mut map = fs_instance.inodes.write().unwrap();
+                let mut map = fs_instance.base.write().unwrap();
                 map.insert(target_ino, new_node);
 
                 if let Some(parent_node_arc) = map.get(&symlink.parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let parent_node = unsafe { parent_node_arc.write() };
-                    if let Node::Directory { entries, .. } = parent_node {
+                    if let Node::Directory {
+                        entries,
+                        mtime,
+                        ctime,
+                        ..
+                    } = parent_node
+                    {
                         entries.push((symlink.name, target_ino));
+                        *mtime = now;
+                        *ctime = now;
                     }
                 }
             }
         }
         OpCode::Rename => {
             if let Ok(rename) = bincode::deserialize::<RenamePayload>(&record.payload) {
-                let mut map = fs_instance.inodes.write().unwrap();
+                let now = crate::clock::unix_to_system_time(rename.op_time.0, rename.op_time.1);
+                let mut map = fs_instance.base.write().unwrap();
 
                 // Live's rename_core treats same-parent renames differently from
                 // cross-parent ones: same-parent does an in-place rename of the
@@ -438,7 +492,13 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     if let Some(parent_node_arc) = map.get(&rename.parent) {
                         // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                         let parent_node = unsafe { parent_node_arc.write() };
-                        if let Node::Directory { entries, .. } = parent_node {
+                        if let Node::Directory {
+                            entries,
+                            mtime,
+                            ctime,
+                            ..
+                        } = parent_node
+                        {
                             if let Some(dest_pos) =
                                 entries.iter().position(|(n, _)| n == &rename.new_name)
                             {
@@ -449,6 +509,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                             {
                                 entries[src_pos].0 = rename.new_name.clone();
                             }
+                            *mtime = now;
+                            *ctime = now;
                         }
                     }
                     overwritten
@@ -457,8 +519,16 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     if let Some(parent_node_arc) = map.get(&rename.parent) {
                         // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                         let parent_node = unsafe { parent_node_arc.write() };
-                        if let Node::Directory { entries, .. } = parent_node {
+                        if let Node::Directory {
+                            entries,
+                            mtime,
+                            ctime,
+                            ..
+                        } = parent_node
+                        {
                             entries.retain(|(name, _)| name != &rename.name);
+                            *mtime = now;
+                            *ctime = now;
                         }
                     }
 
@@ -466,12 +536,20 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     if let Some(newparent_node_arc) = map.get(&rename.new_parent) {
                         // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                         let newparent_node = unsafe { newparent_node_arc.write() };
-                        if let Node::Directory { entries, .. } = newparent_node {
+                        if let Node::Directory {
+                            entries,
+                            mtime,
+                            ctime,
+                            ..
+                        } = newparent_node
+                        {
                             let overwritten = entries
                                 .iter()
                                 .position(|(name, _)| name == &rename.new_name)
                                 .map(|pos| entries.remove(pos).1);
                             entries.push((rename.new_name.clone(), target_ino));
+                            *mtime = now;
+                            *ctime = now;
                             overwritten
                         } else {
                             None
@@ -490,9 +568,11 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                         let dest_node = unsafe { dest_node_arc.write() };
                         match dest_node {
-                            Node::File { nlink, .. } | Node::Symlink { nlink, .. } => {
+                            Node::File { nlink, ctime, .. }
+                            | Node::Symlink { nlink, ctime, .. } => {
                                 if *nlink > 0 {
                                     *nlink -= 1;
+                                    *ctime = now;
                                 }
                                 if *nlink == 0 {
                                     should_delete = true;
@@ -515,14 +595,12 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         OpCode::Setattr => {
             if let Ok(setattr) = bincode::deserialize::<SetattrPayload>(&record.payload) {
-                let map = fs_instance.inodes.read().unwrap();
+                let map = fs_instance.base.read().unwrap();
                 if let Some(node_arc) = map.get(&target_ino) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let node = unsafe { node_arc.write() };
-                    let now = crate::clock::unix_to_system_time(
-                        setattr.op_time.0,
-                        setattr.op_time.1,
-                    );
+                    let now =
+                        crate::clock::unix_to_system_time(setattr.op_time.0, setattr.op_time.1);
                     // Mirrors live: ctime only moves when this call actually changed
                     // something, never on a to_set with no applicable bits.
                     let any_field_set = setattr.mode.is_some()
@@ -636,12 +714,21 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         OpCode::Link => {
             if let Ok(link) = bincode::deserialize::<LinkPayload>(&record.payload) {
-                let map = fs_instance.inodes.write().unwrap();
+                let now = crate::clock::unix_to_system_time(link.op_time.0, link.op_time.1);
+                let map = fs_instance.base.write().unwrap();
                 if let Some(newparent_node_arc) = map.get(&link.new_parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let newparent_node = unsafe { newparent_node_arc.write() };
-                    if let Node::Directory { entries, .. } = newparent_node {
+                    if let Node::Directory {
+                        entries,
+                        mtime,
+                        ctime,
+                        ..
+                    } = newparent_node
+                    {
                         entries.push((link.new_name, target_ino));
+                        *mtime = now;
+                        *ctime = now;
                     }
                 }
 
@@ -649,9 +736,18 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let node = unsafe { node_arc.write() };
                     match node {
-                        Node::File { nlink, .. } => *nlink += 1,
-                        Node::Symlink { nlink, .. } => *nlink += 1,
-                        Node::Directory { nlink, .. } => *nlink += 1,
+                        Node::File { nlink, ctime, .. } => {
+                            *nlink += 1;
+                            *ctime = now;
+                        }
+                        Node::Symlink { nlink, ctime, .. } => {
+                            *nlink += 1;
+                            *ctime = now;
+                        }
+                        Node::Directory { nlink, ctime, .. } => {
+                            *nlink += 1;
+                            *ctime = now;
+                        }
                     }
                 }
             }

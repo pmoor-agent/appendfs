@@ -99,8 +99,14 @@ enum StoredExtent {
 }
 
 /// Shared smart pointer wrapping the extent state for O(1) zero-lookup in-place updates.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SharedExtentState(Arc<RwLock<StoredExtent>>);
+
+impl Clone for SharedExtentState {
+    fn clone(&self) -> Self {
+        self.fork()
+    }
+}
 
 /// On-disk shape of a `SharedExtentState`, used for summary (de)serialization. Kept
 /// identical to the pre-existing `ExtentState::Disk` field layout so `.summary` files
@@ -315,21 +321,37 @@ mod tests {
 
         clone.trim_left(2);
         assert_eq!(
-            state.read_state(),
+            clone.read_state(),
             ExtentState::Staged {
                 data: Arc::new(vec![1, 2, 3, 4, 5]),
                 payload_offset: 2,
                 length: 3,
             }
         );
-
-        clone.trim_right(2);
         assert_eq!(
             state.read_state(),
             ExtentState::Staged {
                 data: Arc::new(vec![1, 2, 3, 4, 5]),
+                payload_offset: 0,
+                length: 5,
+            }
+        );
+
+        clone.trim_right(2);
+        assert_eq!(
+            clone.read_state(),
+            ExtentState::Staged {
+                data: Arc::new(vec![1, 2, 3, 4, 5]),
                 payload_offset: 2,
                 length: 2,
+            }
+        );
+        assert_eq!(
+            state.read_state(),
+            ExtentState::Staged {
+                data: Arc::new(vec![1, 2, 3, 4, 5]),
+                payload_offset: 0,
+                length: 5,
             }
         );
     }
@@ -343,7 +365,10 @@ mod tests {
         state.resolve_write(7, 100, 21);
 
         // A plain clone shares everything, including the resolved write.
-        assert!(matches!(shared_clone.read_state(), ExtentState::Disk { .. }));
+        assert!(matches!(
+            shared_clone.read_state(),
+            ExtentState::Disk { .. }
+        ));
         // A fork only shares the write slot, seeded at fork time - it does resolve too,
         // since fork() was called on an unresolved extent and shares the SAME write
         // slot Arc, not a snapshot of resolution state.

@@ -8,17 +8,18 @@
 use appendfs::InMemoryFS;
 use appendfs::LogWriter;
 use appendfs::clock::{Clock, SystemClock};
-use appendfs::log::{SummaryReader, export_summary, recover_fs};
+use appendfs::log::{SummaryReader, recover_fs};
 use appendfs::node::Node;
 use appendfs::operations::dir::{list_dir_core, mkdir_core, rmdir_core};
-use appendfs::operations::links::{link_core, readlink_core, rename_core, symlink_core, unlink_core};
+use appendfs::operations::links::{
+    link_core, readlink_core, rename_core, symlink_core, unlink_core,
+};
 use appendfs::operations::read_write::{
     FUSE_SET_ATTR_SIZE, create_core, getattr_core, read_core, setattr_core, write_core,
 };
 use appendfs::shim::FileType;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -231,17 +232,21 @@ fn verify_tree_invariants(fs: &InMemoryFS) {
         );
     }
 
-    let total_inodes = fs.inodes.read().unwrap().len();
+    let snapshot = fs.snapshot_all();
+    let total_inodes = snapshot.len();
     if visited.len() != total_inodes {
-        let map = fs.inodes.read().unwrap();
-        let mut orphans: Vec<u64> = map.keys().copied().filter(|k| !visited.contains(k)).collect();
+        let mut orphans: Vec<u64> = snapshot
+            .keys()
+            .copied()
+            .filter(|k| !visited.contains(k))
+            .collect();
         orphans.sort_unstable();
         eprintln!("orphaned/unreachable inodes: {:?}", orphans);
     }
     assert_eq!(
         visited.len(),
         total_inodes,
-        "orphaned or leaked inodes: {} reachable from root, but fs.inodes holds {}",
+        "orphaned or leaked inodes: {} reachable from root, but fs.snapshot_all() holds {}",
         visited.len(),
         total_inodes
     );
@@ -285,10 +290,13 @@ fn normalize_for_compare(ino: u64, mut node: Node) -> Node {
 // Mirrors tests/fuzz_test.rs's test_summary_export_is_deterministic, but against this
 // test's genuinely concurrent log instead of a single-threaded one.
 fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64) {
-    let generation = fs.log_writer.as_ref().unwrap().generation();
-    let written_path = fs
-        .export_summary(log_dir)
-        .unwrap_or_else(|e| panic!("export_summary failed on the live instance (seed {}): {}", seed, e));
+    let _generation = fs.log_writer.as_ref().unwrap().generation();
+    let written_path = fs.export_summary(log_dir).unwrap_or_else(|e| {
+        panic!(
+            "export_summary failed on the live instance (seed {}): {}",
+            seed, e
+        )
+    });
 
     // Reprocess: copy only the raw .log files into a fresh directory (excluding the
     // .summary file just written), so recover_fs has no fast-path available and is
@@ -304,13 +312,14 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
     let mut replayed = recover_fs(replay_dir.path())
         .unwrap_or_else(|e| panic!("recover_fs failed on replay (seed {}): {}", seed, e));
     replayed.track_atime = false;
-    let regenerated_path = export_summary(
-        &replayed,
-        replay_dir.path(),
-        generation,
-        replayed.last_tx_id.load(Ordering::SeqCst),
-    )
-    .unwrap_or_else(|e| panic!("export_summary failed on the replayed instance (seed {}): {}", seed, e));
+    let regenerated_path = replayed
+        .export_summary(replay_dir.path())
+        .unwrap_or_else(|e| {
+            panic!(
+                "export_summary failed on the replayed instance (seed {}): {}",
+                seed, e
+            )
+        });
 
     // Compare tree *content* (the inode map), not raw summary bytes - `next_inode` can
     // legitimately differ between the two: a failed create/mkdir/symlink (EEXIST,
@@ -343,7 +352,8 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
         let live_node = unsafe { written_inodes[&ino].read() }.clone();
         let replayed_node = unsafe { regenerated_inodes[&ino].read() }.clone();
         let live_bytes = bincode::serialize(&normalize_for_compare(ino, live_node)).unwrap();
-        let replayed_bytes = bincode::serialize(&normalize_for_compare(ino, replayed_node)).unwrap();
+        let replayed_bytes =
+            bincode::serialize(&normalize_for_compare(ino, replayed_node)).unwrap();
         assert_eq!(
             live_bytes, replayed_bytes,
             "log replay diverges from the live filesystem state at inode {} for seed {} \
