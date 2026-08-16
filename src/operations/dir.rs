@@ -1,4 +1,4 @@
-use crate::fs::InMemoryFS;
+use crate::fs::{InMemoryFS, find_parent_inode};
 use crate::node::{AttrDelta, DirectoryDelta, NodeDelta};
 use crate::shim::{self, FileAttr, FileType, Request};
 use std::collections::HashMap;
@@ -18,6 +18,23 @@ pub fn lookup(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
     };
     if parent_attr.file_type != FileType::Directory {
         req.reply_err(libc::ENOTDIR);
+        return;
+    }
+
+    if name == "." {
+        req.reply_entry(&parent_attr, 1.0, 1.0);
+        return;
+    }
+    if name == ".." {
+        let dotdot_ino = if parent == 1 {
+            1
+        } else {
+            find_parent_inode(fs, parent).unwrap_or(1)
+        };
+        match fs.get_attr(dotdot_ino) {
+            Some(attr) => req.reply_entry(&attr, 1.0, 1.0),
+            None => req.reply_err(libc::ENOENT),
+        }
         return;
     }
 
@@ -53,9 +70,15 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
         }
     };
 
+    let dotdot_ino = if ino == 1 {
+        1
+    } else {
+        find_parent_inode(fs, ino).unwrap_or(1)
+    };
+
     let mut db = shim::DirectoryBuffer::new(req);
     db.add(".", ino, FileType::Directory);
-    db.add("..", 1, FileType::Directory);
+    db.add("..", dotdot_ino, FileType::Directory);
 
     for (name, child_ino) in &entries {
         if let Some(attr) = fs.get_attr(*child_ino) {
