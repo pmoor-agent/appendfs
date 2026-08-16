@@ -155,10 +155,6 @@ impl InMemoryFS {
             .insert(ino, EntryDelta::Node(delta));
     }
 
-    pub fn remove_new(&self, ino: u64) {
-        self.live.write().unwrap().remove(&ino);
-    }
-
     pub fn tombstone(&self, ino: u64) {
         self.live
             .write()

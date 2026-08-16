@@ -33,60 +33,11 @@ impl ExtentState {
     }
 }
 
-/// Where a single physical write op landed on disk once flushed, plus how many bytes
-/// of record-header/metadata precede the raw write bytes within that record's payload.
-/// `None` until the write has been flushed.
-///
-/// A single `WriteSlot` is shared (via `Arc`) by every RangeMap fragment derived from
-/// the same original staged write, however many times that write has since been split
-/// or trimmed by later overlapping writes. Resolving it once, at flush time, makes the
-/// flush visible to every one of those fragments in O(1) — none of them need to be
-/// individually walked or updated.
-#[derive(Debug)]
-struct WriteSlot(RwLock<Option<DiskLocation>>);
-
-#[derive(Debug, Clone, Copy)]
-struct DiskLocation {
-    generation: u64,
-    record_log_offset: u64,
-    meta_size: u32,
-}
-
-impl WriteSlot {
-    fn unresolved() -> Arc<Self> {
-        Arc::new(Self(RwLock::new(None)))
-    }
-
-    fn get(&self) -> Option<DiskLocation> {
-        match self.0.read() {
-            Ok(guard) => *guard,
-            Err(err) => *err.into_inner(),
-        }
-    }
-
-    fn resolve(&self, loc: DiskLocation) {
-        let mut guard = match self.0.write() {
-            Ok(guard) => guard,
-            Err(err) => err.into_inner(),
-        };
-        *guard = Some(loc);
-    }
-}
-
 /// The actual, internally-stored representation behind `SharedExtentState`.
-///
-/// Unlike `ExtentState`, a `Staged` value here is not necessarily still in memory only
-/// — its `write` slot may have since resolved to a disk location, in which case every
-/// fragment sharing that slot should be treated as flushed. `payload_offset`/`length`
-/// are *not* shared: each fragment produced by `RangeMap::insert` splitting or trimming
-/// a range owns its own independent copy (see `SharedExtentState::fork`), so mutating
-/// one fragment can never corrupt a sibling fragment derived from the same original
-/// write.
 #[derive(Debug, Clone)]
 enum StoredExtent {
     Staged {
         data: Arc<Vec<u8>>,
-        write: Arc<WriteSlot>,
         payload_offset: u32,
         length: u32,
     },
@@ -164,7 +115,6 @@ impl SharedExtentState {
     pub fn new_staged(data: Arc<Vec<u8>>, payload_offset: u32, length: u32) -> Self {
         Self(Arc::new(RwLock::new(StoredExtent::Staged {
             data,
-            write: WriteSlot::unresolved(),
             payload_offset,
             length,
         })))
@@ -196,11 +146,7 @@ impl SharedExtentState {
         }
     }
 
-    /// Resolves the *logical* state: `Staged` iff the backing write genuinely hasn't
-    /// been flushed yet, `Disk` otherwise — collapsing through the `write` slot
-    /// transparently if needed. Callers never need to know whether this value was
-    /// directly constructed as `Disk` or is a `Staged` fragment whose write has since
-    /// completed; both look identical here.
+    /// Resolves the current extent state as either in-memory (`Staged`) or durable (`Disk`).
     pub fn read_state(&self) -> ExtentState {
         match self.raw() {
             StoredExtent::Disk {
@@ -216,35 +162,19 @@ impl SharedExtentState {
             },
             StoredExtent::Staged {
                 data,
-                write,
                 payload_offset,
                 length,
-            } => match write.get() {
-                Some(loc) => ExtentState::Disk {
-                    generation: loc.generation,
-                    record_log_offset: loc.record_log_offset,
-                    payload_offset: loc.meta_size + payload_offset,
-                    length,
-                },
-                None => ExtentState::Staged {
-                    data,
-                    payload_offset,
-                    length,
-                },
+            } => ExtentState::Staged {
+                data,
+                payload_offset,
+                length,
             },
         }
     }
 
     /// Produces an independent fragment: a *new* `Arc<RwLock<..>>`, seeded from the
     /// current state, that can be trimmed (`trim_left`/`trim_right`) without affecting
-    /// `self` or any other fragment. For a `Staged` value, the fragment still shares
-    /// the same underlying `write` slot as `self` — so it still becomes visible once
-    /// that write is flushed — only `payload_offset`/`length` become independent.
-    ///
-    /// Required whenever a single range is split into two pieces that must be
-    /// mutable independently (see `RangeMap`'s "middle split" case): plain `Clone`
-    /// shares the *entire* state, including `payload_offset`/`length`, which is right
-    /// for the single-trim cases but corrupts both halves of a split.
+    /// `self` or any other fragment.
     pub fn fork(&self) -> Self {
         Self(Arc::new(RwLock::new(self.raw())))
     }
@@ -267,24 +197,6 @@ impl SharedExtentState {
             payload_offset,
             length,
         };
-    }
-
-    /// Marks the write backing this extent as flushed to `generation`/`record_log_offset`
-    /// (with `meta_size` bytes of record metadata preceding the raw write bytes). Every
-    /// fragment forked from this same original write becomes visible as `Disk` the
-    /// moment this returns, however many fragments it's since been split into. No-op if
-    /// this extent was constructed directly as `Disk` (nothing to resolve).
-    pub fn resolve_write(&self, generation: u64, record_log_offset: u64, meta_size: u32) {
-        if let StoredExtent::Staged { write, .. } = &*match self.0.read() {
-            Ok(guard) => guard,
-            Err(err) => err.into_inner(),
-        } {
-            write.resolve(DiskLocation {
-                generation,
-                record_log_offset,
-                meta_size,
-            });
-        }
     }
 }
 
@@ -379,25 +291,6 @@ mod tests {
                 length: 5,
             }
         );
-    }
-
-    #[test]
-    fn test_resolve_write_visible_through_clone_but_not_fork() {
-        let state = SharedExtentState::new_staged(Arc::new(vec![1, 2, 3, 4, 5]), 0, 5);
-        let shared_clone = state.clone();
-        let forked = state.fork();
-
-        state.resolve_write(7, 100, 21);
-
-        // A plain clone shares everything, including the resolved write.
-        assert!(matches!(
-            shared_clone.read_state(),
-            ExtentState::Disk { .. }
-        ));
-        // A fork only shares the write slot, seeded at fork time - it does resolve too,
-        // since fork() was called on an unresolved extent and shares the SAME write
-        // slot Arc, not a snapshot of resolution state.
-        assert!(matches!(forked.read_state(), ExtentState::Disk { .. }));
     }
 
     #[test]
