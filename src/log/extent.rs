@@ -184,6 +184,11 @@ impl SharedExtentState {
         })))
     }
 
+    /// Clones the shared pointer without forking an independent state.
+    pub fn share(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+
     fn raw(&self) -> StoredExtent {
         match self.0.read() {
             Ok(guard) => guard.clone(),
@@ -242,6 +247,26 @@ impl SharedExtentState {
     /// for the single-trim cases but corrupts both halves of a split.
     pub fn fork(&self) -> Self {
         Self(Arc::new(RwLock::new(self.raw())))
+    }
+
+    /// Converts this extent directly to Disk state with exact disk payload offset and length.
+    pub fn convert_to_disk(
+        &self,
+        generation: u64,
+        record_log_offset: u64,
+        payload_offset: u32,
+        length: u32,
+    ) {
+        let mut state = match self.0.write() {
+            Ok(guard) => guard,
+            Err(err) => err.into_inner(),
+        };
+        *state = StoredExtent::Disk {
+            generation,
+            record_log_offset,
+            payload_offset,
+            length,
+        };
     }
 
     /// Marks the write backing this extent as flushed to `generation`/`record_log_offset`

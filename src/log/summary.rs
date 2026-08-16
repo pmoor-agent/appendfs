@@ -1,5 +1,7 @@
 use crate::fs::InMemoryFS;
+use crate::log::SharedExtentState;
 use crate::node::{Node, SyncNode};
+use crate::range_map::RangeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, rename};
@@ -170,6 +172,60 @@ pub fn export_summary(
         } = node_to_serialize
         {
             entries.sort_by(|a, b| a.0.cmp(&b.0));
+        } else if let Node::File {
+            ref mut range_map, ..
+        } = node_to_serialize
+        {
+            let entries: Vec<(u64, u64, SharedExtentState)> = range_map
+                .iter()
+                .map(|(start, e)| (*start, e.length, e.value.clone()))
+                .collect();
+            let mut coalesced: RangeMap<SharedExtentState> = RangeMap::new();
+            let mut current: Option<(u64, u64, SharedExtentState)> = None;
+
+            for (start, len, state) in entries {
+                if let Some((cur_start, cur_len, cur_state)) = current.take() {
+                    let mut merged = false;
+                    if cur_start + cur_len == start {
+                        if let (
+                            crate::log::ExtentState::Disk {
+                                generation: g1,
+                                record_log_offset: r1,
+                                payload_offset: p1,
+                                length: l1,
+                            },
+                            crate::log::ExtentState::Disk {
+                                generation: g2,
+                                record_log_offset: r2,
+                                payload_offset: p2,
+                                length: l2,
+                            },
+                        ) = (cur_state.read_state(), state.read_state())
+                        {
+                            if g1 == g2
+                                && r1 == r2
+                                && p1 + l1 == p2
+                                && l1 + l2 == (cur_len + len) as u32
+                            {
+                                let new_state =
+                                    SharedExtentState::new_disk(g1, r1, p1, l1 + l2);
+                                current = Some((cur_start, cur_len + len, new_state));
+                                merged = true;
+                            }
+                        }
+                    }
+                    if !merged {
+                        coalesced.insert(cur_start, cur_len, cur_state);
+                        current = Some((start, len, state));
+                    }
+                } else {
+                    current = Some((start, len, state));
+                }
+            }
+            if let Some((cur_start, cur_len, cur_state)) = current {
+                coalesced.insert(cur_start, cur_len, cur_state);
+            }
+            *range_map = coalesced;
         }
         let payload = bincode::serialize(&node_to_serialize)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

@@ -1,5 +1,4 @@
 use crate::fs::InMemoryFS;
-use crate::log::{MkdirPayload, OpCode, RmdirPayload};
 use crate::node::{AttrDelta, DirectoryDelta, NodeDelta};
 use crate::shim::{self, FileAttr, FileType, Request};
 use std::collections::HashMap;
@@ -109,19 +108,6 @@ pub fn mkdir_core(
     fs.insert_new_node(new_ino, new_delta);
     fs.add_dir_entry(parent, name, new_ino, now);
 
-    let payload = MkdirPayload {
-        parent,
-        name: name.to_string(),
-        mode: mode & 0o777,
-        created_at: crate::clock::system_time_to_unix(now),
-        uid,
-        gid,
-    };
-    if let Ok(bytes) = bincode::serialize(&payload) {
-        fs.log_buffer
-            .stage_op(OpCode::Mkdir, new_ino, bytes, fs.log_writer.as_deref());
-    }
-
     Ok(FileAttr {
         ino: new_ino,
         file_type: FileType::Directory,
@@ -168,16 +154,6 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
 
     fs.remove_dir_entry(parent, name, now);
     fs.tombstone(child_ino);
-
-    let payload = RmdirPayload {
-        parent,
-        name: name.to_string(),
-        op_time: crate::clock::system_time_to_unix(now),
-    };
-    if let Ok(bytes) = bincode::serialize(&payload) {
-        fs.log_buffer
-            .stage_op(OpCode::Rmdir, child_ino, bytes, fs.log_writer.as_deref());
-    }
 
     Ok(())
 }

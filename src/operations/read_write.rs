@@ -1,5 +1,5 @@
 use crate::fs::InMemoryFS;
-use crate::log::{CreatePayload, OpCode, SetattrPayload, SharedExtentState};
+use crate::log::SharedExtentState;
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType, Request};
@@ -74,7 +74,6 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
 }
 
 pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
-    let ingest_checksum = blake3::hash(buf);
     log::trace!("write(ino={}, len={}, offset={})", ino, buf.len(), offset);
     if offset < 0 {
         return Err(libc::EINVAL);
@@ -107,15 +106,12 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
         }
     }
 
-    fs.log_buffer.stage_write(
-        ino,
-        file_offset,
-        shared_state,
-        data,
-        ingest_checksum,
-        crate::clock::system_time_to_unix(now),
-        fs.log_writer.as_deref(),
-    );
+    let prev = fs
+        .staged_bytes
+        .fetch_add(write_len as usize, std::sync::atomic::Ordering::Relaxed);
+    if prev + write_len as usize >= fs.max_buffer_size {
+        let _ = fs.flush_log();
+    }
 
     Ok(buf.len())
 }
@@ -153,40 +149,26 @@ pub fn setattr_core(
     let now = fs.clock.now();
 
     let mut attr_delta = AttrDelta::default();
-    let mut setattr_payload = SetattrPayload {
-        mode: None,
-        uid: None,
-        gid: None,
-        size: None,
-        atime: None,
-        mtime: None,
-        op_time: crate::clock::system_time_to_unix(now),
-    };
 
     if (to_set & FUSE_SET_ATTR_MODE) != 0 {
         attr_delta.mode = Some(mode & 0o777);
         attr_delta.ctime = Some(now);
-        setattr_payload.mode = Some(mode & 0o777);
     }
     if (to_set & FUSE_SET_ATTR_UID) != 0 {
         attr_delta.uid = Some(uid);
         attr_delta.ctime = Some(now);
-        setattr_payload.uid = Some(uid);
     }
     if (to_set & FUSE_SET_ATTR_GID) != 0 {
         attr_delta.gid = Some(gid);
         attr_delta.ctime = Some(now);
-        setattr_payload.gid = Some(gid);
     }
     if (to_set & FUSE_SET_ATTR_ATIME) != 0 {
         attr_delta.atime = Some(atime);
         attr_delta.ctime = Some(now);
-        setattr_payload.atime = Some(crate::clock::system_time_to_unix(atime));
     }
     if (to_set & FUSE_SET_ATTR_MTIME) != 0 {
         attr_delta.mtime = Some(mtime);
         attr_delta.ctime = Some(now);
-        setattr_payload.mtime = Some(crate::clock::system_time_to_unix(mtime));
     }
 
     if (to_set & FUSE_SET_ATTR_SIZE) != 0 && attr.file_type == FileType::RegularFile {
@@ -206,15 +188,9 @@ pub fn setattr_core(
             f.attr_delta.mtime = Some(now);
             f.attr_delta.ctime = Some(now);
         }
-        setattr_payload.size = Some(new_size);
     }
 
     fs.update_attr_delta(ino, attr_delta);
-
-    if let Ok(bytes) = bincode::serialize(&setattr_payload) {
-        fs.log_buffer
-            .stage_op(OpCode::Setattr, ino, bytes, fs.log_writer.as_deref());
-    }
 
     fs.get_attr(ino).ok_or(libc::ENOENT)
 }
@@ -286,19 +262,6 @@ pub fn create_core(
 
     fs.insert_new_node(new_ino, new_delta);
     fs.add_dir_entry(parent, name, new_ino, now);
-
-    let payload = CreatePayload {
-        parent,
-        name: name.to_string(),
-        mode: mode & 0o777,
-        uid,
-        gid,
-        created_at: crate::clock::system_time_to_unix(now),
-    };
-    if let Ok(bytes) = bincode::serialize(&payload) {
-        fs.log_buffer
-            .stage_op(OpCode::Create, new_ino, bytes, fs.log_writer.as_deref());
-    }
 
     Ok(FileAttr {
         ino: new_ino,

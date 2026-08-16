@@ -476,13 +476,13 @@ extern "C" fn lookup_bridge(
     name: *const c_char,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
     fs.lookup(Request { req }, parent, name_str);
 }
 
 extern "C" fn getattr_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.getattr(Request { req }, ino);
 }
 
@@ -493,17 +493,17 @@ extern "C" fn readdir_bridge(
     off: i64,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.readdir(Request { req }, ino, size, off);
 }
 
 extern "C" fn read_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.read(Request { req }, ino, size, off);
 }
 
 extern "C" fn open_bridge(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.open(Request { req }, ino, flags);
 }
 
@@ -515,7 +515,7 @@ extern "C" fn write_bridge(
     off: i64,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let buf_slice = unsafe { std::slice::from_raw_parts(buf, size) };
     fs.write(Request { req }, ino, buf_slice, off);
 }
@@ -534,7 +534,7 @@ extern "C" fn setattr_bridge(
     to_set: u32,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let atime = crate::clock::unix_to_system_time(atime_sec, atime_nsec);
     let mtime = crate::clock::unix_to_system_time(mtime_sec, mtime_nsec);
     fs.setattr(
@@ -558,7 +558,7 @@ extern "C" fn create_bridge(
     flags: u32,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
     fs.create(Request { req }, parent, name_str, mode, flags);
 }
@@ -569,7 +569,7 @@ extern "C" fn unlink_bridge(
     name: *const c_char,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
     fs.unlink(Request { req }, parent, name_str);
 }
@@ -581,7 +581,7 @@ extern "C" fn mkdir_bridge(
     mode: u32,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
     fs.mkdir(Request { req }, parent, name_str, mode);
 }
@@ -592,7 +592,7 @@ extern "C" fn rmdir_bridge(
     name: *const c_char,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
     fs.rmdir(Request { req }, parent, name_str);
 }
@@ -604,14 +604,14 @@ extern "C" fn symlink_bridge(
     name: *const c_char,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let link_str = unsafe { CStr::from_ptr(link) }.to_str().unwrap();
     let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
     fs.symlink(Request { req }, link_str, parent, name_str);
 }
 
 extern "C" fn readlink_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.readlink(Request { req }, ino);
 }
 
@@ -623,7 +623,7 @@ extern "C" fn rename_bridge(
     newname: *const c_char,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
     let newname_str = unsafe { CStr::from_ptr(newname) }.to_str().unwrap();
     fs.rename(Request { req }, parent, name_str, newparent, newname_str);
@@ -636,37 +636,41 @@ extern "C" fn link_bridge(
     newname: *const c_char,
     userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let newname_str = unsafe { CStr::from_ptr(newname) }.to_str().unwrap();
     fs.link(Request { req }, ino, newparent, newname_str);
 }
 
 extern "C" fn fsync_bridge(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.fsync(Request { req }, ino, datasync != 0);
 }
 
 extern "C" fn release_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.release(Request { req }, ino);
 }
 
 extern "C" fn releasedir_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.releasedir(Request { req }, ino);
 }
 
 extern "C" fn fsyncdir_bridge(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.fsyncdir(Request { req }, ino, datasync != 0);
 }
 
 extern "C" fn statfs_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const Box<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.statfs(Request { req }, ino);
 }
 
 pub fn mount(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), i32> {
+    mount_arc(args, std::sync::Arc::new(fs))
+}
+
+pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), i32> {
     let c_args_owners: Vec<CString> = args
         .into_iter()
         .map(|arg| CString::new(arg).unwrap())
@@ -697,15 +701,14 @@ pub fn mount(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), i32> {
         statfs: Some(statfs_bridge),
     };
 
-    let boxed_fs: Box<crate::fs::InMemoryFS> = Box::new(fs);
-    let raw_userdata = Box::into_raw(Box::new(boxed_fs)) as *mut c_void;
+    let raw_userdata = Box::into_raw(Box::new(fs)) as *mut c_void;
 
     let code = unsafe { run_fuse_ll(c_args.len() as c_int, c_args.as_ptr(), &ops, raw_userdata) };
 
     // Clean up heap allocation and execute unmount flush/sync
     unsafe {
-        let boxed_fs = Box::from_raw(raw_userdata as *mut Box<crate::fs::InMemoryFS>);
-        let _ = boxed_fs.sync_and_export_summary();
+        let arc_fs = Box::from_raw(raw_userdata as *mut std::sync::Arc<crate::fs::InMemoryFS>);
+        let _ = arc_fs.sync_and_export_summary();
     }
 
     if code == 0 { Ok(()) } else { Err(code) }

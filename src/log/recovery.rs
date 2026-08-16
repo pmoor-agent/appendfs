@@ -380,7 +380,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         ..
                     } = parent_node
                     {
-                        entries.retain(|(name, _)| name != &unlink.name);
+                        entries.retain(|(name, ino)| !(name == &unlink.name && *ino == target_ino));
                         *mtime = now;
                         *ctime = now;
                     }
@@ -428,7 +428,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         ..
                     } = parent_node
                     {
-                        entries.retain(|(name, _)| name != &rmdir.name);
+                        entries.retain(|(name, ino)| !(name == &rmdir.name && *ino == target_ino));
                         *mtime = now;
                         *ctime = now;
                     }
@@ -500,12 +500,12 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         } = parent_node
                         {
                             if let Some(dest_pos) =
-                                entries.iter().position(|(n, _)| n == &rename.new_name)
+                                entries.iter().position(|(n, ino)| n == &rename.new_name && *ino != target_ino)
                             {
                                 overwritten = Some(entries.remove(dest_pos).1);
                             }
                             if let Some(src_pos) =
-                                entries.iter().position(|(n, _)| n == &rename.name)
+                                entries.iter().position(|(n, ino)| n == &rename.name && *ino == target_ino)
                             {
                                 entries[src_pos].0 = rename.new_name.clone();
                             }
@@ -526,7 +526,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                             ..
                         } = parent_node
                         {
-                            entries.retain(|(name, _)| name != &rename.name);
+                            entries.retain(|(name, ino)| !(name == &rename.name && *ino == target_ino));
                             *mtime = now;
                             *ctime = now;
                         }
@@ -545,7 +545,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         {
                             let overwritten = entries
                                 .iter()
-                                .position(|(name, _)| name == &rename.new_name)
+                                .position(|(name, ino)| name == &rename.new_name && *ino != target_ino)
                                 .map(|pos| entries.remove(pos).1);
                             entries.push((rename.new_name.clone(), target_ino));
                             *mtime = now;
@@ -563,32 +563,34 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 // inode loses a link and is reclaimed once its nlink reaches zero.
                 // Without this, replayed renames-that-overwrite leak the old inode.
                 if let Some(dest_ino) = overwritten_ino {
-                    let mut should_delete = false;
-                    if let Some(dest_node_arc) = map.get(&dest_ino) {
-                        // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                        let dest_node = unsafe { dest_node_arc.write() };
-                        match dest_node {
-                            Node::File { nlink, ctime, .. }
-                            | Node::Symlink { nlink, ctime, .. } => {
-                                if *nlink > 0 {
-                                    *nlink -= 1;
-                                    *ctime = now;
+                    if dest_ino != target_ino {
+                        let mut should_delete = false;
+                        if let Some(dest_node_arc) = map.get(&dest_ino) {
+                            // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
+                            let dest_node = unsafe { dest_node_arc.write() };
+                            match dest_node {
+                                Node::File { nlink, ctime, .. }
+                                | Node::Symlink { nlink, ctime, .. } => {
+                                    if *nlink > 0 {
+                                        *nlink -= 1;
+                                        *ctime = now;
+                                    }
+                                    if *nlink == 0 {
+                                        should_delete = true;
+                                    }
                                 }
-                                if *nlink == 0 {
+                                // Directories carry a fixed nlink=2 for life (see
+                                // mkdir_core) and can't be hardlinked, so the one entry
+                                // just overwritten was necessarily their only reference -
+                                // mirrors live rename_core's overwrite-reclaim fix.
+                                Node::Directory { .. } => {
                                     should_delete = true;
                                 }
                             }
-                            // Directories carry a fixed nlink=2 for life (see
-                            // mkdir_core) and can't be hardlinked, so the one entry
-                            // just overwritten was necessarily their only reference -
-                            // mirrors live rename_core's overwrite-reclaim fix.
-                            Node::Directory { .. } => {
-                                should_delete = true;
-                            }
                         }
-                    }
-                    if should_delete {
-                        map.remove(&dest_ino);
+                        if should_delete {
+                            map.remove(&dest_ino);
+                        }
                     }
                 }
             }
@@ -602,13 +604,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     let now =
                         crate::clock::unix_to_system_time(setattr.op_time.0, setattr.op_time.1);
                     // Mirrors live: ctime only moves when this call actually changed
-                    // something, never on a to_set with no applicable bits.
-                    let any_field_set = setattr.mode.is_some()
-                        || setattr.uid.is_some()
-                        || setattr.gid.is_some()
-                        || setattr.size.is_some()
-                        || setattr.atime.is_some()
-                        || setattr.mtime.is_some();
+                    // something, never on a to_set with no applicable bits. (atime from reads never moves ctime).
 
                     match node {
                         Node::File {
@@ -652,9 +648,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                             if let Some((secs, nsecs)) = setattr.mtime {
                                 *mtime = crate::clock::unix_to_system_time(secs, nsecs);
                             }
-                            if any_field_set {
-                                *ctime = now;
-                            }
+                            *ctime = now;
                         }
                         Node::Directory {
                             perm,
@@ -680,9 +674,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                             if let Some((secs, nsecs)) = setattr.mtime {
                                 *mtime = crate::clock::unix_to_system_time(secs, nsecs);
                             }
-                            if any_field_set {
-                                *ctime = now;
-                            }
+                            *ctime = now;
                         }
                         Node::Symlink {
                             uid,
@@ -704,9 +696,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                             if let Some((secs, nsecs)) = setattr.mtime {
                                 *mtime = crate::clock::unix_to_system_time(secs, nsecs);
                             }
-                            if any_field_set {
-                                *ctime = now;
-                            }
+                            *ctime = now;
                         }
                     }
                 }

@@ -1,5 +1,4 @@
 use crate::fs::{InMemoryFS, find_parent_inode};
-use crate::log::{LinkPayload, OpCode, RenamePayload, SymlinkPayload, UnlinkPayload};
 use crate::node::{AttrDelta, NodeDelta, SymlinkDelta};
 use crate::shim::{FileAttr, FileType, Request};
 
@@ -34,16 +33,6 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
 
     if new_nlink == 0 && fs.open_count(child_ino) == 0 {
         fs.tombstone(child_ino);
-    }
-
-    let payload = UnlinkPayload {
-        parent,
-        name: name.to_string(),
-        op_time: crate::clock::system_time_to_unix(now),
-    };
-    if let Ok(bytes) = bincode::serialize(&payload) {
-        fs.log_buffer
-            .stage_op(OpCode::Unlink, child_ino, bytes, fs.log_writer.as_deref());
     }
 
     Ok(())
@@ -100,19 +89,6 @@ pub fn symlink_core(
 
     fs.insert_new_node(new_ino, new_delta);
     fs.add_dir_entry(parent, name, new_ino, now);
-
-    let payload = SymlinkPayload {
-        parent,
-        name: name.to_string(),
-        target: target.to_string(),
-        uid,
-        gid,
-        created_at: crate::clock::system_time_to_unix(now),
-    };
-    if let Ok(bytes) = bincode::serialize(&payload) {
-        fs.log_buffer
-            .stage_op(OpCode::Symlink, new_ino, bytes, fs.log_writer.as_deref());
-    }
 
     Ok(FileAttr {
         ino: new_ino,
@@ -237,18 +213,6 @@ pub fn rename_core(
     fs.remove_dir_entry(parent, name, now);
     fs.add_dir_entry(newparent, newname, source_ino, now);
 
-    let payload = RenamePayload {
-        parent,
-        name: name.to_string(),
-        new_parent: newparent,
-        new_name: newname.to_string(),
-        op_time: crate::clock::system_time_to_unix(now),
-    };
-    if let Ok(bytes) = bincode::serialize(&payload) {
-        fs.log_buffer
-            .stage_op(OpCode::Rename, source_ino, bytes, fs.log_writer.as_deref());
-    }
-
     Ok(())
 }
 
@@ -306,17 +270,6 @@ pub fn link_core(
     );
 
     fs.add_dir_entry(newparent, newname, ino, now);
-
-    let payload = LinkPayload {
-        ino,
-        new_parent: newparent,
-        new_name: newname.to_string(),
-        op_time: crate::clock::system_time_to_unix(now),
-    };
-    if let Ok(bytes) = bincode::serialize(&payload) {
-        fs.log_buffer
-            .stage_op(OpCode::Link, ino, bytes, fs.log_writer.as_deref());
-    }
 
     fs.get_attr(ino).ok_or(libc::ENOENT)
 }

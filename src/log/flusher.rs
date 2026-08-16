@@ -1,10 +1,8 @@
-use crate::log::buffer::LogBuffer;
-use crate::log::writer::LogWriter;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-/// Background thread manager that periodically flushes `LogBuffer` data to `LogWriter`.
+/// Background thread manager that periodically triggers a flush routine.
 pub struct BackgroundFlusher {
     stop_signal: Arc<(Mutex<bool>, Condvar)>,
     thread_handle: Option<JoinHandle<()>>,
@@ -12,11 +10,10 @@ pub struct BackgroundFlusher {
 
 impl BackgroundFlusher {
     /// Starts a periodic background flusher thread that runs every `interval`.
-    pub fn start(
-        log_buffer: Arc<LogBuffer>,
-        log_writer: Arc<LogWriter>,
-        interval: Duration,
-    ) -> Self {
+    pub fn start<F>(flush_fn: F, interval: Duration) -> Self
+    where
+        F: Fn() -> std::io::Result<()> + Send + 'static,
+    {
         let pair = Arc::new((Mutex::new(false), Condvar::new()));
         let pair_clone = Arc::clone(&pair);
 
@@ -27,7 +24,7 @@ impl BackgroundFlusher {
                 let result = cvar.wait_timeout(stop, interval).unwrap();
                 stop = result.0;
                 if !*stop {
-                    if let Err(e) = log_buffer.flush(&log_writer) {
+                    if let Err(e) = flush_fn() {
                         log::error!("Background flush failed: {}", e);
                     }
                 }
@@ -65,32 +62,24 @@ impl Drop for BackgroundFlusher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::SystemClock;
-    use crate::log::record::OpCode;
-    use tempfile::tempdir;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_background_flusher_periodic_trigger() {
-        let dir = tempdir().unwrap();
-        let clock = SystemClock;
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &clock).unwrap());
-        let buffer = Arc::new(LogBuffer::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
 
-        // Stage an operation
-        buffer.stage_op(OpCode::Mkdir, 2, vec![1, 2, 3], None);
-        assert_eq!(buffer.pending_bytes(), 3);
-
-        // Start flusher with a 50ms interval
         let mut flusher = BackgroundFlusher::start(
-            Arc::clone(&buffer),
-            Arc::clone(&writer),
+            move || {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
             Duration::from_millis(50),
         );
 
-        // Wait for flusher thread to wake up and flush
         thread::sleep(Duration::from_millis(150));
 
-        assert_eq!(buffer.pending_bytes(), 0);
+        assert!(count.load(Ordering::SeqCst) >= 2);
 
         flusher.stop();
     }

@@ -351,9 +351,9 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
         // needed for a single-owner read.
         let live_node = unsafe { written_inodes[&ino].read() }.clone();
         let replayed_node = unsafe { regenerated_inodes[&ino].read() }.clone();
-        let live_bytes = bincode::serialize(&normalize_for_compare(ino, live_node)).unwrap();
+        let live_bytes = bincode::serialize(&normalize_for_compare(ino, live_node.clone())).unwrap();
         let replayed_bytes =
-            bincode::serialize(&normalize_for_compare(ino, replayed_node)).unwrap();
+            bincode::serialize(&normalize_for_compare(ino, replayed_node.clone())).unwrap();
         assert_eq!(
             live_bytes, replayed_bytes,
             "log replay diverges from the live filesystem state at inode {} for seed {} \

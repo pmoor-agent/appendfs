@@ -45,6 +45,9 @@ fn main() {
     fs_instance.log_writer = Some(Arc::clone(&writer));
     fs_instance.set_log_dir(log_dir);
 
+    let fs_instance = Arc::new(fs_instance);
+    let fs_clone = Arc::clone(&fs_instance);
+
     // Start background flusher thread if flush_interval > 0
     let _flusher_guard = if args.flush_interval > 0 {
         println!(
@@ -52,8 +55,7 @@ fn main() {
             args.flush_interval
         );
         Some(BackgroundFlusher::start(
-            Arc::clone(&fs_instance.log_buffer),
-            Arc::clone(&writer),
+            move || fs_clone.flush_log(),
             Duration::from_secs(args.flush_interval),
         ))
     } else {
@@ -67,7 +69,7 @@ fn main() {
     );
 
     let fuse_args = args.to_fuse_args();
-    if let Err(err) = appendfs::mount(fuse_args, fs_instance) {
+    if let Err(err) = appendfs::mount_arc(fuse_args, fs_instance) {
         eprintln!("Failed to mount appendfs FUSE filesystem: {}", err);
         std::process::exit(1);
     }

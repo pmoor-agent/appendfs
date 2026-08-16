@@ -22,3 +22,7 @@ pub use range_map::{RangeEntry, RangeMap, RangeValue};
 pub fn mount(args: Vec<String>, fs: InMemoryFS) -> Result<(), i32> {
     shim::mount(args, fs)
 }
+
+pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<InMemoryFS>) -> Result<(), i32> {
+    shim::mount_arc(args, fs)
+}
