@@ -67,6 +67,8 @@ typedef void (*shim_release_fn)(shim_req_t req, uint64_t ino, void *userdata);
 typedef void (*shim_releasedir_fn)(shim_req_t req, uint64_t ino, void *userdata);
 typedef void (*shim_fsyncdir_fn)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
 typedef void (*shim_statfs_fn)(shim_req_t req, uint64_t ino, void *userdata);
+typedef void (*shim_init_fn)(void *userdata);
+typedef void (*shim_destroy_fn)(void *userdata);
 
 struct RustLowlevelOps {
     shim_lookup_fn lookup;
@@ -90,6 +92,8 @@ struct RustLowlevelOps {
     shim_releasedir_fn releasedir;
     shim_fsyncdir_fn fsyncdir;
     shim_statfs_fn statfs;
+    shim_init_fn init;
+    shim_destroy_fn destroy;
 };
 
 } // extern "C"
@@ -309,6 +313,21 @@ static void ll_statfs(fuse_req_t req, fuse_ino_t ino) {
     }
 }
 
+static void ll_init(void *userdata, struct fuse_conn_info *conn) {
+    (void)conn;
+    auto *ctx = static_cast<ShimContext*>(userdata);
+    if (ctx && ctx->ops.init) {
+        ctx->ops.init(ctx->userdata);
+    }
+}
+
+static void ll_destroy(void *userdata) {
+    auto *ctx = static_cast<ShimContext*>(userdata);
+    if (ctx && ctx->ops.destroy) {
+        ctx->ops.destroy(ctx->userdata);
+    }
+}
+
 extern "C" {
 
 int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, void *userdata) {
@@ -358,6 +377,8 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
         goto err_out1;
     }
 
+    ll_ops.init = ll_init;
+    ll_ops.destroy = ll_destroy;
     ll_ops.lookup = ll_lookup;
     ll_ops.getattr = ll_getattr;
     ll_ops.readdir = ll_readdir;

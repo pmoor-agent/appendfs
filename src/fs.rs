@@ -1,8 +1,8 @@
 use crate::clock::{Clock, SystemClock};
 use crate::lock_pool::LockPool;
 use crate::log::{
-    CreatePayload, ExtentState, GenerationLiveStats, LinkPayload, LogFileCache, LogManifest,
-    LogWriter, MkdirPayload, OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload,
+    BackgroundFlusher, CreatePayload, ExtentState, GenerationLiveStats, LinkPayload, LogFileCache,
+    LogManifest, LogWriter, MkdirPayload, OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload,
     SetattrPayload, SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
 use crate::node::{
@@ -41,6 +41,10 @@ pub struct InMemoryFS {
     pub log_cache: Option<Arc<LogFileCache>>,
     pub staged_bytes: AtomicUsize,
     pub max_buffer_size: usize,
+    pub staged_ops: AtomicUsize,
+    pub max_staged_ops: usize,
+    pub flush_interval: AtomicU64,
+    pub(crate) flusher: Mutex<Option<BackgroundFlusher>>,
     pub flush_lock: Mutex<()>,
     /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to true.
     pub track_atime: bool,
@@ -105,6 +109,10 @@ impl InMemoryFS {
             log_cache,
             staged_bytes: AtomicUsize::new(0),
             max_buffer_size: 128 * 1024 * 1024,
+            staged_ops: AtomicUsize::new(0),
+            max_staged_ops: crate::cli::DEFAULT_MAX_BUFFER_OPS,
+            flush_interval: AtomicU64::new(0),
+            flusher: Mutex::new(None),
             flush_lock: Mutex::new(()),
             track_atime: true,
             dir_lock: Mutex::new(()),
@@ -1308,7 +1316,47 @@ impl InMemoryFS {
         }
         self.fold_flush();
         self.staged_bytes.store(0, Ordering::Relaxed);
+        self.staged_ops.store(0, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Increments mutation counters (ops & bytes) and triggers an automatic flush if thresholds are reached.
+    pub fn notify_mutation(&self, additional_bytes: usize) {
+        let staged_b = if additional_bytes > 0 {
+            self.staged_bytes.fetch_add(additional_bytes, Ordering::Relaxed) + additional_bytes
+        } else {
+            self.staged_bytes.load(Ordering::Relaxed)
+        };
+        let staged_o = self.staged_ops.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if staged_b >= self.max_buffer_size || staged_o >= self.max_staged_ops {
+            let _ = self.flush_log();
+        }
+    }
+
+    /// Initializes background services (e.g. periodic flusher) upon FUSE mount.
+    pub fn init(self: &Arc<Self>) {
+        let interval_secs = self.flush_interval.load(Ordering::SeqCst);
+        if interval_secs > 0 {
+            let self_clone = Arc::clone(self);
+            let mut flusher = self.flusher.lock().unwrap();
+            *flusher = Some(BackgroundFlusher::start(
+                move || self_clone.flush_log(),
+                Duration::from_secs(interval_secs),
+            ));
+            log::info!(
+                "Started background periodic log flusher (interval: {} seconds)",
+                interval_secs
+            );
+        }
+    }
+
+    /// Cleanly stops background services upon FUSE unmount.
+    pub fn destroy(&self) {
+        let mut flusher = self.flusher.lock().unwrap();
+        if let Some(mut f) = flusher.take() {
+            f.stop();
+        }
     }
 
     pub fn sync_log(&self) -> std::io::Result<()> {
@@ -1408,6 +1456,7 @@ impl InMemoryFS {
 
 impl Drop for InMemoryFS {
     fn drop(&mut self) {
+        self.destroy();
         let _ = self.sync_and_export_summary();
     }
 }
@@ -2084,5 +2133,30 @@ mod tests {
         let rec_stats = recovered.calculate_generation_live_stats();
         assert_eq!(rec_stats[0].live_bytes, 25);
         assert_eq!(rec_stats[0].live_extents, 1);
+    }
+
+    #[test]
+    fn test_mutation_threshold_triggers_automatic_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        // Set small operation threshold of 5 ops
+        fs.max_staged_ops = 5;
+
+        // Perform 4 create operations - not flushed yet
+        for i in 0..4 {
+            let name = format!("file_{}.txt", i);
+            crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
+        }
+        assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 4);
+        assert_eq!(fs.manifest.read().unwrap().logs[0].record_count, 0);
+
+        // 5th operation reaches threshold and triggers automatic flush!
+        crate::operations::read_write::create_core(&fs, 1, "file_4.txt", 0o644, 0, 1000, 1000).unwrap();
+
+        // Staged ops reset to 0 after automatic flush
+        assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 0);
+        assert_eq!(fs.manifest.read().unwrap().logs[0].record_count, 12); // 5 creates + 6 setattrs + 1 FlushCommit
     }
 }

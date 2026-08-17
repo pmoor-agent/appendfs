@@ -8,6 +8,9 @@ pub const DEFAULT_MAX_LOG_SIZE: u64 = 1024 * 1024 * 1024;
 /// Default maximum staged write data in memory before triggering a flush (128 MiB).
 pub const DEFAULT_MAX_BUFFER_SIZE: usize = 128 * 1024 * 1024;
 
+/// Default maximum staged mutation operations before triggering an automatic flush (10,000 ops).
+pub const DEFAULT_MAX_BUFFER_OPS: usize = 10_000;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "appendfs",
@@ -71,6 +74,10 @@ pub struct MountArgs {
     /// Threshold in bytes of dirty in-memory data before triggering an automatic flush (default: 128 MiB)
     #[arg(short = 't', long = "flush-threshold", default_value_t = DEFAULT_MAX_BUFFER_SIZE)]
     pub flush_threshold: usize,
+
+    /// Threshold of staged dirty mutations (create/unlink/mkdir/etc) before triggering an automatic flush (default: 10000)
+    #[arg(long = "flush-threshold-ops", default_value_t = DEFAULT_MAX_BUFFER_OPS)]
+    pub flush_threshold_ops: usize,
 
     /// Maximum log file size in bytes before rolling to next generation (default: 1 GiB)
     #[arg(short = 's', long = "max-log-size", default_value_t = DEFAULT_MAX_LOG_SIZE)]

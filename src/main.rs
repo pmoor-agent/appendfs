@@ -1,9 +1,8 @@
 use appendfs::cli::{Cli, Commands};
-use appendfs::log::{BackgroundFlusher, LogWriter};
+use appendfs::log::LogWriter;
 use appendfs::{VolumeStats, init_volume, recover_fs};
 use clap::Parser;
 use std::sync::Arc;
-use std::time::Duration;
 
 fn main() {
     env_logger::init();
@@ -28,7 +27,7 @@ fn main() {
                     println!("  Next Generation: 1 (000001.log)");
                 }
                 Err(e) => {
-                    eprintln!("Error initializing volume: {}", e);
+                    eprintln!("Failed to initialize volume in '{:?}': {}", args.log_dir, e);
                     std::process::exit(1);
                 }
             }
@@ -75,29 +74,17 @@ fn main() {
 
             fs_instance.log_writer = Some(Arc::clone(&writer));
             fs_instance.max_buffer_size = args.flush_threshold;
+            fs_instance.max_staged_ops = args.flush_threshold_ops;
+            fs_instance
+                .flush_interval
+                .store(args.flush_interval, std::sync::atomic::Ordering::SeqCst);
             fs_instance.set_log_dir(log_dir);
 
             let fs_instance = Arc::new(fs_instance);
-            let fs_clone = Arc::clone(&fs_instance);
-
-            // Start background flusher thread if flush_interval > 0
-            let _flusher_guard = if args.flush_interval > 0 {
-                println!(
-                    "Starting background periodic log flusher (interval: {} seconds)...",
-                    args.flush_interval
-                );
-                Some(BackgroundFlusher::start(
-                    move || fs_clone.flush_log(),
-                    Duration::from_secs(args.flush_interval),
-                ))
-            } else {
-                println!("Background periodic log flusher disabled.");
-                None
-            };
 
             println!(
-                "Mounting appendfs at '{:?}' with log-dir '{:?}' (active generation: {}, flush-threshold: {} bytes, max-log-size: {} bytes, foreground: {})...",
-                args.mount_point, args.log_dir, next_gen, args.flush_threshold, args.max_log_size, args.foreground
+                "Mounting appendfs at '{:?}' with log-dir '{:?}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, foreground: {})...",
+                args.mount_point, args.log_dir, next_gen, args.flush_threshold, args.flush_threshold_ops, args.flush_interval, args.max_log_size, args.foreground
             );
 
             let fuse_args = args.to_fuse_args();

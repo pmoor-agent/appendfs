@@ -173,61 +173,67 @@ pub fn mkdir_core(
     uid: u32,
     gid: u32,
 ) -> Result<FileAttr, i32> {
-    let _dir_guard = fs.dir_lock.lock().unwrap();
-    let now = fs.clock.now();
-    log::trace!(
-        "mkdir(parent={}, name={}, mode=0o{:o}, uid={}, gid={})",
-        parent,
-        name,
-        mode,
-        uid,
-        gid
-    );
+    let attr = {
+        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let now = fs.clock.now();
+        log::trace!(
+            "mkdir(parent={}, name={}, mode=0o{:o}, uid={}, gid={})",
+            parent,
+            name,
+            mode,
+            uid,
+            gid
+        );
 
-    if name.len() > 255 {
-        return Err(libc::ENAMETOOLONG);
-    }
+        if name.len() > 255 {
+            return Err(libc::ENAMETOOLONG);
+        }
 
-    let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
-    if parent_attr.file_type != FileType::Directory {
-        return Err(libc::ENOTDIR);
-    }
+        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        if parent_attr.file_type != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
 
-    if fs.lookup_child(parent, name).is_some() {
-        return Err(libc::EEXIST);
-    }
+        if fs.lookup_child(parent, name).is_some() {
+            return Err(libc::EEXIST);
+        }
 
-    let new_ino = fs.allocate_inode();
-    let new_delta = NodeDelta::Directory(DirectoryDelta {
-        parent: Some(parent),
-        added: HashMap::new(),
-        removed: std::collections::HashSet::new(),
-        attr_delta: AttrDelta {
-            mode: Some(mode & 0o777),
-            nlink: Some(2),
-            uid: Some(uid),
-            gid: Some(gid),
-            atime: Some(now),
-            mtime: Some(now),
-            ctime: Some(now),
-        },
-    });
+        let new_ino = fs.allocate_inode();
+        let new_delta = NodeDelta::Directory(DirectoryDelta {
+            parent: Some(parent),
+            added: HashMap::new(),
+            removed: std::collections::HashSet::new(),
+            attr_delta: AttrDelta {
+                mode: Some(mode & 0o777),
+                nlink: Some(2),
+                uid: Some(uid),
+                gid: Some(gid),
+                atime: Some(now),
+                mtime: Some(now),
+                ctime: Some(now),
+            },
+        });
 
-    fs.insert_new_node(new_ino, new_delta);
-    fs.add_dir_entry(parent, name, new_ino, now);
+        fs.insert_new_node(new_ino, new_delta);
+        fs.add_dir_entry(parent, name, new_ino, now);
 
-    Ok(FileAttr {
-        ino: new_ino,
-        file_type: FileType::Directory,
-        perm: mode & 0o777,
-        nlink: 2,
-        uid,
-        gid,
-        size: 0,
-        atime: now,
-        mtime: now,
-        ctime: now,
-    })
+        FileAttr {
+            ino: new_ino,
+            file_type: FileType::Directory,
+            perm: mode & 0o777,
+            nlink: 2,
+            uid,
+            gid,
+            size: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        }
+    };
+
+    fs.notify_mutation(0);
+
+    Ok(attr)
 }
 
 pub fn mkdir(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32) {
@@ -240,32 +246,36 @@ pub fn mkdir(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32) 
 }
 
 pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
-    let _dir_guard = fs.dir_lock.lock().unwrap();
-    let now = fs.clock.now();
-    log::trace!("rmdir(parent={}, name={})", parent, name);
+    {
+        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let now = fs.clock.now();
+        log::trace!("rmdir(parent={}, name={})", parent, name);
 
-    if name.len() > 255 {
-        return Err(libc::ENAMETOOLONG);
+        if name.len() > 255 {
+            return Err(libc::ENAMETOOLONG);
+        }
+
+        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        if parent_attr.file_type != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
+
+        let child_ino = fs.lookup_child(parent, name).ok_or(libc::ENOENT)?;
+        let child_attr = fs.get_attr(child_ino).ok_or(libc::ENOENT)?;
+        if child_attr.file_type != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
+
+        let entries = fs.list_directory(child_ino).ok_or(libc::ENOENT)?;
+        if !entries.is_empty() {
+            return Err(libc::ENOTEMPTY);
+        }
+
+        fs.remove_dir_entry(parent, name, now);
+        fs.tombstone(child_ino);
     }
 
-    let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
-    if parent_attr.file_type != FileType::Directory {
-        return Err(libc::ENOTDIR);
-    }
-
-    let child_ino = fs.lookup_child(parent, name).ok_or(libc::ENOENT)?;
-    let child_attr = fs.get_attr(child_ino).ok_or(libc::ENOENT)?;
-    if child_attr.file_type != FileType::Directory {
-        return Err(libc::ENOTDIR);
-    }
-
-    let entries = fs.list_directory(child_ino).ok_or(libc::ENOENT)?;
-    if !entries.is_empty() {
-        return Err(libc::ENOTEMPTY);
-    }
-
-    fs.remove_dir_entry(parent, name, now);
-    fs.tombstone(child_ino);
+    fs.notify_mutation(0);
 
     Ok(())
 }

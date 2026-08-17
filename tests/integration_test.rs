@@ -1289,3 +1289,86 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
     assert_eq!(root_entries.len(), 1);
     assert_eq!(root_entries[0].0, "testdir");
 }
+
+#[test]
+fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path();
+
+    appendfs::init_volume(log_path, Some("main")).unwrap();
+
+    let mut fs = appendfs::recover_fs(log_path).unwrap();
+    let writer = std::sync::Arc::new(appendfs::LogWriter::create_lazy(
+        log_path,
+        1,
+        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+        1,
+    ));
+    fs.log_writer = Some(writer);
+    fs.set_log_dir(log_path);
+    // Set threshold to 10 operations
+    fs.max_staged_ops = 10;
+
+    // 1. Create a tree with 1 directory and 15 files
+    let dir_attr = appendfs::operations::dir::mkdir_core(&fs, 1, "bigdir", 0o755, 1000, 1000).unwrap();
+    let mut file_names = Vec::new();
+    for i in 0..15 {
+        let name = format!("f_{}.txt", i);
+        appendfs::operations::read_write::create_core(&fs, dir_attr.ino, &name, 0o644, 0, 1000, 1000).unwrap();
+        file_names.push(name);
+    }
+
+    // 2. Perform rm -rf (15 unlinks + 1 rmdir)
+    for name in &file_names {
+        appendfs::operations::links::unlink_core(&fs, dir_attr.ino, name).unwrap();
+    }
+    appendfs::operations::dir::rmdir_core(&fs, 1, "bigdir").unwrap();
+
+    // Verify that the manifest records flushes triggered automatically by operation count!
+    let manifest = fs.manifest.read().unwrap();
+    assert!(manifest.logs.len() >= 1);
+    let total_records: u32 = manifest.logs.iter().map(|l| l.record_count).sum();
+    assert!(total_records > 0, "metadata unlinks must have been automatically flushed to log");
+}
+
+#[test]
+fn test_background_flusher_in_mount_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path();
+
+    appendfs::init_volume(log_path, Some("main")).unwrap();
+
+    let mut fs = appendfs::recover_fs(log_path).unwrap();
+    let writer = std::sync::Arc::new(appendfs::LogWriter::create_lazy(
+        log_path,
+        1,
+        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+        1,
+    ));
+    fs.log_writer = Some(writer);
+    fs.set_log_dir(log_path);
+    // Set 1-second flush interval and high op threshold so automatic threshold does not trigger
+    fs.max_staged_ops = 10_000;
+    fs.flush_interval.store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let fs = std::sync::Arc::new(fs);
+    fs.init();
+
+    // Perform only 2 operations
+    let dir_attr = appendfs::operations::dir::mkdir_core(&fs, 1, "periodic_dir", 0o755, 1000, 1000).unwrap();
+    appendfs::operations::read_write::create_core(&fs, dir_attr.ino, "periodic_file.txt", 0o644, 0, 1000, 1000).unwrap();
+
+    // Staged ops should be 2 initially
+    assert_eq!(fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // Sleep for 1.3 seconds so background flusher fires
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+
+    // Staged ops should have been flushed to 0 by the background flusher
+    assert_eq!(fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let manifest = fs.manifest.read().unwrap();
+    assert!(manifest.logs.len() >= 1);
+    assert!(manifest.logs[0].record_count > 0);
+
+    fs.destroy();
+}

@@ -67,6 +67,8 @@ extern "C" {
     typedef void (*rust_releasedir_t)(shim_req_t req, uint64_t ino, void *userdata);
     typedef void (*rust_fsyncdir_t)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
     typedef void (*rust_statfs_t)(shim_req_t req, uint64_t ino, void *userdata);
+    typedef void (*rust_init_t)(void *userdata);
+    typedef void (*rust_destroy_t)(void *userdata);
 
     struct rust_lowlevel_ops {
         rust_lookup_t lookup;
@@ -90,6 +92,8 @@ extern "C" {
         rust_releasedir_t releasedir;
         rust_fsyncdir_t fsyncdir;
         rust_statfs_t statfs;
+        rust_init_t init;
+        rust_destroy_t destroy;
     };
 
     // Entrypoint to mount and run FUSE low-level loop

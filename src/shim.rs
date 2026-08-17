@@ -170,6 +170,8 @@ struct RustLowlevelOps {
     fsyncdir:
         Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void)>,
     statfs: Option<extern "C" fn(req: shim_req_t, ino: u64, userdata: *mut c_void)>,
+    init: Option<extern "C" fn(userdata: *mut c_void)>,
+    destroy: Option<extern "C" fn(userdata: *mut c_void)>,
 }
 
 unsafe extern "C" {
@@ -805,6 +807,16 @@ extern "C" fn statfs_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
     fs.statfs(Request { req }, ino);
 }
 
+extern "C" fn init_bridge(userdata: *mut c_void) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    fs.init();
+}
+
+extern "C" fn destroy_bridge(userdata: *mut c_void) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    fs.destroy();
+}
+
 pub fn mount(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), i32> {
     mount_arc(args, std::sync::Arc::new(fs))
 }
@@ -839,6 +851,8 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
         releasedir: Some(releasedir_bridge),
         fsyncdir: Some(fsyncdir_bridge),
         statfs: Some(statfs_bridge),
+        init: Some(init_bridge),
+        destroy: Some(destroy_bridge),
     };
 
     let raw_userdata = Box::into_raw(Box::new(fs)) as *mut c_void;

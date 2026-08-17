@@ -106,12 +106,7 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
         }
     }
 
-    let prev = fs
-        .staged_bytes
-        .fetch_add(write_len as usize, std::sync::atomic::Ordering::Relaxed);
-    if prev + write_len as usize >= fs.max_buffer_size {
-        let _ = fs.flush_log();
-    }
+    fs.notify_mutation(write_len as usize);
 
     Ok(buf.len())
 }
@@ -192,7 +187,10 @@ pub fn setattr_core(
 
     fs.update_attr_delta(ino, attr_delta);
 
-    fs.get_attr(ino).ok_or(libc::ENOENT)
+    fs.notify_mutation(0);
+
+    let updated_attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
+    Ok(updated_attr)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -223,62 +221,68 @@ pub fn create_core(
     uid: u32,
     gid: u32,
 ) -> Result<FileAttr, i32> {
-    let _dir_guard = fs.dir_lock.lock().unwrap();
-    let now = fs.clock.now();
-    log::trace!(
-        "create(parent={}, name={}, mode=0o{:o}, flags=0x{:x}, uid={}, gid={})",
-        parent,
-        name,
-        mode,
-        flags,
-        uid,
-        gid
-    );
+    let attr = {
+        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let now = fs.clock.now();
+        log::trace!(
+            "create(parent={}, name={}, mode=0o{:o}, flags=0x{:x}, uid={}, gid={})",
+            parent,
+            name,
+            mode,
+            flags,
+            uid,
+            gid
+        );
 
-    if name.len() > 255 {
-        return Err(libc::ENAMETOOLONG);
-    }
+        if name.len() > 255 {
+            return Err(libc::ENAMETOOLONG);
+        }
 
-    let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
-    if parent_attr.file_type != FileType::Directory {
-        return Err(libc::ENOTDIR);
-    }
+        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        if parent_attr.file_type != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
 
-    if fs.lookup_child(parent, name).is_some() {
-        return Err(libc::EEXIST);
-    }
+        if fs.lookup_child(parent, name).is_some() {
+            return Err(libc::EEXIST);
+        }
 
-    let new_ino = fs.allocate_inode();
-    let new_delta = NodeDelta::File(FileDelta {
-        extents: RangeMap::new(),
-        size: Some(0),
-        truncate_mask: None,
-        attr_delta: AttrDelta {
-            mode: Some(mode & 0o777),
-            nlink: Some(1),
-            uid: Some(uid),
-            gid: Some(gid),
-            atime: Some(now),
-            mtime: Some(now),
-            ctime: Some(now),
-        },
-    });
+        let new_ino = fs.allocate_inode();
+        let new_delta = NodeDelta::File(FileDelta {
+            extents: RangeMap::new(),
+            size: Some(0),
+            truncate_mask: None,
+            attr_delta: AttrDelta {
+                mode: Some(mode & 0o777),
+                nlink: Some(1),
+                uid: Some(uid),
+                gid: Some(gid),
+                atime: Some(now),
+                mtime: Some(now),
+                ctime: Some(now),
+            },
+        });
 
-    fs.insert_new_node(new_ino, new_delta);
-    fs.add_dir_entry(parent, name, new_ino, now);
+        fs.insert_new_node(new_ino, new_delta);
+        fs.add_dir_entry(parent, name, new_ino, now);
 
-    Ok(FileAttr {
-        ino: new_ino,
-        file_type: FileType::RegularFile,
-        perm: mode & 0o777,
-        nlink: 1,
-        uid,
-        gid,
-        size: 0,
-        atime: now,
-        mtime: now,
-        ctime: now,
-    })
+        FileAttr {
+            ino: new_ino,
+            file_type: FileType::RegularFile,
+            perm: mode & 0o777,
+            nlink: 1,
+            uid,
+            gid,
+            size: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        }
+    };
+
+    fs.notify_mutation(0);
+
+    Ok(attr)
 }
 
 pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32, flags: u32) {
