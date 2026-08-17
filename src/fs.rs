@@ -2026,4 +2026,59 @@ mod tests {
         assert_eq!(rec_stats[0].live_bytes, 0);
         assert_eq!(rec_stats[0].live_extents, 0);
     }
+
+    #[test]
+    fn test_hardlink_survives_rm_rf_of_other_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+        // 1. Create /keep and /Gletscher directories
+        let keep_attr = crate::operations::dir::mkdir_core(&fs, 1, "keep", 0o755, 1000, 1000).unwrap();
+        let gletscher_attr = crate::operations::dir::mkdir_core(&fs, 1, "Gletscher", 0o755, 1000, 1000).unwrap();
+
+        // 2. Create /keep/shared.txt (inode N, nlink 1) and write data
+        let file_attr = crate::operations::read_write::create_core(&fs, keep_attr.ino, "shared.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file_attr.ino, b"persistent shared content", 0).unwrap();
+
+        // 3. Create hard link /Gletscher/shared_link.txt -> inode N (nlink becomes 2)
+        let link_attr = crate::operations::links::link_core(&fs, file_attr.ino, gletscher_attr.ino, "shared_link.txt").unwrap();
+        assert_eq!(link_attr.nlink, 2);
+
+        // Commit everything to disk
+        fs.sync_log().unwrap();
+
+        let stats1 = fs.calculate_generation_live_stats();
+        assert_eq!(stats1[0].live_bytes, 25);
+        assert_eq!(stats1[0].live_extents, 1);
+
+        // 4. Delete /Gletscher via rm -rf (/Gletscher/shared_link.txt unlinked, /Gletscher rmdir'd)
+        crate::operations::links::unlink_core(&fs, gletscher_attr.ino, "shared_link.txt").unwrap();
+        crate::operations::dir::rmdir_core(&fs, 1, "Gletscher").unwrap();
+
+        // Verify that /keep/shared.txt still has nlink 1 in memory
+        let keep_file_attr = fs.get_attr(file_attr.ino).unwrap();
+        assert_eq!(keep_file_attr.nlink, 1);
+
+        // Commit deletion to disk
+        fs.sync_log().unwrap();
+
+        // Check in-memory live stats: data is STILL alive because /keep/shared.txt exists!
+        let stats2 = fs.calculate_generation_live_stats();
+        assert_eq!(stats2[0].live_bytes, 25);
+        assert_eq!(stats2[0].live_extents, 1);
+
+        // 5. Crash-recovery: Recover filesystem and verify /keep/shared.txt survived with full data!
+        let recovered = crate::log::recover_fs(dir.path()).unwrap();
+        let rec_file_attr = recovered.get_attr(file_attr.ino).expect("shared.txt must survive recovery");
+        assert_eq!(rec_file_attr.nlink, 1);
+
+        let data = crate::operations::read_write::read_core(&recovered, file_attr.ino, 25, 0).unwrap();
+        assert_eq!(&data, b"persistent shared content");
+
+        let rec_stats = recovered.calculate_generation_live_stats();
+        assert_eq!(rec_stats[0].live_bytes, 25);
+        assert_eq!(rec_stats[0].live_extents, 1);
+    }
 }
