@@ -12,7 +12,7 @@ pub mod stats;
 
 pub use cli::{Cli, Commands, DumpArgs, InitArgs, MountArgs, StatsArgs, find_latest_generation};
 pub use clock::{AdvancingClock, Clock, MockClock, SystemClock, format_local_civil_time};
-pub use dump::dump_log_file;
+pub use dump::{dump_file, dump_log_file, dump_summary_file};
 pub use fs::InMemoryFS;
 pub use log::{
     BackgroundFlusher, ExtentState, LogFileCache, LogReader, LogRecord, LogWriter,

@@ -1194,7 +1194,21 @@ fn test_volume_init_mount_and_stats_flow() {
     assert!(dump_v1.contains("[COMMITTED]"));
 
     // Full hex payload level (verbosity 2)
-    let dump_v2 = appendfs::dump_log_file(&log_file, 2).unwrap();
+    let dump_v2 = appendfs::dump_file(&log_file, 2).unwrap();
     assert!(dump_v2.contains("hello appendfs v"));
     assert!(dump_v2.contains("olume"));
+
+    // 6. Test dump command on the initial summary file 000000.summary
+    let summary_file = log_path.join("000000.summary");
+    assert!(summary_file.exists());
+    let dump_sum_v0 = appendfs::dump_file(&summary_file, 0).unwrap();
+    assert!(dump_sum_v0.contains("=== appendfs Summary File Dump ==="));
+    assert!(dump_sum_v0.contains("Branch:              work"));
+    assert!(dump_sum_v0.contains("Total Inodes:        1"));
+    assert!(dump_sum_v0.contains("Checksum (BLAKE3):"));
+    assert!(dump_sum_v0.contains("VERIFIED"));
+
+    let dump_sum_v1 = appendfs::dump_file(&summary_file, 1).unwrap();
+    assert!(dump_sum_v1.contains("Summary Inode Records"));
+    assert!(dump_sum_v1.contains("Directory  \"/\""));
 }

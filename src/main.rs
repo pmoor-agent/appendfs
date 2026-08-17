@@ -143,14 +143,14 @@ fn main() {
         Commands::Dump(args) => {
             let file_path = &args.file;
             if !file_path.exists() {
-                eprintln!("Error: Log file '{:?}' does not exist.", file_path);
+                eprintln!("Error: File '{:?}' does not exist.", file_path);
                 std::process::exit(1);
             }
 
-            match appendfs::dump_log_file(file_path, args.verbose) {
+            match appendfs::dump_file(file_path, args.verbose) {
                 Ok(output) => print!("{}", output),
                 Err(e) => {
-                    eprintln!("Error dumping log file '{:?}': {}", file_path, e);
+                    eprintln!("Error dumping file '{:?}': {}", file_path, e);
                     std::process::exit(1);
                 }
             }
