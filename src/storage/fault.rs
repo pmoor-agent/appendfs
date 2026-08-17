@@ -1,4 +1,4 @@
-use crate::storage::{Storage, StorageReader, StorageWriter};
+use crate::storage::{Storage, StorageReader, StorageWriter, WriteMode};
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -162,11 +162,11 @@ impl Storage for FaultStorage {
         }))
     }
 
-    fn open_writer(&self, name: &str, create_new: bool) -> io::Result<Box<dyn StorageWriter>> {
+    fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>> {
         if let Some(err_kind) = self.fail_on_open.read().unwrap().get(name) {
             return Err(io::Error::new(*err_kind, format!("fault injected on {}", name)));
         }
-        let writer = self.inner.open_writer(name, create_new)?;
+        let writer = self.inner.open_writer(name, mode)?;
         Ok(Box::new(FaultStorageWriter {
             inner: writer,
             max_append_bytes: Arc::clone(&self.max_append_bytes),

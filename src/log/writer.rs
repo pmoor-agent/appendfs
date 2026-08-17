@@ -1,7 +1,7 @@
 use crate::cli::DEFAULT_MAX_LOG_SIZE;
 use crate::clock::Clock;
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCode, RecordHeader};
-use crate::storage::{OsStorage, Storage, StorageWriter};
+use crate::storage::{OsStorage, Storage, StorageWriter, WriteMode};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -26,7 +26,7 @@ fn open_generation_file(
     clock: &dyn Clock,
 ) -> io::Result<ActiveLogFile> {
     let filename = format!("{:06}.log", generation);
-    let mut writer = storage.open_writer(&filename, true)?;
+    let mut writer = storage.open_writer(&filename, WriteMode::CreateNew)?;
 
     let now = clock.now();
     let file_header = FileHeader::new(generation, now);

@@ -1,4 +1,4 @@
-use crate::storage::{Storage, StorageReader, StorageWriter};
+use crate::storage::{Storage, StorageReader, StorageWriter, WriteMode};
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, RwLock};
@@ -136,9 +136,9 @@ impl Storage for MemoryStorage {
         }
     }
 
-    fn open_writer(&self, name: &str, create_new: bool) -> io::Result<Box<dyn StorageWriter>> {
+    fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>> {
         let mut guard = self.files.write().unwrap();
-        if create_new && guard.contains_key(name) {
+        if guard.contains_key(name) && mode == WriteMode::CreateNew {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("file '{}' already exists", name),
@@ -148,6 +148,7 @@ impl Storage for MemoryStorage {
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
             .clone();
+        buffer.write().unwrap().clear();
 
         Ok(Box::new(MemoryStorageWriter { buffer }))
     }

@@ -1,4 +1,4 @@
-use crate::storage::{Storage, StorageReader, StorageWriter};
+use crate::storage::{Storage, StorageReader, StorageWriter, WriteMode};
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
@@ -107,21 +107,17 @@ impl Storage for OsStorage {
         Ok(Arc::new(OsStorageReader { file }))
     }
 
-    fn open_writer(&self, name: &str, create_new: bool) -> io::Result<Box<dyn StorageWriter>> {
+    fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>> {
         create_dir_all(&self.base_dir)?;
         let path = self.full_path(name);
-        let file = if create_new {
-            OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)?
-        } else {
-            OpenOptions::new()
-                .create(true)
-                
-                .append(true)
-                .open(&path)?
+        let mut options = OpenOptions::new();
+        options.write(true);
+        match mode {
+            WriteMode::CreateNew => options.create_new(true),
+            WriteMode::Overwrite => options.create(true).truncate(true),
         };
-        Ok(Box::new(OsStorageWriter { file }))
+        Ok(Box::new(OsStorageWriter {
+            file: options.open(&path)?,
+        }))
     }
 }

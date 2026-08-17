@@ -15,7 +15,9 @@ pub use check::{
     IntegrityIssue, IntegrityReport, IssueLevel, check_fs_integrity, check_volume,
     check_volume_with_storage,
 };
-pub use storage::{FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter};
+pub use storage::{
+    FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter, WriteMode,
+};
 pub use cli::{
     CheckArgs, Cli, Commands, DumpArgs, InitArgs, MountArgs, MountRoArgs, StatsArgs,
     find_latest_generation, find_latest_generation_in_storage,

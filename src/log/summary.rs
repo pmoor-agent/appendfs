@@ -2,7 +2,7 @@ use crate::fs::InMemoryFS;
 use crate::log::SharedExtentState;
 use crate::node::Node;
 use crate::range_map::RangeMap;
-use crate::storage::{OsStorage, Storage, StorageReader};
+use crate::storage::{OsStorage, Storage, StorageReader, WriteMode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
@@ -140,7 +140,9 @@ pub fn export_summary_with_time_to_storage(
     let filename = format!("{:06}.summary", generation);
     let tmp_filename = format!("{:06}.summary.tmp", generation);
 
-    let mut writer = storage.open_writer(&tmp_filename, false)?;
+    // Overwrite: a `.tmp` left behind by a previously failed export is discarded rather
+    // than prefixed to this one and silently renamed over the real summary.
+    let mut writer = storage.open_writer(&tmp_filename, WriteMode::Overwrite)?;
 
     // Hashes everything written before the footer
     let mut hasher = blake3::Hasher::new();
@@ -554,7 +556,7 @@ impl SummaryReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::MemoryStorage;
+    use crate::storage::{FaultStorage, MemoryStorage};
     use std::time::SystemTime;
 
     #[test]
@@ -733,5 +735,72 @@ mod tests {
 
         // Opening corrupted summary file must panic with bitrot detected
         let _ = SummaryReader::open_with_storage(storage.as_ref(), "000000.summary");
+    }
+
+    #[test]
+    fn test_stale_tmp_from_failed_export_does_not_corrupt_next_summary() {
+        let mem = Arc::new(MemoryStorage::new());
+        let storage = Arc::new(FaultStorage::new(mem.clone()));
+
+        let mut snapshot: HashMap<u64, Arc<Node>> = HashMap::new();
+        snapshot.insert(
+            1,
+            Arc::new(Node::Directory {
+                parent: 1,
+                entries: vec![("a.txt".to_string(), 2)],
+                perm: 0o755,
+                nlink: 2,
+                uid: 1000,
+                gid: 1000,
+                atime: SystemTime::UNIX_EPOCH,
+                mtime: SystemTime::UNIX_EPOCH,
+                ctime: SystemTime::UNIX_EPOCH,
+            }),
+        );
+
+        let manifest = crate::log::LogManifest {
+            branch: "main".to_string(),
+            logs: Vec::new(),
+            next_generation: 2,
+            next_filename: "000002.log".to_string(),
+        };
+
+        // A first export dies partway, leaving a partial 000001.summary.tmp behind.
+        storage.fail_writes_after_bytes(16, true);
+        let failed = export_summary_with_time_to_storage(
+            &snapshot,
+            &manifest,
+            storage.as_ref(),
+            1,
+            42,
+            3,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(failed.is_err(), "injected write fault should fail the export");
+        let stale = mem
+            .get_file_bytes("000001.summary.tmp")
+            .expect("failed export should leave a stale tmp");
+        assert!(!stale.is_empty(), "stale tmp should hold the partial export");
+
+        // Retrying on a healthy backend must not prefix the stale bytes to the new summary.
+        storage.clear_write_limit();
+        let filename = export_summary_with_time_to_storage(
+            &snapshot,
+            &manifest,
+            storage.as_ref(),
+            1,
+            42,
+            3,
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+
+        let reader = SummaryReader::open_with_storage(storage.as_ref(), &filename).unwrap();
+        assert_eq!(reader.header.generation, 1);
+        assert_eq!(reader.footer.entry_count, 1);
+        match reader.read_inode(1).unwrap().unwrap() {
+            Node::Directory { entries, .. } => assert_eq!(entries[0].0, "a.txt"),
+            _ => panic!("expected directory root"),
+        }
     }
 }

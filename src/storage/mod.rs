@@ -50,6 +50,21 @@ pub trait StorageWriter: Send + Sync {
     }
 }
 
+/// How `Storage::open_writer` should treat a file that already exists.
+///
+/// Either way the returned writer starts from an empty file at offset 0 - there is no
+/// append-to-existing mode, so a partial file left behind by a failed write can never be
+/// silently prefixed to the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Fail with `AlreadyExists` if the file is already present. Use for files that must
+    /// never be clobbered, such as a numbered log generation.
+    CreateNew,
+    /// Discard the contents of any existing file. Use for scratch files that are rewritten
+    /// from scratch each time, such as `NNNNNN.summary.tmp`.
+    Overwrite,
+}
+
 /// Volume log storage container interface.
 pub trait Storage: Send + Sync {
     /// Lists all file names in the volume (e.g. `["000001.log", "000001.summary"]`).
@@ -73,8 +88,9 @@ pub trait Storage: Send + Sync {
     /// Opens a file for reading.
     fn open_reader(&self, name: &str) -> io::Result<Arc<dyn StorageReader>>;
 
-    /// Opens a file for append-writing. If `create_new` is true, fails if it already exists.
-    fn open_writer(&self, name: &str, create_new: bool) -> io::Result<Box<dyn StorageWriter>>;
+    /// Opens a file for writing, starting from empty at offset 0. `mode` decides whether an
+    /// existing file is an error or is discarded.
+    fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>>;
 }
 
 impl<T: StorageReader + ?Sized> StorageReader for Arc<T> {
@@ -112,8 +128,8 @@ impl<T: Storage + ?Sized> Storage for Arc<T> {
         (**self).open_reader(name)
     }
 
-    fn open_writer(&self, name: &str, create_new: bool) -> io::Result<Box<dyn StorageWriter>> {
-        (**self).open_writer(name, create_new)
+    fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>> {
+        (**self).open_writer(name, mode)
     }
 }
 
@@ -142,8 +158,8 @@ impl<T: Storage + ?Sized> Storage for &T {
         (**self).open_reader(name)
     }
 
-    fn open_writer(&self, name: &str, create_new: bool) -> io::Result<Box<dyn StorageWriter>> {
-        (**self).open_writer(name, create_new)
+    fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>> {
+        (**self).open_writer(name, mode)
     }
 }
 
@@ -156,7 +172,7 @@ mod tests {
         let storage = MemoryStorage::new();
         assert!(!storage.exists("test.log"));
 
-        let mut writer = storage.open_writer("test.log", true).unwrap();
+        let mut writer = storage.open_writer("test.log", WriteMode::CreateNew).unwrap();
         writer.append(b"hello world").unwrap();
         assert_eq!(writer.len().unwrap(), 11);
         writer.truncate(5).unwrap();
@@ -191,7 +207,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = OsStorage::new(dir.path());
 
-        let mut writer = storage.open_writer("os_test.bin", true).unwrap();
+        let mut writer = storage.open_writer("os_test.bin", WriteMode::CreateNew).unwrap();
         writer.append(b"0123456789ABCDEF").unwrap();
         writer.sync().unwrap();
         assert_eq!(writer.len().unwrap(), 16);
@@ -220,14 +236,14 @@ mod tests {
 
         // Fail open
         fault.fail_on_file("protected.log", io::ErrorKind::PermissionDenied);
-        let err = match fault.open_writer("protected.log", true) {
+        let err = match fault.open_writer("protected.log", WriteMode::CreateNew) {
             Err(e) => e,
             Ok(_) => panic!("expected error"),
         };
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 
         // Write limit with partial write
-        let mut writer = fault.open_writer("data.log", true).unwrap();
+        let mut writer = fault.open_writer("data.log", WriteMode::CreateNew).unwrap();
         writer.append(b"initial 10").unwrap();
         assert_eq!(writer.len().unwrap(), 10);
 
@@ -244,5 +260,47 @@ mod tests {
         let mut first_byte = [0u8; 1];
         reader.read_exact_at(0, &mut first_byte).unwrap();
         assert_eq!(first_byte[0], b'i' ^ 0x01);
+    }
+
+    /// Both modes must hand back an empty file, so a partial write left by a failed
+    /// operation can never be prefixed to the next one.
+    fn assert_write_mode_contract(storage: &dyn Storage) {
+        let mut writer = storage.open_writer("f.bin", WriteMode::CreateNew).unwrap();
+        assert_eq!(writer.len().unwrap(), 0);
+        writer.append(b"stale partial write").unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        // CreateNew refuses to clobber an existing file.
+        let err = match storage.open_writer("f.bin", WriteMode::CreateNew) {
+            Err(e) => e,
+            Ok(_) => panic!("CreateNew must reject an existing file"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(storage.file_len("f.bin").unwrap(), 19, "must be untouched");
+
+        // Overwrite discards the previous contents rather than appending to them.
+        let mut writer = storage.open_writer("f.bin", WriteMode::Overwrite).unwrap();
+        assert_eq!(writer.len().unwrap(), 0);
+        writer.append(b"fresh").unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        assert_eq!(storage.file_len("f.bin").unwrap(), 5);
+        let reader = storage.open_reader("f.bin").unwrap();
+        assert_eq!(reader.read_vec(0, 5).unwrap(), b"fresh");
+    }
+
+    #[test]
+    fn test_write_mode_contract_holds_for_every_backend() {
+        assert_write_mode_contract(&MemoryStorage::new());
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_write_mode_contract(&OsStorage::new(dir.path()));
+
+        let fault_dir = tempfile::tempdir().unwrap();
+        assert_write_mode_contract(&FaultStorage::new(Arc::new(OsStorage::new(
+            fault_dir.path(),
+        ))));
     }
 }
