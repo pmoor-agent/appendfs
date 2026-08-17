@@ -15,8 +15,11 @@ pub enum Node {
         nlink: u32,
         uid: u32,
         gid: u32,
+        #[serde(with = "crate::clock::serde_system_time")]
         atime: SystemTime,
+        #[serde(with = "crate::clock::serde_system_time")]
         mtime: SystemTime,
+        #[serde(with = "crate::clock::serde_system_time")]
         ctime: SystemTime,
     },
     File {
@@ -26,8 +29,11 @@ pub enum Node {
         nlink: u32,
         uid: u32,
         gid: u32,
+        #[serde(with = "crate::clock::serde_system_time")]
         atime: SystemTime,
+        #[serde(with = "crate::clock::serde_system_time")]
         mtime: SystemTime,
+        #[serde(with = "crate::clock::serde_system_time")]
         ctime: SystemTime,
     },
     Symlink {
@@ -35,8 +41,11 @@ pub enum Node {
         nlink: u32,
         uid: u32,
         gid: u32,
+        #[serde(with = "crate::clock::serde_system_time")]
         atime: SystemTime,
+        #[serde(with = "crate::clock::serde_system_time")]
         mtime: SystemTime,
+        #[serde(with = "crate::clock::serde_system_time")]
         ctime: SystemTime,
     },
 }
@@ -69,8 +78,11 @@ pub struct AttrDelta {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub nlink: Option<u32>,
+    #[serde(default, with = "crate::clock::serde_system_time_opt")]
     pub atime: Option<SystemTime>,
+    #[serde(default, with = "crate::clock::serde_system_time_opt")]
     pub mtime: Option<SystemTime>,
+    #[serde(default, with = "crate::clock::serde_system_time_opt")]
     pub ctime: Option<SystemTime>,
 }
 

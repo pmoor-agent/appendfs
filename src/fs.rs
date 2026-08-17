@@ -794,7 +794,6 @@ impl InMemoryFS {
         writer: &LogWriter,
     ) -> std::io::Result<()> {
         let now = self.clock.now();
-        let now_unix = crate::clock::system_time_to_unix(now);
         let mut written_count: u32 = 0;
 
         // Estimate size for log rolling
@@ -854,8 +853,8 @@ impl InMemoryFS {
 
         // 2. Identify Renames (paired removal + addition for an inode) vs Unlinks/Rmdirs
         let mut renamed_additions: HashSet<(u64, String)> = HashSet::new();
-        let mut renames_to_emit: Vec<(u64, u64, String, u64, String, (i64, u32))> = Vec::new();
-        let mut unlinks_to_emit: Vec<(u64, u64, String, bool, (i64, u32))> = Vec::new();
+        let mut renames_to_emit: Vec<(u64, u64, String, u64, String, SystemTime)> = Vec::new();
+        let mut unlinks_to_emit: Vec<(u64, u64, String, bool, SystemTime)> = Vec::new();
 
         for &parent_ino in &inos {
             if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&parent_ino) {
@@ -886,11 +885,7 @@ impl InMemoryFS {
 
                 removed_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-                let op_time = d
-                    .attr_delta
-                    .mtime
-                    .map(crate::clock::system_time_to_unix)
-                    .unwrap_or(now_unix);
+                let op_time = d.attr_delta.mtime.unwrap_or(now);
 
                 for (name, child_ino, is_dir) in removed_entries {
                     if let Some((new_parent, new_name)) =
@@ -944,11 +939,7 @@ impl InMemoryFS {
                         .get(&ino)
                         .cloned()
                         .unwrap_or_else(|| (1, format!("dir_{}", ino)));
-                    let op_time = d
-                        .attr_delta
-                        .ctime
-                        .map(crate::clock::system_time_to_unix)
-                        .unwrap_or(now_unix);
+                    let op_time = d.attr_delta.ctime.unwrap_or(now);
 
                     if parent >= ino && !base_map.contains_key(&parent) {
                         let tmp_name = format!(".agy_tmp_{}", ino);
@@ -993,11 +984,7 @@ impl InMemoryFS {
                             .get(&ino)
                             .cloned()
                             .unwrap_or_else(|| (1, format!("file_{}", ino)));
-                        let op_time = f
-                            .attr_delta
-                            .ctime
-                            .map(crate::clock::system_time_to_unix)
-                            .unwrap_or(now_unix);
+                        let op_time = f.attr_delta.ctime.unwrap_or(now);
                         let payload = CreatePayload {
                             parent,
                             name,
@@ -1018,11 +1005,7 @@ impl InMemoryFS {
                             .get(&ino)
                             .cloned()
                             .unwrap_or_else(|| (1, format!("symlink_{}", ino)));
-                        let op_time = s
-                            .attr_delta
-                            .ctime
-                            .map(crate::clock::system_time_to_unix)
-                            .unwrap_or(now_unix);
+                        let op_time = s.attr_delta.ctime.unwrap_or(now);
                         let payload = SymlinkPayload {
                             parent,
                             name,
@@ -1074,10 +1057,7 @@ impl InMemoryFS {
                         Some(EntryDelta::Node(NodeDelta::Directory(cd))) => cd.attr_delta.ctime,
                         _ => None,
                     };
-                    let op_time = child_ctime
-                        .or(d.attr_delta.mtime)
-                        .map(crate::clock::system_time_to_unix)
-                        .unwrap_or(now_unix);
+                    let op_time = child_ctime.or(d.attr_delta.mtime).unwrap_or(now);
                     let payload = LinkPayload {
                         ino: child_ino,
                         new_parent: parent_ino,
@@ -1140,11 +1120,7 @@ impl InMemoryFS {
                     let start_offset = run[0].file_offset;
                     let write_meta = WriteMeta {
                         file_offset: start_offset,
-                        op_time: f
-                            .attr_delta
-                            .mtime
-                            .map(crate::clock::system_time_to_unix)
-                            .unwrap_or(now_unix),
+                        op_time: f.attr_delta.mtime.unwrap_or(now),
                     };
                     let mut payload = bincode::serialize(&write_meta)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1191,12 +1167,7 @@ impl InMemoryFS {
                         || f.truncate_mask.is_some()
                         || (f.extents.is_empty() && f.size.is_some());
                     if has_explicit_attr {
-                        let op_time = f
-                            .attr_delta
-                            .ctime
-                            .or(f.attr_delta.mtime)
-                            .map(crate::clock::system_time_to_unix)
-                            .unwrap_or(now_unix);
+                        let op_time = f.attr_delta.ctime.or(f.attr_delta.mtime).unwrap_or(now);
                         let payload = SetattrPayload {
                             mode: f.attr_delta.mode,
                             uid: f.attr_delta.uid,
@@ -1206,8 +1177,8 @@ impl InMemoryFS {
                             } else {
                                 None
                             },
-                            atime: f.attr_delta.atime.map(crate::clock::system_time_to_unix),
-                            mtime: f.attr_delta.mtime.map(crate::clock::system_time_to_unix),
+                            atime: f.attr_delta.atime,
+                            mtime: f.attr_delta.mtime,
                             op_time,
                         };
                         let bytes = bincode::serialize(&payload)
@@ -1223,19 +1194,14 @@ impl InMemoryFS {
                         || d.attr_delta.mtime.is_some()
                         || d.attr_delta.ctime.is_some();
                     if has_attr {
-                        let op_time = d
-                            .attr_delta
-                            .ctime
-                            .or(d.attr_delta.mtime)
-                            .map(crate::clock::system_time_to_unix)
-                            .unwrap_or(now_unix);
+                        let op_time = d.attr_delta.ctime.or(d.attr_delta.mtime).unwrap_or(now);
                         let payload = SetattrPayload {
                             mode: d.attr_delta.mode,
                             uid: d.attr_delta.uid,
                             gid: d.attr_delta.gid,
                             size: None,
-                            atime: d.attr_delta.atime.map(crate::clock::system_time_to_unix),
-                            mtime: d.attr_delta.mtime.map(crate::clock::system_time_to_unix),
+                            atime: d.attr_delta.atime,
+                            mtime: d.attr_delta.mtime,
                             op_time,
                         };
                         let bytes = bincode::serialize(&payload)
@@ -1251,19 +1217,14 @@ impl InMemoryFS {
                         || s.attr_delta.mtime.is_some()
                         || s.attr_delta.ctime.is_some();
                     if has_attr {
-                        let op_time = s
-                            .attr_delta
-                            .ctime
-                            .or(s.attr_delta.mtime)
-                            .map(crate::clock::system_time_to_unix)
-                            .unwrap_or(now_unix);
+                        let op_time = s.attr_delta.ctime.or(s.attr_delta.mtime).unwrap_or(now);
                         let payload = SetattrPayload {
                             mode: s.attr_delta.mode,
                             uid: s.attr_delta.uid,
                             gid: s.attr_delta.gid,
                             size: None,
-                            atime: s.attr_delta.atime.map(crate::clock::system_time_to_unix),
-                            mtime: s.attr_delta.mtime.map(crate::clock::system_time_to_unix),
+                            atime: s.attr_delta.atime,
+                            mtime: s.attr_delta.mtime,
                             op_time,
                         };
                         let bytes = bincode::serialize(&payload)

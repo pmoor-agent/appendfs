@@ -255,8 +255,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
     match header.op_code {
         OpCode::Create => {
             if let Ok(create) = bincode::deserialize::<CreatePayload>(&record.payload) {
-                let now =
-                    crate::clock::unix_to_system_time(create.created_at.0, create.created_at.1);
+                let now = create.created_at;
                 let new_node = Arc::new(SyncNode::new(Node::File {
                     range_map: RangeMap::new(),
                     size: 0,
@@ -291,7 +290,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         OpCode::Mkdir => {
             if let Ok(mkdir) = bincode::deserialize::<MkdirPayload>(&record.payload) {
-                let now = crate::clock::unix_to_system_time(mkdir.created_at.0, mkdir.created_at.1);
+                let now = mkdir.created_at;
                 let new_node = Arc::new(SyncNode::new(Node::Directory {
                     parent: mkdir.parent,
                     entries: Vec::new(),
@@ -352,10 +351,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         if end_offset > *size {
                             *size = end_offset;
                         }
-                        let now = crate::clock::unix_to_system_time(
-                            write_meta.op_time.0,
-                            write_meta.op_time.1,
-                        );
+                        let now = write_meta.op_time;
                         *mtime = now;
                         *ctime = now;
                         range_map.insert(
@@ -369,7 +365,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         OpCode::Unlink => {
             if let Ok(unlink) = bincode::deserialize::<UnlinkPayload>(&record.payload) {
-                let now = crate::clock::unix_to_system_time(unlink.op_time.0, unlink.op_time.1);
+                let now = unlink.op_time;
                 let mut map = fs_instance.base.write().unwrap();
                 if let Some(parent_node_arc) = map.get(&unlink.parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
@@ -417,7 +413,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         OpCode::Rmdir => {
             if let Ok(rmdir) = bincode::deserialize::<RmdirPayload>(&record.payload) {
-                let now = crate::clock::unix_to_system_time(rmdir.op_time.0, rmdir.op_time.1);
+                let now = rmdir.op_time;
                 let mut map = fs_instance.base.write().unwrap();
                 if let Some(parent_node_arc) = map.get(&rmdir.parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
@@ -439,8 +435,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         OpCode::Symlink => {
             if let Ok(symlink) = bincode::deserialize::<SymlinkPayload>(&record.payload) {
-                let now =
-                    crate::clock::unix_to_system_time(symlink.created_at.0, symlink.created_at.1);
+                let now = symlink.created_at;
                 let new_node = Arc::new(SyncNode::new(Node::Symlink {
                     target: symlink.target,
                     nlink: 1,
@@ -473,7 +468,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         OpCode::Rename => {
             if let Ok(rename) = bincode::deserialize::<RenamePayload>(&record.payload) {
-                let now = crate::clock::unix_to_system_time(rename.op_time.0, rename.op_time.1);
+                let now = rename.op_time;
                 let mut map = fs_instance.base.write().unwrap();
 
                 // Live's rename_core treats same-parent renames differently from
@@ -611,8 +606,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 if let Some(node_arc) = map.get(&target_ino) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let node = unsafe { node_arc.write() };
-                    let now =
-                        crate::clock::unix_to_system_time(setattr.op_time.0, setattr.op_time.1);
+                    let now = setattr.op_time;
                     // Mirrors live: ctime only moves when this call actually changed
                     // something, never on a to_set with no applicable bits. (atime from reads never moves ctime).
 
@@ -652,11 +646,11 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                                 // mode/uid/gid, which only ever touch ctime.
                                 *mtime = now;
                             }
-                            if let Some((secs, nsecs)) = setattr.atime {
-                                *atime = crate::clock::unix_to_system_time(secs, nsecs);
+                            if let Some(t) = setattr.atime {
+                                *atime = t;
                             }
-                            if let Some((secs, nsecs)) = setattr.mtime {
-                                *mtime = crate::clock::unix_to_system_time(secs, nsecs);
+                            if let Some(t) = setattr.mtime {
+                                *mtime = t;
                             }
                             *ctime = now;
                         }
@@ -678,11 +672,11 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                             if let Some(g) = setattr.gid {
                                 *gid = g;
                             }
-                            if let Some((secs, nsecs)) = setattr.atime {
-                                *atime = crate::clock::unix_to_system_time(secs, nsecs);
+                            if let Some(t) = setattr.atime {
+                                *atime = t;
                             }
-                            if let Some((secs, nsecs)) = setattr.mtime {
-                                *mtime = crate::clock::unix_to_system_time(secs, nsecs);
+                            if let Some(t) = setattr.mtime {
+                                *mtime = t;
                             }
                             *ctime = now;
                         }
@@ -700,11 +694,11 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                             if let Some(g) = setattr.gid {
                                 *gid = g;
                             }
-                            if let Some((secs, nsecs)) = setattr.atime {
-                                *atime = crate::clock::unix_to_system_time(secs, nsecs);
+                            if let Some(t) = setattr.atime {
+                                *atime = t;
                             }
-                            if let Some((secs, nsecs)) = setattr.mtime {
-                                *mtime = crate::clock::unix_to_system_time(secs, nsecs);
+                            if let Some(t) = setattr.mtime {
+                                *mtime = t;
                             }
                             *ctime = now;
                         }
@@ -714,7 +708,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         OpCode::Link => {
             if let Ok(link) = bincode::deserialize::<LinkPayload>(&record.payload) {
-                let now = crate::clock::unix_to_system_time(link.op_time.0, link.op_time.1);
+                let now = link.op_time;
                 let map = fs_instance.base.write().unwrap();
                 if let Some(newparent_node_arc) = map.get(&link.new_parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.

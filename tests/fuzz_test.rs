@@ -968,7 +968,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
         mode: 0o755,
         uid: 1000,
         gid: 1000,
-        created_at: (0, 0),
+        created_at: SystemTime::UNIX_EPOCH,
     };
     let bytes = bincode::serialize(&mkdir_payload).unwrap();
     writer.append_record(OpCode::Mkdir, 2, &bytes).unwrap();
@@ -983,7 +983,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
         mode: 0o644,
         uid: 1000,
         gid: 1000,
-        created_at: (0, 0),
+        created_at: SystemTime::UNIX_EPOCH,
     };
     let bytes = bincode::serialize(&create_payload).unwrap();
     writer.append_record(OpCode::Create, 3, &bytes).unwrap();
@@ -1034,7 +1034,7 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
         mode: 0o644,
         uid: 1000,
         gid: 1000,
-        created_at: (0, 0),
+        created_at: SystemTime::UNIX_EPOCH,
     };
     let bytes = bincode::serialize(&create_payload).unwrap();
     writer.append_record(OpCode::Create, 2, &bytes).unwrap();
@@ -1065,7 +1065,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
         mode: 0o644,
         uid: 1000,
         gid: 1000,
-        created_at: (0, 0),
+        created_at: SystemTime::UNIX_EPOCH,
     };
     let bytes = bincode::serialize(&create_payload).unwrap();
     writer.append_record(OpCode::Create, 2, &bytes).unwrap();

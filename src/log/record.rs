@@ -1,3 +1,4 @@
+use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
@@ -164,8 +165,8 @@ impl RecordHeader {
 /// Also carries the flush's wall-clock time, for point-in-time replay/time-travel.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchCommitPayload {
-    pub timestamp_sec: i64,
-    pub timestamp_nsec: u32,
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub timestamp: SystemTime,
     pub record_count: u32,
 }
 
@@ -178,7 +179,8 @@ pub struct BatchCommitPayload {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteMeta {
     pub file_offset: u64,
-    pub op_time: (i64, u32),
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub op_time: SystemTime,
 }
 
 /// Structured metadata payload for file creation operations (`OP_CREATE`).
@@ -194,7 +196,8 @@ pub struct CreatePayload {
     pub uid: u32,
     #[serde(default)]
     pub gid: u32,
-    pub created_at: (i64, u32),
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub created_at: SystemTime,
 }
 
 /// Structured metadata payload for directory creation operations (`OP_MKDIR`).
@@ -208,7 +211,8 @@ pub struct MkdirPayload {
     pub uid: u32,
     #[serde(default)]
     pub gid: u32,
-    pub created_at: (i64, u32),
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub created_at: SystemTime,
 }
 
 /// Structured metadata payload for file unlink operations (`OP_UNLINK`).
@@ -216,8 +220,8 @@ pub struct MkdirPayload {
 pub struct UnlinkPayload {
     pub parent: u64,
     pub name: String,
-    #[serde(default)]
-    pub op_time: (i64, u32),
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    pub op_time: SystemTime,
 }
 
 /// Structured metadata payload for directory rmdir operations (`OP_RMDIR`).
@@ -225,8 +229,8 @@ pub struct UnlinkPayload {
 pub struct RmdirPayload {
     pub parent: u64,
     pub name: String,
-    #[serde(default)]
-    pub op_time: (i64, u32),
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    pub op_time: SystemTime,
 }
 
 /// Structured metadata payload for symlink creation operations (`OP_SYMLINK`).
@@ -240,7 +244,8 @@ pub struct SymlinkPayload {
     pub uid: u32,
     #[serde(default)]
     pub gid: u32,
-    pub created_at: (i64, u32),
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub created_at: SystemTime,
 }
 
 /// Structured metadata payload for rename operations (`OP_RENAME`).
@@ -250,8 +255,8 @@ pub struct RenamePayload {
     pub name: String,
     pub new_parent: u64,
     pub new_name: String,
-    #[serde(default)]
-    pub op_time: (i64, u32),
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    pub op_time: SystemTime,
 }
 
 /// Structured metadata payload for setattr operations (`OP_SETATTR`).
@@ -273,11 +278,12 @@ pub struct SetattrPayload {
     pub gid: Option<u32>,
     #[serde(default)]
     pub size: Option<u64>,
-    #[serde(default)]
-    pub atime: Option<(i64, u32)>,
-    #[serde(default)]
-    pub mtime: Option<(i64, u32)>,
-    pub op_time: (i64, u32),
+    #[serde(default, with = "crate::clock::serde_system_time_opt")]
+    pub atime: Option<SystemTime>,
+    #[serde(default, with = "crate::clock::serde_system_time_opt")]
+    pub mtime: Option<SystemTime>,
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    pub op_time: SystemTime,
 }
 
 /// Structured metadata payload for hard link operations (`OP_LINK`).
@@ -286,8 +292,8 @@ pub struct LinkPayload {
     pub ino: u64,
     pub new_parent: u64,
     pub new_name: String,
-    #[serde(default)]
-    pub op_time: (i64, u32),
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    pub op_time: SystemTime,
 }
 
 #[cfg(test)]
@@ -340,7 +346,7 @@ mod tests {
             mode: 0o644,
             uid: 1000,
             gid: 1000,
-            created_at: (1_721_838_000, 0),
+            created_at: crate::clock::unix_to_system_time(1_721_838_000, 0),
         };
         let bytes = bincode::serialize(&create).unwrap();
         let deserialized: CreatePayload = bincode::deserialize(&bytes).unwrap();

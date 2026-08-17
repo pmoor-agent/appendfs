@@ -36,6 +36,51 @@ pub fn unix_to_system_time(secs: i64, nsecs: u32) -> SystemTime {
     }
 }
 
+pub fn default_epoch() -> SystemTime {
+    UNIX_EPOCH
+}
+
+pub mod serde_system_time {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        system_time_to_unix(*time).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (sec, nsec) = <(i64, u32)>::deserialize(deserializer)?;
+        Ok(unix_to_system_time(sec, nsec))
+    }
+}
+
+pub mod serde_system_time_opt {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(time: &Option<SystemTime>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let opt_tuple = time.map(system_time_to_unix);
+        opt_tuple.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<SystemTime>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt_tuple = <Option<(i64, u32)>>::deserialize(deserializer)?;
+        Ok(opt_tuple.map(|(sec, nsec)| unix_to_system_time(sec, nsec)))
+    }
+}
+
 /// Fixed-time clock for deterministic tests - e.g. asserting exact timestamps survive
 /// a crash/recovery cycle, which a real wall clock can't do reliably (real time keeps
 /// moving between the write and the check).
@@ -78,6 +123,7 @@ impl Clock for AdvancingClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn test_system_clock_now() {
@@ -114,5 +160,31 @@ mod tests {
         assert_eq!(handle_a.now(), start + Duration::from_secs(5));
         assert_eq!(handle_b.now(), start + Duration::from_secs(5));
         assert_eq!(clock.now(), start + Duration::from_secs(5));
+    }
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct TimestampTestWrapper {
+        #[serde(with = "serde_system_time")]
+        time: SystemTime,
+        #[serde(with = "serde_system_time_opt")]
+        opt_some: Option<SystemTime>,
+        #[serde(default, with = "serde_system_time_opt")]
+        opt_none: Option<SystemTime>,
+    }
+
+    #[test]
+    fn test_serde_system_time_round_trip() {
+        let post_epoch = UNIX_EPOCH + Duration::new(1_720_000_000, 123_456_789);
+        let pre_epoch = UNIX_EPOCH - Duration::new(100_000, 500);
+
+        let test_obj = TimestampTestWrapper {
+            time: post_epoch,
+            opt_some: Some(pre_epoch),
+            opt_none: None,
+        };
+
+        let bytes = bincode::serialize(&test_obj).unwrap();
+        let deserialized: TimestampTestWrapper = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(test_obj, deserialized);
     }
 }

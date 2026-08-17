@@ -192,12 +192,8 @@ impl LogWriter {
     /// (everything since the previous commit) as a complete, replay-safe batch.
     pub fn emit_batch_commit(&self, record_count: u32, clock: &dyn Clock) -> io::Result<u64> {
         let now = clock.now();
-        let duration = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
         let commit_payload = BatchCommitPayload {
-            timestamp_sec: duration.as_secs() as i64,
-            timestamp_nsec: duration.subsec_nanos(),
+            timestamp: now,
             record_count,
         };
 
