@@ -332,13 +332,14 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
             } else {
                 0.0
             };
+            let pct_str = format!("{:.1}%", pct);
             writeln!(
                 out,
-                "{:<14?} {:>10} {:>14} {:>11.1}%",
+                "{:<14} {:>10} {:>14} {:>12}",
                 opcode,
                 stats.count,
                 format_bytes(stats.payload_bytes),
-                pct
+                pct_str
             )
             .unwrap();
         }
@@ -399,7 +400,7 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
 
                     writeln!(
                         out,
-                        "#{:<5} [0x{:08x} / {:<8}] {:<14?} inode {:<5} tx {:<5} len {:<8} checksum {:02x}{:02x}{:02x}{:02x} {}",
+                        "#{:<5} [0x{:08x} / {:<8}] {:<14} inode {:<5} tx {:<5} len {:<8} checksum {:02x}{:02x}{:02x}{:02x} {}",
                         i + 1,
                         offset,
                         offset,

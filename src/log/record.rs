@@ -114,6 +114,24 @@ impl TryFrom<u8> for OpCode {
     }
 }
 
+impl std::fmt::Display for OpCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            OpCode::Create => "Create",
+            OpCode::Mkdir => "Mkdir",
+            OpCode::Write => "Write",
+            OpCode::Unlink => "Unlink",
+            OpCode::Rmdir => "Rmdir",
+            OpCode::Symlink => "Symlink",
+            OpCode::Rename => "Rename",
+            OpCode::Setattr => "Setattr",
+            OpCode::Link => "Link",
+            OpCode::BatchCommit => "BatchCommit",
+        };
+        f.pad(name)
+    }
+}
+
 /// Compact per-record header (25 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
