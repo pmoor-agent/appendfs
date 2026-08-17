@@ -40,6 +40,29 @@ pub fn default_epoch() -> SystemTime {
     UNIX_EPOCH
 }
 
+/// Formats a `SystemTime` as `<unix_secs>.<nanos>s (YYYY-MM-DD HH:MM:SS)` in local civil time.
+pub fn format_local_civil_time(time: SystemTime) -> String {
+    let (secs, nsecs) = system_time_to_unix(time);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time_t = secs as libc::time_t;
+    let res = unsafe { libc::localtime_r(&time_t, &mut tm) };
+    if !res.is_null() {
+        format!(
+            "{}.{:09}s ({:04}-{:02}-{:02} {:02}:{:02}:{:02})",
+            secs,
+            nsecs,
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    } else {
+        format!("{}.{:09}s", secs, nsecs)
+    }
+}
+
 pub mod serde_system_time {
     use super::*;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -186,5 +209,21 @@ mod tests {
         let bytes = bincode::serialize(&test_obj).unwrap();
         let deserialized: TimestampTestWrapper = bincode::deserialize(&bytes).unwrap();
         assert_eq!(test_obj, deserialized);
+    }
+
+    #[test]
+    fn test_format_local_civil_time() {
+        let time = unix_to_system_time(1786953681, 901426641);
+        let formatted = format_local_civil_time(time);
+        assert!(formatted.starts_with("1786953681.901426641s ("));
+        assert!(formatted.ends_with(')'));
+        // Verify format inside parentheses is YYYY-MM-DD HH:MM:SS
+        let civil_part = &formatted[formatted.find('(').unwrap() + 1..formatted.len() - 1];
+        assert_eq!(civil_part.len(), 19);
+        assert_eq!(&civil_part[4..5], "-");
+        assert_eq!(&civil_part[7..8], "-");
+        assert_eq!(&civil_part[10..11], " ");
+        assert_eq!(&civil_part[13..14], ":");
+        assert_eq!(&civil_part[16..17], ":");
     }
 }

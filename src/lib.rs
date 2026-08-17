@@ -11,7 +11,7 @@ pub mod shim;
 pub mod stats;
 
 pub use cli::{Cli, Commands, DumpArgs, InitArgs, MountArgs, StatsArgs, find_latest_generation};
-pub use clock::{AdvancingClock, Clock, MockClock, SystemClock};
+pub use clock::{AdvancingClock, Clock, MockClock, SystemClock, format_local_civil_time};
 pub use dump::dump_log_file;
 pub use fs::InMemoryFS;
 pub use log::{

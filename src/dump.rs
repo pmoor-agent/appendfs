@@ -687,8 +687,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn format_system_time(time: SystemTime) -> String {
-    let (secs, nsecs) = crate::clock::system_time_to_unix(time);
-    format!("{}.{:09}s (UNIX epoch)", secs, nsecs)
+    crate::clock::format_local_civil_time(time)
 }
 
 #[cfg(test)]
