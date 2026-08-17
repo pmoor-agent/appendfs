@@ -16,9 +16,42 @@ struct ActiveLogFile {
     log_path: PathBuf,
 }
 
+enum ActiveLogState {
+    Unopened { generation: u64 },
+    Open(ActiveLogFile),
+}
+
+fn open_generation_file(
+    log_dir: &Path,
+    generation: u64,
+    clock: &dyn Clock,
+) -> io::Result<ActiveLogFile> {
+    create_dir_all(log_dir)?;
+
+    let filename = format!("{:06}.log", generation);
+    let log_path = log_dir.join(filename);
+
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&log_path)?;
+
+    let now = clock.now();
+    let file_header = FileHeader::new(generation, now);
+    file.write_all(&file_header.to_bytes())?;
+    file.flush()?;
+
+    Ok(ActiveLogFile {
+        file,
+        generation,
+        current_offset: FILE_HEADER_SIZE as u64,
+        log_path,
+    })
+}
+
 /// Active log writer managing append-only writes to generation log files with automatic rolling.
 pub struct LogWriter {
-    active_file: Mutex<ActiveLogFile>,
+    active_state: Mutex<ActiveLogState>,
     tx_id: AtomicU64,
     log_dir: PathBuf,
     max_log_size: u64,
@@ -53,92 +86,92 @@ impl LogWriter {
         start_tx_id: u64,
     ) -> io::Result<Self> {
         let log_dir = log_dir.as_ref().to_path_buf();
-        create_dir_all(&log_dir)?;
-
-        let filename = format!("{:06}.log", generation);
-        let log_path = log_dir.join(filename);
-
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&log_path)?;
-
-        let now = clock.now();
-        let file_header = FileHeader::new(generation, now);
-        file.write_all(&file_header.to_bytes())?;
-        file.flush()?;
-
-        let active_file = ActiveLogFile {
-            file,
-            generation,
-            current_offset: FILE_HEADER_SIZE as u64,
-            log_path,
-        };
+        let active_file = open_generation_file(&log_dir, generation, clock)?;
 
         Ok(Self {
-            active_file: Mutex::new(active_file),
+            active_state: Mutex::new(ActiveLogState::Open(active_file)),
             tx_id: AtomicU64::new(start_tx_id),
             log_dir,
             max_log_size,
         })
     }
 
-    /// Rolls to a new generation log file if the active file, having already been
-    /// written up to its current offset, would exceed `max_log_size` upon receiving
-    /// at least `estimated_additional_bytes` more.
+    /// Creates a lazy log writer that does NOT create a `.log` file on disk until the first write.
+    pub fn create_lazy(
+        log_dir: impl AsRef<Path>,
+        generation: u64,
+        max_log_size: u64,
+        start_tx_id: u64,
+    ) -> Self {
+        let log_dir = log_dir.as_ref().to_path_buf();
+        Self {
+            active_state: Mutex::new(ActiveLogState::Unopened { generation }),
+            tx_id: AtomicU64::new(start_tx_id),
+            log_dir,
+            max_log_size,
+        }
+    }
+
+    /// Returns `true` if a physical `.log` file has been created on disk.
+    pub fn is_open(&self) -> bool {
+        let state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        matches!(*state, ActiveLogState::Open(_))
+    }
+
+    /// Rolls to a new generation log file (or opens the initial lazy log file) if needed.
     ///
-    /// Must be called at most once per flush batch, *before* writing any
-    /// of that batch's records - never mid-batch. `append_record` itself never rolls,
-    /// so a whole batch (its records plus its `FlushCommit` trailer) always lands in
-    /// exactly one generation file, which is what lets recovery treat "buffer records
-    /// since the last commit" as a purely per-file operation, never needing to carry
-    /// state across a generation boundary. The tradeoff: a single large batch can push
-    /// a generation file somewhat past `max_log_size`.
+    /// - If currently unopened (lazy), opens generation `generation` on disk and returns `Some(generation)`.
+    /// - If open and the active file would exceed `max_log_size` upon receiving `estimated_additional_bytes`,
+    ///   rolls to `generation + 1` and returns `Some(generation + 1)`.
+    /// - Otherwise returns `None`.
     pub fn roll_if_needed(
         &self,
         estimated_additional_bytes: u64,
         clock: &dyn Clock,
     ) -> io::Result<Option<u64>> {
-        let mut active = match self.active_file.lock() {
+        let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
 
-        if active.current_offset <= FILE_HEADER_SIZE as u64
-            || active.current_offset + estimated_additional_bytes <= self.max_log_size
-        {
-            return Ok(None);
+        match &mut *state {
+            ActiveLogState::Unopened { generation } => {
+                let gen_num = *generation;
+                let active_file = open_generation_file(&self.log_dir, gen_num, clock)?;
+                *state = ActiveLogState::Open(active_file);
+                log::info!(
+                    "Lazily opened initial log file for generation {} in {:?}",
+                    gen_num,
+                    self.log_dir
+                );
+                Ok(Some(gen_num))
+            }
+            ActiveLogState::Open(active) => {
+                if active.current_offset <= FILE_HEADER_SIZE as u64
+                    || active.current_offset + estimated_additional_bytes <= self.max_log_size
+                {
+                    return Ok(None);
+                }
+
+                active.file.flush()?;
+                active.file.sync_data()?;
+
+                let next_gen = active.generation + 1;
+                let next_active = open_generation_file(&self.log_dir, next_gen, clock)?;
+
+                log::info!(
+                    "Rolled log file to generation {} ({:?})",
+                    next_gen,
+                    next_active.log_path
+                );
+
+                *active = next_active;
+                Ok(Some(next_gen))
+            }
         }
-
-        active.file.flush()?;
-        active.file.sync_data()?;
-
-        let next_gen = active.generation + 1;
-        let next_filename = format!("{:06}.log", next_gen);
-        let next_path = self.log_dir.join(next_filename);
-
-        let mut next_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&next_path)?;
-
-        let now = clock.now();
-        let file_header = FileHeader::new(next_gen, now);
-        next_file.write_all(&file_header.to_bytes())?;
-        next_file.flush()?;
-
-        log::info!(
-            "Rolled log file to generation {} ({:?})",
-            next_gen,
-            next_path
-        );
-
-        active.file = next_file;
-        active.generation = next_gen;
-        active.current_offset = FILE_HEADER_SIZE as u64;
-        active.log_path = next_path;
-
-        Ok(Some(next_gen))
     }
 
     /// Appends a record (`RecordHeader` + payload bytes) to the active log file.
@@ -161,9 +194,23 @@ impl LogWriter {
         let header_bytes = header.to_bytes();
         let total_bytes = header_bytes.len() + payload.len();
 
-        let mut active = match self.active_file.lock() {
+        let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
+        };
+
+        let active = match &mut *state {
+            ActiveLogState::Open(a) => a,
+            ActiveLogState::Unopened { generation } => {
+                let gen_num = *generation;
+                let active_file =
+                    open_generation_file(&self.log_dir, gen_num, &crate::clock::SystemClock)?;
+                *state = ActiveLogState::Open(active_file);
+                match &mut *state {
+                    ActiveLogState::Open(a) => a,
+                    _ => unreachable!(),
+                }
+            }
         };
 
         let record_log_offset = active.current_offset;
@@ -195,48 +242,67 @@ impl LogWriter {
 
     /// Flushes unwritten internal buffers to the OS page cache.
     pub fn flush(&self) -> io::Result<()> {
-        let mut active = match self.active_file.lock() {
+        let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        active.file.flush()
+        if let ActiveLogState::Open(active) = &mut *state {
+            active.file.flush()
+        } else {
+            Ok(())
+        }
     }
 
     /// Performs a physical hardware disk sync (`fsync` / `fdatasync`).
     pub fn sync(&self) -> io::Result<()> {
-        let mut active = match self.active_file.lock() {
+        let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        active.file.flush()?;
-        active.file.sync_all()
+        if let ActiveLogState::Open(active) = &mut *state {
+            active.file.flush()?;
+            active.file.sync_all()
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns the active generation sequence number.
     pub fn generation(&self) -> u64 {
-        let active = match self.active_file.lock() {
+        let state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        active.generation
+        match &*state {
+            ActiveLogState::Unopened { generation } => *generation,
+            ActiveLogState::Open(active) => active.generation,
+        }
     }
 
     /// Returns the current byte offset of the active log file.
     pub fn current_offset(&self) -> u64 {
-        let active = match self.active_file.lock() {
+        let state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        active.current_offset
+        match &*state {
+            ActiveLogState::Unopened { .. } => 0,
+            ActiveLogState::Open(active) => active.current_offset,
+        }
     }
 
     /// Returns the filesystem path to the active log file.
     pub fn path(&self) -> PathBuf {
-        let active = match self.active_file.lock() {
+        let state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        active.log_path.clone()
+        match &*state {
+            ActiveLogState::Unopened { generation } => {
+                self.log_dir.join(format!("{:06}.log", generation))
+            }
+            ActiveLogState::Open(active) => active.log_path.clone(),
+        }
     }
 
     /// Returns the last transaction ID assigned by this writer.
@@ -325,5 +391,27 @@ mod tests {
         assert_eq!(records[2].header.op_code, OpCode::FlushCommit);
         let payload: FlushCommitPayload = bincode::deserialize(&records[2].payload).unwrap();
         assert_eq!(payload.record_count, 2);
+    }
+
+    #[test]
+    fn test_lazy_log_writer_creates_no_file_until_first_write() {
+        let dir = tempdir().unwrap();
+        let clock = SystemClock;
+        let writer = LogWriter::create_lazy(dir.path(), 1, DEFAULT_MAX_LOG_SIZE, 1);
+
+        assert!(!writer.is_open());
+        assert_eq!(writer.generation(), 1);
+        let expected_path = dir.path().join("000001.log");
+        assert!(!expected_path.exists(), "lazy writer must not create a file on disk yet");
+
+        // Calling roll_if_needed opens the initial generation on disk
+        let opened_gen = writer.roll_if_needed(100, &clock).unwrap();
+        assert_eq!(opened_gen, Some(1));
+        assert!(writer.is_open());
+        assert!(expected_path.exists(), "file must now exist on disk");
+
+        // Subsequent roll_if_needed within limits does not roll
+        let no_roll = writer.roll_if_needed(100, &clock).unwrap();
+        assert_eq!(no_roll, None);
     }
 }

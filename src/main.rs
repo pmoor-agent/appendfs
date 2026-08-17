@@ -1,5 +1,4 @@
 use appendfs::cli::{Cli, Commands};
-use appendfs::clock::SystemClock;
 use appendfs::log::{BackgroundFlusher, LogWriter};
 use appendfs::{VolumeStats, init_volume, recover_fs};
 use clap::Parser;
@@ -9,7 +8,6 @@ use std::time::Duration;
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
-    let clock = SystemClock;
 
     match cli.command {
         Commands::Init(args) => {
@@ -58,9 +56,9 @@ fn main() {
                 }
             };
 
-            let (next_gen, next_filename) = {
+            let next_gen = {
                 let manifest = fs_instance.manifest.read().unwrap();
-                (manifest.next_generation, manifest.next_filename.clone())
+                manifest.next_generation
             };
 
             let start_tx = fs_instance
@@ -68,27 +66,12 @@ fn main() {
                 .load(std::sync::atomic::Ordering::SeqCst)
                 + 1;
 
-            let writer = Arc::new(
-                LogWriter::create_with_max_size_and_start_tx(
-                    log_dir,
-                    next_gen,
-                    &clock,
-                    args.max_log_size,
-                    start_tx,
-                )
-                .expect("Failed to create log writer for generation"),
-            );
-
-            {
-                let mut manifest = fs_instance.manifest.write().unwrap();
-                if manifest.get_by_generation(next_gen).is_none() {
-                    manifest.record_roll(
-                        next_gen,
-                        next_filename,
-                        appendfs::log::record::FILE_HEADER_SIZE as u64,
-                    );
-                }
-            }
+            let writer = Arc::new(LogWriter::create_lazy(
+                log_dir,
+                next_gen,
+                args.max_log_size,
+                start_tx,
+            ));
 
             fs_instance.log_writer = Some(Arc::clone(&writer));
             fs_instance.max_buffer_size = args.flush_threshold;

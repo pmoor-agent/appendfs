@@ -1388,6 +1388,10 @@ impl InMemoryFS {
     pub fn sync_and_export_summary(&self) -> std::io::Result<Option<PathBuf>> {
         self.sync_log()?;
         if let Some(ref writer) = self.log_writer {
+            if !writer.is_open() {
+                // Read-only session where no log records were ever flushed or written
+                return Ok(None);
+            }
             if let Some(log_dir) = writer.path().parent() {
                 match self.export_summary(log_dir) {
                     Ok(p) => return Ok(Some(p)),

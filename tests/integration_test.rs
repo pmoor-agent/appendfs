@@ -1212,3 +1212,80 @@ fn test_volume_init_mount_and_stats_flow() {
     assert!(dump_sum_v1.contains("Summary Inode Records"));
     assert!(dump_sum_v1.contains("Directory  \"/\""));
 }
+
+#[test]
+fn test_lazy_log_creation_and_clean_read_only_unmount() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path();
+
+    // 1. Initialize volume
+    appendfs::init_volume(log_path, Some("main")).unwrap();
+
+    // Verify only 000000.summary exists
+    let files: Vec<_> = std::fs::read_dir(log_path)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(files, vec!["000000.summary"]);
+
+    // 2. Simulate Mount 1: Read-only mount session
+    {
+        let mut fs = appendfs::recover_fs(log_path).unwrap();
+        let writer = std::sync::Arc::new(appendfs::LogWriter::create_lazy(
+            log_path,
+            1,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+        ));
+        fs.log_writer = Some(writer);
+        fs.set_log_dir(log_path);
+
+        // Perform read-only operations
+        let root_entries = fs.list_directory(1).unwrap();
+        assert_eq!(root_entries.len(), 0);
+
+        // Drop fs (simulating unmount)
+    }
+
+    // Assert that the log directory remains 100% clean and untouched!
+    let files_after_ro: Vec<_> = std::fs::read_dir(log_path)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(files_after_ro, vec!["000000.summary"]);
+
+    // 3. Simulate Mount 2: Mutation session
+    {
+        let mut fs = appendfs::recover_fs(log_path).unwrap();
+        let writer = std::sync::Arc::new(appendfs::LogWriter::create_lazy(
+            log_path,
+            1,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+        ));
+        fs.log_writer = Some(writer);
+        fs.set_log_dir(log_path);
+
+        // Create directory and file
+        let dir_attr = appendfs::operations::dir::mkdir_core(&fs, 1, "testdir", 0o755, 1000, 1000).unwrap();
+        let file_attr = appendfs::operations::read_write::create_core(&fs, dir_attr.ino, "data.txt", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, file_attr.ino, b"hello lazy log", 0).unwrap();
+
+        // Flush & unmount
+        fs.sync_log().unwrap();
+    }
+
+    // Assert that 000001.log and 000001.summary were created cleanly
+    let mut files_after_write: Vec<_> = std::fs::read_dir(log_path)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    files_after_write.sort();
+    assert_eq!(files_after_write, vec!["000000.summary", "000001.log", "000001.summary"]);
+
+    // 4. Verify recovery restores the written state
+    let recovered = appendfs::recover_fs(log_path).unwrap();
+    let root_entries = recovered.list_directory(1).unwrap();
+    assert_eq!(root_entries.len(), 1);
+    assert_eq!(root_entries[0].0, "testdir");
+}
