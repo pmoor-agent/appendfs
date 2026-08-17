@@ -105,6 +105,12 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
 
     {
         let mut live = fs.live.write().unwrap();
+        // The `get_attr` check above happened before this lock was taken, so the file may
+        // have been unlinked in between. If its tombstone has already been frozen out of
+        // `live`, inserting a delta here would resurrect the inode at the next fold.
+        if !live.contains_key(&ino) && !fs.exists_below_live(ino) {
+            return Err(libc::ENOENT);
+        }
         let entry = live
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
@@ -187,6 +193,12 @@ pub fn setattr_core(
         log::trace!("truncating file to {}", size);
         let new_size = size as u64;
         let mut live = fs.live.write().unwrap();
+        // The `get_attr` check above happened before this lock was taken, so the file may
+        // have been unlinked in between. If its tombstone has already been frozen out of
+        // `live`, inserting a delta here would resurrect the inode at the next fold.
+        if !live.contains_key(&ino) && !fs.exists_below_live(ino) {
+            return Err(libc::ENOENT);
+        }
         let entry = live
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));

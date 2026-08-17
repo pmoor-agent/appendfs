@@ -385,6 +385,29 @@ impl InMemoryFS {
         }
     }
 
+    /// Whether `ino` still resolves in the layers *below* `live`.
+    ///
+    /// Callers that would insert a fresh delta for an inode absent from `live` must check
+    /// this while holding the `live` write lock. Validating with `get_attr` first is not
+    /// enough: the inode can be unlinked in the window before the lock is taken, and once
+    /// its tombstone has been frozen out of `live` it is invisible to `live.entry(..)`, so
+    /// the new delta folds into `base` *after* the tombstone and resurrects the inode -
+    /// with `delta_to_node`'s defaults (uid/gid 0, atime at the epoch) and no directory
+    /// referencing it.
+    pub fn exists_below_live(&self, ino: u64) -> bool {
+        {
+            let flushing = self.flushing.read().unwrap();
+            for batch in flushing.iter().rev() {
+                match batch.get(&ino) {
+                    Some(EntryDelta::Tombstone) => return false,
+                    Some(EntryDelta::Node(_)) => return true,
+                    None => {}
+                }
+            }
+        }
+        self.base.read().unwrap().contains_key(&ino)
+    }
+
     // --- Overlay Query & Resolution Methods ---
 
     /// Resolves full `FileAttr` for an inode across `live` -> `flushing` -> `base`.
@@ -2428,6 +2451,36 @@ mod tests {
         let rec_stats = recovered.calculate_generation_live_stats();
         assert_eq!(rec_stats[0].live_bytes, 25);
         assert_eq!(rec_stats[0].live_extents, 1);
+    }
+
+    #[test]
+    fn test_exists_below_live_sees_a_tombstone_frozen_out_of_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+        let attr =
+            crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000)
+                .unwrap();
+        fs.sync_log().unwrap();
+        assert!(fs.exists_below_live(attr.ino));
+
+        crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
+        assert!(
+            fs.exists_below_live(attr.ino),
+            "base still describes the inode until the tombstone's batch folds"
+        );
+
+        // Freeze the tombstone out of `live`. From here `live.entry(ino)` sees nothing, so
+        // a writer that validated before taking the lock would insert a fresh delta and
+        // resurrect the inode at the next fold - this predicate is what stops it.
+        fs.begin_flush();
+        assert!(!fs.live.read().unwrap().contains_key(&attr.ino));
+        assert!(
+            !fs.exists_below_live(attr.ino),
+            "a tombstone frozen out of live must still report the inode as gone"
+        );
     }
 
     #[test]
