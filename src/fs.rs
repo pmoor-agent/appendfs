@@ -1132,6 +1132,37 @@ impl InMemoryFS {
                 }
             }
 
+            // Phase 5b: Shrinking truncates, emitted *before* the writes below.
+            //
+            // `apply_delta_to_node` folds a file delta as truncate(mask) -> apply extents ->
+            // set size, so the log has to replay in that same order. A batch that truncates
+            // down and then grows again (truncate to 3, write/extend back to 6) collapses in
+            // Phase 7 into a single Setattr carrying only the *final* size, which loses the
+            // shrink entirely - recovery would keep the bytes past the truncation point and
+            // resurrect data the live filesystem had already dropped. Emitting the shrink as
+            // its own record first reproduces the intermediate state.
+            for &ino in &inos {
+                if let Some(EntryDelta::Node(NodeDelta::File(f))) = frozen.get(&ino)
+                    && let Some(mask) = f.truncate_mask
+                    && f.size.is_some_and(|final_size| final_size > mask)
+                {
+                    let op_time = f.attr_delta.ctime.or(f.attr_delta.mtime).unwrap_or(now);
+                    let payload = SetattrPayload {
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                        size: Some(mask),
+                        atime: None,
+                        mtime: None,
+                        op_time,
+                    };
+                    let bytes = bincode::serialize(&payload)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    writer.append_record(OpCode::Setattr, ino, &bytes)?;
+                    written_count += 1;
+                }
+            }
+
             // Phase 6: Synthesize File Writes (with extent coalescing)
             for &ino in &inos {
                 if !base_map.contains_key(&ino) && !primary_creation.contains_key(&ino) {

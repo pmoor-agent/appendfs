@@ -213,6 +213,15 @@ pub fn rename_core(
         let src_is_dir = source_attr.file_type == FileType::Directory;
 
         if let Some(dest_ino) = fs.lookup_child(newparent, newname) {
+            // POSIX: when old and new resolve to different directory entries for the same
+            // file - two hardlinks to one inode - rename succeeds and does nothing. Without
+            // this the destination is treated as a victim and its link count is dropped,
+            // which also desynchronizes the log: synthesis emits a bare Rename whose replay
+            // does not reproduce that decrement.
+            if dest_ino == source_ino {
+                return Ok(());
+            }
+
             let dest_attr = fs.get_attr(dest_ino).ok_or(libc::ENOENT)?;
             let dest_is_dir = dest_attr.file_type == FileType::Directory;
 

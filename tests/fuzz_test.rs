@@ -795,6 +795,81 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     );
 }
 
+// Sibling of test_truncate_shrink_then_grow_repro below, but for the *log* rather than
+// the live read path. `apply_delta_to_node` folds a file delta as truncate(mask) ->
+// extents -> size, so the synthesized records have to replay in that same order. A batch
+// that shrinks and then grows back ends with a final size above the shrink point, and
+// collapsing it into a single Setattr carrying only that final size loses the shrink -
+// recovery then keeps the bytes past the truncation point that the live filesystem had
+// already dropped. Needs a flush boundary before the truncate so the extent is in `base`.
+#[test]
+fn test_truncate_shrink_then_grow_within_one_batch_survives_crash_recovery() {
+    let fs = TestFS::new_temp(None);
+    let ino = fs.create(1, "f.bin", 0o644).unwrap();
+    fs.write(ino, 0, &[0xAA; 6]).unwrap();
+    fs.fs.flush_log().unwrap();
+
+    // Both of these land in one batch, whose final size (6) is above the shrink point (3).
+    fs.setattr(ino, None, None, None, Some(3), None, None)
+        .unwrap();
+    fs.setattr(ino, None, None, None, Some(6), None, None)
+        .unwrap();
+
+    let live = fs.read(ino, 0, 6).unwrap();
+    assert_eq!(
+        live,
+        vec![0xAA, 0xAA, 0xAA, 0, 0, 0],
+        "live must read the re-grown region as a hole"
+    );
+
+    let fs = fs.unclean_crash();
+    assert_eq!(
+        fs.read(ino, 0, 6).unwrap(),
+        live,
+        "recovery must not resurrect bytes dropped by the truncate"
+    );
+}
+
+// POSIX: "If the old argument and the new argument resolve to either the same existing
+// directory entry or different directory entries for the same existing file, rename()
+// shall return successfully and perform no other action." Treating the destination as a
+// victim instead drops a link, and synthesis then emits a bare Rename whose replay does
+// not reproduce that decrement, so live and the log disagree on nlink.
+#[test]
+fn test_rename_onto_own_hardlink_is_a_noop_and_survives_recovery() {
+    let fs = TestFS::new_temp(None);
+    let ino = fs.create(1, "f0", 0o644).unwrap();
+    fs.write(ino, 0, b"payload").unwrap();
+    fs.link(ino, 1, "f1").unwrap();
+    // Flush so both names are in `base` when the rename resolves them.
+    fs.fs.flush_log().unwrap();
+
+    fs.rename(1, "f0", 1, "f1").unwrap();
+
+    let names = |f: &TestFS| -> Vec<String> {
+        f.fs.list_directory(1)
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    };
+    assert_eq!(names(&fs), vec!["f0", "f1"], "both hardlinks must survive");
+    assert_eq!(
+        fs.fs.get_attr(ino).unwrap().nlink,
+        2,
+        "renaming a file onto its own hardlink must not drop a link"
+    );
+
+    let fs = fs.unclean_crash();
+    assert_eq!(names(&fs), vec!["f0", "f1"], "both names must survive recovery");
+    assert_eq!(
+        fs.fs.get_attr(ino).unwrap().nlink,
+        2,
+        "link count must survive recovery"
+    );
+    assert_eq!(fs.read(ino, 0, 7).unwrap(), b"payload".to_vec());
+}
+
 #[test]
 fn test_truncate_shrink_then_grow_repro() {
     // Targeted repro: write full content, shrink via truncate, write a small amount,
