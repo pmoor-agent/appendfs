@@ -63,13 +63,8 @@ impl LogWriter {
             .write(true)
             .open(&log_path)?;
 
-        let now_unix = clock
-            .now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        let file_header = FileHeader::new(generation, now_unix);
+        let now = clock.now();
+        let file_header = FileHeader::new(generation, now);
         file.write_all(&file_header.to_bytes())?;
         file.flush()?;
 
@@ -127,13 +122,8 @@ impl LogWriter {
             .write(true)
             .open(&next_path)?;
 
-        let now_unix = clock
-            .now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        let file_header = FileHeader::new(next_gen, now_unix);
+        let now = clock.now();
+        let file_header = FileHeader::new(next_gen, now);
         next_file.write_all(&file_header.to_bytes())?;
         next_file.flush()?;
 

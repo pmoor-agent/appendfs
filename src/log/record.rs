@@ -24,16 +24,17 @@ pub fn checksum_payload(payload: &[u8]) -> [u8; RECORD_CHECKSUM_SIZE] {
 
 /// Fixed-size header written at offset 0 of every `.log` file.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileHeader {
     pub magic: [u8; 4],
     pub version: u32,
     pub generation: u64,
-    pub created_at: i64,
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub created_at: SystemTime,
 }
 
 impl FileHeader {
-    pub fn new(generation: u64, created_at: i64) -> Self {
+    pub fn new(generation: u64, created_at: SystemTime) -> Self {
         Self {
             magic: FILE_MAGIC,
             version: CURRENT_VERSION,
@@ -47,7 +48,8 @@ impl FileHeader {
         buf[0..4].copy_from_slice(&self.magic);
         buf[4..8].copy_from_slice(&self.version.to_le_bytes());
         buf[8..16].copy_from_slice(&self.generation.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.created_at.to_le_bytes());
+        let (secs, _) = crate::clock::system_time_to_unix(self.created_at);
+        buf[16..24].copy_from_slice(&secs.to_le_bytes());
         buf
     }
 
@@ -61,7 +63,8 @@ impl FileHeader {
             return Err("Unsupported log format version");
         }
         let generation = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let created_at = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let created_at_sec = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let created_at = crate::clock::unix_to_system_time(created_at_sec, 0);
 
         Ok(Self {
             magic,
@@ -302,7 +305,8 @@ mod tests {
 
     #[test]
     fn test_file_header_serialization() {
-        let header = FileHeader::new(42, 1721838000);
+        let time = crate::clock::unix_to_system_time(1721838000, 0);
+        let header = FileHeader::new(42, time);
         let bytes = header.to_bytes();
         assert_eq!(bytes.len(), FILE_HEADER_SIZE);
 

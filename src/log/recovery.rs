@@ -98,8 +98,7 @@ pub fn recover_fs_with_clock(
     if latest_summary.is_none() {
         if let Some((_, oldest_path)) = log_files.first() {
             if let Ok(oldest_reader) = LogReader::open(oldest_path) {
-                let created =
-                    crate::clock::unix_to_system_time(oldest_reader.file_header().created_at, 0);
+                let created = oldest_reader.file_header().created_at;
                 if let Some(root_arc) = fs_instance.base.read().unwrap().get(&1) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let root_node = unsafe { root_arc.write() };
