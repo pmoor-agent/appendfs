@@ -144,10 +144,9 @@ fn main() {
                 let manifest = fs_instance.manifest.read().unwrap();
                 manifest.logs.last().map(|l| l.generation).unwrap_or(1)
             };
-            let effective_time_str = fs_instance.recovered_time().map_or_else(
-                || "N/A".to_string(),
-                appendfs::format_local_civil_time,
-            );
+            let effective_time_str = fs_instance
+                .recovered_time()
+                .map_or_else(|| "N/A".to_string(), appendfs::format_local_civil_time);
 
             println!(
                 "Recovered appendfs state (read-only) -> Effective Version: generation {}, last tx_id: {}, timestamp: {}",

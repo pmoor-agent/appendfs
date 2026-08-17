@@ -867,453 +867,467 @@ impl InMemoryFS {
             );
         }
 
-        let base_map = self.base.read().unwrap();
-        let mut inos: Vec<u64> = frozen.keys().cloned().collect();
-        inos.sort();
+        let batch_gen = writer.generation();
+        let batch_start_offset = writer.current_offset();
 
-        let mut written_count = 0;
-        let mut flushed_data_bytes = 0u64;
-        let now = self.clock.now();
+        let write_res = (|| -> std::io::Result<()> {
+            let base_map = self.base.read().unwrap();
+            let mut inos: Vec<u64> = frozen.keys().cloned().collect();
+            inos.sort();
 
-        // 1. Build map of added entries: for each new inode, record its primary creation parent
-        let mut primary_creation: HashMap<u64, (u64, String)> = HashMap::new();
-        let mut all_added: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
-        for &parent_ino in &inos {
-            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&parent_ino) {
-                let mut added_entries: Vec<(&String, &u64)> = d.added.iter().collect();
-                added_entries.sort_by_key(|(name, _)| *name);
-                for (name, &child_ino) in added_entries {
-                    if !base_map.contains_key(&child_ino)
-                        && !primary_creation.contains_key(&child_ino)
-                    {
-                        primary_creation.insert(child_ino, (parent_ino, name.clone()));
-                        continue;
+            let mut written_count = 0;
+            let mut flushed_data_bytes = 0u64;
+            let now = self.clock.now();
+
+            // 1. Build map of added entries: for each new inode, record its primary creation parent
+            let mut primary_creation: HashMap<u64, (u64, String)> = HashMap::new();
+            let mut all_added: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
+            for &parent_ino in &inos {
+                if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&parent_ino) {
+                    let mut added_entries: Vec<(&String, &u64)> = d.added.iter().collect();
+                    added_entries.sort_by_key(|(name, _)| *name);
+                    for (name, &child_ino) in added_entries {
+                        if !base_map.contains_key(&child_ino)
+                            && !primary_creation.contains_key(&child_ino)
+                        {
+                            primary_creation.insert(child_ino, (parent_ino, name.clone()));
+                            continue;
+                        }
+                        all_added
+                            .entry(child_ino)
+                            .or_default()
+                            .push((parent_ino, name.clone()));
                     }
-                    all_added
-                        .entry(child_ino)
-                        .or_default()
-                        .push((parent_ino, name.clone()));
                 }
             }
-        }
 
-        // 2. Identify Renames (paired removal + addition for an inode) vs Unlinks/Rmdirs
-        let mut renamed_additions: HashSet<(u64, String)> = HashSet::new();
-        let mut renames_to_emit: Vec<(u64, u64, String, u64, String, SystemTime)> = Vec::new();
-        let mut unlinks_to_emit: Vec<(u64, u64, String, bool, SystemTime)> = Vec::new();
+            // 2. Identify Renames (paired removal + addition for an inode) vs Unlinks/Rmdirs
+            let mut renamed_additions: HashSet<(u64, String)> = HashSet::new();
+            let mut renames_to_emit: Vec<(u64, u64, String, u64, String, SystemTime)> = Vec::new();
+            let mut unlinks_to_emit: Vec<(u64, u64, String, bool, SystemTime)> = Vec::new();
 
-        for &parent_ino in &inos {
-            let (d_removed, d_added, op_time) = match frozen.get(&parent_ino) {
-                Some(EntryDelta::Node(NodeDelta::Directory(d))) => (
-                    &d.removed,
-                    Some(&d.added),
-                    d.attr_delta.mtime.unwrap_or(now),
-                ),
-                Some(EntryDelta::Tombstone) => {
-                    static EMPTY_REMOVED: std::sync::LazyLock<HashSet<String>> =
-                        std::sync::LazyLock::new(HashSet::new);
-                    (&*EMPTY_REMOVED, None, now)
-                }
-                _ => continue,
-            };
+            for &parent_ino in &inos {
+                let (d_removed, d_added, op_time) = match frozen.get(&parent_ino) {
+                    Some(EntryDelta::Node(NodeDelta::Directory(d))) => (
+                        &d.removed,
+                        Some(&d.added),
+                        d.attr_delta.mtime.unwrap_or(now),
+                    ),
+                    Some(EntryDelta::Tombstone) => {
+                        static EMPTY_REMOVED: std::sync::LazyLock<HashSet<String>> =
+                            std::sync::LazyLock::new(HashSet::new);
+                        (&*EMPTY_REMOVED, None, now)
+                    }
+                    _ => continue,
+                };
 
-            let mut removed_entries: Vec<(String, u64, bool)> = Vec::new();
+                let mut removed_entries: Vec<(String, u64, bool)> = Vec::new();
 
-            if let Some(base_arc) = base_map.get(&parent_ino) {
-                let node = base_arc.as_ref();
-                if let Node::Directory { entries, .. } = node {
-                    for (name, c_ino) in entries {
-                        let was_removed = d_added.is_none()
-                            || d_removed.contains(name)
-                            || d_added
-                                .unwrap()
-                                .get(name)
-                                .map(|new_ino| new_ino != c_ino)
-                                .unwrap_or(false);
-                        if was_removed {
-                            let mut is_dir = false;
-                            if let Some(child_arc) = base_map.get(c_ino) {
-                                if let Node::Directory { .. } = child_arc.as_ref() {
+                if let Some(base_arc) = base_map.get(&parent_ino) {
+                    let node = base_arc.as_ref();
+                    if let Node::Directory { entries, .. } = node {
+                        for (name, c_ino) in entries {
+                            let was_removed = d_added.is_none()
+                                || d_removed.contains(name)
+                                || d_added
+                                    .unwrap()
+                                    .get(name)
+                                    .map(|new_ino| new_ino != c_ino)
+                                    .unwrap_or(false);
+                            if was_removed {
+                                let mut is_dir = false;
+                                if let Some(child_arc) = base_map.get(c_ino) {
+                                    if let Node::Directory { .. } = child_arc.as_ref() {
+                                        is_dir = true;
+                                    }
+                                } else if let Some(EntryDelta::Node(NodeDelta::Directory(_))) =
+                                    frozen.get(c_ino)
+                                {
                                     is_dir = true;
                                 }
-                            } else if let Some(EntryDelta::Node(NodeDelta::Directory(_))) =
-                                frozen.get(c_ino)
-                            {
-                                is_dir = true;
+                                removed_entries.push((name.clone(), *c_ino, is_dir));
                             }
-                            removed_entries.push((name.clone(), *c_ino, is_dir));
                         }
                     }
                 }
-            }
 
-            removed_entries.sort_by(|a, b| a.0.cmp(&b.0));
+                removed_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-            for (name, child_ino, is_dir) in removed_entries {
-                if let Some((new_parent, new_name)) =
-                    all_added.get_mut(&child_ino).and_then(|v| v.pop())
-                {
-                    renamed_additions.insert((new_parent, new_name.clone()));
-                    renames_to_emit
-                        .push((child_ino, parent_ino, name, new_parent, new_name, op_time));
-                } else {
-                    unlinks_to_emit.push((child_ino, parent_ino, name, is_dir, op_time));
-                }
-            }
-        }
-
-        // Phase 1: Unlinks and Rmdirs
-        for (child_ino, parent_ino, name, is_dir, op_time) in unlinks_to_emit {
-            if is_dir {
-                let payload = RmdirPayload {
-                    parent: parent_ino,
-                    name,
-                    op_time,
-                };
-                let bytes = bincode::serialize(&payload)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                writer.append_record(OpCode::Rmdir, child_ino, &bytes)?;
-            } else {
-                let payload = UnlinkPayload {
-                    parent: parent_ino,
-                    name,
-                    op_time,
-                };
-                let bytes = bincode::serialize(&payload)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                writer.append_record(OpCode::Unlink, child_ino, &bytes)?;
-            }
-            written_count += 1;
-        }
-
-        // Phase 2: Mkdir
-        for &ino in &inos {
-            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&ino) {
-                if !base_map.contains_key(&ino) {
-                    if let Some((parent, name)) = primary_creation.get(&ino).cloned() {
-                        let op_time = d.attr_delta.ctime.unwrap_or(now);
-
-                        if parent >= ino && !base_map.contains_key(&parent) {
-                            let tmp_name = format!(".agy_tmp_{}", ino);
-                            let payload = MkdirPayload {
-                                parent: 1,
-                                name: tmp_name.clone(),
-                                mode: d.attr_delta.mode.unwrap_or(0o755),
-                                uid: d.attr_delta.uid.unwrap_or(0),
-                                gid: d.attr_delta.gid.unwrap_or(0),
-                                created_at: op_time,
-                            };
-                            let bytes = bincode::serialize(&payload).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                            })?;
-                            writer.append_record(OpCode::Mkdir, ino, &bytes)?;
-                            written_count += 1;
-
-                            renames_to_emit.push((ino, 1, tmp_name, parent, name, op_time));
-                        } else {
-                            let payload = MkdirPayload {
-                                parent,
-                                name,
-                                mode: d.attr_delta.mode.unwrap_or(0o755),
-                                uid: d.attr_delta.uid.unwrap_or(0),
-                                gid: d.attr_delta.gid.unwrap_or(0),
-                                created_at: op_time,
-                            };
-                            let bytes = bincode::serialize(&payload).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                            })?;
-                            writer.append_record(OpCode::Mkdir, ino, &bytes)?;
-                            written_count += 1;
-                        }
+                for (name, child_ino, is_dir) in removed_entries {
+                    if let Some((new_parent, new_name)) =
+                        all_added.get_mut(&child_ino).and_then(|v| v.pop())
+                    {
+                        renamed_additions.insert((new_parent, new_name.clone()));
+                        renames_to_emit
+                            .push((child_ino, parent_ino, name, new_parent, new_name, op_time));
+                    } else {
+                        unlinks_to_emit.push((child_ino, parent_ino, name, is_dir, op_time));
                     }
                 }
             }
-        }
 
-        // Phase 3: Create and Symlink
-        for &ino in &inos {
-            match frozen.get(&ino) {
-                Some(EntryDelta::Node(NodeDelta::File(f))) => {
-                    if !base_map.contains_key(&ino) {
-                        if let Some((parent, name)) = primary_creation.get(&ino).cloned() {
-                            let op_time = f.attr_delta.ctime.unwrap_or(now);
-                            let payload = CreatePayload {
-                                parent,
-                                name,
-                                mode: f.attr_delta.mode.unwrap_or(0o644),
-                                uid: f.attr_delta.uid.unwrap_or(0),
-                                gid: f.attr_delta.gid.unwrap_or(0),
-                                created_at: op_time,
-                            };
-                            let bytes = bincode::serialize(&payload).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                            })?;
-                            writer.append_record(OpCode::Create, ino, &bytes)?;
-                            written_count += 1;
-                        }
-                    }
-                }
-                Some(EntryDelta::Node(NodeDelta::Symlink(s))) => {
-                    if !base_map.contains_key(&ino) {
-                        if let Some((parent, name)) = primary_creation.get(&ino).cloned() {
-                            let op_time = s.attr_delta.ctime.unwrap_or(now);
-                            let payload = SymlinkPayload {
-                                parent,
-                                name,
-                                target: s.target.clone().unwrap_or_default(),
-                                uid: s.attr_delta.uid.unwrap_or(0),
-                                gid: s.attr_delta.gid.unwrap_or(0),
-                                created_at: op_time,
-                            };
-                            let bytes = bincode::serialize(&payload).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                            })?;
-                            writer.append_record(OpCode::Symlink, ino, &bytes)?;
-                            written_count += 1;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Phase 4: Renames
-        for (child_ino, parent, name, new_parent, new_name, op_time) in renames_to_emit {
-            let payload = RenamePayload {
-                parent,
-                name,
-                new_parent,
-                new_name,
-                op_time,
-            };
-            let bytes = bincode::serialize(&payload)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            writer.append_record(OpCode::Rename, child_ino, &bytes)?;
-            written_count += 1;
-        }
-
-        // Phase 5: Hardlinks
-        for &parent_ino in &inos {
-            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&parent_ino) {
-                let mut added_entries: Vec<(&String, &u64)> = d.added.iter().collect();
-                added_entries.sort_by_key(|(name, _)| *name);
-                for (name, &child_ino) in added_entries {
-                    if primary_creation.get(&child_ino) == Some(&(parent_ino, name.clone())) {
-                        continue;
-                    }
-                    if renamed_additions.contains(&(parent_ino, name.clone())) {
-                        continue;
-                    }
-                    let child_ctime = match frozen.get(&child_ino) {
-                        Some(EntryDelta::Node(NodeDelta::File(f))) => f.attr_delta.ctime,
-                        Some(EntryDelta::Node(NodeDelta::Symlink(s))) => s.attr_delta.ctime,
-                        Some(EntryDelta::Node(NodeDelta::Directory(cd))) => cd.attr_delta.ctime,
-                        _ => None,
-                    };
-                    let op_time = child_ctime.or(d.attr_delta.mtime).unwrap_or(now);
-                    let payload = LinkPayload {
-                        ino: child_ino,
-                        new_parent: parent_ino,
-                        new_name: name.clone(),
+            // Phase 1: Unlinks and Rmdirs
+            for (child_ino, parent_ino, name, is_dir, op_time) in unlinks_to_emit {
+                if is_dir {
+                    let payload = RmdirPayload {
+                        parent: parent_ino,
+                        name,
                         op_time,
                     };
                     let bytes = bincode::serialize(&payload)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    writer.append_record(OpCode::Link, child_ino, &bytes)?;
-                    written_count += 1;
+                    writer.append_record(OpCode::Rmdir, child_ino, &bytes)?;
+                } else {
+                    let payload = UnlinkPayload {
+                        parent: parent_ino,
+                        name,
+                        op_time,
+                    };
+                    let bytes = bincode::serialize(&payload)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    writer.append_record(OpCode::Unlink, child_ino, &bytes)?;
+                }
+                written_count += 1;
+            }
+
+            // Phase 2: Mkdir
+            for &ino in &inos {
+                if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&ino) {
+                    if !base_map.contains_key(&ino) {
+                        if let Some((parent, name)) = primary_creation.get(&ino).cloned() {
+                            let op_time = d.attr_delta.ctime.unwrap_or(now);
+
+                            if parent >= ino && !base_map.contains_key(&parent) {
+                                let tmp_name = format!(".agy_tmp_{}", ino);
+                                let payload = MkdirPayload {
+                                    parent: 1,
+                                    name: tmp_name.clone(),
+                                    mode: d.attr_delta.mode.unwrap_or(0o755),
+                                    uid: d.attr_delta.uid.unwrap_or(0),
+                                    gid: d.attr_delta.gid.unwrap_or(0),
+                                    created_at: op_time,
+                                };
+                                let bytes = bincode::serialize(&payload).map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                                })?;
+                                writer.append_record(OpCode::Mkdir, ino, &bytes)?;
+                                written_count += 1;
+
+                                renames_to_emit.push((ino, 1, tmp_name, parent, name, op_time));
+                            } else {
+                                let payload = MkdirPayload {
+                                    parent,
+                                    name,
+                                    mode: d.attr_delta.mode.unwrap_or(0o755),
+                                    uid: d.attr_delta.uid.unwrap_or(0),
+                                    gid: d.attr_delta.gid.unwrap_or(0),
+                                    created_at: op_time,
+                                };
+                                let bytes = bincode::serialize(&payload).map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                                })?;
+                                writer.append_record(OpCode::Mkdir, ino, &bytes)?;
+                                written_count += 1;
+                            }
+                        }
+                    }
                 }
             }
-        }
 
-        // Phase 6: Synthesize File Writes (with extent coalescing)
-        for &ino in &inos {
-            if !base_map.contains_key(&ino) && !primary_creation.contains_key(&ino) {
-                continue;
+            // Phase 3: Create and Symlink
+            for &ino in &inos {
+                match frozen.get(&ino) {
+                    Some(EntryDelta::Node(NodeDelta::File(f))) => {
+                        if !base_map.contains_key(&ino) {
+                            if let Some((parent, name)) = primary_creation.get(&ino).cloned() {
+                                let op_time = f.attr_delta.ctime.unwrap_or(now);
+                                let payload = CreatePayload {
+                                    parent,
+                                    name,
+                                    mode: f.attr_delta.mode.unwrap_or(0o644),
+                                    uid: f.attr_delta.uid.unwrap_or(0),
+                                    gid: f.attr_delta.gid.unwrap_or(0),
+                                    created_at: op_time,
+                                };
+                                let bytes = bincode::serialize(&payload).map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                                })?;
+                                writer.append_record(OpCode::Create, ino, &bytes)?;
+                                written_count += 1;
+                            }
+                        }
+                    }
+                    Some(EntryDelta::Node(NodeDelta::Symlink(s))) => {
+                        if !base_map.contains_key(&ino) {
+                            if let Some((parent, name)) = primary_creation.get(&ino).cloned() {
+                                let op_time = s.attr_delta.ctime.unwrap_or(now);
+                                let payload = SymlinkPayload {
+                                    parent,
+                                    name,
+                                    target: s.target.clone().unwrap_or_default(),
+                                    uid: s.attr_delta.uid.unwrap_or(0),
+                                    gid: s.attr_delta.gid.unwrap_or(0),
+                                    created_at: op_time,
+                                };
+                                let bytes = bincode::serialize(&payload).map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                                })?;
+                                writer.append_record(OpCode::Symlink, ino, &bytes)?;
+                                written_count += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
-            if let Some(EntryDelta::Node(NodeDelta::File(f))) = frozen.get_mut(&ino) {
-                if f.extents.is_empty() {
+
+            // Phase 4: Renames
+            for (child_ino, parent, name, new_parent, new_name, op_time) in renames_to_emit {
+                let payload = RenamePayload {
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    op_time,
+                };
+                let bytes = bincode::serialize(&payload)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                writer.append_record(OpCode::Rename, child_ino, &bytes)?;
+                written_count += 1;
+            }
+
+            // Phase 5: Hardlinks
+            for &parent_ino in &inos {
+                if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&parent_ino) {
+                    let mut added_entries: Vec<(&String, &u64)> = d.added.iter().collect();
+                    added_entries.sort_by_key(|(name, _)| *name);
+                    for (name, &child_ino) in added_entries {
+                        if primary_creation.get(&child_ino) == Some(&(parent_ino, name.clone())) {
+                            continue;
+                        }
+                        if renamed_additions.contains(&(parent_ino, name.clone())) {
+                            continue;
+                        }
+                        let child_ctime = match frozen.get(&child_ino) {
+                            Some(EntryDelta::Node(NodeDelta::File(f))) => f.attr_delta.ctime,
+                            Some(EntryDelta::Node(NodeDelta::Symlink(s))) => s.attr_delta.ctime,
+                            Some(EntryDelta::Node(NodeDelta::Directory(cd))) => cd.attr_delta.ctime,
+                            _ => None,
+                        };
+                        let op_time = child_ctime.or(d.attr_delta.mtime).unwrap_or(now);
+                        let payload = LinkPayload {
+                            ino: child_ino,
+                            new_parent: parent_ino,
+                            new_name: name.clone(),
+                            op_time,
+                        };
+                        let bytes = bincode::serialize(&payload)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        writer.append_record(OpCode::Link, child_ino, &bytes)?;
+                        written_count += 1;
+                    }
+                }
+            }
+
+            // Phase 6: Synthesize File Writes (with extent coalescing)
+            for &ino in &inos {
+                if !base_map.contains_key(&ino) && !primary_creation.contains_key(&ino) {
                     continue;
                 }
+                if let Some(EntryDelta::Node(NodeDelta::File(f))) = frozen.get_mut(&ino) {
+                    if f.extents.is_empty() {
+                        continue;
+                    }
 
-                struct StagedSlice {
-                    file_offset: u64,
-                    data: Arc<Vec<u8>>,
-                    payload_offset: u32,
-                    length: u32,
-                }
+                    struct StagedSlice {
+                        file_offset: u64,
+                        data: Arc<Vec<u8>>,
+                        payload_offset: u32,
+                        length: u32,
+                    }
 
-                let mut staged_slices = Vec::new();
-                for (offset, entry) in f.extents.iter() {
-                    if let ExtentState::Staged {
-                        data,
-                        payload_offset,
-                        length,
-                    } = entry.value.read_state()
-                    {
-                        staged_slices.push(StagedSlice {
-                            file_offset: *offset,
+                    let mut staged_slices = Vec::new();
+                    for (offset, entry) in f.extents.iter() {
+                        if let ExtentState::Staged {
                             data,
                             payload_offset,
                             length,
-                        });
-                    }
-                }
-
-                let mut idx = 0;
-                while idx < staged_slices.len() {
-                    let mut run_end = idx + 1;
-                    while run_end < staged_slices.len() {
-                        let prev = &staged_slices[run_end - 1];
-                        let curr = &staged_slices[run_end];
-                        if prev.file_offset + prev.length as u64 == curr.file_offset {
-                            run_end += 1;
-                        } else {
-                            break;
+                        } = entry.value.read_state()
+                        {
+                            staged_slices.push(StagedSlice {
+                                file_offset: *offset,
+                                data,
+                                payload_offset,
+                                length,
+                            });
                         }
                     }
 
-                    let run = &staged_slices[idx..run_end];
-                    let start_offset = run[0].file_offset;
-                    let write_meta = WriteMeta {
-                        file_offset: start_offset,
-                        op_time: f.attr_delta.mtime.unwrap_or(now),
-                    };
-                    let mut payload = bincode::serialize(&write_meta)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    let meta_size = payload.len() as u32;
-
-                    let mut total_length: u64 = 0;
-                    for item in run {
-                        total_length += item.length as u64;
-                        let slice = &item.data[item.payload_offset as usize
-                            ..(item.payload_offset + item.length) as usize];
-                        payload.extend_from_slice(slice);
-                    }
-
-                    let (_, generation, record_log_offset) =
-                        writer.append_record(OpCode::Write, ino, &payload)?;
-                    written_count += 1;
-                    flushed_data_bytes += total_length;
-
-                    // Collapse the entire contiguous run into a single consolidated RangeEntry in f.extents
-                    let consolidated_extent = SharedExtentState::new_disk(
-                        generation,
-                        record_log_offset,
-                        meta_size,
-                        total_length as u32,
-                    );
-                    f.extents
-                        .insert(start_offset, total_length, consolidated_extent);
-
-                    idx = run_end;
-                }
-            }
-        }
-
-        // Phase 7: Synthesize Setattr updates
-        for &ino in &inos {
-            if !base_map.contains_key(&ino) && !primary_creation.contains_key(&ino) {
-                continue;
-            }
-            match frozen.get(&ino) {
-                Some(EntryDelta::Node(NodeDelta::File(f))) => {
-                    if f.attr_delta.nlink == Some(0) {
-                        continue;
-                    }
-                    let has_explicit_attr = f.attr_delta.mode.is_some()
-                        || f.attr_delta.uid.is_some()
-                        || f.attr_delta.gid.is_some()
-                        || f.attr_delta.mtime.is_some()
-                        || f.attr_delta.ctime.is_some()
-                        || f.truncate_mask.is_some()
-                        || (f.extents.is_empty() && f.size.is_some());
-                    if has_explicit_attr {
-                        let op_time = f.attr_delta.ctime.or(f.attr_delta.mtime).unwrap_or(now);
-                        let payload = SetattrPayload {
-                            mode: f.attr_delta.mode,
-                            uid: f.attr_delta.uid,
-                            gid: f.attr_delta.gid,
-                            size: if f.truncate_mask.is_some() || f.extents.is_empty() {
-                                f.size
+                    let mut idx = 0;
+                    while idx < staged_slices.len() {
+                        let mut run_end = idx + 1;
+                        while run_end < staged_slices.len() {
+                            let prev = &staged_slices[run_end - 1];
+                            let curr = &staged_slices[run_end];
+                            if prev.file_offset + prev.length as u64 == curr.file_offset {
+                                run_end += 1;
                             } else {
-                                None
-                            },
-                            atime: f.attr_delta.atime,
-                            mtime: f.attr_delta.mtime,
-                            op_time,
+                                break;
+                            }
+                        }
+
+                        let run = &staged_slices[idx..run_end];
+                        let start_offset = run[0].file_offset;
+                        let write_meta = WriteMeta {
+                            file_offset: start_offset,
+                            op_time: f.attr_delta.mtime.unwrap_or(now),
                         };
-                        let bytes = bincode::serialize(&payload)
+                        let mut payload = bincode::serialize(&write_meta)
                             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                        writer.append_record(OpCode::Setattr, ino, &bytes)?;
+                        let meta_size = payload.len() as u32;
+
+                        let mut total_length: u64 = 0;
+                        for item in run {
+                            total_length += item.length as u64;
+                            let slice = &item.data[item.payload_offset as usize
+                                ..(item.payload_offset + item.length) as usize];
+                            payload.extend_from_slice(slice);
+                        }
+
+                        let (_, generation, record_log_offset) =
+                            writer.append_record(OpCode::Write, ino, &payload)?;
                         written_count += 1;
+                        flushed_data_bytes += total_length;
+
+                        // Collapse the entire contiguous run into a single consolidated RangeEntry in f.extents
+                        let consolidated_extent = SharedExtentState::new_disk(
+                            generation,
+                            record_log_offset,
+                            meta_size,
+                            total_length as u32,
+                        );
+                        f.extents
+                            .insert(start_offset, total_length, consolidated_extent);
+
+                        idx = run_end;
                     }
                 }
-                Some(EntryDelta::Node(NodeDelta::Directory(d))) => {
-                    if d.attr_delta.mode.is_some()
-                        || d.attr_delta.uid.is_some()
-                        || d.attr_delta.gid.is_some()
-                        || d.attr_delta.mtime.is_some()
-                        || d.attr_delta.ctime.is_some()
-                    {
-                        let op_time = d.attr_delta.ctime.or(d.attr_delta.mtime).unwrap_or(now);
-                        let payload = SetattrPayload {
-                            mode: d.attr_delta.mode,
-                            uid: d.attr_delta.uid,
-                            gid: d.attr_delta.gid,
-                            size: None,
-                            atime: d.attr_delta.atime,
-                            mtime: d.attr_delta.mtime,
-                            op_time,
-                        };
-                        let bytes = bincode::serialize(&payload)
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                        writer.append_record(OpCode::Setattr, ino, &bytes)?;
-                        written_count += 1;
-                    }
-                }
-                Some(EntryDelta::Node(NodeDelta::Symlink(s))) => {
-                    if s.attr_delta.mode.is_some()
-                        || s.attr_delta.uid.is_some()
-                        || s.attr_delta.gid.is_some()
-                        || s.attr_delta.mtime.is_some()
-                        || s.attr_delta.ctime.is_some()
-                    {
-                        let op_time = s.attr_delta.ctime.or(s.attr_delta.mtime).unwrap_or(now);
-                        let payload = SetattrPayload {
-                            mode: s.attr_delta.mode,
-                            uid: s.attr_delta.uid,
-                            gid: s.attr_delta.gid,
-                            size: None,
-                            atime: s.attr_delta.atime,
-                            mtime: s.attr_delta.mtime,
-                            op_time,
-                        };
-                        let bytes = bincode::serialize(&payload)
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                        writer.append_record(OpCode::Setattr, ino, &bytes)?;
-                        written_count += 1;
-                    }
-                }
-                _ => {}
             }
-        }
 
-        drop(base_map);
-
-        // 5. Emit FlushCommit
-        writer.emit_flush_commit(written_count, &*self.clock)?;
-
-        writer.flush()?;
-
-        let active_gen = writer.generation();
-        let active_offset = writer.current_offset();
-        {
-            let mut manifest = self.manifest.write().unwrap();
-            if let Some(entry) = manifest.get_mut_by_generation(active_gen) {
-                entry.record_count += written_count + 1; // including FlushCommit
-                entry.total_data_bytes += flushed_data_bytes;
-                entry.total_bytes = active_offset;
+            // Phase 7: Synthesize Setattr updates
+            for &ino in &inos {
+                if !base_map.contains_key(&ino) && !primary_creation.contains_key(&ino) {
+                    continue;
+                }
+                match frozen.get(&ino) {
+                    Some(EntryDelta::Node(NodeDelta::File(f))) => {
+                        if f.attr_delta.nlink == Some(0) {
+                            continue;
+                        }
+                        let has_explicit_attr = f.attr_delta.mode.is_some()
+                            || f.attr_delta.uid.is_some()
+                            || f.attr_delta.gid.is_some()
+                            || f.attr_delta.mtime.is_some()
+                            || f.attr_delta.ctime.is_some()
+                            || f.truncate_mask.is_some()
+                            || (f.extents.is_empty() && f.size.is_some());
+                        if has_explicit_attr {
+                            let op_time = f.attr_delta.ctime.or(f.attr_delta.mtime).unwrap_or(now);
+                            let payload = SetattrPayload {
+                                mode: f.attr_delta.mode,
+                                uid: f.attr_delta.uid,
+                                gid: f.attr_delta.gid,
+                                size: if f.truncate_mask.is_some() || f.extents.is_empty() {
+                                    f.size
+                                } else {
+                                    None
+                                },
+                                atime: f.attr_delta.atime,
+                                mtime: f.attr_delta.mtime,
+                                op_time,
+                            };
+                            let bytes = bincode::serialize(&payload).map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                            })?;
+                            writer.append_record(OpCode::Setattr, ino, &bytes)?;
+                            written_count += 1;
+                        }
+                    }
+                    Some(EntryDelta::Node(NodeDelta::Directory(d))) => {
+                        if d.attr_delta.mode.is_some()
+                            || d.attr_delta.uid.is_some()
+                            || d.attr_delta.gid.is_some()
+                            || d.attr_delta.mtime.is_some()
+                            || d.attr_delta.ctime.is_some()
+                        {
+                            let op_time = d.attr_delta.ctime.or(d.attr_delta.mtime).unwrap_or(now);
+                            let payload = SetattrPayload {
+                                mode: d.attr_delta.mode,
+                                uid: d.attr_delta.uid,
+                                gid: d.attr_delta.gid,
+                                size: None,
+                                atime: d.attr_delta.atime,
+                                mtime: d.attr_delta.mtime,
+                                op_time,
+                            };
+                            let bytes = bincode::serialize(&payload).map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                            })?;
+                            writer.append_record(OpCode::Setattr, ino, &bytes)?;
+                            written_count += 1;
+                        }
+                    }
+                    Some(EntryDelta::Node(NodeDelta::Symlink(s))) => {
+                        if s.attr_delta.mode.is_some()
+                            || s.attr_delta.uid.is_some()
+                            || s.attr_delta.gid.is_some()
+                            || s.attr_delta.mtime.is_some()
+                            || s.attr_delta.ctime.is_some()
+                        {
+                            let op_time = s.attr_delta.ctime.or(s.attr_delta.mtime).unwrap_or(now);
+                            let payload = SetattrPayload {
+                                mode: s.attr_delta.mode,
+                                uid: s.attr_delta.uid,
+                                gid: s.attr_delta.gid,
+                                size: None,
+                                atime: s.attr_delta.atime,
+                                mtime: s.attr_delta.mtime,
+                                op_time,
+                            };
+                            let bytes = bincode::serialize(&payload).map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                            })?;
+                            writer.append_record(OpCode::Setattr, ino, &bytes)?;
+                            written_count += 1;
+                        }
+                    }
+                    _ => {}
+                }
             }
+
+            drop(base_map);
+
+            // 5. Emit FlushCommit
+            writer.emit_flush_commit(written_count, &*self.clock)?;
+
+            writer.flush()?;
+
+            let active_gen = writer.generation();
+            let active_offset = writer.current_offset();
+            {
+                let mut manifest = self.manifest.write().unwrap();
+                if let Some(entry) = manifest.get_mut_by_generation(active_gen) {
+                    entry.record_count += written_count + 1; // including FlushCommit
+                    entry.total_data_bytes += flushed_data_bytes;
+                    entry.total_bytes = active_offset;
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = write_res {
+            let _ = writer.rollback_to(batch_gen, batch_start_offset);
+            return Err(e);
         }
 
         Ok(())
@@ -2535,5 +2549,101 @@ mod tests {
         assert_eq!(&rec_d2, b"second payload");
         let rec_d3 = crate::operations::read_write::read_core(&recovered, f3.ino, 13, 0).unwrap();
         assert_eq!(&rec_d3, b"third payload");
+    }
+
+    #[test]
+    fn test_flush_mid_batch_failure_rolls_back_and_retries_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+        // 1. Initial batch with 2 files flushed cleanly
+        let mut initial_inos = Vec::new();
+        for i in 1..=2 {
+            let name = format!("init_{}.txt", i);
+            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000)
+                .unwrap();
+            crate::operations::read_write::write_core(&fs, f.ino, b"initial payload", 0).unwrap();
+            initial_inos.push(f.ino);
+        }
+        fs.flush_log().unwrap();
+
+        let initial_offset = {
+            let log_file = dir.path().join("000001.log");
+            std::fs::metadata(&log_file).unwrap().len()
+        };
+
+        // 2. Stage a second batch with 8 files
+        let mut batch2_inos = Vec::new();
+        for i in 1..=8 {
+            let name = format!("batch2_file_{}.bin", i);
+            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000)
+                .unwrap();
+            let payload = vec![(i as u8) * 0x11; 128];
+            crate::operations::read_write::write_core(&fs, f.ino, &payload, 0).unwrap();
+            batch2_inos.push((f.ino, payload));
+        }
+
+        // 3. Set fault_after_bytes slightly larger than initial_offset to force simulated write failure mid-batch
+        fs.log_writer
+            .as_ref()
+            .unwrap()
+            .fault_after_bytes
+            .store(initial_offset + 300, Ordering::SeqCst);
+
+        // 4. Attempt flush - MUST fail with simulated mid-record write error
+        let flush_res = fs.flush_log();
+        assert!(
+            flush_res.is_err(),
+            "Expected flush to fail with simulated mid-record write error"
+        );
+
+        // 5. Verify the on-disk file was rolled back to initial_offset!
+        let rolled_back_len = {
+            let log_file = dir.path().join("000001.log");
+            std::fs::metadata(&log_file).unwrap().len()
+        };
+        assert_eq!(
+            rolled_back_len, initial_offset,
+            "Log file must be rolled back to batch_start_offset on mid-batch failure"
+        );
+
+        // 6. Clear fault injection
+        fs.log_writer
+            .as_ref()
+            .unwrap()
+            .fault_after_bytes
+            .store(0, Ordering::SeqCst);
+
+        // 7. Retry flush - MUST succeed cleanly
+        let retry_res = fs.flush_log();
+        assert!(
+            retry_res.is_ok(),
+            "Retried flush must succeed: {:?}",
+            retry_res
+        );
+        assert_eq!(fs.flushing.read().unwrap().len(), 0);
+
+        // 8. Recover filesystem and verify 100% data integrity without checksum mismatches!
+        let recovered = crate::log::recover_fs(dir.path()).expect("Recovery must succeed cleanly");
+        for ino in initial_inos {
+            assert!(recovered.get_attr(ino).is_some());
+            let d = crate::operations::read_write::read_core(&recovered, ino, 15, 0).unwrap();
+            assert_eq!(&d, b"initial payload");
+        }
+        for (ino, payload) in batch2_inos {
+            assert!(recovered.get_attr(ino).is_some());
+            let d = crate::operations::read_write::read_core(&recovered, ino, payload.len(), 0)
+                .unwrap();
+            assert_eq!(d, payload);
+        }
+
+        let report = crate::check::check_volume(dir.path(), true).unwrap();
+        assert!(
+            report.is_clean(),
+            "Integrity check must be clean: {:?}",
+            report.issues
+        );
     }
 }

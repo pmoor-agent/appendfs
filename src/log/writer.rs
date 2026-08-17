@@ -2,7 +2,7 @@ use crate::cli::DEFAULT_MAX_LOG_SIZE;
 use crate::clock::Clock;
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCode, RecordHeader};
 use std::fs::{File, OpenOptions, create_dir_all};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +53,8 @@ pub struct LogWriter {
     tx_id: AtomicU64,
     log_dir: PathBuf,
     max_log_size: u64,
+    #[cfg(test)]
+    pub fault_after_bytes: AtomicU64,
 }
 
 impl LogWriter {
@@ -91,6 +93,8 @@ impl LogWriter {
             tx_id: AtomicU64::new(start_tx_id),
             log_dir,
             max_log_size,
+            #[cfg(test)]
+            fault_after_bytes: AtomicU64::new(0),
         })
     }
 
@@ -107,6 +111,8 @@ impl LogWriter {
             tx_id: AtomicU64::new(start_tx_id),
             log_dir,
             max_log_size,
+            #[cfg(test)]
+            fault_after_bytes: AtomicU64::new(0),
         }
     }
 
@@ -212,14 +218,56 @@ impl LogWriter {
         };
 
         let record_log_offset = active.current_offset;
-        active.file.write_all(&header_bytes)?;
-        if !payload.is_empty() {
-            active.file.write_all(payload)?;
+        let write_result = (|| -> io::Result<()> {
+            #[cfg(test)]
+            {
+                let limit = self.fault_after_bytes.load(Ordering::SeqCst);
+                if limit > 0 && record_log_offset + total_bytes as u64 > limit {
+                    // Write partial header bytes to disk to simulate a torn mid-record write
+                    let _ = active
+                        .file
+                        .write_all(&header_bytes[..header_bytes.len() / 2]);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "simulated ENOSPC / EFBIG mid-record write",
+                    ));
+                }
+            }
+            active.file.write_all(&header_bytes)?;
+            if !payload.is_empty() {
+                active.file.write_all(payload)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = active.file.set_len(record_log_offset);
+            let _ = active.file.seek(SeekFrom::Start(record_log_offset));
+            active.current_offset = record_log_offset;
+            return Err(e);
         }
+
         active.current_offset += total_bytes as u64;
 
         let generation = active.generation;
         Ok((tx, generation, record_log_offset))
+    }
+
+    /// Rolls back the active log file to `offset` if it is currently in `generation`
+    /// and its offset is past `offset`. Truncates the underlying file on disk and seeks back.
+    pub fn rollback_to(&self, generation: u64, offset: u64) -> io::Result<()> {
+        let mut state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if let ActiveLogState::Open(active) = &mut *state {
+            if active.generation == generation && active.current_offset > offset {
+                let _ = active.file.set_len(offset);
+                let _ = active.file.seek(SeekFrom::Start(offset));
+                active.current_offset = offset;
+            }
+        }
+        Ok(())
     }
 
     /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records
