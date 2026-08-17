@@ -1,9 +1,9 @@
 use crate::clock::{Clock, SystemClock};
 use crate::lock_pool::LockPool;
 use crate::log::{
-    CreatePayload, ExtentState, LinkPayload, LogFileCache, LogWriter, MkdirPayload,
-    OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload, SetattrPayload, SharedExtentState,
-    SymlinkPayload, UnlinkPayload, WriteMeta,
+    CreatePayload, ExtentState, GenerationLiveStats, LinkPayload, LogFileCache, LogManifest,
+    LogWriter, MkdirPayload, OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload,
+    SetattrPayload, SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
 use crate::node::{
     AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SymlinkDelta, SyncNode,
@@ -31,6 +31,8 @@ pub struct InMemoryFS {
     pub live: RwLock<HashMap<u64, EntryDelta>>,
     /// Active open file descriptor reference counts per inode for POSIX unlinking semantics.
     pub open_handles: RwLock<HashMap<u64, u32>>,
+    /// Authoritative manifest of all active log generations and lineage.
+    pub manifest: Arc<RwLock<LogManifest>>,
     pub next_inode: AtomicU64,
     pub last_tx_id: AtomicU64,
     pub lock_pool: LockPool,
@@ -86,11 +88,15 @@ impl InMemoryFS {
             path.parent().map(|p| Arc::new(LogFileCache::new(p)))
         });
 
+        let start_gen = log_writer.as_ref().map_or(1, |w| w.generation());
+        let manifest = Arc::new(RwLock::new(LogManifest::new(start_gen, "main")));
+
         Self {
             base: RwLock::new(map),
             flushing: RwLock::new(None),
             live: RwLock::new(HashMap::new()),
             open_handles: RwLock::new(HashMap::new()),
+            manifest,
             next_inode: AtomicU64::new(2),
             last_tx_id: AtomicU64::new(0),
             lock_pool: LockPool::new(),
@@ -793,9 +799,6 @@ impl InMemoryFS {
         frozen: &mut HashMap<u64, EntryDelta>,
         writer: &LogWriter,
     ) -> std::io::Result<()> {
-        let now = self.clock.now();
-        let mut written_count: u32 = 0;
-
         // Estimate size for log rolling
         let mut estimated_bytes: u64 = RECORD_HEADER_SIZE as u64 + 64; // BatchCommit
         for entry in frozen.values() {
@@ -825,11 +828,22 @@ impl InMemoryFS {
                 }
             }
         }
-        writer.roll_if_needed(estimated_bytes, &*self.clock)?;
+        if let Some(next_gen) = writer.roll_if_needed(estimated_bytes, &*self.clock)? {
+            let mut manifest = self.manifest.write().unwrap();
+            manifest.record_roll(
+                next_gen,
+                format!("{:06}.log", next_gen),
+                crate::log::record::FILE_HEADER_SIZE as u64,
+            );
+        }
 
         let base_map = self.base.read().unwrap();
         let mut inos: Vec<u64> = frozen.keys().cloned().collect();
         inos.sort();
+
+        let mut written_count = 0;
+        let mut flushed_data_bytes = 0u64;
+        let now = self.clock.now();
 
         // 1. Build map of added entries: for each new inode, record its primary creation parent
         let mut primary_creation: HashMap<u64, (u64, String)> = HashMap::new();
@@ -1072,22 +1086,22 @@ impl InMemoryFS {
             }
         }
 
-        // 3. Synthesize File Writes (with extent coalescing)
+        // Phase 6: Synthesize File Writes (with extent coalescing)
         for &ino in &inos {
             if let Some(EntryDelta::Node(NodeDelta::File(f))) = frozen.get_mut(&ino) {
-                if f.attr_delta.nlink == Some(0) {
+                if f.extents.is_empty() {
                     continue;
                 }
 
                 struct StagedSlice {
+                    file_offset: u64,
                     data: Arc<Vec<u8>>,
                     payload_offset: u32,
                     length: u32,
-                    file_offset: u64,
                 }
 
-                let mut staged_slices: Vec<StagedSlice> = Vec::new();
-                for (ext_start, entry) in f.extents.iter() {
+                let mut staged_slices = Vec::new();
+                for (offset, entry) in f.extents.iter() {
                     if let ExtentState::Staged {
                         data,
                         payload_offset,
@@ -1095,10 +1109,10 @@ impl InMemoryFS {
                     } = entry.value.read_state()
                     {
                         staged_slices.push(StagedSlice {
+                            file_offset: *offset,
                             data,
                             payload_offset,
                             length,
-                            file_offset: *ext_start,
                         });
                     }
                 }
@@ -1108,8 +1122,8 @@ impl InMemoryFS {
                     let mut run_end = idx + 1;
                     while run_end < staged_slices.len() {
                         let prev = &staged_slices[run_end - 1];
-                        let next = &staged_slices[run_end];
-                        if prev.file_offset + prev.length as u64 == next.file_offset {
+                        let curr = &staged_slices[run_end];
+                        if prev.file_offset + prev.length as u64 == curr.file_offset {
                             run_end += 1;
                         } else {
                             break;
@@ -1137,6 +1151,7 @@ impl InMemoryFS {
                     let (_, generation, record_log_offset) =
                         writer.append_record(OpCode::Write, ino, &payload)?;
                     written_count += 1;
+                    flushed_data_bytes += total_length;
 
                     // Collapse the entire contiguous run into a single consolidated RangeEntry in f.extents
                     let consolidated_extent = SharedExtentState::new_disk(
@@ -1152,7 +1167,7 @@ impl InMemoryFS {
             }
         }
 
-        // 4. Synthesize Setattr updates
+        // Phase 7: Synthesize Setattr updates
         for &ino in &inos {
             match frozen.get(&ino) {
                 Some(EntryDelta::Node(NodeDelta::File(f))) => {
@@ -1188,12 +1203,12 @@ impl InMemoryFS {
                     }
                 }
                 Some(EntryDelta::Node(NodeDelta::Directory(d))) => {
-                    let has_attr = d.attr_delta.mode.is_some()
+                    if d.attr_delta.mode.is_some()
                         || d.attr_delta.uid.is_some()
                         || d.attr_delta.gid.is_some()
                         || d.attr_delta.mtime.is_some()
-                        || d.attr_delta.ctime.is_some();
-                    if has_attr {
+                        || d.attr_delta.ctime.is_some()
+                    {
                         let op_time = d.attr_delta.ctime.or(d.attr_delta.mtime).unwrap_or(now);
                         let payload = SetattrPayload {
                             mode: d.attr_delta.mode,
@@ -1211,12 +1226,12 @@ impl InMemoryFS {
                     }
                 }
                 Some(EntryDelta::Node(NodeDelta::Symlink(s))) => {
-                    let has_attr = s.attr_delta.mode.is_some()
+                    if s.attr_delta.mode.is_some()
                         || s.attr_delta.uid.is_some()
                         || s.attr_delta.gid.is_some()
                         || s.attr_delta.mtime.is_some()
-                        || s.attr_delta.ctime.is_some();
-                    if has_attr {
+                        || s.attr_delta.ctime.is_some()
+                    {
                         let op_time = s.attr_delta.ctime.or(s.attr_delta.mtime).unwrap_or(now);
                         let payload = SetattrPayload {
                             mode: s.attr_delta.mode,
@@ -1243,6 +1258,17 @@ impl InMemoryFS {
         writer.emit_batch_commit(written_count, &*self.clock)?;
 
         writer.flush()?;
+
+        let active_gen = writer.generation();
+        let active_offset = writer.current_offset();
+        {
+            let mut manifest = self.manifest.write().unwrap();
+            if let Some(entry) = manifest.get_mut_by_generation(active_gen) {
+                entry.record_count += written_count + 1; // including BatchCommit
+                entry.total_data_bytes += flushed_data_bytes;
+                entry.total_bytes = active_offset;
+            }
+        }
 
         Ok(())
     }
@@ -1280,6 +1306,51 @@ impl InMemoryFS {
         Ok(())
     }
 
+    /// Dynamically calculates live extent statistics across all active files and log generations.
+    pub fn calculate_generation_live_stats(&self) -> Vec<GenerationLiveStats> {
+        let manifest = self.manifest.read().unwrap().clone();
+        let base = self.base.read().unwrap();
+
+        let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
+        for node_arc in base.values() {
+            let node = unsafe { node_arc.read() };
+            if let Node::File { range_map, .. } = node {
+                for (_, entry) in range_map.iter() {
+                    if let ExtentState::Disk {
+                        generation, length, ..
+                    } = entry.value.read_state()
+                    {
+                        let stats = live_map.entry(generation).or_insert((0, 0));
+                        stats.0 += length as u64;
+                        stats.1 += 1;
+                    }
+                }
+            }
+        }
+
+        let mut result = Vec::new();
+        for log in &manifest.logs {
+            let (live_bytes, live_extents) =
+                live_map.get(&log.generation).copied().unwrap_or((0, 0));
+            let live_ratio = if log.total_data_bytes > 0 {
+                live_bytes as f64 / log.total_data_bytes as f64
+            } else {
+                0.0
+            };
+            result.push(GenerationLiveStats {
+                generation: log.generation,
+                filename: log.filename.clone(),
+                record_count: log.record_count,
+                total_bytes: log.total_bytes,
+                total_data_bytes: log.total_data_bytes,
+                live_bytes,
+                live_extents,
+                live_ratio,
+            });
+        }
+        result
+    }
+
     /// Exports a single-file summary snapshot of the current in-memory filesystem state.
     pub fn export_summary(&self, log_dir: impl AsRef<Path>) -> std::io::Result<PathBuf> {
         self.sync_log()?;
@@ -1290,7 +1361,15 @@ impl InMemoryFS {
             |w| w.last_tx_id(),
         );
         let next_inode = self.next_inode.load(Ordering::SeqCst);
-        crate::log::export_summary(&snapshot, log_dir, generation, last_tx_id, next_inode)
+        let manifest = self.manifest.read().unwrap().clone();
+        crate::log::export_summary(
+            &snapshot,
+            &manifest,
+            log_dir,
+            generation,
+            last_tx_id,
+            next_inode,
+        )
     }
 
     pub fn sync_and_export_summary(&self) -> std::io::Result<Option<PathBuf>> {
@@ -1800,5 +1879,70 @@ mod tests {
         assert_eq!(fs.get_parent_dir_inode(dir1), Some(1));
         assert_eq!(fs.get_parent_dir_inode(dir3), Some(1));
         assert_eq!(fs.get_parent_dir_inode(dir2), Some(dir3));
+    }
+
+    #[test]
+    fn test_generation_live_stats_and_manifest_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+        let ino1 = fs.allocate_inode();
+        fs.base.write().unwrap().insert(
+            ino1,
+            Arc::new(SyncNode::new(Node::File {
+                range_map: RangeMap::new(),
+                size: 0,
+                perm: 0o644,
+                nlink: 1,
+                uid: 1000,
+                gid: 1000,
+                atime: clock.now(),
+                mtime: clock.now(),
+                ctime: clock.now(),
+            })),
+        );
+        fs.add_dir_entry(1, "file1.bin", ino1, clock.now());
+
+        // Write 100 bytes to file1 in gen 1
+        let data1 = vec![0xAA; 100];
+        crate::operations::read_write::write_core(&fs, ino1, &data1, 0).unwrap();
+        fs.sync_log().unwrap();
+
+        // Check manifest and stats after gen 1 write
+        let stats = fs.calculate_generation_live_stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].generation, 1);
+        assert_eq!(stats[0].filename, "000001.log");
+        assert_eq!(stats[0].total_data_bytes, 100);
+        assert_eq!(stats[0].live_bytes, 100);
+        assert_eq!(stats[0].live_extents, 1);
+        assert!((stats[0].live_ratio - 1.0).abs() < 1e-6);
+
+        // Overwrite 40 bytes of file1 (offset 0..40)
+        let overwrite_data = vec![0xBB; 40];
+        crate::operations::read_write::write_core(&fs, ino1, &overwrite_data, 0).unwrap();
+        fs.sync_log().unwrap();
+
+        // Now gen 1 only has 60 live bytes (offset 40..100) and gen 1 total data is 140 bytes
+        let stats = fs.calculate_generation_live_stats();
+        assert_eq!(stats[0].total_data_bytes, 140);
+        assert_eq!(stats[0].live_bytes, 100); // 60 from 1st write + 40 from 2nd write (both landed in gen 1)
+        assert_eq!(stats[0].live_extents, 2);
+        assert!((stats[0].live_ratio - (100.0 / 140.0)).abs() < 1e-6);
+
+        // Export summary snapshot
+        let summary_path = fs.export_summary(dir.path()).unwrap();
+        assert!(summary_path.exists());
+
+        // Recover filesystem and verify manifest is restored identically
+        let recovered = crate::log::recover_fs(dir.path()).unwrap();
+        let recovered_stats = recovered.calculate_generation_live_stats();
+        assert_eq!(recovered_stats.len(), 1);
+        assert_eq!(recovered_stats[0].generation, 1);
+        assert_eq!(recovered_stats[0].total_data_bytes, 140);
+        assert_eq!(recovered_stats[0].live_bytes, 100);
+        assert_eq!(recovered_stats[0].live_extents, 2);
     }
 }

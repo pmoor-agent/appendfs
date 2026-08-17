@@ -1,7 +1,7 @@
 use crate::cli::DEFAULT_MAX_LOG_SIZE;
 use crate::clock::Clock;
 use crate::log::record::{
-    BatchCommitPayload, FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader,
+    BatchCommitPayload, FILE_HEADER_SIZE, FileHeader, OpCode, RecordHeader,
 };
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{self, Write};
@@ -98,7 +98,7 @@ impl LogWriter {
         &self,
         estimated_additional_bytes: u64,
         clock: &dyn Clock,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<u64>> {
         let mut active = match self.active_file.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -107,7 +107,7 @@ impl LogWriter {
         if active.current_offset <= FILE_HEADER_SIZE as u64
             || active.current_offset + estimated_additional_bytes <= self.max_log_size
         {
-            return Ok(());
+            return Ok(None);
         }
 
         active.file.flush()?;
@@ -138,7 +138,7 @@ impl LogWriter {
         active.current_offset = FILE_HEADER_SIZE as u64;
         active.log_path = next_path;
 
-        Ok(())
+        Ok(Some(next_gen))
     }
 
     /// Appends a record (`RecordHeader` + payload bytes) to the active log file.
@@ -158,9 +158,8 @@ impl LogWriter {
             payload_len: payload.len() as u32,
             checksum: crate::log::record::checksum_payload(payload),
         };
-
         let header_bytes = header.to_bytes();
-        let total_bytes = RECORD_HEADER_SIZE + payload.len();
+        let total_bytes = header_bytes.len() + payload.len();
 
         let mut active = match self.active_file.lock() {
             Ok(g) => g,
@@ -210,7 +209,7 @@ impl LogWriter {
             Err(e) => e.into_inner(),
         };
         active.file.flush()?;
-        active.file.sync_data()
+        active.file.sync_all()
     }
 
     /// Returns the active generation sequence number.
@@ -220,6 +219,15 @@ impl LogWriter {
             Err(e) => e.into_inner(),
         };
         active.generation
+    }
+
+    /// Returns the current byte offset of the active log file.
+    pub fn current_offset(&self) -> u64 {
+        let active = match self.active_file.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        active.current_offset
     }
 
     /// Returns the filesystem path to the active log file.

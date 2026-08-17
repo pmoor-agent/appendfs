@@ -134,6 +134,7 @@ pub fn recover_fs_with_clock(
         last_tx_id = reader.header.last_tx_id;
 
         *fs_instance.base.write().unwrap() = inodes_map;
+        *fs_instance.manifest.write().unwrap() = reader.manifest.clone();
         fs_instance.next_inode.store(next_ino, Ordering::SeqCst);
         min_log_gen = summary_gen;
     }
@@ -157,6 +158,8 @@ pub fn recover_fs_with_clock(
         // partway through a flush: that trailing, uncommitted run is discarded below
         // rather than partially applied.
         let mut pending: Vec<LogRecord> = Vec::new();
+        let mut committed_records_count = 0u32;
+        let mut log_data_bytes = 0u64;
 
         let reader = LogReader::open(&path)?;
         for record_res in reader {
@@ -209,7 +212,18 @@ pub fn recover_fs_with_clock(
                     ));
                 }
 
+                committed_records_count += commit.record_count + 1;
+
                 for buffered in pending.drain(..) {
+                    if buffered.header.op_code == OpCode::Write {
+                        if let Ok(meta) = bincode::deserialize::<WriteMeta>(&buffered.payload) {
+                            let meta_bytes = bincode::serialize(&meta).unwrap_or_default();
+                            if buffered.payload.len() > meta_bytes.len() {
+                                log_data_bytes +=
+                                    (buffered.payload.len() - meta_bytes.len()) as u64;
+                            }
+                        }
+                    }
                     apply_record(&fs_instance, gen_num, &buffered);
                 }
             } else {
@@ -223,6 +237,34 @@ pub fn recover_fs_with_clock(
                 pending.len(),
                 gen_num
             );
+        }
+
+        let log_file_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        {
+            let mut manifest = fs_instance.manifest.write().unwrap();
+            if manifest.get_by_generation(gen_num).is_none() {
+                if manifest.logs.len() == 1 && manifest.logs[0].generation == 1 && min_log_gen == 0 && gen_num == 1 {
+                    let entry = &mut manifest.logs[0];
+                    entry.record_count = committed_records_count;
+                    entry.total_data_bytes = log_data_bytes;
+                    entry.total_bytes = log_file_len;
+                } else {
+                    manifest.record_roll(
+                        gen_num,
+                        format!("{:06}.log", gen_num),
+                        crate::log::record::FILE_HEADER_SIZE as u64,
+                    );
+                    if let Some(entry) = manifest.get_mut_by_generation(gen_num) {
+                        entry.record_count = committed_records_count;
+                        entry.total_data_bytes = log_data_bytes;
+                        entry.total_bytes = log_file_len;
+                    }
+                }
+            } else if let Some(entry) = manifest.get_mut_by_generation(gen_num) {
+                entry.record_count = committed_records_count;
+                entry.total_data_bytes = log_data_bytes;
+                entry.total_bytes = log_file_len;
+            }
         }
     }
 

@@ -11,14 +11,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 pub const SUMMARY_HEADER_SIZE: usize = 32;
-// 20 bytes (index_offset + entry_count + magic) + 32-byte BLAKE3 checksum.
-pub const SUMMARY_FOOTER_SIZE: usize = 52;
+// 28 bytes (manifest_offset + index_offset + entry_count + magic) + 32-byte BLAKE3 checksum.
+pub const SUMMARY_FOOTER_SIZE: usize = 60;
 pub const SUMMARY_INDEX_ENTRY_SIZE: usize = 16;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
-// Bumped for SummaryFooter's new checksum field (a breaking format change) and for
-// consistency with the log format's own version bump for the same reason - old
-// summaries are cleanly rejected rather than misparsed.
-pub const CURRENT_SUMMARY_VERSION: u32 = 2;
+// Bumped for SummaryFooter's manifest_offset and LogManifest section.
+pub const CURRENT_SUMMARY_VERSION: u32 = 3;
 
 /// 32-byte header written at offset 0 of `{:06}.summary`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,12 +65,10 @@ impl SummaryHeader {
 /// Footer written at EOF (last `SUMMARY_FOOTER_SIZE` bytes) of `{:06}.summary`.
 ///
 /// `checksum` is a full (untruncated) BLAKE3 hash of everything in the file *before*
-/// the footer - the header, every inode record, and the index array. Unlike the log's
-/// per-record checksums (truncated to 4 bytes to bound overhead on many small
-/// records), space isn't a concern for a single whole-snapshot checksum, and this file
-/// is the root of trust for fast-path recovery, so it gets the strongest check.
+/// the footer - the header, every inode record, the manifest, and the index array.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryFooter {
+    pub manifest_offset: u64,
     pub index_offset: u64,
     pub entry_count: u64,
     pub magic: [u8; 4],
@@ -80,8 +76,14 @@ pub struct SummaryFooter {
 }
 
 impl SummaryFooter {
-    pub fn new(index_offset: u64, entry_count: u64, checksum: [u8; 32]) -> Self {
+    pub fn new(
+        manifest_offset: u64,
+        index_offset: u64,
+        entry_count: u64,
+        checksum: [u8; 32],
+    ) -> Self {
         Self {
+            manifest_offset,
             index_offset,
             entry_count,
             magic: *SUMMARY_MAGIC,
@@ -126,6 +128,7 @@ impl SummaryIndexEntry {
 /// Exports a single-file summary snapshot of an inodes snapshot map into `log_dir`.
 pub fn export_summary(
     snapshot: &HashMap<u64, Arc<SyncNode>>,
+    manifest: &crate::log::LogManifest,
     log_dir: impl AsRef<Path>,
     generation: u64,
     last_tx_id: u64,
@@ -248,10 +251,21 @@ pub fn export_summary(
         current_offset += 8 + 4 + payload.len() as u64;
     }
 
-    // 3. Sort index entries by inode ascending
+    // 3. Serialize and write LogManifest
+    let manifest_offset = current_offset;
+    let manifest_bytes = bincode::serialize(manifest)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let manifest_len_bytes = (manifest_bytes.len() as u32).to_le_bytes();
+    file.write_all(&manifest_len_bytes)?;
+    file.write_all(&manifest_bytes)?;
+    hasher.update(&manifest_len_bytes);
+    hasher.update(&manifest_bytes);
+    current_offset += 4 + manifest_bytes.len() as u64;
+
+    // 4. Sort index entries by inode ascending
     index_entries.sort_by_key(|entry| entry.inode);
 
-    // 4. Append index entries
+    // 5. Append index entries
     let index_offset = current_offset;
     for entry in &index_entries {
         let entry_bytes = entry.to_bytes();
@@ -259,16 +273,21 @@ pub fn export_summary(
         hasher.update(&entry_bytes);
     }
 
-    // 5. Append SummaryFooter at EOF
+    // 6. Append SummaryFooter at EOF
     let checksum: [u8; 32] = *hasher.finalize().as_bytes();
-    let footer = SummaryFooter::new(index_offset, index_entries.len() as u64, checksum);
+    let footer = SummaryFooter::new(
+        manifest_offset,
+        index_offset,
+        index_entries.len() as u64,
+        checksum,
+    );
     file.write_all(&footer.to_bytes())?;
 
     file.flush()?;
     file.sync_data()?;
     drop(file);
 
-    // 6. Atomically rename .tmp -> .summary
+    // 7. Atomically rename .tmp -> .summary
     rename(&tmp_path, &final_path)?;
 
     log::info!(
@@ -290,7 +309,15 @@ pub fn export_fs_summary(
 ) -> io::Result<PathBuf> {
     let snapshot = fs.snapshot_all();
     let next_inode = fs.next_inode.load(Ordering::SeqCst);
-    export_summary(&snapshot, log_dir, generation, last_tx_id, next_inode)
+    let manifest = fs.manifest.read().unwrap().clone();
+    export_summary(
+        &snapshot,
+        &manifest,
+        log_dir,
+        generation,
+        last_tx_id,
+        next_inode,
+    )
 }
 
 /// Reader for single-file `{:06}.summary` snapshot files.
@@ -298,11 +325,12 @@ pub struct SummaryReader {
     file: File,
     pub header: SummaryHeader,
     pub footer: SummaryFooter,
+    pub manifest: crate::log::LogManifest,
     index_entries: Vec<SummaryIndexEntry>,
 }
 
 impl SummaryReader {
-    /// Opens a `.summary` file, reads header and EOF footer, and loads index entries.
+    /// Opens a `.summary` file, reads header and EOF footer, loads manifest and index entries.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let mut file = File::open(path)?;
@@ -319,9 +347,7 @@ impl SummaryReader {
         file.read_exact(&mut footer_buf)?;
         let footer = SummaryFooter::from_bytes(&footer_buf)?;
 
-        // 3. Verify the whole-file checksum before trusting anything in this summary -
-        // it's the root of trust for fast-path recovery. Streamed in chunks so memory
-        // use stays bounded regardless of how many inodes the snapshot covers.
+        // 3. Verify the whole-file checksum before trusting anything in this summary
         let content_len = file_len.saturating_sub(SUMMARY_FOOTER_SIZE as u64);
         file.seek(SeekFrom::Start(0))?;
         let mut hasher = blake3::Hasher::new();
@@ -334,19 +360,23 @@ impl SummaryReader {
             remaining -= chunk as u64;
         }
         if hasher.finalize().as_bytes() != &footer.checksum {
-            // Unlike a bad magic/version (which just means "not a valid summary" - a
-            // stray file, or an old format, neither of which implies corruption), a
-            // checksum mismatch is proof that previously-valid, already-exported data
-            // has rotted. There's no safe way to continue past proven corruption of
-            // the root of trust for fast-path recovery, so this panics rather than
-            // returning an Err a caller could silently swallow and fall back past.
             panic!(
                 "summary checksum mismatch in {:?}: this data has been corrupted (possible bitrot)",
                 path
             );
         }
 
-        // 4. Read index array from index_offset
+        // 4. Read LogManifest from manifest_offset
+        file.seek(SeekFrom::Start(footer.manifest_offset))?;
+        let mut manifest_len_buf = [0u8; 4];
+        file.read_exact(&mut manifest_len_buf)?;
+        let manifest_len = u32::from_le_bytes(manifest_len_buf) as usize;
+        let mut manifest_buf = vec![0u8; manifest_len];
+        file.read_exact(&mut manifest_buf)?;
+        let manifest: crate::log::LogManifest = bincode::deserialize(&manifest_buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // 5. Read index array from index_offset
         file.seek(SeekFrom::Start(footer.index_offset))?;
         let mut index_entries = Vec::with_capacity(footer.entry_count as usize);
         for _ in 0..footer.entry_count {
@@ -359,6 +389,7 @@ impl SummaryReader {
             file,
             header,
             footer,
+            manifest,
             index_entries,
         })
     }
@@ -434,7 +465,7 @@ mod tests {
         let decoded_header = SummaryHeader::from_bytes(&header_bytes).unwrap();
         assert_eq!(header, decoded_header);
 
-        let footer = SummaryFooter::new(1024, 10, [0xAB; 32]);
+        let footer = SummaryFooter::new(512, 1024, 10, [0xAB; 32]);
         let footer_bytes = footer.to_bytes();
         assert_eq!(footer_bytes.len(), SUMMARY_FOOTER_SIZE);
         let decoded_footer = SummaryFooter::from_bytes(&footer_bytes).unwrap();

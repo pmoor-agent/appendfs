@@ -982,3 +982,95 @@ fn test_large_directory_readdir_and_readdirplus() {
     unmount_fuse(&mount_path_str);
     handle.join().unwrap();
 }
+
+#[test]
+fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
+    let clock = Arc::new(appendfs::SystemClock);
+    let log_dir = tempfile::Builder::new()
+        .prefix("appendfs_manifest_log_")
+        .tempdir()
+        .unwrap();
+    let log_path = log_dir.path().to_path_buf();
+
+    // 2KB max log size to trigger rolling across writes
+    let writer = Arc::new(
+        appendfs::LogWriter::create_with_max_size(&log_path, 1, &*clock, 2048).unwrap(),
+    );
+    let fs = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("appendfs_manifest_mount_")
+        .tempdir()
+        .unwrap();
+    let mount_path = temp_dir.path().to_path_buf();
+    let mount_path_str = mount_path.to_str().unwrap().to_string();
+
+    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
+    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
+
+    let mount_path_clone = mount_path.clone();
+    let handle = thread::spawn(move || {
+        let args = vec![
+            "test_manifest".to_string(),
+            mount_path_clone.to_str().unwrap().to_string(),
+            "-f".to_string(),
+        ];
+        let _ = appendfs::mount(args, fs);
+    });
+
+    for _ in 0..200 {
+        if let Ok(meta) = fs::metadata(&mount_path) {
+            if meta.dev() != initial_dev {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Helper function to write and fsync
+    let write_and_sync = |path: &std::path::Path, data: &[u8]| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        file.write_all(data).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+    };
+
+    // Write file1 (1KB) in gen 1
+    let file1 = mount_path.join("file1.bin");
+    write_and_sync(&file1, &vec![0x11; 1000]);
+
+    // Write file2 (1.5KB) -> forces rolling to generation 2
+    let file2 = mount_path.join("file2.bin");
+    write_and_sync(&file2, &vec![0x22; 1500]);
+
+    // Write file3 (1.5KB) -> forces rolling to generation 3
+    let file3 = mount_path.join("file3.bin");
+    write_and_sync(&file3, &vec![0x33; 1500]);
+
+    // Overwrite file1 completely with 500 bytes -> gen 1 now has 0 live bytes!
+    write_and_sync(&file1, &vec![0x99; 500]);
+
+    unmount_fuse(&mount_path_str);
+    handle.join().unwrap();
+
+    // Recover filesystem
+    let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
+    let stats = recovered_fs.calculate_generation_live_stats();
+
+    assert!(stats.len() >= 3, "Expected at least 3 generations");
+    // Gen 1 file1 was overwritten in gen 3, so gen 1 live_bytes is 0!
+    let gen1 = stats.iter().find(|s| s.generation == 1).unwrap();
+    assert_eq!(gen1.live_bytes, 0);
+    assert_eq!(gen1.live_ratio, 0.0);
+
+    // Gen 2 (file2) is fully live
+    let gen2 = stats.iter().find(|s| s.generation == 2).unwrap();
+    assert_eq!(gen2.live_bytes, 1500);
+    assert_eq!(gen2.live_extents, 1);
+    assert!((gen2.live_ratio - 1.0).abs() < 1e-6);
+}
