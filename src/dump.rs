@@ -1409,6 +1409,7 @@ mod tests {
                 crate::log::LogFileInfo {
                     generation: 1,
                     filename: "000001.log".to_string(),
+                    created_at: std::time::UNIX_EPOCH,
                     record_count: 50,
                     total_bytes: 5000,
                     total_data_bytes: 4096,
@@ -1416,6 +1417,7 @@ mod tests {
                 crate::log::LogFileInfo {
                     generation: 2,
                     filename: "000002.log".to_string(),
+                    created_at: std::time::UNIX_EPOCH,
                     record_count: 50,
                     total_bytes: 5000,
                     total_data_bytes: 4096,

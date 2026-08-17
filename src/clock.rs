@@ -59,8 +59,44 @@ pub fn format_local_civil_time(time: SystemTime) -> String {
             tm.tm_sec
         )
     } else {
-        format!("{}.{:09}s", secs, nsecs)
+        format!("{}.{:09}s (unknown time)", secs, nsecs)
     }
+}
+
+/// Parses a human-readable or unix timestamp string into `SystemTime`.
+/// Supports unix seconds (`1755424800`), decimals (`1755424800.5`),
+/// ISO 8601 / RFC 3339 (`2026-08-17T10:00:00Z`), `2026-08-17 10:00:00`, and `2026-08-17`.
+pub fn parse_timestamp(input: &str) -> Result<SystemTime, String> {
+    let trimmed = input.trim();
+    if let Ok(secs_f) = trimmed.parse::<f64>() {
+        let secs = secs_f.floor() as i64;
+        let nsecs = ((secs_f - secs_f.floor()) * 1_000_000_000.0) as u32;
+        return Ok(unix_to_system_time(secs, nsecs));
+    }
+
+    let formats = [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ];
+
+    for fmt_str in &formats {
+        let c_fmt = std::ffi::CString::new(*fmt_str).unwrap();
+        let c_input = std::ffi::CString::new(trimmed.trim_end_matches('Z')).unwrap();
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let res = unsafe { libc::strptime(c_input.as_ptr(), c_fmt.as_ptr(), &mut tm) };
+        if !res.is_null() {
+            let time_t = unsafe { libc::timegm(&mut tm) };
+            if time_t != -1 {
+                return Ok(UNIX_EPOCH + Duration::from_secs(time_t as u64));
+            }
+        }
+    }
+
+    Err(format!(
+        "Invalid timestamp '{}'. Expected unix seconds or ISO date (e.g. '2026-08-17T10:00:00Z')",
+        input
+    ))
 }
 
 pub mod serde_system_time {

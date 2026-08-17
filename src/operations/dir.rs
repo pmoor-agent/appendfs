@@ -173,6 +173,10 @@ pub fn mkdir_core(
     uid: u32,
     gid: u32,
 ) -> Result<FileAttr, i32> {
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+
     let attr = {
         let _dir_guard = fs.dir_lock.lock().unwrap();
         let now = fs.clock.now();
@@ -246,6 +250,10 @@ pub fn mkdir(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32) 
 }
 
 pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+
     {
         let _dir_guard = fs.dir_lock.lock().unwrap();
         let now = fs.clock.now();

@@ -18,9 +18,12 @@ pub use record::{
     RECORD_HEADER_SIZE, RecordHeader, RenamePayload, RmdirPayload, SetattrPayload, SymlinkPayload,
     UnlinkPayload, WriteMeta,
 };
-pub use recovery::{recover_fs, recover_fs_with_clock};
+pub use recovery::{
+    RecoveryTarget, recover_fs, recover_fs_to_target, recover_fs_to_target_with_clock,
+    recover_fs_with_clock,
+};
 pub use summary::{
     SummaryFooter, SummaryHeader, SummaryIndexEntry, SummaryReader, export_fs_summary,
-    export_summary, init_volume,
+    export_summary, export_summary_with_time, init_volume,
 };
 pub use writer::LogWriter;

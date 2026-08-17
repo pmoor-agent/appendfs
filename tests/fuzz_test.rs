@@ -1,7 +1,7 @@
 use appendfs::InMemoryFS;
 use appendfs::LogWriter;
 use appendfs::clock::{AdvancingClock, Clock, MockClock, SystemClock};
-use appendfs::log::{CreatePayload, MkdirPayload, OpCode, recover_fs};
+use appendfs::log::{CreatePayload, MkdirPayload, OpCode, recover_fs, recover_fs_with_clock};
 use appendfs::node::Node;
 use appendfs::shim::{FileAttr, FileType};
 use std::collections::HashMap;
@@ -1450,7 +1450,8 @@ fn test_summary_export_is_deterministic() {
                 std::fs::copy(&path, replay_dir.path().join(entry.file_name())).unwrap();
             }
         }
-        let mut replayed = recover_fs(replay_dir.path()).expect("recover_fs failed on replay");
+        let mut replayed = recover_fs_with_clock(replay_dir.path(), Arc::new(clock.clone()))
+            .expect("recover_fs failed on replay");
         replayed.track_atime = false;
         let regenerated_path = replayed
             .export_summary(replay_dir.path())

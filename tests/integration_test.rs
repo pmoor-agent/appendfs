@@ -1435,3 +1435,201 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
     assert!(corrupted_output.contains("ORPHAN_INODE"));
     assert!(corrupted_output.contains("Inode 888"));
 }
+
+#[test]
+fn test_mount_ro_rejects_mutations_and_enables_point_in_time_time_travel() {
+    let log_dir = tempfile::tempdir().unwrap();
+    let mount_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path();
+    let mount_path = mount_dir.path().to_path_buf();
+
+    // 1. Initialize volume
+    appendfs::init_volume(log_path, Some("main")).unwrap();
+
+    // 2. RW Mount: create directory and file (Tx 1 & 2)
+    {
+        let mut fs_instance = appendfs::recover_fs(log_path).unwrap();
+        let next_gen = fs_instance.manifest.read().unwrap().next_generation;
+        let writer = Arc::new(appendfs::LogWriter::create_lazy(log_path, next_gen, 1024 * 1024, 1));
+        fs_instance.log_writer = Some(Arc::clone(&writer));
+        fs_instance.set_log_dir(log_path);
+
+        let m_path = mount_path.clone();
+        let handle = thread::spawn(move || {
+            let fuse_args = vec![
+                "appendfs".to_string(),
+                m_path.to_str().unwrap().to_string(),
+                "-f".to_string(),
+            ];
+            appendfs::mount(fuse_args, fs_instance).unwrap();
+        });
+
+        // Wait for FUSE mount
+        let initial_dev = fs::metadata(&mount_path).unwrap().dev();
+        let mut mounted = false;
+        for _ in 0..100 {
+            if let Ok(meta) = fs::metadata(&mount_path) {
+                if meta.dev() != initial_dev {
+                    mounted = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(mounted, "Mount 1 timed out");
+
+        let step1_dir = mount_path.join("step1");
+        fs::create_dir(&step1_dir).unwrap();
+        let file1 = step1_dir.join("file1.txt");
+        fs::write(&file1, "version 1 content").unwrap();
+
+        // Unmount
+        unmount_fuse(mount_path.to_str().unwrap());
+        handle.join().unwrap();
+    }
+
+    // 3. RW Mount 2: append changes (Tx 3 & 4)
+    {
+        let mut fs_instance = appendfs::recover_fs(log_path).unwrap();
+        let next_gen = fs_instance.manifest.read().unwrap().next_generation;
+        let writer = Arc::new(appendfs::LogWriter::create_lazy(
+            log_path,
+            next_gen,
+            1024 * 1024,
+            fs_instance.last_tx_id.load(std::sync::atomic::Ordering::SeqCst) + 1,
+        ));
+        fs_instance.log_writer = Some(Arc::clone(&writer));
+        fs_instance.set_log_dir(log_path);
+
+        let m_path = mount_path.clone();
+        let handle = thread::spawn(move || {
+            let fuse_args = vec![
+                "appendfs".to_string(),
+                m_path.to_str().unwrap().to_string(),
+                "-f".to_string(),
+            ];
+            appendfs::mount(fuse_args, fs_instance).unwrap();
+        });
+
+        let initial_dev = fs::metadata(&mount_path).unwrap().dev();
+        let mut mounted = false;
+        for _ in 0..100 {
+            if let Ok(meta) = fs::metadata(&mount_path) {
+                if meta.dev() != initial_dev {
+                    mounted = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(mounted, "Mount 2 timed out");
+
+        let step2_dir = mount_path.join("step2");
+        fs::create_dir(&step2_dir).unwrap();
+        let file2 = step2_dir.join("file2.txt");
+        fs::write(&file2, "version 2 content").unwrap();
+
+        unmount_fuse(mount_path.to_str().unwrap());
+        handle.join().unwrap();
+    }
+
+    // Count summary and log files before RO mount
+    let files_before_ro: Vec<String> = fs::read_dir(log_path)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+
+    // 4. RO Mount (Latest state)
+    {
+        let mut fs_instance = appendfs::recover_fs_to_target(log_path, appendfs::RecoveryTarget::Latest).unwrap();
+        fs_instance.set_log_dir(log_path);
+        fs_instance.set_read_only(true);
+
+        let m_path = mount_path.clone();
+        let handle = thread::spawn(move || {
+            let fuse_args = vec![
+                "appendfs".to_string(),
+                m_path.to_str().unwrap().to_string(),
+                "-f".to_string(),
+            ];
+            appendfs::mount_ro(fuse_args, fs_instance).unwrap();
+        });
+
+        let initial_dev = fs::metadata(&mount_path).unwrap().dev();
+        let mut mounted = false;
+        for _ in 0..100 {
+            if let Ok(meta) = fs::metadata(&mount_path) {
+                if meta.dev() != initial_dev {
+                    mounted = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(mounted, "RO Mount timed out");
+
+        // Read operations must succeed
+        let file1 = mount_path.join("step1/file1.txt");
+        assert_eq!(fs::read_to_string(&file1).unwrap(), "version 1 content");
+        let file2 = mount_path.join("step2/file2.txt");
+        assert_eq!(fs::read_to_string(&file2).unwrap(), "version 2 content");
+
+        // Mutation operations must fail with EROFS / PermissionDenied
+        assert!(fs::write(&file1, "tampered").is_err(), "Write on RO mount must fail");
+        assert!(fs::create_dir(mount_path.join("forbidden_dir")).is_err(), "Mkdir on RO mount must fail");
+        assert!(fs::remove_file(&file1).is_err(), "Unlink on RO mount must fail");
+
+        unmount_fuse(mount_path.to_str().unwrap());
+        handle.join().unwrap();
+    }
+
+    // Verify RO mount never created/modified summary or log files
+    let files_after_ro: Vec<String> = fs::read_dir(log_path)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(files_before_ro, files_after_ro, "RO mount must never write to disk files");
+
+    // 5. RO Mount with Point-in-Time Historical Recovery (TxId cutoff before step2)
+    {
+        // Replay up to TxId(4) which is before step2 creation
+        let mut fs_instance = appendfs::recover_fs_to_target(log_path, appendfs::RecoveryTarget::TxId(4)).unwrap();
+        fs_instance.set_log_dir(log_path);
+        fs_instance.set_read_only(true);
+
+        let m_path = mount_path.clone();
+        let handle = thread::spawn(move || {
+            let fuse_args = vec![
+                "appendfs".to_string(),
+                m_path.to_str().unwrap().to_string(),
+                "-f".to_string(),
+            ];
+            appendfs::mount_ro(fuse_args, fs_instance).unwrap();
+        });
+
+        let initial_dev = fs::metadata(&mount_path).unwrap().dev();
+        let mut mounted = false;
+        for _ in 0..100 {
+            if let Ok(meta) = fs::metadata(&mount_path) {
+                if meta.dev() != initial_dev {
+                    mounted = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(mounted, "Point-in-time RO Mount timed out");
+
+        // step1 exists
+        let file1 = mount_path.join("step1/file1.txt");
+        assert!(file1.exists(), "step1/file1.txt must exist at historical point-in-time");
+        assert_eq!(fs::read_to_string(&file1).unwrap(), "version 1 content");
+
+        // step2 does NOT exist at this historical point in time
+        let step2 = mount_path.join("step2");
+        assert!(!step2.exists(), "step2 must NOT exist at historical point-in-time");
+
+        unmount_fuse(mount_path.to_str().unwrap());
+        handle.join().unwrap();
+    }
+}

@@ -48,6 +48,10 @@ pub struct InMemoryFS {
     pub flush_lock: Mutex<()>,
     /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to true.
     pub track_atime: bool,
+    /// When true, filesystem is mounted strictly read-only (EROFS).
+    pub read_only: std::sync::atomic::AtomicBool,
+    /// Timestamp of the latest recovered operation / summary snapshot (if recovered).
+    pub recovered_time: RwLock<Option<SystemTime>>,
     /// Serializes every directory-structure mutation (mkdir/create/symlink/unlink/rmdir/rename/link).
     pub dir_lock: Mutex<()>,
 }
@@ -93,7 +97,7 @@ impl InMemoryFS {
         });
 
         let start_gen = log_writer.as_ref().map_or(1, |w| w.generation());
-        let manifest = Arc::new(RwLock::new(LogManifest::new(start_gen, "main")));
+        let manifest = Arc::new(RwLock::new(LogManifest::new_with_time(start_gen, "main", now)));
 
         Self {
             base: RwLock::new(map),
@@ -115,8 +119,26 @@ impl InMemoryFS {
             flusher: Mutex::new(None),
             flush_lock: Mutex::new(()),
             track_atime: true,
+            read_only: std::sync::atomic::AtomicBool::new(false),
+            recovered_time: RwLock::new(None),
             dir_lock: Mutex::new(()),
         }
+    }
+
+    pub fn set_read_only(&self, ro: bool) {
+        self.read_only.store(ro, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn recovered_time(&self) -> Option<SystemTime> {
+        *self.recovered_time.read().unwrap()
+    }
+
+    pub fn set_recovered_time(&self, time: Option<SystemTime>) {
+        *self.recovered_time.write().unwrap() = time;
     }
 
     pub fn set_log_dir(&mut self, log_dir: impl AsRef<Path>) {
@@ -841,6 +863,7 @@ impl InMemoryFS {
             manifest.record_roll(
                 next_gen,
                 format!("{:06}.log", next_gen),
+                self.clock.now(),
                 crate::log::record::FILE_HEADER_SIZE as u64,
             );
         }
@@ -1336,6 +1359,9 @@ impl InMemoryFS {
 
     /// Initializes background services (e.g. periodic flusher) upon FUSE mount.
     pub fn init(self: &Arc<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         let interval_secs = self.flush_interval.load(Ordering::SeqCst);
         if interval_secs > 0 {
             let self_clone = Arc::clone(self);
@@ -1353,6 +1379,9 @@ impl InMemoryFS {
 
     /// Cleanly stops background services upon FUSE unmount.
     pub fn destroy(&self) {
+        if self.is_read_only() {
+            return;
+        }
         let mut flusher = self.flusher.lock().unwrap();
         if let Some(mut f) = flusher.take() {
             f.stop();
@@ -1432,13 +1461,15 @@ impl InMemoryFS {
         );
         let next_inode = self.next_inode.load(Ordering::SeqCst);
         let manifest = self.manifest.read().unwrap().clone();
-        crate::log::export_summary(
+        let now = self.clock.now();
+        crate::log::summary::export_summary_with_time(
             &snapshot,
             &manifest,
             log_dir,
             generation,
             last_tx_id,
             next_inode,
+            now,
         )
     }
 

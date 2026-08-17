@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
 
 /// Metadata and physical counters for an individual `.log` generation file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7,6 +8,9 @@ pub struct LogFileInfo {
     pub generation: u64,
     /// Physical filename on disk (e.g. "000001.log" or "branch_a_000004.log").
     pub filename: String,
+    /// Creation timestamp for this log generation.
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub created_at: SystemTime,
     /// Total number of log records physically written into this file.
     pub record_count: u32,
     /// Total physical file size on disk (bytes).
@@ -16,10 +20,16 @@ pub struct LogFileInfo {
 }
 
 impl LogFileInfo {
-    pub fn new(generation: u64, filename: impl Into<String>, initial_header_size: u64) -> Self {
+    pub fn new(
+        generation: u64,
+        filename: impl Into<String>,
+        created_at: SystemTime,
+        initial_header_size: u64,
+    ) -> Self {
         Self {
             generation,
             filename: filename.into(),
+            created_at,
             record_count: 0,
             total_bytes: initial_header_size,
             total_data_bytes: 0,
@@ -48,6 +58,14 @@ impl Default for LogManifest {
 
 impl LogManifest {
     pub fn new(start_generation: u64, branch: impl Into<String>) -> Self {
+        Self::new_with_time(start_generation, branch, SystemTime::now())
+    }
+
+    pub fn new_with_time(
+        start_generation: u64,
+        branch: impl Into<String>,
+        created_at: SystemTime,
+    ) -> Self {
         let branch = branch.into();
         let current_filename = format!("{:06}.log", start_generation);
         let next_generation = start_generation + 1;
@@ -55,15 +73,26 @@ impl LogManifest {
 
         Self {
             branch,
-            logs: vec![LogFileInfo::new(start_generation, current_filename, 24)],
+            logs: vec![LogFileInfo::new(
+                start_generation,
+                current_filename,
+                created_at,
+                24,
+            )],
             next_generation,
             next_filename,
         }
     }
 
     /// Appends a new rolled log generation and advances `next_generation` / `next_filename`.
-    pub fn record_roll(&mut self, next_gen: u64, next_file: String, initial_header_size: u64) {
-        let entry = LogFileInfo::new(next_gen, next_file, initial_header_size);
+    pub fn record_roll(
+        &mut self,
+        next_gen: u64,
+        next_file: String,
+        created_at: SystemTime,
+        initial_header_size: u64,
+    ) {
+        let entry = LogFileInfo::new(next_gen, next_file, created_at, initial_header_size);
         self.logs.push(entry);
         self.next_generation = next_gen + 1;
         self.next_filename = format!("{:06}.log", self.next_generation);
@@ -109,7 +138,7 @@ mod tests {
         assert_eq!(manifest.next_generation, 2);
         assert_eq!(manifest.next_filename, "000002.log");
 
-        manifest.record_roll(2, "000002.log".to_string(), 24);
+        manifest.record_roll(2, "000002.log".to_string(), SystemTime::now(), 24);
         assert_eq!(manifest.logs.len(), 2);
         assert_eq!(manifest.logs[1].generation, 2);
         assert_eq!(manifest.next_generation, 3);

@@ -29,6 +29,11 @@ pub enum Commands {
     Init(InitArgs),
     /// Mount an initialized appendfs volume as a FUSE filesystem
     Mount(MountArgs),
+    /// Mount volume in read-only mode (with optional point-in-time time-travel recovery)
+    #[command(name = "mount-ro")]
+    MountRo(MountRoArgs),
+    /// Alias for mount-ro (read-only mount)
+    Mountro(MountRoArgs),
     /// Display volume statistics, inode breakdown, and log live extent ratios
     Stats(StatsArgs),
     /// Inspect and dump records from a single .log file
@@ -93,6 +98,53 @@ pub struct MountArgs {
 }
 
 impl MountArgs {
+    /// Formats CLI arguments into libfuse-compatible C-style argv.
+    pub fn to_fuse_args(&self) -> Vec<String> {
+        let mut fuse_args = vec![
+            "appendfs".to_string(),
+            self.mount_point.to_str().unwrap().to_string(),
+        ];
+        if self.foreground {
+            fuse_args.push("-f".to_string());
+        }
+        for opt in &self.fuse_options {
+            fuse_args.push("-o".to_string());
+            fuse_args.push(opt.clone());
+        }
+        fuse_args
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct MountRoArgs {
+    /// Directory path where the appendfs volume log and summary files are stored
+    pub log_dir: PathBuf,
+
+    /// Directory where the read-only filesystem will be mounted
+    pub mount_point: PathBuf,
+
+    /// Target transaction ID for point-in-time historical recovery
+    #[arg(long = "tx-id")]
+    pub tx_id: Option<u64>,
+
+    /// Target timestamp for point-in-time recovery (unix epoch secs or ISO 8601 string, e.g. "2026-08-17T10:00:00Z")
+    #[arg(long = "at-time")]
+    pub at_time: Option<String>,
+
+    /// Target log generation for historical recovery
+    #[arg(long = "generation")]
+    pub generation: Option<u64>,
+
+    /// Run filesystem in foreground (default: false / daemonize)
+    #[arg(short = 'f', long = "foreground")]
+    pub foreground: bool,
+
+    /// Additional raw FUSE options passed to libfuse (e.g. -o allow_other)
+    #[arg(short = 'o', value_delimiter = ',')]
+    pub fuse_options: Vec<String>,
+}
+
+impl MountRoArgs {
     /// Formats CLI arguments into libfuse-compatible C-style argv.
     pub fn to_fuse_args(&self) -> Vec<String> {
         let mut fuse_args = vec![

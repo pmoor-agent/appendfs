@@ -10,15 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-pub const SUMMARY_HEADER_SIZE: usize = 32;
+pub const SUMMARY_HEADER_SIZE: usize = 44;
 // 28 bytes (manifest_offset + index_offset + entry_count + magic) + 32-byte BLAKE3 checksum.
 pub const SUMMARY_FOOTER_SIZE: usize = 60;
 pub const SUMMARY_INDEX_ENTRY_SIZE: usize = 16;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
-// Bumped for SummaryFooter's manifest_offset and LogManifest section.
-pub const CURRENT_SUMMARY_VERSION: u32 = 3;
+// Bumped for SummaryHeader's created_at field.
+pub const CURRENT_SUMMARY_VERSION: u32 = 4;
 
-/// 32-byte header written at offset 0 of `{:06}.summary`.
+/// 44-byte header written at offset 0 of `{:06}.summary`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryHeader {
     pub magic: [u8; 4],
@@ -26,16 +26,33 @@ pub struct SummaryHeader {
     pub generation: u64,
     pub last_tx_id: u64,
     pub next_inode: u64,
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub created_at: std::time::SystemTime,
 }
 
 impl SummaryHeader {
     pub fn new(generation: u64, last_tx_id: u64, next_inode: u64) -> Self {
+        Self::new_with_time(
+            generation,
+            last_tx_id,
+            next_inode,
+            std::time::SystemTime::now(),
+        )
+    }
+
+    pub fn new_with_time(
+        generation: u64,
+        last_tx_id: u64,
+        next_inode: u64,
+        created_at: std::time::SystemTime,
+    ) -> Self {
         Self {
             magic: *SUMMARY_MAGIC,
             version: CURRENT_SUMMARY_VERSION,
             generation,
             last_tx_id,
             next_inode,
+            created_at,
         }
     }
 
@@ -134,6 +151,27 @@ pub fn export_summary(
     last_tx_id: u64,
     next_inode: u64,
 ) -> io::Result<PathBuf> {
+    export_summary_with_time(
+        snapshot,
+        manifest,
+        log_dir,
+        generation,
+        last_tx_id,
+        next_inode,
+        std::time::SystemTime::now(),
+    )
+}
+
+/// Exports a single-file summary snapshot of an inodes snapshot map into `log_dir` with custom created_at timestamp.
+pub fn export_summary_with_time(
+    snapshot: &HashMap<u64, Arc<SyncNode>>,
+    manifest: &crate::log::LogManifest,
+    log_dir: impl AsRef<Path>,
+    generation: u64,
+    last_tx_id: u64,
+    next_inode: u64,
+    created_at: std::time::SystemTime,
+) -> io::Result<PathBuf> {
     let log_dir = log_dir.as_ref();
 
     let mut inodes_snapshot: Vec<(u64, Arc<SyncNode>)> = snapshot
@@ -158,7 +196,7 @@ pub fn export_summary(
     let mut hasher = blake3::Hasher::new();
 
     // 1. Write SummaryHeader at offset 0
-    let header = SummaryHeader::new(generation, last_tx_id, next_inode);
+    let header = SummaryHeader::new_with_time(generation, last_tx_id, next_inode, created_at);
     let header_bytes = header.to_bytes();
     file.write_all(&header_bytes)?;
     hasher.update(&header_bytes);

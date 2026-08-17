@@ -54,6 +54,11 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
         return;
     }
 
+    if fs.is_read_only() && (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0 {
+        req.reply_err(libc::EROFS);
+        return;
+    }
+
     fs.open_handle(ino);
 
     if (flags & libc::O_TRUNC as u32) != 0 {
@@ -75,6 +80,10 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
 
 pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
     log::trace!("write(ino={}, len={}, offset={})", ino, buf.len(), offset);
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+
     if offset < 0 {
         return Err(libc::EINVAL);
     }
@@ -139,6 +148,10 @@ pub fn setattr_core(
         size,
         to_set
     );
+
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
 
     let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
     let now = fs.clock.now();
@@ -221,6 +234,10 @@ pub fn create_core(
     uid: u32,
     gid: u32,
 ) -> Result<FileAttr, i32> {
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+
     let attr = {
         let _dir_guard = fs.dir_lock.lock().unwrap();
         let now = fs.clock.now();

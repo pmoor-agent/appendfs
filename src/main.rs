@@ -93,6 +93,69 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::MountRo(args) | Commands::Mountro(args) => {
+            let log_dir = &args.log_dir;
+            if !log_dir.exists() {
+                eprintln!("Error: Log directory '{:?}' does not exist.", log_dir);
+                std::process::exit(1);
+            }
+
+            let target = if let Some(tx_id) = args.tx_id {
+                appendfs::RecoveryTarget::TxId(tx_id)
+            } else if let Some(ref time_str) = args.at_time {
+                match appendfs::parse_timestamp(time_str) {
+                    Ok(t) => appendfs::RecoveryTarget::Timestamp(t),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else if let Some(target_gen) = args.generation {
+                appendfs::RecoveryTarget::Generation(target_gen)
+            } else {
+                appendfs::RecoveryTarget::Latest
+            };
+
+            println!(
+                "Recovering appendfs state (read-only, target: {:?}) from '{:?}'...",
+                target, log_dir
+            );
+            let mut fs_instance = match appendfs::recover_fs_to_target(log_dir, target) {
+                Ok(fs) => fs,
+                Err(e) => {
+                    eprintln!("Failed to recover volume from '{:?}': {}", log_dir, e);
+                    std::process::exit(1);
+                }
+            };
+            fs_instance.set_log_dir(log_dir);
+            fs_instance.set_read_only(true);
+
+            let effective_tx_id = fs_instance.last_tx_id.load(std::sync::atomic::Ordering::SeqCst);
+            let effective_gen = {
+                let manifest = fs_instance.manifest.read().unwrap();
+                manifest.logs.last().map(|l| l.generation).unwrap_or(1)
+            };
+            let effective_time_str = fs_instance.recovered_time().map_or_else(
+                || "N/A".to_string(),
+                |t| appendfs::format_local_civil_time(t),
+            );
+
+            println!(
+                "Recovered appendfs state (read-only) -> Effective Version: generation {}, last tx_id: {}, timestamp: {}",
+                effective_gen, effective_tx_id, effective_time_str
+            );
+            println!(
+                "Mounting appendfs (read-only) at '{:?}' with log-dir '{:?}' (foreground: {})...",
+                args.mount_point, args.log_dir, args.foreground
+            );
+
+            let fs_instance = Arc::new(fs_instance);
+            let fuse_args = args.to_fuse_args();
+            if let Err(err) = appendfs::mount_ro_arc(fuse_args, fs_instance) {
+                eprintln!("Failed to mount read-only appendfs FUSE filesystem: {}", err);
+                std::process::exit(1);
+            }
+        }
         Commands::Stats(args) => {
             let log_dir = &args.log_dir;
             if !log_dir.exists() {

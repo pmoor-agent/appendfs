@@ -14,22 +14,50 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+
+/// Target boundary for point-in-time recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryTarget {
+    /// Replay all available logs and summaries up to the latest state.
+    Latest,
+    /// Replay up to and including transaction ID `tx_id`.
+    TxId(u64),
+    /// Replay up to and including the given wall-clock timestamp.
+    Timestamp(std::time::SystemTime),
+    /// Replay up to and including log generation `generation`.
+    Generation(u64),
+}
 
 /// Rebuilds complete in-memory filesystem state from summary files and `.log` files
 /// inside `log_dir`, using the real system clock for any timestamp not otherwise
 /// carried by the log itself. See `recover_fs_with_clock` for injecting a different
 /// clock (e.g. for deterministic tests).
 pub fn recover_fs(log_dir: impl AsRef<Path>) -> io::Result<InMemoryFS> {
-    recover_fs_with_clock(log_dir, Arc::new(SystemClock))
+    recover_fs_to_target_with_clock(log_dir, RecoveryTarget::Latest, Arc::new(SystemClock))
 }
 
 /// Same as `recover_fs`, but with an injectable clock instead of always defaulting to
-/// `SystemClock` internally. Most timestamps are reconstructed exactly from what's
-/// carried in the log regardless of this clock; it only matters for the (rare, and
-/// arguably already a lossy edge case) fallback paths that don't have a recorded
-/// timestamp to apply.
+/// `SystemClock` internally.
 pub fn recover_fs_with_clock(
     log_dir: impl AsRef<Path>,
+    clock: Arc<dyn Clock>,
+) -> io::Result<InMemoryFS> {
+    recover_fs_to_target_with_clock(log_dir, RecoveryTarget::Latest, clock)
+}
+
+/// Rebuilds filesystem state from summary and log files up to the specified `target` point in time.
+pub fn recover_fs_to_target(
+    log_dir: impl AsRef<Path>,
+    target: RecoveryTarget,
+) -> io::Result<InMemoryFS> {
+    recover_fs_to_target_with_clock(log_dir, target, Arc::new(SystemClock))
+}
+
+/// Rebuilds filesystem state up to `target` using an injectable clock.
+pub fn recover_fs_to_target_with_clock(
+    log_dir: impl AsRef<Path>,
+    target: RecoveryTarget,
     clock: Arc<dyn Clock>,
 ) -> io::Result<InMemoryFS> {
     let log_dir = log_dir.as_ref();
@@ -40,7 +68,7 @@ pub fn recover_fs_with_clock(
         ));
     }
 
-    // 1. Scan for latest valid single-file .summary snapshot
+    // 1. Scan for eligible single-file .summary snapshots matching the target
     let mut latest_summary: Option<(u64, SummaryReader)> = None;
     if let Ok(entries) = fs::read_dir(log_dir) {
         for entry in entries.flatten() {
@@ -48,15 +76,18 @@ pub fn recover_fs_with_clock(
             if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("summary") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     if let Ok(gen_num) = stem.parse::<u64>() {
-                        // SummaryReader::open panics outright on a checksum mismatch
-                        // (proven corruption - see its doc comment), so an Err reaching
-                        // here only ever means "not a valid summary" (bad magic/stale
-                        // version, or a stray file) - not corruption, so it's safe to
-                        // just skip and fall back to an older summary or full replay.
                         match SummaryReader::open(&path) {
                             Ok(reader) => {
-                                if latest_summary.as_ref().map_or(true, |(g, _)| gen_num > *g) {
-                                    latest_summary = Some((gen_num, reader));
+                                let eligible = match target {
+                                    RecoveryTarget::Latest => true,
+                                    RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
+                                    RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
+                                    RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
+                                };
+                                if eligible {
+                                    if latest_summary.as_ref().map_or(true, |(g, _)| gen_num > *g) {
+                                        latest_summary = Some((gen_num, reader));
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -87,18 +118,12 @@ pub fn recover_fs_with_clock(
     let mut fs_instance = InMemoryFS::with_clock(clock);
     fs_instance.set_log_dir(log_dir);
 
-    // Root (inode 1) is created implicitly, never through a log record, so nothing in
-    // replay ever touches its timestamps - `InMemoryFS::with_clock` just stamped it with
-    // "now" at this recovery call, which is wrong whenever a summary isn't around to
-    // supply the real value (handled below). The oldest surviving log file's FileHeader
-    // was written at essentially the same moment the filesystem (and its root) was first
-    // created - see `main.rs`, which creates `InMemoryFS::new()` immediately before the
-    // generation-1 `LogWriter` - so it's the best available stand-in for root's actual
-    // creation time.
+    let mut last_op_time: Option<SystemTime> = None;
     if latest_summary.is_none() {
         if let Some((_, oldest_path)) = log_files.first() {
             if let Ok(oldest_reader) = LogReader::open(oldest_path) {
                 let created = oldest_reader.file_header().created_at;
+                last_op_time = Some(created);
                 if let Some(root_arc) = fs_instance.base.read().unwrap().get(&1) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let root_node = unsafe { root_arc.write() };
@@ -132,6 +157,7 @@ pub fn recover_fs_with_clock(
         let inodes_map = reader.read_all_inodes()?;
         let next_ino = reader.header.next_inode;
         last_tx_id = reader.header.last_tx_id;
+        last_op_time = Some(reader.header.created_at);
 
         *fs_instance.base.write().unwrap() = inodes_map;
         *fs_instance.manifest.write().unwrap() = reader.manifest.clone();
@@ -144,24 +170,26 @@ pub fn recover_fs_with_clock(
         .load(Ordering::SeqCst)
         .saturating_sub(1);
 
-    // 3. Replay log files with generation > min_log_gen (since min_log_gen is fully snapshot by summary)
+    let mut target_cutoff_reached = false;
+
+    // 3. Replay log files with generation > min_log_gen
     for (gen_num, path) in log_files {
         if gen_num <= min_log_gen && min_log_gen > 0 {
             continue;
         }
 
-        // Records are buffered here until a matching FlushCommit trailer confirms the
-        // whole run is complete and safe to apply. LogWriter never rolls mid-batch (see
-        // LogWriter::roll_if_needed), so a batch can never span two generation files -
-        // this buffer is reset fresh per file, nothing needs to carry across the outer
-        // loop. A non-empty `pending` left over at end-of-file means the writer crashed
-        // partway through a flush: that trailing, uncommitted run is discarded below
-        // rather than partially applied.
+        if let RecoveryTarget::Generation(max_gen) = target {
+            if gen_num > max_gen {
+                break;
+            }
+        }
+
         let mut pending: Vec<LogRecord> = Vec::new();
         let mut committed_records_count = 0u32;
         let mut log_data_bytes = 0u64;
 
         let reader = LogReader::open(&path)?;
+        let log_created_at = reader.file_header().created_at;
         for record_res in reader {
             let record = match record_res {
                 Ok(r) => r,
@@ -175,15 +203,12 @@ pub fn recover_fs_with_clock(
             };
 
             let header = record.header;
-            if header.tx_id > last_tx_id {
-                last_tx_id = header.tx_id;
-            }
-            let target_ino = header.inode;
-            if target_ino > max_inode {
-                max_inode = target_ino;
-            }
 
             if header.op_code == OpCode::FlushCommit {
+                if header.tx_id > last_tx_id {
+                    last_tx_id = header.tx_id;
+                }
+
                 let commit =
                     bincode::deserialize::<FlushCommitPayload>(&record.payload).map_err(|e| {
                         io::Error::new(
@@ -195,11 +220,6 @@ pub fn recover_fs_with_clock(
                         )
                     })?;
 
-                // Every individual record's own checksum already passed (LogReader
-                // verifies that before yielding it) by the time we get here, so the
-                // only way record_count can disagree with what was actually buffered
-                // is a bug in the writer, not bitrot - fail hard rather than silently
-                // dropping a batch that might otherwise be entirely valid.
                 if commit.record_count as usize != pending.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -215,6 +235,33 @@ pub fn recover_fs_with_clock(
                 committed_records_count += commit.record_count + 1;
 
                 for buffered in pending.drain(..) {
+                    // Check if this record exceeds point-in-time recovery target
+                    match target {
+                        RecoveryTarget::TxId(max_tx) => {
+                            if buffered.header.tx_id > max_tx {
+                                target_cutoff_reached = true;
+                                break;
+                            }
+                        }
+                        RecoveryTarget::Timestamp(max_time) => {
+                            if let Some(op_time) = record_op_time(&buffered) {
+                                if op_time > max_time {
+                                    target_cutoff_reached = true;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    if buffered.header.tx_id > last_tx_id {
+                        last_tx_id = buffered.header.tx_id;
+                    }
+                    let target_ino = buffered.header.inode;
+                    if target_ino > max_inode {
+                        max_inode = target_ino;
+                    }
+
                     if buffered.header.op_code == OpCode::Write {
                         if let Ok(meta) = bincode::deserialize::<WriteMeta>(&buffered.payload) {
                             let meta_bytes = bincode::serialize(&meta).unwrap_or_default();
@@ -224,14 +271,21 @@ pub fn recover_fs_with_clock(
                             }
                         }
                     }
+                    if let Some(op_time) = record_op_time(&buffered) {
+                        last_op_time = Some(op_time);
+                    }
                     apply_record(&fs_instance, gen_num, &buffered);
+                }
+
+                if target_cutoff_reached {
+                    break;
                 }
             } else {
                 pending.push(record);
             }
         }
 
-        if !pending.is_empty() {
+        if !pending.is_empty() && !target_cutoff_reached {
             log::warn!(
                 "Discarding {} uncommitted record(s) at end of generation {} (crash mid-flush)",
                 pending.len(),
@@ -245,6 +299,7 @@ pub fn recover_fs_with_clock(
             if manifest.get_by_generation(gen_num).is_none() {
                 if manifest.logs.len() == 1 && manifest.logs[0].generation == 1 && min_log_gen == 0 && gen_num == 1 {
                     let entry = &mut manifest.logs[0];
+                    entry.created_at = log_created_at;
                     entry.record_count = committed_records_count;
                     entry.total_data_bytes = log_data_bytes;
                     entry.total_bytes = log_file_len;
@@ -252,6 +307,7 @@ pub fn recover_fs_with_clock(
                     manifest.record_roll(
                         gen_num,
                         format!("{:06}.log", gen_num),
+                        log_created_at,
                         crate::log::record::FILE_HEADER_SIZE as u64,
                     );
                     if let Some(entry) = manifest.get_mut_by_generation(gen_num) {
@@ -261,10 +317,15 @@ pub fn recover_fs_with_clock(
                     }
                 }
             } else if let Some(entry) = manifest.get_mut_by_generation(gen_num) {
+                entry.created_at = log_created_at;
                 entry.record_count = committed_records_count;
                 entry.total_data_bytes = log_data_bytes;
                 entry.total_bytes = log_file_len;
             }
+        }
+
+        if target_cutoff_reached {
+            break;
         }
     }
 
@@ -282,8 +343,45 @@ pub fn recover_fs_with_clock(
         }
     });
     fs_instance.last_tx_id.store(last_tx_id, Ordering::SeqCst);
+    fs_instance.set_recovered_time(last_op_time);
 
     Ok(fs_instance)
+}
+
+/// Helper extracting operation timestamp from a deserialized record payload.
+fn record_op_time(record: &LogRecord) -> Option<std::time::SystemTime> {
+    match record.header.op_code {
+        OpCode::Create => bincode::deserialize::<CreatePayload>(&record.payload)
+            .ok()
+            .map(|p| p.created_at),
+        OpCode::Mkdir => bincode::deserialize::<MkdirPayload>(&record.payload)
+            .ok()
+            .map(|p| p.created_at),
+        OpCode::Symlink => bincode::deserialize::<SymlinkPayload>(&record.payload)
+            .ok()
+            .map(|p| p.created_at),
+        OpCode::Link => bincode::deserialize::<LinkPayload>(&record.payload)
+            .ok()
+            .map(|p| p.op_time),
+        OpCode::Unlink => bincode::deserialize::<UnlinkPayload>(&record.payload)
+            .ok()
+            .map(|p| p.op_time),
+        OpCode::Rmdir => bincode::deserialize::<RmdirPayload>(&record.payload)
+            .ok()
+            .map(|p| p.op_time),
+        OpCode::Rename => bincode::deserialize::<RenamePayload>(&record.payload)
+            .ok()
+            .map(|p| p.op_time),
+        OpCode::Setattr => bincode::deserialize::<SetattrPayload>(&record.payload)
+            .ok()
+            .map(|p| p.op_time),
+        OpCode::Write => bincode::deserialize::<WriteMeta>(&record.payload)
+            .ok()
+            .map(|p| p.op_time),
+        OpCode::FlushCommit => bincode::deserialize::<FlushCommitPayload>(&record.payload)
+            .ok()
+            .map(|p| p.timestamp),
+    }
 }
 
 /// Applies one already-committed log record to `fs_instance`'s in-memory state. Only
@@ -790,5 +888,92 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         OpCode::FlushCommit => {
             // Never buffered/applied - recover_fs handles these directly.
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::AdvancingClock;
+    use crate::log::LogWriter;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn test_recovery_to_specific_tx_id() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::init_volume(dir.path(), Some("main")).unwrap();
+
+        let mut fs = recover_fs(dir.path()).unwrap();
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        fs.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        fs.log_writer = Some(writer);
+        fs.set_log_dir(dir.path());
+
+        // Tx 1: Create dir "step1"
+        let d1 = crate::operations::dir::mkdir_core(&fs, 1, "step1", 0o755, 1000, 1000).unwrap();
+        fs.sync_log().unwrap();
+
+        // Tx 2: Create file "file1.txt" inside "step1"
+        let f1 = crate::operations::read_write::create_core(&fs, d1.ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f1.ino, b"version 1", 0).unwrap();
+        fs.sync_log().unwrap();
+
+        // Tx 3: Create file "file2.txt" inside "step1"
+        let f2 = crate::operations::read_write::create_core(&fs, d1.ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f2.ino, b"version 2", 0).unwrap();
+        fs.sync_log().unwrap();
+
+        // 1. Recover to Latest -> step1, file1.txt, file2.txt all exist
+        let fs_latest = recover_fs(dir.path()).unwrap();
+        assert!(fs_latest.lookup_child(1, "step1").is_some());
+        let d1_ino = fs_latest.lookup_child(1, "step1").unwrap();
+        assert!(fs_latest.lookup_child(d1_ino, "file1.txt").is_some());
+        assert!(fs_latest.lookup_child(d1_ino, "file2.txt").is_some());
+
+        // 2. Recover to TxId(1) or TxId(4) -> only step1 exists, no file1.txt or file2.txt
+        let fs_tx1 = recover_fs_to_target(dir.path(), RecoveryTarget::TxId(1)).unwrap();
+        assert!(fs_tx1.lookup_child(1, "step1").is_some());
+        let d1_tx1 = fs_tx1.lookup_child(1, "step1").unwrap();
+        assert!(fs_tx1.lookup_child(d1_tx1, "file1.txt").is_none());
+        assert!(fs_tx1.lookup_child(d1_tx1, "file2.txt").is_none());
+
+        // 3. Recover to TxId(6) -> step1 and file1.txt exist, but not file2.txt
+        let fs_tx6 = recover_fs_to_target(dir.path(), RecoveryTarget::TxId(6)).unwrap();
+        let d1_tx6 = fs_tx6.lookup_child(1, "step1").unwrap();
+        assert!(fs_tx6.lookup_child(d1_tx6, "file1.txt").is_some());
+        assert!(fs_tx6.lookup_child(d1_tx6, "file2.txt").is_none());
+    }
+
+    #[test]
+    fn test_recovery_to_specific_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::init_volume(dir.path(), Some("main")).unwrap();
+
+        let mut fs = recover_fs(dir.path()).unwrap();
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        fs.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        fs.log_writer = Some(writer);
+        fs.set_log_dir(dir.path());
+
+        // T = 1000: Create "early_dir"
+        crate::operations::dir::mkdir_core(&fs, 1, "early_dir", 0o755, 1000, 1000).unwrap();
+        fs.sync_log().unwrap();
+
+        // Advance clock to T = 2000
+        clock.advance(Duration::from_secs(1000));
+        crate::operations::dir::mkdir_core(&fs, 1, "late_dir", 0o755, 1000, 1000).unwrap();
+        fs.sync_log().unwrap();
+
+        // Recover at T = 1500 -> early_dir exists, late_dir does not
+        let fs_t1500 = recover_fs_to_target(dir.path(), RecoveryTarget::Timestamp(UNIX_EPOCH + Duration::from_secs(1500))).unwrap();
+        assert!(fs_t1500.lookup_child(1, "early_dir").is_some());
+        assert!(fs_t1500.lookup_child(1, "late_dir").is_none());
+
+        // Recover at T = 2500 -> both exist
+        let fs_t2500 = recover_fs_to_target(dir.path(), RecoveryTarget::Timestamp(UNIX_EPOCH + Duration::from_secs(2500))).unwrap();
+        assert!(fs_t2500.lookup_child(1, "early_dir").is_some());
+        assert!(fs_t2500.lookup_child(1, "late_dir").is_some());
     }
 }

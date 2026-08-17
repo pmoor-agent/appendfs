@@ -3,6 +3,10 @@ use crate::node::{AttrDelta, NodeDelta, SymlinkDelta};
 use crate::shim::{FileAttr, FileType, Request};
 
 pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+
     {
         let _dir_guard = fs.dir_lock.lock().unwrap();
         let now = fs.clock.now();
@@ -61,6 +65,10 @@ pub fn symlink_core(
     uid: u32,
     gid: u32,
 ) -> Result<FileAttr, i32> {
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+
     let attr = {
         let _dir_guard = fs.dir_lock.lock().unwrap();
         let now = fs.clock.now();
@@ -150,6 +158,10 @@ pub fn rename_core(
     newparent: u64,
     newname: &str,
 ) -> Result<(), i32> {
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+
     {
         let _dir_guard = fs.dir_lock.lock().unwrap();
         let now = fs.clock.now();
@@ -265,6 +277,10 @@ pub fn link_core(
     newparent: u64,
     newname: &str,
 ) -> Result<FileAttr, i32> {
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+
     {
         let _dir_guard = fs.dir_lock.lock().unwrap();
         let now = fs.clock.now();

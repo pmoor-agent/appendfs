@@ -821,6 +821,18 @@ pub fn mount(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), i32> {
     mount_arc(args, std::sync::Arc::new(fs))
 }
 
+pub fn mount_ro(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), i32> {
+    mount_ro_arc(args, std::sync::Arc::new(fs))
+}
+
+pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), i32> {
+    fs.set_read_only(true);
+    // Injects kernel-level read-only mount option
+    args.push("-o".to_string());
+    args.push("ro".to_string());
+    mount_arc(args, fs)
+}
+
 pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), i32> {
     let c_args_owners: Vec<CString> = args
         .into_iter()
@@ -859,10 +871,12 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
 
     let code = unsafe { run_fuse_ll(c_args.len() as c_int, c_args.as_ptr(), &ops, raw_userdata) };
 
-    // Clean up heap allocation and execute unmount flush/sync
+    // Clean up heap allocation and execute unmount flush/sync (only on read-write mounts)
     unsafe {
         let arc_fs = Box::from_raw(raw_userdata as *mut std::sync::Arc<crate::fs::InMemoryFS>);
-        let _ = arc_fs.sync_and_export_summary();
+        if !arc_fs.is_read_only() {
+            let _ = arc_fs.sync_and_export_summary();
+        }
     }
 
     if code == 0 { Ok(()) } else { Err(code) }
