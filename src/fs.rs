@@ -69,6 +69,7 @@ impl InMemoryFS {
         map.insert(
             1,
             Arc::new(SyncNode::new(Node::Directory {
+                parent: 1,
                 entries: Vec::new(),
                 perm: 0o755,
                 nlink: 2,
@@ -188,6 +189,60 @@ impl InMemoryFS {
         }
     }
 
+    pub fn update_dir_parent(&self, ino: u64, new_parent: u64) {
+        let mut live = self.live.write().unwrap();
+        let entry = live
+            .entry(ino)
+            .or_insert_with(|| EntryDelta::Node(NodeDelta::Directory(DirectoryDelta::default())));
+        if let EntryDelta::Node(NodeDelta::Directory(d)) = entry {
+            d.parent = Some(new_parent);
+        }
+    }
+
+    pub fn get_parent_dir_inode(&self, ino: u64) -> Option<u64> {
+        if ino == 1 {
+            return Some(1);
+        }
+
+        // 1. Check live delta
+        if let Some(entry) = self.live.read().unwrap().get(&ino) {
+            match entry {
+                EntryDelta::Tombstone => return None,
+                EntryDelta::Node(NodeDelta::Directory(d)) => {
+                    if let Some(p) = d.parent {
+                        return Some(p);
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        // 2. Check flushing delta
+        if let Some(flushing) = self.flushing.read().unwrap().as_ref() {
+            if let Some(entry) = flushing.get(&ino) {
+                match entry {
+                    EntryDelta::Tombstone => return None,
+                    EntryDelta::Node(NodeDelta::Directory(d)) => {
+                        if let Some(p) = d.parent {
+                            return Some(p);
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        // 3. Check base
+        if let Some(arc) = self.base.read().unwrap().get(&ino) {
+            let node = unsafe { arc.read() };
+            if let Node::Directory { parent, .. } = node {
+                return Some(*parent);
+            }
+        }
+
+        None
+    }
+
     pub fn update_attr_delta(&self, ino: u64, delta: AttrDelta) {
         let mut live = self.live.write().unwrap();
         if let Some(EntryDelta::Node(node_delta)) = live.get_mut(&ino) {
@@ -230,6 +285,7 @@ impl InMemoryFS {
                 live.insert(
                     ino,
                     EntryDelta::Node(NodeDelta::Directory(DirectoryDelta {
+                        parent: None,
                         added: HashMap::new(),
                         removed: HashSet::new(),
                         attr_delta: delta,
@@ -1498,6 +1554,7 @@ fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
     match (node, delta) {
         (
             Node::Directory {
+                parent,
                 entries,
                 perm,
                 nlink,
@@ -1509,6 +1566,9 @@ fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
             },
             NodeDelta::Directory(d),
         ) => {
+            if let Some(p) = d.parent {
+                *parent = p;
+            }
             for rem in &d.removed {
                 entries.retain(|(name, _)| name != rem);
             }
@@ -1629,6 +1689,7 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
                 d.added.iter().map(|(k, v)| (k.clone(), *v)).collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             Node::Directory {
+                parent: d.parent.unwrap_or(1),
                 entries,
                 perm: d.attr_delta.mode.unwrap_or(0o755),
                 nlink: d.attr_delta.nlink.unwrap_or(2),
@@ -1669,71 +1730,7 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
 }
 
 pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
-    // 1. Check live delta directory additions
-    {
-        let live = fs.live.read().unwrap();
-        for (parent_ino, entry) in live.iter() {
-            if let EntryDelta::Node(NodeDelta::Directory(d)) = entry {
-                if d.added.values().any(|&c| c == child_ino) {
-                    return Some(*parent_ino);
-                }
-            }
-        }
-    }
-
-    // 2. Check flushing delta directory additions
-    {
-        let flushing = fs.flushing.read().unwrap();
-        if let Some(map) = flushing.as_ref() {
-            for (parent_ino, entry) in map.iter() {
-                if let EntryDelta::Node(NodeDelta::Directory(d)) = entry {
-                    if d.added.values().any(|&c| c == child_ino) {
-                        return Some(*parent_ino);
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Check base directory entries, respecting removes in flushing and live
-    {
-        let live = fs.live.read().unwrap();
-        let flushing = fs.flushing.read().unwrap();
-        let base = fs.base.read().unwrap();
-        for (parent_ino, node_arc) in base.iter() {
-            let node = unsafe { node_arc.read() };
-            if let Node::Directory { entries, .. } = &*node {
-                for (name, c_ino) in entries {
-                    if *c_ino == child_ino {
-                        let mut removed = false;
-                        if let Some(EntryDelta::Node(NodeDelta::Directory(d))) =
-                            live.get(parent_ino)
-                        {
-                            if d.removed.contains(name) {
-                                removed = true;
-                            }
-                        }
-                        if !removed {
-                            if let Some(flush_map) = flushing.as_ref() {
-                                if let Some(EntryDelta::Node(NodeDelta::Directory(d))) =
-                                    flush_map.get(parent_ino)
-                                {
-                                    if d.removed.contains(name) {
-                                        removed = true;
-                                    }
-                                }
-                            }
-                        }
-                        if !removed {
-                            return Some(*parent_ino);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
+    fs.get_parent_dir_inode(child_ino)
 }
 
 #[cfg(test)]
@@ -1803,5 +1800,44 @@ mod tests {
         let data = fs.read_file_data(ino, 0, 50).unwrap();
         let expected: Vec<u8> = (0..50u8).collect();
         assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_directory_parent_tracking_across_mkdir_rename_and_flush() {
+        let clock = Arc::new(crate::clock::MockClock(SystemTime::UNIX_EPOCH));
+        let fs = InMemoryFS::with_clock(clock);
+
+        // Root inode 1 parent is 1
+        assert_eq!(fs.get_parent_dir_inode(1), Some(1));
+
+        // Create dir1 (child of root)
+        let dir1 = crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap().ino;
+        assert_eq!(fs.get_parent_dir_inode(dir1), Some(1));
+
+        // Create dir2 (child of dir1)
+        let dir2 = crate::operations::dir::mkdir_core(&fs, dir1, "dir2", 0o755, 1000, 1000).unwrap().ino;
+        assert_eq!(fs.get_parent_dir_inode(dir2), Some(dir1));
+
+        // Create dir3 (child of root)
+        let dir3 = crate::operations::dir::mkdir_core(&fs, 1, "dir3", 0o755, 1000, 1000).unwrap().ino;
+        assert_eq!(fs.get_parent_dir_inode(dir3), Some(1));
+
+        // Move dir2 from dir1 into dir3
+        crate::operations::links::rename_core(&fs, dir1, "dir2", dir3, "dir2_moved").unwrap();
+        assert_eq!(fs.get_parent_dir_inode(dir2), Some(dir3));
+
+        // Fold live to base
+        {
+            let mut live = fs.live.write().unwrap();
+            let mut flushing = fs.flushing.write().unwrap();
+            *flushing = Some(std::mem::take(&mut *live));
+        }
+        fs.fold_flush();
+
+        // Verify parent relations are preserved in base after fold
+        assert_eq!(fs.get_parent_dir_inode(1), Some(1));
+        assert_eq!(fs.get_parent_dir_inode(dir1), Some(1));
+        assert_eq!(fs.get_parent_dir_inode(dir3), Some(1));
+        assert_eq!(fs.get_parent_dir_inode(dir2), Some(dir3));
     }
 }

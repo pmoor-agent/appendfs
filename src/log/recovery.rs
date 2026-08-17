@@ -293,6 +293,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             if let Ok(mkdir) = bincode::deserialize::<MkdirPayload>(&record.payload) {
                 let now = crate::clock::unix_to_system_time(mkdir.created_at.0, mkdir.created_at.1);
                 let new_node = Arc::new(SyncNode::new(Node::Directory {
+                    parent: mkdir.parent,
                     entries: Vec::new(),
                     perm: mkdir.mode & 0o777,
                     nlink: 2,
@@ -558,6 +559,15 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         None
                     }
                 };
+
+                if rename.parent != rename.new_parent {
+                    if let Some(target_node_arc) = map.get(&target_ino) {
+                        let target_node = unsafe { target_node_arc.write() };
+                        if let Node::Directory { parent, .. } = target_node {
+                            *parent = rename.new_parent;
+                        }
+                    }
+                }
 
                 // Mirror live rename's overwrite semantics: the clobbered destination
                 // inode loses a link and is reclaimed once its nlink reaches zero.

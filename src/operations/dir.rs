@@ -123,6 +123,7 @@ pub fn mkdir_core(
 
     let new_ino = fs.allocate_inode();
     let new_delta = NodeDelta::Directory(DirectoryDelta {
+        parent: Some(parent),
         added: HashMap::new(),
         removed: std::collections::HashSet::new(),
         attr_delta: AttrDelta {

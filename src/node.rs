@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Node {
     Directory {
+        parent: u64,
         entries: Vec<(String, u64)>,
         perm: u32,
         nlink: u32,
@@ -75,6 +76,7 @@ pub struct AttrDelta {
 
 #[derive(Debug, Clone, Default)]
 pub struct DirectoryDelta {
+    pub parent: Option<u64>,
     pub added: std::collections::HashMap<String, u64>,
     pub removed: std::collections::HashSet<String>,
     pub attr_delta: AttrDelta,

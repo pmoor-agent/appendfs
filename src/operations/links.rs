@@ -224,6 +224,9 @@ pub fn rename_core(
 
     fs.remove_dir_entry(parent, name, now);
     fs.add_dir_entry(newparent, newname, source_ino, now);
+    if src_is_dir && parent != newparent {
+        fs.update_dir_parent(source_ino, newparent);
+    }
 
     Ok(())
 }
