@@ -320,6 +320,45 @@ pub fn export_fs_summary(
     )
 }
 
+/// Explicitly initializes a fresh, empty appendfs volume at `log_dir`.
+/// Creates `000000.summary` containing the root directory (inode 1) and an initial LogManifest.
+pub fn init_volume(log_dir: impl AsRef<Path>, branch: Option<&str>) -> io::Result<PathBuf> {
+    let log_dir = log_dir.as_ref();
+    std::fs::create_dir_all(log_dir)?;
+
+    // Verify directory does not already contain an initialized volume (.summary or .log)
+    if let Ok(entries) = std::fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if ext == "summary" || ext == "log" {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "Volume already initialized at {:?} (found existing {} file {:?})",
+                                log_dir, ext, path.file_name().unwrap_or_default()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let fs = InMemoryFS::new();
+    let snapshot = fs.snapshot_all();
+    let branch_name = branch.unwrap_or("main");
+    let manifest = crate::log::LogManifest {
+        branch: branch_name.to_string(),
+        logs: Vec::new(),
+        next_generation: 1,
+        next_filename: "000001.log".to_string(),
+    };
+
+    export_summary(&snapshot, &manifest, log_dir, 0, 0, 2)
+}
+
 /// Reader for single-file `{:06}.summary` snapshot files.
 pub struct SummaryReader {
     file: File,
@@ -528,5 +567,32 @@ mod tests {
         // Bitrot in the whole-file checksum must panic, not return an Err a caller
         // could silently swallow and fall back past - see SummaryReader::open.
         let _ = SummaryReader::open(&path);
+    }
+
+    #[test]
+    fn test_init_volume_creates_valid_summary_and_manifest() {
+        let dir = tempdir().unwrap();
+        let summary_path = init_volume(dir.path(), Some("feature-test")).unwrap();
+        assert!(summary_path.exists());
+        assert_eq!(summary_path.file_name().unwrap(), "000000.summary");
+
+        // Verify SummaryReader opens it cleanly
+        let mut reader = SummaryReader::open(&summary_path).unwrap();
+        assert_eq!(reader.header.generation, 0);
+        assert_eq!(reader.header.last_tx_id, 0);
+        assert_eq!(reader.header.next_inode, 2);
+        assert_eq!(reader.footer.entry_count, 1);
+        assert_eq!(reader.manifest.branch, "feature-test");
+        assert_eq!(reader.manifest.next_generation, 1);
+        assert_eq!(reader.manifest.next_filename, "000001.log");
+        assert!(reader.manifest.logs.is_empty());
+
+        let root_node = reader.read_node(1).unwrap().unwrap();
+        assert!(matches!(root_node, Node::Directory { .. }));
+
+        // Re-initializing on the same directory must fail with AlreadyExists
+        let re_init = init_volume(dir.path(), Some("feature-test"));
+        assert!(re_init.is_err());
+        assert_eq!(re_init.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
     }
 }

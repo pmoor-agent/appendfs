@@ -21,6 +21,6 @@ pub use record::{
 pub use recovery::{recover_fs, recover_fs_with_clock};
 pub use summary::{
     SummaryFooter, SummaryHeader, SummaryIndexEntry, SummaryReader, export_fs_summary,
-    export_summary,
+    export_summary, init_volume,
 };
 pub use writer::LogWriter;

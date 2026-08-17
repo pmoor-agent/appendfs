@@ -81,7 +81,7 @@ impl LogManifest {
 }
 
 /// Dynamically computed live extent statistics for a single log generation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationLiveStats {
     pub generation: u64,
     pub filename: String,

@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,16 +10,40 @@ pub const DEFAULT_MAX_LOG_SIZE: u64 = 1024 * 1024 * 1024;
     name = "appendfs",
     author,
     version,
-    about = "High-performance log-structured FUSE filesystem"
+    about = "High-performance log-structured FUSE filesystem with append-only storage"
 )]
-pub struct CliArgs {
-    /// Target directory path where the FUSE filesystem will be mounted
-    #[arg(required = true)]
-    pub mount_point: PathBuf,
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
 
-    /// Directory path where append-only .log files are stored and recovered
-    #[arg(short = 'l', long = "log-dir", required = true)]
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Initialize a fresh, empty appendfs volume
+    Init(InitArgs),
+    /// Mount an initialized appendfs volume as a FUSE filesystem
+    Mount(MountArgs),
+    /// Display volume statistics, inode breakdown, and log live extent ratios
+    Stats(StatsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct InitArgs {
+    /// Directory path where the appendfs volume log and summary files will be stored
     pub log_dir: PathBuf,
+
+    /// Initial branch name (default: "main")
+    #[arg(long = "branch", default_value = "main")]
+    pub branch: String,
+}
+
+#[derive(Args, Debug)]
+pub struct MountArgs {
+    /// Directory path where appendfs volume log and summary files are stored
+    pub log_dir: PathBuf,
+
+    /// Target mount point directory where the FUSE filesystem will be mounted
+    pub mount_point: PathBuf,
 
     /// Run FUSE in foreground mode (do not daemonize)
     #[arg(short = 'f', long = "foreground", default_value_t = false)]
@@ -29,7 +53,7 @@ pub struct CliArgs {
     #[arg(short = 'i', long = "flush-interval", default_value_t = 60)]
     pub flush_interval: u64,
 
-    /// Maximum log file size in bytes before rolling to next generation (default: 1073741824 / 1 GiB)
+    /// Maximum log file size in bytes before rolling to next generation (default: 1 GiB)
     #[arg(short = 's', long = "max-log-size", default_value_t = DEFAULT_MAX_LOG_SIZE)]
     pub max_log_size: u64,
 
@@ -38,7 +62,7 @@ pub struct CliArgs {
     pub fuse_options: Vec<String>,
 }
 
-impl CliArgs {
+impl MountArgs {
     /// Formats CLI arguments into libfuse-compatible C-style argv.
     pub fn to_fuse_args(&self) -> Vec<String> {
         let mut fuse_args = vec![
@@ -54,6 +78,16 @@ impl CliArgs {
         }
         fuse_args
     }
+}
+
+#[derive(Args, Debug)]
+pub struct StatsArgs {
+    /// Directory path where the appendfs volume log and summary files are stored
+    pub log_dir: PathBuf,
+
+    /// Output statistics in JSON format
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
 }
 
 /// Helper scanning `log_dir` for existing `.log` files to find the highest generation number.

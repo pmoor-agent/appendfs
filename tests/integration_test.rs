@@ -1074,3 +1074,84 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
     assert_eq!(gen2.live_extents, 1);
     assert!((gen2.live_ratio - 1.0).abs() < 1e-6);
 }
+
+#[test]
+fn test_volume_init_mount_and_stats_flow() {
+    let clock = Arc::new(appendfs::SystemClock);
+    let log_dir = tempfile::Builder::new()
+        .prefix("appendfs_init_vol_")
+        .tempdir()
+        .unwrap();
+    let log_path = log_dir.path().to_path_buf();
+
+    // 1. Explicitly initialize empty volume
+    let summary_path = appendfs::init_volume(&log_path, Some("work")).unwrap();
+    assert!(summary_path.exists());
+    assert_eq!(summary_path.file_name().unwrap(), "000000.summary");
+
+    // 2. Mount initialized volume
+    let mut fs_instance = appendfs::recover_fs(&log_path).unwrap();
+    let next_gen = fs_instance.manifest.read().unwrap().next_generation;
+    assert_eq!(next_gen, 1);
+
+    let writer = Arc::new(
+        appendfs::LogWriter::create_with_max_size(&log_path, next_gen, &*clock, 1024 * 1024).unwrap(),
+    );
+    fs_instance.log_writer = Some(Arc::clone(&writer));
+    fs_instance.set_log_dir(&log_path);
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("appendfs_init_mount_")
+        .tempdir()
+        .unwrap();
+    let mount_path = temp_dir.path().to_path_buf();
+    let mount_path_str = mount_path.to_str().unwrap().to_string();
+
+    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
+    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
+
+    let mount_path_clone = mount_path.clone();
+    let handle = thread::spawn(move || {
+        let args = vec![
+            "test_init_mount".to_string(),
+            mount_path_clone.to_str().unwrap().to_string(),
+            "-f".to_string(),
+        ];
+        let _ = appendfs::mount(args, fs_instance);
+    });
+
+    for _ in 0..200 {
+        if let Ok(meta) = fs::metadata(&mount_path) {
+            if meta.dev() != initial_dev {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Create a directory and file
+    let docs = mount_path.join("docs");
+    fs::create_dir(&docs).unwrap();
+    let note = docs.join("note.txt");
+    fs::write(&note, "hello appendfs volume").unwrap();
+
+    // Unmount
+    unmount_fuse(&mount_path_str);
+    handle.join().unwrap();
+
+    // 3. Inspect volume with stats
+    let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
+    let stats = appendfs::VolumeStats::collect(&recovered_fs);
+
+    assert_eq!(stats.branch, "work");
+    assert_eq!(stats.total_inodes, 3); // root (1) + docs (2) + note.txt (3)
+    assert_eq!(stats.directory_count, 2);
+    assert_eq!(stats.file_count, 1);
+    assert_eq!(stats.symlink_count, 0);
+    assert_eq!(stats.total_logical_bytes, 21);
+
+    let display = stats.display_text();
+    assert!(display.contains("Branch:              work"));
+    assert!(display.contains("Total Inodes:        3 (2 directories, 1 files, 0 symlinks)"));
+    assert!(display.contains("000001.log"));
+}
