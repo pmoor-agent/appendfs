@@ -126,7 +126,7 @@ impl VolumeStats {
         } else {
             writeln!(
                 out,
-                "{:<14} {:<10} {:<12} {:<12} {:<12} {:<8} {:<12} {}",
+                "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
                 "LOG FILE",
                 "RECORDS",
                 "LOG SIZE",
@@ -139,7 +139,7 @@ impl VolumeStats {
             .unwrap();
             writeln!(
                 out,
-                "{:-<14} {:-<10} {:-<12} {:-<12} {:-<12} {:-<8} {:-<12} {:-<20}",
+                "{:-<14} {:-<10} {:-<12} {:-<12} {:-<12} {:-<8} {:-<12}  {:-<24}",
                 "", "", "", "", "", "", "", ""
             )
             .unwrap();
@@ -155,16 +155,17 @@ impl VolumeStats {
                     "Healthy"
                 };
 
+                let ratio_str = format!("{:.1}%", g.live_ratio * 100.0);
                 writeln!(
                     out,
-                    "{:<14} {:<10} {:<12} {:<12} {:<12} {:<8} {:<11.1}% {}",
+                    "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
                     g.filename,
                     g.record_count,
                     format_bytes(g.total_bytes),
                     format_bytes(g.total_data_bytes),
                     format_bytes(g.live_bytes),
                     g.live_extents,
-                    g.live_ratio * 100.0,
+                    ratio_str,
                     status,
                 )
                 .unwrap();
