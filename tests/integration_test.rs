@@ -1173,4 +1173,28 @@ fn test_volume_init_mount_and_stats_flow() {
     assert!(display.contains("Branch:              work"));
     assert!(display.contains("Total Inodes:        3 (2 directories, 1 files, 0 symlinks)"));
     assert!(display.contains("000001.log"));
+
+    // 5. Test dump command on the generated 000001.log file
+    let log_file = log_path.join("000001.log");
+    assert!(log_file.exists());
+
+    // Summary level (verbosity 0)
+    let dump_v0 = appendfs::dump_log_file(&log_file, 0).unwrap();
+    assert!(dump_v0.contains("File Size:"));
+    assert!(dump_v0.contains("Committed Flushes:"));
+    assert!(dump_v0.contains("Trailing Batch:      None"));
+    assert!(dump_v0.contains("Create"));
+    assert!(dump_v0.contains("Write"));
+
+    // Record stream level (verbosity 1)
+    let dump_v1 = appendfs::dump_log_file(&log_file, 1).unwrap();
+    assert!(dump_v1.contains("Create"));
+    assert!(dump_v1.contains("Write"));
+    assert!(dump_v1.contains("note.txt"));
+    assert!(dump_v1.contains("[COMMITTED]"));
+
+    // Full hex payload level (verbosity 2)
+    let dump_v2 = appendfs::dump_log_file(&log_file, 2).unwrap();
+    assert!(dump_v2.contains("hello appendfs v"));
+    assert!(dump_v2.contains("olume"));
 }

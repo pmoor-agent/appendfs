@@ -25,6 +25,18 @@ pub enum Commands {
     Mount(MountArgs),
     /// Display volume statistics, inode breakdown, and log live extent ratios
     Stats(StatsArgs),
+    /// Inspect and dump records from a single .log file
+    Dump(DumpArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DumpArgs {
+    /// Path to the .log file to inspect
+    pub file: PathBuf,
+
+    /// Verbosity level (-v for record details, -vv for full hex/ASCII payload dumps)
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    pub verbose: u8,
 }
 
 #[derive(Args, Debug)]

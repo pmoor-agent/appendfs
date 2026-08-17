@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod clock;
+pub mod dump;
 pub mod fs;
 pub mod lock_pool;
 pub mod log;
@@ -9,8 +10,9 @@ pub mod range_map;
 pub mod shim;
 pub mod stats;
 
-pub use cli::{Cli, Commands, InitArgs, MountArgs, StatsArgs, find_latest_generation};
+pub use cli::{Cli, Commands, DumpArgs, InitArgs, MountArgs, StatsArgs, find_latest_generation};
 pub use clock::{AdvancingClock, Clock, MockClock, SystemClock};
+pub use dump::dump_log_file;
 pub use fs::InMemoryFS;
 pub use log::{
     BackgroundFlusher, ExtentState, LogFileCache, LogReader, LogRecord, LogWriter,
