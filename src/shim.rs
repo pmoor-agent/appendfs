@@ -825,7 +825,10 @@ pub fn mount_ro(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), i32>
     mount_ro_arc(args, std::sync::Arc::new(fs))
 }
 
-pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), i32> {
+pub fn mount_ro_arc(
+    mut args: Vec<String>,
+    fs: std::sync::Arc<crate::fs::InMemoryFS>,
+) -> Result<(), i32> {
     fs.set_read_only(true);
     // Injects kernel-level read-only mount option
     args.push("-o".to_string());

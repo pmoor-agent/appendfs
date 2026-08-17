@@ -1,6 +1,6 @@
 use crate::fs::InMemoryFS;
 use crate::log::SharedExtentState;
-use crate::node::{Node, SyncNode};
+use crate::node::Node;
 use crate::range_map::RangeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -57,25 +57,11 @@ impl SummaryHeader {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap()
+        bincode::serialize(self).expect("SummaryHeader serialization failed")
     }
 
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
-        let header: Self =
-            bincode::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if &header.magic != SUMMARY_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid SummaryHeader magic bytes",
-            ));
-        }
-        if header.version != CURRENT_SUMMARY_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported SummaryHeader version: {}", header.version),
-            ));
-        }
-        Ok(header)
+        bincode::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -109,19 +95,11 @@ impl SummaryFooter {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap()
+        bincode::serialize(self).expect("SummaryFooter serialization failed")
     }
 
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
-        let footer: Self =
-            bincode::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if &footer.magic != SUMMARY_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid SummaryFooter magic bytes",
-            ));
-        }
-        Ok(footer)
+        bincode::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -134,7 +112,7 @@ pub struct SummaryIndexEntry {
 
 impl SummaryIndexEntry {
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap()
+        bincode::serialize(self).expect("SummaryIndexEntry serialization failed")
     }
 
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
@@ -144,7 +122,7 @@ impl SummaryIndexEntry {
 
 /// Exports a single-file summary snapshot of an inodes snapshot map into `log_dir`.
 pub fn export_summary(
-    snapshot: &HashMap<u64, Arc<SyncNode>>,
+    snapshot: &HashMap<u64, Arc<Node>>,
     manifest: &crate::log::LogManifest,
     log_dir: impl AsRef<Path>,
     generation: u64,
@@ -164,7 +142,7 @@ pub fn export_summary(
 
 /// Exports a single-file summary snapshot of an inodes snapshot map into `log_dir` with custom created_at timestamp.
 pub fn export_summary_with_time(
-    snapshot: &HashMap<u64, Arc<SyncNode>>,
+    snapshot: &HashMap<u64, Arc<Node>>,
     manifest: &crate::log::LogManifest,
     log_dir: impl AsRef<Path>,
     generation: u64,
@@ -174,7 +152,7 @@ pub fn export_summary_with_time(
 ) -> io::Result<PathBuf> {
     let log_dir = log_dir.as_ref();
 
-    let mut inodes_snapshot: Vec<(u64, Arc<SyncNode>)> = snapshot
+    let mut inodes_snapshot: Vec<(u64, Arc<Node>)> = snapshot
         .iter()
         .map(|(ino, arc)| (*ino, Arc::clone(arc)))
         .collect();
@@ -205,8 +183,8 @@ pub fn export_summary_with_time(
     let mut index_entries = Vec::with_capacity(inodes_snapshot.len());
 
     // 2. Serialize all inode nodes into data payload body
-    for (inode, sync_node_arc) in &inodes_snapshot {
-        let node = unsafe { sync_node_arc.read() };
+    for (inode, node_arc) in &inodes_snapshot {
+        let node = node_arc.as_ref();
         let mut node_to_serialize = node.clone();
         if let Node::Directory {
             ref mut entries, ..
@@ -248,8 +226,7 @@ pub fn export_summary_with_time(
                                 && p1 + l1 == p2
                                 && l1 + l2 == (cur_len + len) as u32
                             {
-                                let new_state =
-                                    SharedExtentState::new_disk(g1, r1, p1, l1 + l2);
+                                let new_state = SharedExtentState::new_disk(g1, r1, p1, l1 + l2);
                                 current = Some((cur_start, cur_len + len, new_state));
                                 merged = true;
                             }
@@ -291,8 +268,8 @@ pub fn export_summary_with_time(
 
     // 3. Serialize and write LogManifest
     let manifest_offset = current_offset;
-    let manifest_bytes = bincode::serialize(manifest)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let manifest_bytes =
+        bincode::serialize(manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let manifest_len_bytes = (manifest_bytes.len() as u32).to_le_bytes();
     file.write_all(&manifest_len_bytes)?;
     file.write_all(&manifest_bytes)?;
@@ -349,12 +326,7 @@ pub fn export_fs_summary(
     let next_inode = fs.next_inode.load(Ordering::SeqCst);
     let manifest = fs.manifest.read().unwrap().clone();
     export_summary(
-        &snapshot,
-        &manifest,
-        log_dir,
-        generation,
-        last_tx_id,
-        next_inode,
+        &snapshot, &manifest, log_dir, generation, last_tx_id, next_inode,
     )
 }
 
@@ -375,7 +347,9 @@ pub fn init_volume(log_dir: impl AsRef<Path>, branch: Option<&str>) -> io::Resul
                             io::ErrorKind::AlreadyExists,
                             format!(
                                 "Volume already initialized at {:?} (found existing {} file {:?})",
-                                log_dir, ext, path.file_name().unwrap_or_default()
+                                log_dir,
+                                ext,
+                                path.file_name().unwrap_or_default()
                             ),
                         ));
                     }
@@ -513,12 +487,12 @@ impl SummaryReader {
     }
 
     /// Reads all inode entries to reconstruct an `InMemoryFS` map for recovery.
-    pub fn read_all_inodes(&mut self) -> io::Result<HashMap<u64, Arc<SyncNode>>> {
+    pub fn read_all_inodes(&mut self) -> io::Result<HashMap<u64, Arc<Node>>> {
         let inodes: Vec<u64> = self.index_entries.iter().map(|e| e.inode).collect();
         let mut map = HashMap::with_capacity(inodes.len());
         for inode in inodes {
             if let Some(node) = self.read_node(inode)? {
-                map.insert(inode, Arc::new(SyncNode::new(node)));
+                map.insert(inode, Arc::new(node));
             }
         }
         Ok(map)

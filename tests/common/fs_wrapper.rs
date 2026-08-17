@@ -4,8 +4,8 @@ use appendfs::log::recover_fs_with_clock;
 use appendfs::shim::{FileAttr, FileType};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 /// Per-inode snapshot entry produced by `TestFS::get_tree_snapshot` - built entirely

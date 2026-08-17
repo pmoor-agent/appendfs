@@ -8,11 +8,7 @@ pub struct TestRng {
 impl TestRng {
     pub fn new(seed: u64) -> Self {
         Self {
-            state: if seed == 0 {
-                0x123456789ABCDEF0
-            } else {
-                seed
-            },
+            state: if seed == 0 { 0x123456789ABCDEF0 } else { seed },
         }
     }
 

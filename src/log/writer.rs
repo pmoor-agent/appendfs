@@ -1,8 +1,6 @@
 use crate::cli::DEFAULT_MAX_LOG_SIZE;
 use crate::clock::Clock;
-use crate::log::record::{
-    FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCode, RecordHeader,
-};
+use crate::log::record::{FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCode, RecordHeader};
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -402,7 +400,10 @@ mod tests {
         assert!(!writer.is_open());
         assert_eq!(writer.generation(), 1);
         let expected_path = dir.path().join("000001.log");
-        assert!(!expected_path.exists(), "lazy writer must not create a file on disk yet");
+        assert!(
+            !expected_path.exists(),
+            "lazy writer must not create a file on disk yet"
+        );
 
         // Calling roll_if_needed opens the initial generation on disk
         let opened_gen = writer.roll_if_needed(100, &clock).unwrap();

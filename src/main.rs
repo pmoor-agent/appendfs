@@ -84,7 +84,14 @@ fn main() {
 
             println!(
                 "Mounting appendfs at '{:?}' with log-dir '{:?}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, foreground: {})...",
-                args.mount_point, args.log_dir, next_gen, args.flush_threshold, args.flush_threshold_ops, args.flush_interval, args.max_log_size, args.foreground
+                args.mount_point,
+                args.log_dir,
+                next_gen,
+                args.flush_threshold,
+                args.flush_threshold_ops,
+                args.flush_interval,
+                args.max_log_size,
+                args.foreground
             );
 
             let fuse_args = args.to_fuse_args();
@@ -130,14 +137,16 @@ fn main() {
             fs_instance.set_log_dir(log_dir);
             fs_instance.set_read_only(true);
 
-            let effective_tx_id = fs_instance.last_tx_id.load(std::sync::atomic::Ordering::SeqCst);
+            let effective_tx_id = fs_instance
+                .last_tx_id
+                .load(std::sync::atomic::Ordering::SeqCst);
             let effective_gen = {
                 let manifest = fs_instance.manifest.read().unwrap();
                 manifest.logs.last().map(|l| l.generation).unwrap_or(1)
             };
             let effective_time_str = fs_instance.recovered_time().map_or_else(
                 || "N/A".to_string(),
-                |t| appendfs::format_local_civil_time(t),
+                appendfs::format_local_civil_time,
             );
 
             println!(
@@ -152,7 +161,10 @@ fn main() {
             let fs_instance = Arc::new(fs_instance);
             let fuse_args = args.to_fuse_args();
             if let Err(err) = appendfs::mount_ro_arc(fuse_args, fs_instance) {
-                eprintln!("Failed to mount read-only appendfs FUSE filesystem: {}", err);
+                eprintln!(
+                    "Failed to mount read-only appendfs FUSE filesystem: {}",
+                    err
+                );
                 std::process::exit(1);
             }
         }

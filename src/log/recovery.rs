@@ -4,7 +4,7 @@ use crate::log::extent::SharedExtentState;
 use crate::log::reader::{LogReader, LogRecord};
 use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode};
 use crate::log::summary::SummaryReader;
-use crate::node::{Node, SyncNode};
+use crate::node::Node;
 use crate::range_map::RangeMap;
 use std::fs;
 use std::io;
@@ -51,19 +51,14 @@ pub fn recover_fs_to_target(
     recover_fs_to_target_with_clock(log_dir, target, Arc::new(SystemClock))
 }
 
-/// Rebuilds filesystem state up to `target` using an injectable clock.
+/// Rebuilds filesystem state from summary and log files up to the specified `target` point in time,
+/// with an injectable `clock` for deterministic test time recovery.
 pub fn recover_fs_to_target_with_clock(
     log_dir: impl AsRef<Path>,
     target: RecoveryTarget,
     clock: Arc<dyn Clock>,
 ) -> io::Result<InMemoryFS> {
     let log_dir = log_dir.as_ref();
-    if !log_dir.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "Log directory does not exist",
-        ));
-    }
 
     // 1. Scan for eligible single-file .summary snapshots matching the target
     let mut latest_summary: Option<(u64, SummaryReader)> = None;
@@ -77,8 +72,12 @@ pub fn recover_fs_to_target_with_clock(
                             Ok(reader) => {
                                 let eligible = match target {
                                     RecoveryTarget::Latest => true,
-                                    RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
-                                    RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
+                                    RecoveryTarget::TxId(max_tx) => {
+                                        reader.header.last_tx_id <= max_tx
+                                    }
+                                    RecoveryTarget::Timestamp(max_time) => {
+                                        reader.header.created_at <= max_time
+                                    }
                                     RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
                                 };
                                 if eligible {
@@ -121,15 +120,13 @@ pub fn recover_fs_to_target_with_clock(
             if let Ok(oldest_reader) = LogReader::open(oldest_path) {
                 let created = oldest_reader.file_header().created_at;
                 last_op_time = Some(created);
-                if let Some(root_arc) = fs_instance.base.read().unwrap().get(&1) {
-                    // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                    let root_node = unsafe { root_arc.write() };
+                if let Some(root_arc) = fs_instance.base.write().unwrap().get_mut(&1) {
                     if let Node::Directory {
                         atime,
                         mtime,
                         ctime,
                         ..
-                    } = root_node
+                    } = Arc::make_mut(root_arc)
                     {
                         *atime = created;
                         *mtime = created;
@@ -288,7 +285,11 @@ pub fn recover_fs_to_target_with_clock(
         {
             let mut manifest = fs_instance.manifest.write().unwrap();
             if manifest.get_by_generation(gen_num).is_none() {
-                if manifest.logs.len() == 1 && manifest.logs[0].generation == 1 && min_log_gen == 0 && gen_num == 1 {
+                if manifest.logs.len() == 1
+                    && manifest.logs[0].generation == 1
+                    && min_log_gen == 0
+                    && gen_num == 1
+                {
                     let entry = &mut manifest.logs[0];
                     entry.created_at = log_created_at;
                     entry.record_count = committed_records_count;
@@ -326,8 +327,7 @@ pub fn recover_fs_to_target_with_clock(
             .store(max_inode + 1, Ordering::SeqCst);
     }
     fs_instance.base.write().unwrap().retain(|_ino, arc| {
-        // SAFETY: Single-threaded post-recovery cleanup; no concurrent LockPool access.
-        let node = unsafe { arc.read() };
+        let node = arc.as_ref();
         match node {
             Node::File { nlink, .. } | Node::Symlink { nlink, .. } => *nlink > 0,
             Node::Directory { .. } => true,
@@ -355,7 +355,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
     match decoded {
         DecodedPayload::Create(create) => {
             let now = create.created_at;
-            let new_node = Arc::new(SyncNode::new(Node::File {
+            let new_node = Arc::new(Node::File {
                 range_map: RangeMap::new(),
                 size: 0,
                 perm: create.mode & 0o777,
@@ -365,14 +365,13 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 atime: now,
                 mtime: now,
                 ctime: now,
-            }));
+            });
 
             let mut map = fs_instance.base.write().unwrap();
             map.insert(target_ino, new_node);
 
-            if let Some(parent_node_arc) = map.get(&create.parent) {
-                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                let parent_node = unsafe { parent_node_arc.write() };
+            if let Some(parent_node_arc) = map.get_mut(&create.parent) {
+                let parent_node = Arc::make_mut(parent_node_arc);
                 if let Node::Directory {
                     entries,
                     mtime,
@@ -388,7 +387,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         DecodedPayload::Mkdir(mkdir) => {
             let now = mkdir.created_at;
-            let new_node = Arc::new(SyncNode::new(Node::Directory {
+            let new_node = Arc::new(Node::Directory {
                 parent: mkdir.parent,
                 entries: Vec::new(),
                 perm: mkdir.mode & 0o777,
@@ -398,13 +397,13 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 atime: now,
                 mtime: now,
                 ctime: now,
-            }));
+            });
 
             let mut map = fs_instance.base.write().unwrap();
             map.insert(target_ino, new_node);
 
-            if let Some(parent_node_arc) = map.get(&mkdir.parent) {
-                let parent_node = unsafe { parent_node_arc.write() };
+            if let Some(parent_node_arc) = map.get_mut(&mkdir.parent) {
+                let parent_node = Arc::make_mut(parent_node_arc);
                 if let Node::Directory {
                     entries,
                     mtime,
@@ -418,7 +417,10 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 }
             }
         }
-        DecodedPayload::Write { meta: write_meta, data } => {
+        DecodedPayload::Write {
+            meta: write_meta,
+            data,
+        } => {
             let meta_size = (record.payload.len() - data.len()) as u32;
             let write_data_len = data.len() as u32;
 
@@ -429,9 +431,9 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 write_data_len,
             );
 
-            let map = fs_instance.base.read().unwrap();
-            if let Some(node_arc) = map.get(&target_ino) {
-                let node = unsafe { node_arc.write() };
+            let mut map = fs_instance.base.write().unwrap();
+            if let Some(node_arc) = map.get_mut(&target_ino) {
+                let node = Arc::make_mut(node_arc);
                 if let Node::File {
                     range_map,
                     size,
@@ -447,20 +449,15 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     let now = write_meta.op_time;
                     *mtime = now;
                     *ctime = now;
-                    range_map.insert(
-                        write_meta.file_offset,
-                        write_data_len as u64,
-                        shared_state,
-                    );
+                    range_map.insert(write_meta.file_offset, write_data_len as u64, shared_state);
                 }
             }
         }
         DecodedPayload::Unlink(unlink) => {
             let now = unlink.op_time;
             let mut map = fs_instance.base.write().unwrap();
-            if let Some(parent_node_arc) = map.get(&unlink.parent) {
-                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                let parent_node = unsafe { parent_node_arc.write() };
+            if let Some(parent_node_arc) = map.get_mut(&unlink.parent) {
+                let parent_node = Arc::make_mut(parent_node_arc);
                 if let Node::Directory {
                     entries,
                     mtime,
@@ -475,9 +472,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             }
 
             let mut should_delete = false;
-            if let Some(child_node_arc) = map.get(&target_ino) {
-                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                let child_node = unsafe { child_node_arc.write() };
+            if let Some(child_node_arc) = map.get_mut(&target_ino) {
+                let child_node = Arc::make_mut(child_node_arc);
                 match child_node {
                     Node::File { nlink, ctime, .. } | Node::Symlink { nlink, ctime, .. } => {
                         if *nlink > 0 {
@@ -500,9 +496,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         DecodedPayload::Rmdir(rmdir) => {
             let now = rmdir.op_time;
             let mut map = fs_instance.base.write().unwrap();
-            if let Some(parent_node_arc) = map.get(&rmdir.parent) {
-                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                let parent_node = unsafe { parent_node_arc.write() };
+            if let Some(parent_node_arc) = map.get_mut(&rmdir.parent) {
+                let parent_node = Arc::make_mut(parent_node_arc);
                 if let Node::Directory {
                     entries,
                     mtime,
@@ -519,7 +514,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         DecodedPayload::Symlink(symlink) => {
             let now = symlink.created_at;
-            let new_node = Arc::new(SyncNode::new(Node::Symlink {
+            let new_node = Arc::new(Node::Symlink {
                 target: symlink.target,
                 nlink: 1,
                 uid: symlink.uid,
@@ -527,14 +522,13 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 atime: now,
                 mtime: now,
                 ctime: now,
-            }));
+            });
 
             let mut map = fs_instance.base.write().unwrap();
             map.insert(target_ino, new_node);
 
-            if let Some(parent_node_arc) = map.get(&symlink.parent) {
-                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                let parent_node = unsafe { parent_node_arc.write() };
+            if let Some(parent_node_arc) = map.get_mut(&symlink.parent) {
+                let parent_node = Arc::make_mut(parent_node_arc);
                 if let Node::Directory {
                     entries,
                     mtime,
@@ -554,9 +548,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
 
             let overwritten_ino = if rename.parent == rename.new_parent {
                 let mut overwritten = None;
-                if let Some(parent_node_arc) = map.get(&rename.parent) {
-                    // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                    let parent_node = unsafe { parent_node_arc.write() };
+                if let Some(parent_node_arc) = map.get_mut(&rename.parent) {
+                    let parent_node = Arc::make_mut(parent_node_arc);
                     if let Node::Directory {
                         entries,
                         mtime,
@@ -564,13 +557,15 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         ..
                     } = parent_node
                     {
-                        if let Some(dest_pos) =
-                            entries.iter().position(|(n, ino)| n == &rename.new_name && *ino != target_ino)
+                        if let Some(dest_pos) = entries
+                            .iter()
+                            .position(|(n, ino)| n == &rename.new_name && *ino != target_ino)
                         {
                             overwritten = Some(entries.remove(dest_pos).1);
                         }
-                        if let Some(src_pos) =
-                            entries.iter().position(|(n, ino)| n == &rename.name && *ino == target_ino)
+                        if let Some(src_pos) = entries
+                            .iter()
+                            .position(|(n, ino)| n == &rename.name && *ino == target_ino)
                         {
                             entries[src_pos].0 = rename.new_name.clone();
                         }
@@ -581,9 +576,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 overwritten
             } else {
                 // Remove source entry
-                if let Some(parent_node_arc) = map.get(&rename.parent) {
-                    // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                    let parent_node = unsafe { parent_node_arc.write() };
+                if let Some(parent_node_arc) = map.get_mut(&rename.parent) {
+                    let parent_node = Arc::make_mut(parent_node_arc);
                     if let Node::Directory {
                         entries,
                         mtime,
@@ -598,9 +592,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 }
 
                 // Add new entry, capturing any destination inode it clobbers
-                if let Some(newparent_node_arc) = map.get(&rename.new_parent) {
-                    // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                    let newparent_node = unsafe { newparent_node_arc.write() };
+                if let Some(newparent_node_arc) = map.get_mut(&rename.new_parent) {
+                    let newparent_node = Arc::make_mut(newparent_node_arc);
                     if let Node::Directory {
                         entries,
                         mtime,
@@ -625,8 +618,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             };
 
             if rename.parent != rename.new_parent {
-                if let Some(target_node_arc) = map.get(&target_ino) {
-                    let target_node = unsafe { target_node_arc.write() };
+                if let Some(target_node_arc) = map.get_mut(&target_ino) {
+                    let target_node = Arc::make_mut(target_node_arc);
                     if let Node::Directory { parent, .. } = target_node {
                         *parent = rename.new_parent;
                     }
@@ -636,9 +629,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             if let Some(dest_ino) = overwritten_ino {
                 if dest_ino != target_ino {
                     let mut should_delete = false;
-                    if let Some(dest_node_arc) = map.get(&dest_ino) {
-                        // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                        let dest_node = unsafe { dest_node_arc.write() };
+                    if let Some(dest_node_arc) = map.get_mut(&dest_ino) {
+                        let dest_node = Arc::make_mut(dest_node_arc);
                         match dest_node {
                             Node::File { nlink, ctime, .. }
                             | Node::Symlink { nlink, ctime, .. } => {
@@ -662,10 +654,9 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             }
         }
         DecodedPayload::Setattr(setattr) => {
-            let map = fs_instance.base.read().unwrap();
-            if let Some(node_arc) = map.get(&target_ino) {
-                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                let node = unsafe { node_arc.write() };
+            let mut map = fs_instance.base.write().unwrap();
+            if let Some(node_arc) = map.get_mut(&target_ino) {
+                let node = Arc::make_mut(node_arc);
                 let now = setattr.op_time;
 
                 match node {
@@ -757,10 +748,9 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
         }
         DecodedPayload::Link(link) => {
             let now = link.op_time;
-            let map = fs_instance.base.write().unwrap();
-            if let Some(newparent_node_arc) = map.get(&link.new_parent) {
-                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                let newparent_node = unsafe { newparent_node_arc.write() };
+            let mut map = fs_instance.base.write().unwrap();
+            if let Some(newparent_node_arc) = map.get_mut(&link.new_parent) {
+                let newparent_node = Arc::make_mut(newparent_node_arc);
                 if let Node::Directory {
                     entries,
                     mtime,
@@ -774,9 +764,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 }
             }
 
-            if let Some(node_arc) = map.get(&target_ino) {
-                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                let node = unsafe { node_arc.write() };
+            if let Some(node_arc) = map.get_mut(&target_ino) {
+                let node = Arc::make_mut(node_arc);
                 match node {
                     Node::File { nlink, ctime, .. } => {
                         *nlink += 1;
@@ -821,12 +810,30 @@ mod tests {
         fs.sync_log().unwrap();
 
         // Tx 2: Create file "file1.txt" inside "step1"
-        let f1 = crate::operations::read_write::create_core(&fs, d1.ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
+        let f1 = crate::operations::read_write::create_core(
+            &fs,
+            d1.ino,
+            "file1.txt",
+            0o644,
+            0,
+            1000,
+            1000,
+        )
+        .unwrap();
         crate::operations::read_write::write_core(&fs, f1.ino, b"version 1", 0).unwrap();
         fs.sync_log().unwrap();
 
         // Tx 3: Create file "file2.txt" inside "step1"
-        let f2 = crate::operations::read_write::create_core(&fs, d1.ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
+        let f2 = crate::operations::read_write::create_core(
+            &fs,
+            d1.ino,
+            "file2.txt",
+            0o644,
+            0,
+            1000,
+            1000,
+        )
+        .unwrap();
         crate::operations::read_write::write_core(&fs, f2.ino, b"version 2", 0).unwrap();
         fs.sync_log().unwrap();
 
@@ -873,12 +880,20 @@ mod tests {
         fs.sync_log().unwrap();
 
         // Recover at T = 1500 -> early_dir exists, late_dir does not
-        let fs_t1500 = recover_fs_to_target(dir.path(), RecoveryTarget::Timestamp(UNIX_EPOCH + Duration::from_secs(1500))).unwrap();
+        let fs_t1500 = recover_fs_to_target(
+            dir.path(),
+            RecoveryTarget::Timestamp(UNIX_EPOCH + Duration::from_secs(1500)),
+        )
+        .unwrap();
         assert!(fs_t1500.lookup_child(1, "early_dir").is_some());
         assert!(fs_t1500.lookup_child(1, "late_dir").is_none());
 
         // Recover at T = 2500 -> both exist
-        let fs_t2500 = recover_fs_to_target(dir.path(), RecoveryTarget::Timestamp(UNIX_EPOCH + Duration::from_secs(2500))).unwrap();
+        let fs_t2500 = recover_fs_to_target(
+            dir.path(),
+            RecoveryTarget::Timestamp(UNIX_EPOCH + Duration::from_secs(2500)),
+        )
+        .unwrap();
         assert!(fs_t2500.lookup_child(1, "early_dir").is_some());
         assert!(fs_t2500.lookup_child(1, "late_dir").is_some());
     }

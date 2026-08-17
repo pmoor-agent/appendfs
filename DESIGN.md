@@ -67,16 +67,22 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 - Each log file is named using a strictly increasing 64-bit **generation sequence number** as the primary sort key (e.g. `000001_1721838000.log`, `000002_1721841600.log`).
 - The generation sequence number guarantees deterministic ordering during recovery, replay, and cloud syncing regardless of system clock skew.
 
-### 3.2 In-Memory Write Staging & Flush Semantics
-- Individual `write()` calls do **not** write to disk immediately. Writes are staged in an in-memory mutation buffer.
-- Pending staged writes are flushed to the active log file under the following conditions:
-  1. **Explicit Sync:** Client issues `fsync()`, `fsyncdir()`, or opens a file with `O_SYNC` / `O_DSYNC`.
-  2. **Periodic Timer:** A background worker flushes staged data periodically (e.g., every 2–5 seconds).
-  3. **Buffer Threshold:** Staged buffer size reaches a configured memory threshold (e.g., 4MB or 16MB).
+### 3.2 LSM Delta-Overlay In-Memory Architecture & Flush Semantics
+- `InMemoryFS` organizes in-memory filesystem state into a multi-layered Log-Structured Merge (LSM) overlay:
+  1. **`base` (`RwLock<HashMap<u64, Arc<Node>>>`):** The resting, fully consolidated filesystem state. Nodes are stored in safe, immutable `Arc<Node>` pointers.
+  2. **`flushing` (`RwLock<VecDeque<HashMap<u64, EntryDelta>>>`):** An ordered FIFO queue of frozen snapshot batches waiting to be serialized and committed to disk.
+  3. **`live` (`RwLock<HashMap<u64, EntryDelta>>`):** Active in-memory mutations. Operations modify lightweight `EntryDelta` records without locking base nodes.
+- **Top-Down Read Resolution:** Reads query `live` $\rightarrow$ `flushing.iter().rev()` (newest to oldest) $\rightarrow$ `base`.
+- **Layered Truncate Masking:** When reading file data, if any upper layer recorded a truncation (`truncate_mask = Some(mask)`), the read range is clamped by the minimum truncate mask across all layers above the queried extent, preventing stale data resurrection when files are truncated down and subsequently extended.
+- **Multi-Batch Ordered Flushing Queue & Resilient Retry:**
+  - `begin_flush()` non-blockingly swaps the current `live` delta map into `flushing.push_back(frozen)`.
+  - `flush_log()` synthesizes log records from `flushing.front()`. Upon successfully appending records and committing via `FlushCommit`, the batch is folded into `base` via `fold_flushed_batch` and popped from the queue.
+  - If a flush fails due to an I/O or disk error, the unwritten batch is **retained at the front of `flushing`** and retried on the next flush cycle without wedging filesystem threads or losing live concurrent mutations.
+- **Safe Concurrency & Elimination of Lock Pools:** Stripped unsafe raw cell locks in favor of idiomatic Rust `Arc<Node>` CoW semantics.
 
 ### 3.3 Log Record Types & Extended Attributes (`xattrs`)
 Each entry in the log file consists of a header and an optional compressed/encrypted payload:
-- **`RecordHeader`:** Transaction ID, Operation Type (`WRITE`, `CREATE`, `MKDIR`, `UNLINK`, `RENAME`, `SETATTR`, `SETXATTR`, `REMOVEXATTR`), Inode ID, Payload Length, Uncompressed Length, Encryption Nonce, and Checksum.
+- **`RecordHeader`:** Transaction ID, Operation Type (`WRITE`, `CREATE`, `MKDIR`, `UNLINK`, `RENAME`, `SETATTR`, `SETXATTR`, `REMOVEXATTR`, `FLUSH_COMMIT`), Inode ID, Payload Length, Uncompressed Length, Encryption Nonce, and Checksum.
 - **`WritePayload`:** Compressed & encrypted byte sequence belonging to a file write (optionally deduplicated via FastCDC).
 - **`MetadataPayload`:** Serialized metadata update (permissions, UID/GID, target link paths, timestamps, extended attribute key-values).
 

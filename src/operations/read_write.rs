@@ -54,7 +54,9 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
         return;
     }
 
-    if fs.is_read_only() && (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0 {
+    if fs.is_read_only()
+        && (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0
+    {
         req.reply_err(libc::EROFS);
         return;
     }

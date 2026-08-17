@@ -6,19 +6,19 @@
 // misuse around the striped `lock_pool` / `SyncNode` unsafe-cell design that a
 // single-threaded fuzz test structurally cannot exercise.
 mod common;
+use appendfs::InMemoryFS;
+use appendfs::LogWriter;
 use appendfs::clock::{Clock, SystemClock};
-use appendfs::log::{recover_fs, SummaryReader};
+use appendfs::log::{SummaryReader, recover_fs};
 use appendfs::node::Node;
 use appendfs::operations::dir::{list_dir_core, mkdir_core, rmdir_core};
 use appendfs::operations::links::{
     link_core, readlink_core, rename_core, symlink_core, unlink_core,
 };
 use appendfs::operations::read_write::{
-    create_core, getattr_core, read_core, setattr_core, write_core, FUSE_SET_ATTR_SIZE,
+    FUSE_SET_ATTR_SIZE, create_core, getattr_core, read_core, setattr_core, write_core,
 };
 use appendfs::shim::FileType;
-use appendfs::InMemoryFS;
-use appendfs::LogWriter;
 use common::TestRng;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -319,12 +319,10 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
     );
 
     for ino in written_keys {
-        // Safe: both maps were just built fresh by this thread from summary files on
-        // disk, never shared with or touched by any other thread - no lock_pool guard
-        // needed for a single-owner read.
-        let live_node = unsafe { written_inodes[&ino].read() }.clone();
-        let replayed_node = unsafe { regenerated_inodes[&ino].read() }.clone();
-        let live_bytes = bincode::serialize(&normalize_for_compare(ino, live_node.clone())).unwrap();
+        let live_node = (*written_inodes[&ino]).clone();
+        let replayed_node = (*regenerated_inodes[&ino]).clone();
+        let live_bytes =
+            bincode::serialize(&normalize_for_compare(ino, live_node.clone())).unwrap();
         let replayed_bytes =
             bincode::serialize(&normalize_for_compare(ino, replayed_node.clone())).unwrap();
         assert_eq!(

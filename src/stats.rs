@@ -33,7 +33,7 @@ impl VolumeStats {
         let mut total_logical_bytes = 0;
 
         for node_arc in base.values() {
-            let node = unsafe { node_arc.read() };
+            let node = node_arc.as_ref();
             match node {
                 Node::Directory { .. } => directory_count += 1,
                 Node::File { size, .. } => {
@@ -242,13 +242,31 @@ mod tests {
     #[test]
     fn test_format_generation_status() {
         // Zero data bytes
-        assert_eq!(format_generation_status(0, 0, 0.0, 0), ("Empty", "N/A".to_string()));
-        assert_eq!(format_generation_status(0, 0, 0.0, 10), ("Metadata Only", "N/A".to_string()));
+        assert_eq!(
+            format_generation_status(0, 0, 0.0, 0),
+            ("Empty", "N/A".to_string())
+        );
+        assert_eq!(
+            format_generation_status(0, 0, 0.0, 10),
+            ("Metadata Only", "N/A".to_string())
+        );
 
         // Non-zero data bytes
-        assert_eq!(format_generation_status(1000, 0, 0.0, 10), ("Dead (0% - Reclaimable)", "0.0%".to_string()));
-        assert_eq!(format_generation_status(1000, 200, 0.20, 10), ("Compaction Candidate", "20.0%".to_string()));
-        assert_eq!(format_generation_status(1000, 500, 0.50, 10), ("Fragmented", "50.0%".to_string()));
-        assert_eq!(format_generation_status(1000, 950, 0.95, 10), ("Healthy", "95.0%".to_string()));
+        assert_eq!(
+            format_generation_status(1000, 0, 0.0, 10),
+            ("Dead (0% - Reclaimable)", "0.0%".to_string())
+        );
+        assert_eq!(
+            format_generation_status(1000, 200, 0.20, 10),
+            ("Compaction Candidate", "20.0%".to_string())
+        );
+        assert_eq!(
+            format_generation_status(1000, 500, 0.50, 10),
+            ("Fragmented", "50.0%".to_string())
+        );
+        assert_eq!(
+            format_generation_status(1000, 950, 0.95, 10),
+            ("Healthy", "95.0%".to_string())
+        );
     }
 }

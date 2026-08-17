@@ -1,5 +1,5 @@
-use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
 
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
 // Bumped for RecordHeader's new checksum field - a breaking format change, so old logs
@@ -241,7 +241,10 @@ pub struct MkdirPayload {
 pub struct UnlinkPayload {
     pub parent: u64,
     pub name: String,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    #[serde(
+        default = "crate::clock::default_epoch",
+        with = "crate::clock::serde_system_time"
+    )]
     pub op_time: SystemTime,
 }
 
@@ -250,7 +253,10 @@ pub struct UnlinkPayload {
 pub struct RmdirPayload {
     pub parent: u64,
     pub name: String,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    #[serde(
+        default = "crate::clock::default_epoch",
+        with = "crate::clock::serde_system_time"
+    )]
     pub op_time: SystemTime,
 }
 
@@ -276,7 +282,10 @@ pub struct RenamePayload {
     pub name: String,
     pub new_parent: u64,
     pub new_name: String,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    #[serde(
+        default = "crate::clock::default_epoch",
+        with = "crate::clock::serde_system_time"
+    )]
     pub op_time: SystemTime,
 }
 
@@ -303,7 +312,10 @@ pub struct SetattrPayload {
     pub atime: Option<SystemTime>,
     #[serde(default, with = "crate::clock::serde_system_time_opt")]
     pub mtime: Option<SystemTime>,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    #[serde(
+        default = "crate::clock::default_epoch",
+        with = "crate::clock::serde_system_time"
+    )]
     pub op_time: SystemTime,
 }
 
@@ -313,7 +325,10 @@ pub struct LinkPayload {
     pub ino: u64,
     pub new_parent: u64,
     pub new_name: String,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    #[serde(
+        default = "crate::clock::default_epoch",
+        with = "crate::clock::serde_system_time"
+    )]
     pub op_time: SystemTime,
 }
 

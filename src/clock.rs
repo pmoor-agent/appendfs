@@ -74,11 +74,7 @@ pub fn parse_timestamp(input: &str) -> Result<SystemTime, String> {
         return Ok(unix_to_system_time(secs, nsecs));
     }
 
-    let formats = [
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-    ];
+    let formats = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"];
 
     for fmt_str in &formats {
         let c_fmt = std::ffi::CString::new(*fmt_str).unwrap();

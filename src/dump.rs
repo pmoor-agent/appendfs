@@ -1,9 +1,9 @@
-use crate::log::record::{
-    checksum_payload, DecodedPayload, FileHeader, OpCode, RecordHeader, FILE_HEADER_SIZE,
-    RECORD_HEADER_SIZE,
-};
-use crate::log::summary::{SummaryReader, SUMMARY_MAGIC};
 use crate::log::ExtentState;
+use crate::log::record::{
+    DecodedPayload, FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader,
+    checksum_payload,
+};
+use crate::log::summary::{SUMMARY_MAGIC, SummaryReader};
 use crate::node::Node;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
@@ -25,9 +25,13 @@ pub fn dump_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
         ));
     }
 
-    if &magic == &crate::log::record::FILE_MAGIC || path.extension().and_then(|s| s.to_str()) == Some("log") {
+    if &magic == &crate::log::record::FILE_MAGIC
+        || path.extension().and_then(|s| s.to_str()) == Some("log")
+    {
         dump_log_file(path, verbosity)
-    } else if &magic == SUMMARY_MAGIC || path.extension().and_then(|s| s.to_str()) == Some("summary") {
+    } else if &magic == SUMMARY_MAGIC
+        || path.extension().and_then(|s| s.to_str()) == Some("summary")
+    {
         dump_summary_file(path, verbosity)
     } else {
         Err(io::Error::new(
@@ -320,22 +324,12 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
 
     // Flush batch statistics
     writeln!(out, "--- Flush Batch Statistics ---").unwrap();
-    writeln!(
-        out,
-        "Committed Flushes:   {}",
-        total_flush_batches
-    )
-    .unwrap();
+    writeln!(out, "Committed Flushes:   {}", total_flush_batches).unwrap();
     if total_flush_batches > 0 {
         let avg_records = (records.len().saturating_sub(uncommitted_records_count)) as f64
             / total_flush_batches as f64;
         let avg_data = total_data_bytes as f64 / total_flush_batches as f64;
-        writeln!(
-            out,
-            "Avg Records / Flush: {:.1}",
-            avg_records
-        )
-        .unwrap();
+        writeln!(out, "Avg Records / Flush: {:.1}", avg_records).unwrap();
         writeln!(
             out,
             "Avg Data / Flush:    {}",
@@ -351,11 +345,7 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
         )
         .unwrap();
     } else {
-        writeln!(
-            out,
-            "Trailing Batch:      None (cleanly committed at EOF)"
-        )
-        .unwrap();
+        writeln!(out, "Trailing Batch:      None (cleanly committed at EOF)").unwrap();
     }
     writeln!(out).unwrap();
 
@@ -367,12 +357,7 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
         "OP CODE", "COUNT", "TOTAL BYTES", "% OF RECORDS"
     )
     .unwrap();
-    writeln!(
-        out,
-        "{:-<14} {:-<10} {:-<14} {:-<12}",
-        "", "", "", ""
-    )
-    .unwrap();
+    writeln!(out, "{:-<14} {:-<10} {:-<14} {:-<12}", "", "", "", "").unwrap();
 
     let total_valid = records
         .iter()
@@ -411,12 +396,7 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
             "SIZE RANGE", "COUNT", "TOTAL BYTES", "DISTRIBUTION"
         )
         .unwrap();
-        writeln!(
-            out,
-            "{:-<18} {:-<8} {:-<14}   {:-<20}",
-            "", "", "", ""
-        )
-        .unwrap();
+        writeln!(out, "{:-<18} {:-<8} {:-<14}   {:-<20}", "", "", "", "").unwrap();
 
         for b in &write_buckets {
             let pct = (b.count as f64 / total_writes as f64) * 100.0;
@@ -555,8 +535,8 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
             .cloned()
             .unwrap_or_else(|| format!("<inode {}>", dir_ino));
         if let Some(sync_node) = inodes.get(&dir_ino) {
-            let node = unsafe { sync_node.read() };
-            if let Node::Directory { entries, .. } = &*node {
+            let node = sync_node.as_ref();
+            if let Node::Directory { entries, .. } = node {
                 for (name, child_ino) in entries {
                     let child_path = if dir_ino == 1 {
                         format!("/{}", name)
@@ -565,8 +545,8 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
                     };
                     path_map.insert(*child_ino, child_path);
                     if let Some(child_sync) = inodes.get(child_ino) {
-                        let child_node = unsafe { child_sync.read() };
-                        if matches!(&*child_node, Node::Directory { .. }) {
+                        let child_node = child_sync.as_ref();
+                        if matches!(child_node, Node::Directory { .. }) {
                             queue.push_back(*child_ino);
                         }
                     }
@@ -578,8 +558,8 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
     // Inspect all inodes
     for &ino in &sorted_inodes {
         if let Some(sync_node) = inodes.get(&ino) {
-            let node = unsafe { sync_node.read() };
-            match &*node {
+            let node = sync_node.as_ref();
+            match node {
                 Node::Directory { .. } => {
                     dir_count += 1;
                 }
@@ -620,11 +600,7 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
     }
 
     // Sort top fragmented files
-    file_frag_list.sort_by(|a, b| {
-        b.extents
-            .cmp(&a.extents)
-            .then_with(|| b.size.cmp(&a.size))
-    });
+    file_frag_list.sort_by(|a, b| b.extents.cmp(&a.extents).then_with(|| b.size.cmp(&a.size)));
 
     let mut out = String::new();
     writeln!(out, "=== appendfs Summary File Dump ===").unwrap();
@@ -632,12 +608,7 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
     writeln!(out, "Branch:              {}", reader.manifest.branch).unwrap();
     writeln!(out, "Generation:          {}", reader.header.generation).unwrap();
     writeln!(out, "Format Version:      {}", reader.header.version).unwrap();
-    writeln!(
-        out,
-        "Last Transaction ID: {}",
-        reader.header.last_tx_id
-    )
-    .unwrap();
+    writeln!(out, "Last Transaction ID: {}", reader.header.last_tx_id).unwrap();
     writeln!(out, "Next Inode:          {}", reader.header.next_inode).unwrap();
     writeln!(out, "File Size:           {}", format_bytes(file_len)).unwrap();
 
@@ -691,12 +662,7 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
             "EXTENTS RANGE", "FILES", "% OF FILES", "DISTRIBUTION"
         )
         .unwrap();
-        writeln!(
-            out,
-            "{:-<24} {:-<8} {:-<12}   {:-<20}",
-            "", "", "", ""
-        )
-        .unwrap();
+        writeln!(out, "{:-<24} {:-<8} {:-<12}   {:-<20}", "", "", "", "").unwrap();
 
         for b in &extent_buckets {
             let pct = (b.count as f64 / file_count as f64) * 100.0;
@@ -794,8 +760,8 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
         // Compute live bytes and extents from snapshot inodes
         let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
         for sync_node in inodes.values() {
-            let node = unsafe { sync_node.read() };
-            if let Node::File { range_map, .. } = &*node {
+            let node = sync_node.as_ref();
+            if let Node::File { range_map, .. } = node {
                 for (_, entry) in range_map.iter() {
                     if let ExtentState::Disk {
                         generation, length, ..
@@ -810,8 +776,7 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
         }
 
         for g in &reader.manifest.logs {
-            let (live_bytes, live_extents) =
-                live_map.get(&g.generation).copied().unwrap_or((0, 0));
+            let (live_bytes, live_extents) = live_map.get(&g.generation).copied().unwrap_or((0, 0));
             let live_ratio = if g.total_data_bytes > 0 {
                 live_bytes as f64 / g.total_data_bytes as f64
             } else {
@@ -845,9 +810,9 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
         writeln!(out, "=== Summary Inode Records ===").unwrap();
         for (i, &ino) in sorted_inodes.iter().enumerate() {
             if let Some(sync_node) = inodes.get(&ino) {
-                let node = unsafe { sync_node.read() };
+                let node = sync_node.as_ref();
                 let path_str = path_map.get(&ino).map(|p| p.as_str()).unwrap_or("");
-                match &*node {
+                match node {
                     Node::Directory {
                         entries,
                         perm,
@@ -878,8 +843,7 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
                                     format!("{:?} -> Inode {}", name, child_ino)
                                 })
                                 .collect();
-                            writeln!(out, "      entries: [{}]", entry_strs.join(", "))
-                                .unwrap();
+                            writeln!(out, "      entries: [{}]", entry_strs.join(", ")).unwrap();
                         }
                     }
                     Node::Symlink {
@@ -932,9 +896,7 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
                                 writeln!(out, "      extents: (empty / 0 bytes)").unwrap();
                             } else {
                                 writeln!(out, "      extents ({}):", range_map.len()).unwrap();
-                                for (ext_idx, (&start, entry)) in
-                                    range_map.iter().enumerate()
-                                {
+                                for (ext_idx, (&start, entry)) in range_map.iter().enumerate() {
                                     let state_desc = match entry.value.read_state() {
                                         ExtentState::Disk {
                                             generation,
@@ -1203,8 +1165,8 @@ fn format_system_time(time: SystemTime) -> String {
 mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
-    use crate::log::record::{CreatePayload, WriteMeta};
     use crate::log::LogWriter;
+    use crate::log::record::{CreatePayload, WriteMeta};
     use tempfile::tempdir;
 
     #[test]
@@ -1298,7 +1260,7 @@ mod tests {
         use crate::fs::InMemoryFS;
         use crate::log::summary::{export_summary, init_volume};
         use crate::log::{LogManifest, SharedExtentState};
-        use crate::node::{Node, SyncNode};
+        use crate::node::Node;
         use crate::range_map::RangeMap;
         use std::sync::Arc;
 
@@ -1312,7 +1274,9 @@ mod tests {
         let dump_v0 = dump_file(&summary_path, 0).unwrap();
         assert!(dump_v0.contains("=== appendfs Summary File Dump ==="));
         assert!(dump_v0.contains("Branch:              feature-branch"));
-        assert!(dump_v0.contains("Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)"));
+        assert!(
+            dump_v0.contains("Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)")
+        );
         assert!(dump_v0.contains("Checksum (BLAKE3):"));
         assert!(dump_v0.contains("VERIFIED"));
 
@@ -1321,7 +1285,7 @@ mod tests {
         let now = SystemClock.now();
 
         // Create directory /docs (inode 2)
-        let dir_node = Arc::new(SyncNode::new(Node::Directory {
+        let dir_node = Arc::new(Node::Directory {
             parent: 1,
             entries: vec![("fragmented.bin".to_string(), 3)],
             perm: 0o755,
@@ -1331,14 +1295,14 @@ mod tests {
             atime: now,
             mtime: now,
             ctime: now,
-        }));
+        });
 
         // Create fragmented file (inode 3) with 2 extents
         let mut rmap = RangeMap::new();
         rmap.insert(0, 4096, SharedExtentState::new_disk(1, 100, 20, 4096));
         rmap.insert(4096, 4096, SharedExtentState::new_disk(2, 200, 20, 4096));
 
-        let file_node = Arc::new(SyncNode::new(Node::File {
+        let file_node = Arc::new(Node::File {
             range_map: rmap,
             size: 8192,
             perm: 0o644,
@@ -1348,10 +1312,10 @@ mod tests {
             atime: now,
             mtime: now,
             ctime: now,
-        }));
+        });
 
         // Root directory (inode 1)
-        let root_node = Arc::new(SyncNode::new(Node::Directory {
+        let root_node = Arc::new(Node::Directory {
             parent: 1,
             entries: vec![("docs".to_string(), 2)],
             perm: 0o755,
@@ -1361,7 +1325,7 @@ mod tests {
             atime: now,
             mtime: now,
             ctime: now,
-        }));
+        });
 
         {
             let mut base = fs.base.write().unwrap();

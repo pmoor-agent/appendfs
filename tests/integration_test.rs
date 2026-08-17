@@ -643,7 +643,8 @@ fn test_large_directory_readdir_and_readdirplus() {
         .prefix("appendfs_large_dir_")
         .tempdir()
         .unwrap();
-    let mut mount = TestMount::mount_custom(dummy_log, temp_dir, appendfs::InMemoryFS::new(), false);
+    let mut mount =
+        TestMount::mount_custom(dummy_log, temp_dir, appendfs::InMemoryFS::new(), false);
     let mount_path = mount.path().to_path_buf();
 
     let large_dir = mount_path.join("large_dir");
@@ -694,9 +695,8 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
     let log_path = log_dir.path().to_path_buf();
 
     // 2KB max log size to trigger rolling across writes
-    let writer = Arc::new(
-        appendfs::LogWriter::create_with_max_size(&log_path, 1, &*clock, 2048).unwrap(),
-    );
+    let writer =
+        Arc::new(appendfs::LogWriter::create_with_max_size(&log_path, 1, &*clock, 2048).unwrap());
     let fs = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
     let temp_dir = tempfile::Builder::new()
@@ -773,7 +773,8 @@ fn test_volume_init_mount_and_stats_flow() {
     assert_eq!(next_gen, 1);
 
     let writer = Arc::new(
-        appendfs::LogWriter::create_with_max_size(&log_path, next_gen, &*clock, 1024 * 1024).unwrap(),
+        appendfs::LogWriter::create_with_max_size(&log_path, next_gen, &*clock, 1024 * 1024)
+            .unwrap(),
     );
     fs_instance.log_writer = Some(Arc::clone(&writer));
     fs_instance.set_log_dir(&log_path);
@@ -926,9 +927,20 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
         fs.set_log_dir(log_path);
 
         // Create directory and file
-        let dir_attr = appendfs::operations::dir::mkdir_core(&fs, 1, "testdir", 0o755, 1000, 1000).unwrap();
-        let file_attr = appendfs::operations::read_write::create_core(&fs, dir_attr.ino, "data.txt", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, file_attr.ino, b"hello lazy log", 0).unwrap();
+        let dir_attr =
+            appendfs::operations::dir::mkdir_core(&fs, 1, "testdir", 0o755, 1000, 1000).unwrap();
+        let file_attr = appendfs::operations::read_write::create_core(
+            &fs,
+            dir_attr.ino,
+            "data.txt",
+            0o644,
+            0,
+            1000,
+            1000,
+        )
+        .unwrap();
+        appendfs::operations::read_write::write_core(&fs, file_attr.ino, b"hello lazy log", 0)
+            .unwrap();
 
         // Flush & unmount
         fs.sync_log().unwrap();
@@ -940,7 +952,10 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
         .collect();
     files_after_write.sort();
-    assert_eq!(files_after_write, vec!["000000.summary", "000001.log", "000001.summary"]);
+    assert_eq!(
+        files_after_write,
+        vec!["000000.summary", "000001.log", "000001.summary"]
+    );
 
     // 4. Verify recovery restores the written state
     let recovered = appendfs::recover_fs(log_path).unwrap();
@@ -969,11 +984,21 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
     fs.max_staged_ops = 10;
 
     // 1. Create a tree with 1 directory and 15 files
-    let dir_attr = appendfs::operations::dir::mkdir_core(&fs, 1, "bigdir", 0o755, 1000, 1000).unwrap();
+    let dir_attr =
+        appendfs::operations::dir::mkdir_core(&fs, 1, "bigdir", 0o755, 1000, 1000).unwrap();
     let mut file_names = Vec::new();
     for i in 0..15 {
         let name = format!("f_{}.txt", i);
-        appendfs::operations::read_write::create_core(&fs, dir_attr.ino, &name, 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::create_core(
+            &fs,
+            dir_attr.ino,
+            &name,
+            0o644,
+            0,
+            1000,
+            1000,
+        )
+        .unwrap();
         file_names.push(name);
     }
 
@@ -987,7 +1012,10 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
     let manifest = fs.manifest.read().unwrap();
     assert!(manifest.logs.len() >= 1);
     let total_records: u32 = manifest.logs.iter().map(|l| l.record_count).sum();
-    assert!(total_records > 0, "metadata unlinks must have been automatically flushed to log");
+    assert!(
+        total_records > 0,
+        "metadata unlinks must have been automatically flushed to log"
+    );
 }
 
 #[test]
@@ -1008,14 +1036,25 @@ fn test_background_flusher_in_mount_session() {
     fs.set_log_dir(log_path);
     // Set 1-second flush interval and high op threshold so automatic threshold does not trigger
     fs.max_staged_ops = 10_000;
-    fs.flush_interval.store(1, std::sync::atomic::Ordering::SeqCst);
+    fs.flush_interval
+        .store(1, std::sync::atomic::Ordering::SeqCst);
 
     let fs = std::sync::Arc::new(fs);
     fs.init();
 
     // Perform only 2 operations
-    let dir_attr = appendfs::operations::dir::mkdir_core(&fs, 1, "periodic_dir", 0o755, 1000, 1000).unwrap();
-    appendfs::operations::read_write::create_core(&fs, dir_attr.ino, "periodic_file.txt", 0o644, 0, 1000, 1000).unwrap();
+    let dir_attr =
+        appendfs::operations::dir::mkdir_core(&fs, 1, "periodic_dir", 0o755, 1000, 1000).unwrap();
+    appendfs::operations::read_write::create_core(
+        &fs,
+        dir_attr.ino,
+        "periodic_file.txt",
+        0o644,
+        0,
+        1000,
+        1000,
+    )
+    .unwrap();
 
     // Staged ops should be 2 initially
     assert_eq!(fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -1051,7 +1090,16 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
 
     // 1. Populate valid filesystem tree
     let d = appendfs::operations::dir::mkdir_core(&fs, 1, "sub", 0o755, 1000, 1000).unwrap();
-    let f1 = appendfs::operations::read_write::create_core(&fs, d.ino, "hello.txt", 0o644, 0, 1000, 1000).unwrap();
+    let f1 = appendfs::operations::read_write::create_core(
+        &fs,
+        d.ino,
+        "hello.txt",
+        0o644,
+        0,
+        1000,
+        1000,
+    )
+    .unwrap();
     appendfs::operations::read_write::write_core(&fs, f1.ino, b"integrity test data", 0).unwrap();
     let _l = appendfs::operations::links::link_core(&fs, f1.ino, 1, "hardlink.txt").unwrap();
 
@@ -1059,7 +1107,11 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
 
     // 2. Check clean volume
     let report = appendfs::check_volume(log_path, true).unwrap();
-    assert!(report.is_clean(), "Clean volume must pass check: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "Clean volume must pass check: {:?}",
+        report.issues
+    );
     assert_eq!(report.error_count(), 0);
     assert_eq!(report.orphaned_inodes.len(), 0);
     assert_eq!(report.directories, 2);
@@ -1082,7 +1134,10 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
         mtime: std::time::SystemTime::UNIX_EPOCH,
         ctime: std::time::SystemTime::UNIX_EPOCH,
     };
-    fs.base.write().unwrap().insert(orphan_ino, std::sync::Arc::new(appendfs::SyncNode::new(orphan_node)));
+    fs.base
+        .write()
+        .unwrap()
+        .insert(orphan_ino, std::sync::Arc::new(orphan_node));
 
     let corrupted_report = appendfs::check_fs_integrity(&fs, Some(log_path), true);
     assert!(!corrupted_report.is_clean());
@@ -1134,9 +1189,18 @@ fn test_mount_ro_rejects_mutations_and_enables_point_in_time_time_travel() {
     assert_eq!(fs::read_to_string(&file2).unwrap(), "version 2 content");
 
     // Mutation operations must fail with EROFS / PermissionDenied
-    assert!(fs::write(&file1, "tampered").is_err(), "Write on RO mount must fail");
-    assert!(fs::create_dir(mount.path().join("forbidden_dir")).is_err(), "Mkdir on RO mount must fail");
-    assert!(fs::remove_file(&file1).is_err(), "Unlink on RO mount must fail");
+    assert!(
+        fs::write(&file1, "tampered").is_err(),
+        "Write on RO mount must fail"
+    );
+    assert!(
+        fs::create_dir(mount.path().join("forbidden_dir")).is_err(),
+        "Mkdir on RO mount must fail"
+    );
+    assert!(
+        fs::remove_file(&file1).is_err(),
+        "Unlink on RO mount must fail"
+    );
 
     mount.unmount();
 
@@ -1146,17 +1210,26 @@ fn test_mount_ro_rejects_mutations_and_enables_point_in_time_time_travel() {
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
         .collect();
     files_after_ro.sort();
-    assert_eq!(files_before_ro, files_after_ro, "RO mount must never write to disk files");
+    assert_eq!(
+        files_before_ro, files_after_ro,
+        "RO mount must never write to disk files"
+    );
 
     // 5. RO Mount with Point-in-Time Historical Recovery (TxId cutoff before step2)
     mount.remount_ro(appendfs::RecoveryTarget::TxId(4));
 
     // step1 exists
     let file1 = mount.path().join("step1/file1.txt");
-    assert!(file1.exists(), "step1/file1.txt must exist at historical point-in-time");
+    assert!(
+        file1.exists(),
+        "step1/file1.txt must exist at historical point-in-time"
+    );
     assert_eq!(fs::read_to_string(&file1).unwrap(), "version 1 content");
 
     // step2 does NOT exist at this historical point in time
     let step2 = mount.path().join("step2");
-    assert!(!step2.exists(), "step2 must NOT exist at historical point-in-time");
+    assert!(
+        !step2.exists(),
+        "step2 must NOT exist at historical point-in-time"
+    );
 }
