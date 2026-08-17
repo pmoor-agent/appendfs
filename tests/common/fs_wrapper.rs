@@ -2,6 +2,7 @@ use appendfs::InMemoryFS;
 use appendfs::clock::{Clock, SystemClock};
 use appendfs::log::recover_fs_with_clock;
 use appendfs::shim::{FileAttr, FileType};
+use appendfs::storage::{FaultStorage, OsStorage, Storage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,10 +29,48 @@ pub enum SnapshotNode {
     },
 }
 
+/// Builds the active `LogWriter`, routing it through `fault` when this instance was
+/// created with fault injection so a test can fail its writes on demand.
+fn make_writer(
+    log_dir: &Path,
+    fault: Option<&Arc<FaultStorage>>,
+    generation: u64,
+    clock: &dyn Clock,
+    max_log_size: u64,
+    start_tx: u64,
+) -> Arc<appendfs::LogWriter> {
+    match fault {
+        Some(f) => Arc::new(
+            appendfs::LogWriter::create_with_storage(
+                Arc::clone(f) as Arc<dyn Storage>,
+                generation,
+                clock,
+                max_log_size,
+                start_tx,
+            )
+            .unwrap(),
+        ),
+        None => Arc::new(
+            appendfs::LogWriter::create_with_max_size_and_start_tx(
+                log_dir,
+                generation,
+                clock,
+                max_log_size,
+                start_tx,
+            )
+            .unwrap(),
+        ),
+    }
+}
+
 #[allow(dead_code)]
 pub struct TestFS {
     pub fs: InMemoryFS,
     pub log_dir: PathBuf,
+    /// Present only for instances built by `new_temp_with_fault_injection`; the handle
+    /// used to inject and clear log write failures. Survives remount/crash so faults can
+    /// be injected repeatedly across a run.
+    pub fault: Option<Arc<FaultStorage>>,
     pub _temp_dir: Option<Arc<tempfile::TempDir>>,
 }
 
@@ -42,21 +81,45 @@ impl TestFS {
     }
 
     pub fn new_temp_with_clock(max_log_size: Option<u64>, clock: Arc<dyn Clock>) -> Self {
+        Self::new_temp_inner(max_log_size, clock, false)
+    }
+
+    /// Like `new_temp_with_clock`, but routes all log I/O through a `FaultStorage`, so a
+    /// test can make flushes fail at chosen moments via `self.fault`.
+    pub fn new_temp_with_fault_injection(
+        max_log_size: Option<u64>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self::new_temp_inner(max_log_size, clock, true)
+    }
+
+    fn new_temp_inner(
+        max_log_size: Option<u64>,
+        clock: Arc<dyn Clock>,
+        inject_faults: bool,
+    ) -> Self {
         let temp_dir = tempfile::tempdir().unwrap();
         let log_dir = temp_dir.path().to_path_buf();
-        let writer = if let Some(max_size) = max_log_size {
-            Arc::new(
-                appendfs::LogWriter::create_with_max_size(&log_dir, 1, &*clock, max_size).unwrap(),
-            )
-        } else {
-            Arc::new(appendfs::LogWriter::create(&log_dir, 1, &*clock).unwrap())
-        };
+        let fault = inject_faults
+            .then(|| Arc::new(FaultStorage::new(Arc::new(OsStorage::new(&log_dir)))));
+        let writer = make_writer(
+            &log_dir,
+            fault.as_ref(),
+            1,
+            &*clock,
+            max_log_size.unwrap_or(appendfs::cli::DEFAULT_MAX_LOG_SIZE),
+            1,
+        );
 
         let mut fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
-        fs.set_log_dir(&log_dir);
+        match fault.as_ref() {
+            Some(f) => fs.set_storage(Arc::clone(f) as Arc<dyn Storage>),
+            None => fs.set_log_dir(&log_dir),
+        }
         Self {
             fs,
             log_dir,
+            fault,
             _temp_dir: Some(Arc::new(temp_dir)),
         }
     }
@@ -69,6 +132,7 @@ impl TestFS {
         Self {
             fs,
             log_dir: log_dir.to_path_buf(),
+            fault: None,
             _temp_dir: temp_dir,
         }
     }
@@ -219,48 +283,53 @@ impl TestFS {
         let log_dir = self.log_dir.clone();
         let temp_dir = self._temp_dir.clone();
         let clock = self.fs.clock.clone();
+        let fault = self.fault.clone();
         let _ = self.fs.sync_and_export_summary();
         drop(self);
-        let mut recovered = recover_fs_with_clock(&log_dir, clock.clone()).unwrap();
-        let next_gen = appendfs::find_latest_generation(&log_dir) + 1;
-        let start_tx = recovered.last_tx_id.load(Ordering::SeqCst) + 1;
-        let writer = Arc::new(
-            appendfs::LogWriter::create_with_max_size_and_start_tx(
-                &log_dir,
-                next_gen,
-                &*clock,
-                appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-                start_tx,
-            )
-            .unwrap(),
-        );
-        recovered.log_writer = Some(writer);
-        recovered.set_log_dir(&log_dir);
-        Self::from_instance(recovered, &log_dir, temp_dir)
+        Self::recover_into(&log_dir, temp_dir, clock, fault)
     }
 
     pub fn unclean_crash(mut self) -> Self {
         let log_dir = self.log_dir.clone();
         let temp_dir = self._temp_dir.clone();
         let clock = self.fs.clock.clone();
+        let fault = self.fault.clone();
         let _ = self.fs.sync_log();
         self.fs.log_writer = None;
         drop(self);
-        let mut recovered = recover_fs_with_clock(&log_dir, clock.clone()).unwrap();
-        let next_gen = appendfs::find_latest_generation(&log_dir) + 1;
+        Self::recover_into(&log_dir, temp_dir, clock, fault)
+    }
+
+    /// Replays `log_dir` into a fresh instance and opens the next generation for writing.
+    /// Recovery itself always reads through the real OS filesystem - the log files on disk
+    /// are real either way - while `fault`, when present, is carried over so the new
+    /// instance can keep having its writes failed on demand.
+    fn recover_into(
+        log_dir: &Path,
+        temp_dir: Option<Arc<tempfile::TempDir>>,
+        clock: Arc<dyn Clock>,
+        fault: Option<Arc<FaultStorage>>,
+    ) -> Self {
+        let mut recovered = recover_fs_with_clock(log_dir, clock.clone()).unwrap();
+        let next_gen = appendfs::find_latest_generation(log_dir) + 1;
         let start_tx = recovered.last_tx_id.load(Ordering::SeqCst) + 1;
-        let writer = Arc::new(
-            appendfs::LogWriter::create_with_max_size_and_start_tx(
-                &log_dir,
-                next_gen,
-                &*clock,
-                appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-                start_tx,
-            )
-            .unwrap(),
-        );
-        recovered.log_writer = Some(writer);
-        recovered.set_log_dir(&log_dir);
-        Self::from_instance(recovered, &log_dir, temp_dir)
+        recovered.log_writer = Some(make_writer(
+            log_dir,
+            fault.as_ref(),
+            next_gen,
+            &*clock,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            start_tx,
+        ));
+        match fault.as_ref() {
+            Some(f) => recovered.set_storage(Arc::clone(f) as Arc<dyn Storage>),
+            None => recovered.set_log_dir(log_dir),
+        }
+        Self {
+            fs: recovered,
+            log_dir: log_dir.to_path_buf(),
+            fault,
+            _temp_dir: temp_dir,
+        }
     }
 }

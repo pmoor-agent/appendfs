@@ -25,7 +25,13 @@ fn test_differential_fuzzing_and_crash_recovery() {
         let fs_baseline = TestFS::new_temp_with_clock(None, Arc::new(clock.clone()));
         let fs_micro = TestFS::new_temp_with_clock(Some(256), Arc::new(clock.clone()));
         let mut fs_remount = TestFS::new_temp_with_clock(None, Arc::new(clock.clone()));
-        let mut fs_crash = TestFS::new_temp_with_clock(None, Arc::new(clock.clone()));
+        // The crash instance routes its log through a FaultStorage, so each checkpoint can
+        // force a mid-flush I/O failure before crashing. Every durability bug found so far
+        // (the permanent wedge, mid-batch torn records, the unbounded flush queue) lived in
+        // that seam and was invisible to a fuzzer that only ever saw a healthy disk.
+        let mut fs_crash =
+            TestFS::new_temp_with_fault_injection(None, Arc::new(clock.clone()));
+        let mut observed_flush_failures = 0usize;
 
         // Keep track of created subdirectories (inode IDs) to perform operations on
         let mut active_dirs = vec![1u64];
@@ -363,6 +369,24 @@ fn test_differential_fuzzing_and_crash_recovery() {
             // At each randomly-drawn checkpoint step, simulate clean remount & unclean
             // crash recovery.
             if checkpoints.contains(&step) {
+                // Fail a flush partway through writing this batch, then clear the fault.
+                // The batch stays queued and is retried; if that retry ever leaves the log
+                // in a state recovery can't read - a torn record, a duplicated one - the
+                // crash comparison below turns it into a failure instead of silent
+                // corruption nobody notices until a real disk fills up.
+                if let Some(fault) = fs_crash.fault.clone() {
+                    let offset = fs_crash
+                        .fs
+                        .log_writer
+                        .as_ref()
+                        .map_or(0, |w| w.current_offset());
+                    fault.fail_writes_after_bytes(offset + 200, true);
+                    if fs_crash.fs.flush_log().is_err() {
+                        observed_flush_failures += 1;
+                    }
+                    fault.clear_write_limit();
+                }
+
                 fs_remount = fs_remount.clean_remount();
                 fs_crash = fs_crash.unclean_crash();
 
@@ -642,6 +666,16 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 }
             }
         }
+
+        // The injection above is only worth anything if it actually fires. Without this,
+        // a future change to batching or thresholds could quietly stop producing failures
+        // and the run would still pass while testing nothing.
+        assert!(
+            observed_flush_failures > 0,
+            "seed {}: no flush ever failed, so crash recovery was never exercised against \
+             a failed-then-retried batch",
+            seed
+        );
     }
 }
 
