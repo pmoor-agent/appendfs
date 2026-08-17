@@ -138,14 +138,7 @@ fn main() {
             };
 
             let stats = VolumeStats::collect(&fs);
-            if args.json {
-                match serde_json::to_string_pretty(&stats) {
-                    Ok(json_str) => println!("{}", json_str),
-                    Err(e) => eprintln!("Failed to format JSON: {}", e),
-                }
-            } else {
-                print!("{}", stats.display_text());
-            }
+            print!("{}", stats.display_text());
         }
     }
 }

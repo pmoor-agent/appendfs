@@ -1,11 +1,10 @@
 use crate::fs::InMemoryFS;
 use crate::log::manifest::GenerationLiveStats;
 use crate::node::Node;
-use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
 
 /// Aggregate statistics and fragmentation status for an appendfs volume.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VolumeStats {
     pub branch: String,
     pub next_generation: u64,

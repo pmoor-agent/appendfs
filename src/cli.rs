@@ -84,10 +84,6 @@ impl MountArgs {
 pub struct StatsArgs {
     /// Directory path where the appendfs volume log and summary files are stored
     pub log_dir: PathBuf,
-
-    /// Output statistics in JSON format
-    #[arg(long = "json", default_value_t = false)]
-    pub json: bool,
 }
 
 /// Helper scanning `log_dir` for existing `.log` files to find the highest generation number.
