@@ -871,52 +871,65 @@ impl InMemoryFS {
         let mut unlinks_to_emit: Vec<(u64, u64, String, bool, SystemTime)> = Vec::new();
 
         for &parent_ino in &inos {
-            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&parent_ino) {
-                let mut removed_entries: Vec<(String, u64, bool)> = Vec::new();
+            let (d_removed, d_added, op_time) = match frozen.get(&parent_ino) {
+                Some(EntryDelta::Node(NodeDelta::Directory(d))) => {
+                    (&d.removed, Some(&d.added), d.attr_delta.mtime.unwrap_or(now))
+                }
+                Some(EntryDelta::Tombstone) => {
+                    static EMPTY_REMOVED: std::sync::LazyLock<HashSet<String>> =
+                        std::sync::LazyLock::new(HashSet::new);
+                    (&*EMPTY_REMOVED, None, now)
+                }
+                _ => continue,
+            };
 
-                if let Some(base_arc) = base_map.get(&parent_ino) {
-                    let node = unsafe { base_arc.read() };
-                    if let Node::Directory { entries, .. } = node {
-                        for (name, c_ino) in entries {
-                            let was_removed = d.removed.contains(name);
-                            let was_replaced = d.added.get(name).map(|new_ino| new_ino != c_ino).unwrap_or(false);
-                            if was_removed || was_replaced {
-                                let mut is_dir = false;
-                                if let Some(child_arc) = base_map.get(c_ino) {
-                                    if let Node::Directory { .. } = unsafe { child_arc.read() } {
-                                        is_dir = true;
-                                    }
-                                } else if let Some(EntryDelta::Node(NodeDelta::Directory(_))) =
-                                    frozen.get(c_ino)
-                                {
+            let mut removed_entries: Vec<(String, u64, bool)> = Vec::new();
+
+            if let Some(base_arc) = base_map.get(&parent_ino) {
+                let node = unsafe { base_arc.read() };
+                if let Node::Directory { entries, .. } = node {
+                    for (name, c_ino) in entries {
+                        let was_removed = d_added.is_none()
+                            || d_removed.contains(name)
+                            || d_added
+                                .unwrap()
+                                .get(name)
+                                .map(|new_ino| new_ino != c_ino)
+                                .unwrap_or(false);
+                        if was_removed {
+                            let mut is_dir = false;
+                            if let Some(child_arc) = base_map.get(c_ino) {
+                                if let Node::Directory { .. } = unsafe { child_arc.read() } {
                                     is_dir = true;
                                 }
-                                removed_entries.push((name.clone(), *c_ino, is_dir));
+                            } else if let Some(EntryDelta::Node(NodeDelta::Directory(_))) =
+                                frozen.get(c_ino)
+                            {
+                                is_dir = true;
                             }
+                            removed_entries.push((name.clone(), *c_ino, is_dir));
                         }
                     }
                 }
+            }
 
-                removed_entries.sort_by(|a, b| a.0.cmp(&b.0));
+            removed_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-                let op_time = d.attr_delta.mtime.unwrap_or(now);
-
-                for (name, child_ino, is_dir) in removed_entries {
-                    if let Some((new_parent, new_name)) =
-                        all_added.get_mut(&child_ino).and_then(|v| v.pop())
-                    {
-                        renamed_additions.insert((new_parent, new_name.clone()));
-                        renames_to_emit.push((
-                            child_ino,
-                            parent_ino,
-                            name,
-                            new_parent,
-                            new_name,
-                            op_time,
-                        ));
-                    } else {
-                        unlinks_to_emit.push((child_ino, parent_ino, name, is_dir, op_time));
-                    }
+            for (name, child_ino, is_dir) in removed_entries {
+                if let Some((new_parent, new_name)) =
+                    all_added.get_mut(&child_ino).and_then(|v| v.pop())
+                {
+                    renamed_additions.insert((new_parent, new_name.clone()));
+                    renames_to_emit.push((
+                        child_ino,
+                        parent_ino,
+                        name,
+                        new_parent,
+                        new_name,
+                        op_time,
+                    ));
+                } else {
+                    unlinks_to_emit.push((child_ino, parent_ino, name, is_dir, op_time));
                 }
             }
         }
@@ -1944,5 +1957,73 @@ mod tests {
         assert_eq!(recovered_stats[0].total_data_bytes, 140);
         assert_eq!(recovered_stats[0].live_bytes, 100);
         assert_eq!(recovered_stats[0].live_extents, 2);
+    }
+
+    #[test]
+    fn test_rm_rf_directory_tree_emits_unlinks_for_all_children_and_recovers_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+        // 1. Create /Gletscher, /Gletscher/sub, and files
+        let gletscher_attr = crate::operations::dir::mkdir_core(&fs, 1, "Gletscher", 0o755, 1000, 1000).unwrap();
+        let gletscher_ino = gletscher_attr.ino;
+
+        let file1_attr = crate::operations::read_write::create_core(&fs, gletscher_ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file1_attr.ino, &[1, 2, 3, 4], 0).unwrap();
+
+        let file2_attr = crate::operations::read_write::create_core(&fs, gletscher_ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file2_attr.ino, &[5, 6, 7, 8], 0).unwrap();
+
+        let sub_attr = crate::operations::dir::mkdir_core(&fs, gletscher_ino, "sub", 0o755, 1000, 1000).unwrap();
+        let sub_ino = sub_attr.ino;
+
+        let file3_attr = crate::operations::read_write::create_core(&fs, sub_ino, "file3.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file3_attr.ino, &[9, 10, 11, 12], 0).unwrap();
+
+        // Flush creation to disk
+        fs.sync_log().unwrap();
+
+        // Verify live stats show 3 files and 12 live bytes
+        let stats_before = fs.calculate_generation_live_stats();
+        assert_eq!(stats_before[0].live_bytes, 12);
+        assert_eq!(stats_before[0].live_extents, 3);
+
+        // 2. Perform rm -rf /Gletscher
+        crate::operations::links::unlink_core(&fs, sub_ino, "file3.txt").unwrap();
+        crate::operations::dir::rmdir_core(&fs, gletscher_ino, "sub").unwrap();
+        crate::operations::links::unlink_core(&fs, gletscher_ino, "file1.txt").unwrap();
+        crate::operations::links::unlink_core(&fs, gletscher_ino, "file2.txt").unwrap();
+        crate::operations::dir::rmdir_core(&fs, 1, "Gletscher").unwrap();
+
+        // Flush deletion to disk
+        fs.sync_log().unwrap();
+
+        // Check live stats in memory
+        let stats_after = fs.calculate_generation_live_stats();
+        assert_eq!(stats_after[0].live_bytes, 0);
+        assert_eq!(stats_after[0].live_extents, 0);
+
+        // 3. Inspect the log dump to verify Unlink and Rmdir records were written
+        let log_file = dir.path().join("000001.log");
+        let dump_text = crate::dump::dump_log_file(&log_file, 1).unwrap();
+        assert!(dump_text.contains("Unlink"));
+        assert!(dump_text.contains("Rmdir"));
+        assert!(dump_text.contains("file1.txt"));
+        assert!(dump_text.contains("file2.txt"));
+        assert!(dump_text.contains("file3.txt"));
+        assert!(dump_text.contains("Gletscher"));
+        assert!(dump_text.contains("sub"));
+
+        // 4. Recover filesystem and verify no orphaned nodes remain
+        let recovered = crate::log::recover_fs(dir.path()).unwrap();
+        let base = recovered.base.read().unwrap();
+        assert_eq!(base.len(), 1); // ONLY root directory (inode 1) remains!
+        assert!(base.contains_key(&1));
+
+        let rec_stats = recovered.calculate_generation_live_stats();
+        assert_eq!(rec_stats[0].live_bytes, 0);
+        assert_eq!(rec_stats[0].live_extents, 0);
     }
 }
