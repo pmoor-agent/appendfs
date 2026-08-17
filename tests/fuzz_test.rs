@@ -904,6 +904,62 @@ fn test_rename_onto_own_hardlink_is_a_noop_and_survives_recovery() {
     assert_eq!(fs.read(ino, 0, 7).unwrap(), b"payload".to_vec());
 }
 
+// Synthesis reconstructs renames from a batch's net effect, so the order it emits them in
+// has nothing to do with the order they happened. Replaying a rename while its destination
+// is still occupied makes recovery treat the occupant as an overwrite victim, and for a
+// directory that means deleting it outright along with everything under it.
+#[test]
+fn test_rename_into_a_name_freed_by_another_rename_in_the_same_batch() {
+    let fs = TestFS::new_temp(None);
+    let a = fs.mkdir(1, "A", 0o755).unwrap();
+    let b = fs.mkdir(1, "B", 0o755).unwrap();
+    let f = fs.create(b, "payload.txt", 0o644).unwrap();
+    fs.write(f, 0, b"important").unwrap();
+    fs.fs.flush_log().unwrap();
+
+    // One batch: free the name "B" first, then move "A" into it.
+    fs.rename(1, "B", 1, "C").unwrap();
+    fs.rename(1, "A", 1, "B").unwrap();
+
+    let live = fs.fs.list_directory(1).unwrap();
+    assert_eq!(live, vec![("B".to_string(), a), ("C".to_string(), b)]);
+
+    let fs = fs.unclean_crash();
+    assert_eq!(
+        fs.fs.list_directory(1).unwrap(),
+        live,
+        "replaying the renames out of order destroyed the displaced directory"
+    );
+    assert_eq!(fs.read(f, 0, 9).unwrap(), b"important".to_vec());
+}
+
+// `add_dir_entry` clears the matching removal, so a name removed and put back inside one
+// batch is recorded as a bare addition that merely restates what `base` already holds.
+// Treating it as a real addition makes synthesis emit a Link, or pair it with an unrelated
+// removal into a Rename, and replay then lands the entry twice.
+#[test]
+fn test_rename_away_and_back_within_one_batch_does_not_duplicate_the_entry() {
+    let fs = TestFS::new_temp(None);
+    let d = fs.mkdir(1, "d", 0o755).unwrap();
+    let f = fs.create(d, "f", 0o644).unwrap();
+    fs.fs.flush_log().unwrap();
+
+    fs.rename(d, "f", 1, "moved").unwrap();
+    fs.rename(1, "moved", d, "f").unwrap();
+
+    let live = fs.fs.list_directory(d).unwrap();
+    let live_nlink = fs.fs.get_attr(f).unwrap().nlink;
+    assert_eq!(live, vec![("f".to_string(), f)]);
+
+    let fs = fs.unclean_crash();
+    assert_eq!(
+        fs.fs.list_directory(d).unwrap(),
+        live,
+        "replay duplicated the directory entry"
+    );
+    assert_eq!(fs.fs.get_attr(f).unwrap().nlink, live_nlink);
+}
+
 #[test]
 fn test_truncate_shrink_then_grow_repro() {
     // Targeted repro: write full content, shrink via truncate, write a small amount,

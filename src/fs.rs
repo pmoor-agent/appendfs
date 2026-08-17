@@ -292,13 +292,21 @@ impl InMemoryFS {
 
     pub fn update_attr_delta(&self, ino: u64, delta: AttrDelta) {
         let mut live = self.live.write().unwrap();
-        if let Some(EntryDelta::Node(node_delta)) = live.get_mut(&ino) {
-            match node_delta {
-                NodeDelta::Directory(d) => merge_attr_delta(&mut d.attr_delta, &delta),
-                NodeDelta::File(f) => merge_attr_delta(&mut f.attr_delta, &delta),
-                NodeDelta::Symlink(s) => merge_attr_delta(&mut s.attr_delta, &delta),
+        match live.get_mut(&ino) {
+            // Already deleted in this batch. The fallback below reconstructs a node delta
+            // from the lower layers, which for a tombstoned inode would replace the
+            // tombstone and bring the inode back from the dead - still carrying its old
+            // link count, but with nothing referencing it.
+            Some(EntryDelta::Tombstone) => return,
+            Some(EntryDelta::Node(node_delta)) => {
+                match node_delta {
+                    NodeDelta::Directory(d) => merge_attr_delta(&mut d.attr_delta, &delta),
+                    NodeDelta::File(f) => merge_attr_delta(&mut f.attr_delta, &delta),
+                    NodeDelta::Symlink(s) => merge_attr_delta(&mut s.attr_delta, &delta),
+                }
+                return;
             }
-            return;
+            None => {}
         }
 
         // Inode not in live yet - query existing type from lower layers without re-acquiring live lock
@@ -886,6 +894,24 @@ impl InMemoryFS {
             let mut flushed_data_bytes = 0u64;
             let now = self.clock.now();
 
+            // True when `base` already maps this exact name to this exact child. Such an
+            // "addition" is not a new reference at all: it is a name that was removed and
+            // put back within the batch (a rename away and back), which `add_dir_entry`
+            // records as a bare addition because it clears the matching removal. Treating it
+            // as real makes synthesis emit a Link, or pair it with an unrelated removal to
+            // form a Rename, and either way replay ends up with the entry twice.
+            let entry_already_in_base = |parent: u64, name: &str, child: u64| -> bool {
+                base_map
+                    .get(&parent)
+                    .map(|arc| match &**arc {
+                        Node::Directory { entries, .. } => {
+                            entries.iter().any(|(n, c)| n == name && *c == child)
+                        }
+                        _ => false,
+                    })
+                    .unwrap_or(false)
+            };
+
             // 1. Build map of added entries: for each new inode, record its primary creation parent
             let mut primary_creation: HashMap<u64, (u64, String)> = HashMap::new();
             let mut all_added: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
@@ -898,6 +924,9 @@ impl InMemoryFS {
                             && !primary_creation.contains_key(&child_ino)
                         {
                             primary_creation.insert(child_ino, (parent_ino, name.clone()));
+                            continue;
+                        }
+                        if entry_already_in_base(parent_ino, name, child_ino) {
                             continue;
                         }
                         all_added
@@ -1084,8 +1113,59 @@ impl InMemoryFS {
                 }
             }
 
-            // Phase 4: Renames
-            for (child_ino, parent, name, new_parent, new_name, op_time) in renames_to_emit {
+            // Phase 4: Renames, ordered so that a rename *into* a name is emitted after the
+            // rename that frees that name.
+            //
+            // These records are reconstructed from the batch's net effect, so the order they
+            // were discovered in has nothing to do with the order they actually happened. If
+            // one is replayed while its destination is still occupied, recovery treats the
+            // occupant as an overwrite victim - and for a directory that means deleting it
+            // outright, taking its whole subtree with it. Live never allows that (renaming
+            // onto a non-empty directory is ENOTEMPTY), so it is purely an artifact of the
+            // emission order.
+            //
+            // A name has one occupant, so each rename has at most one predecessor and this is
+            // a forest rather than a general DAG.
+            let mut vacated_by: HashMap<(u64, &str), usize> = HashMap::new();
+            for (idx, r) in renames_to_emit.iter().enumerate() {
+                vacated_by.insert((r.1, r.2.as_str()), idx);
+            }
+            let mut predecessor: Vec<Option<usize>> = vec![None; renames_to_emit.len()];
+            for (idx, r) in renames_to_emit.iter().enumerate() {
+                if let Some(&freed_by) = vacated_by.get(&(r.3, r.4.as_str()))
+                    && freed_by != idx
+                {
+                    predecessor[idx] = Some(freed_by);
+                }
+            }
+            let mut emitted = vec![false; renames_to_emit.len()];
+            let mut order: Vec<usize> = Vec::with_capacity(renames_to_emit.len());
+            loop {
+                let mut progressed = false;
+                for idx in 0..renames_to_emit.len() {
+                    if !emitted[idx] && predecessor[idx].is_none_or(|p| emitted[p]) {
+                        emitted[idx] = true;
+                        order.push(idx);
+                        progressed = true;
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            // Anything left is a dependency cycle (names swapped among themselves), which
+            // has no correct emission order; fall back to discovery order for those.
+            for idx in 0..renames_to_emit.len() {
+                if !emitted[idx] {
+                    order.push(idx);
+                }
+            }
+
+            let ordered_renames: Vec<_> = order
+                .into_iter()
+                .map(|idx| renames_to_emit[idx].clone())
+                .collect();
+            for (child_ino, parent, name, new_parent, new_name, op_time) in ordered_renames {
                 let payload = RenamePayload {
                     parent,
                     name,
@@ -1109,6 +1189,9 @@ impl InMemoryFS {
                             continue;
                         }
                         if renamed_additions.contains(&(parent_ino, name.clone())) {
+                            continue;
+                        }
+                        if entry_already_in_base(parent_ino, name, child_ino) {
                             continue;
                         }
                         let child_ctime = match frozen.get(&child_ino) {
@@ -2345,6 +2428,41 @@ mod tests {
         let rec_stats = recovered.calculate_generation_live_stats();
         assert_eq!(rec_stats[0].live_bytes, 25);
         assert_eq!(rec_stats[0].live_extents, 1);
+    }
+
+    #[test]
+    fn test_attr_update_does_not_resurrect_a_tombstoned_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+        let attr =
+            crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000)
+                .unwrap();
+        // Fold it into `base`, so the lower layers still describe the inode after deletion.
+        fs.sync_log().unwrap();
+        crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
+        assert!(fs.get_attr(attr.ino).is_none(), "unlinked file must be gone");
+
+        // A late attribute update - an atime bump racing the unlink, say - must not rebuild
+        // the node from `base` and bring it back carrying its old link count, unreferenced
+        // by any directory.
+        fs.update_attr_delta(
+            attr.ino,
+            AttrDelta {
+                atime: Some(clock.now()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            fs.get_attr(attr.ino).is_none(),
+            "attribute update resurrected a deleted inode"
+        );
+        assert!(
+            !fs.snapshot_all().contains_key(&attr.ino),
+            "resurrected inode leaked into the snapshot as an orphan"
+        );
     }
 
     #[test]
