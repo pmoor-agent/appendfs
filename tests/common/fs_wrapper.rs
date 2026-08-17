@@ -112,6 +112,7 @@ impl TestFS {
         appendfs::operations::links::link_core(&self.fs, ino, newparent, newname).map(|_| ())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn setattr(
         &self,
         ino: u64,

@@ -176,8 +176,8 @@ pub fn export_summary_with_time_to_storage(
             for (start, len, state) in entries {
                 if let Some((cur_start, cur_len, cur_state)) = current.take() {
                     let mut merged = false;
-                    if cur_start + cur_len == start {
-                        if let (
+                    if cur_start + cur_len == start
+                        && let (
                             crate::log::ExtentState::Disk {
                                 generation: g1,
                                 record_log_offset: r1,
@@ -191,8 +191,7 @@ pub fn export_summary_with_time_to_storage(
                                 length: _,
                             },
                         ) = (cur_state.read_state(), state.read_state())
-                        {
-                            if g1 == g2
+                            && g1 == g2
                                 && r1 == r2
                                 && p1 as u64 + cur_len == p2 as u64
                             {
@@ -205,8 +204,6 @@ pub fn export_summary_with_time_to_storage(
                                 current = Some((cur_start, cur_len + len, new_state));
                                 merged = true;
                             }
-                        }
-                    }
                     if !merged {
                         coalesced.insert(cur_start, cur_len, cur_state);
                         current = Some((start, len, state));

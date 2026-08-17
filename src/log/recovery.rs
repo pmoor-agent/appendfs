@@ -90,11 +90,10 @@ pub fn recover_fs_to_target_with_storage(
                             }
                             RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
                         };
-                        if eligible {
-                            if latest_summary.as_ref().map_or(true, |(g, _)| gen_num > *g) {
+                        if eligible
+                            && latest_summary.as_ref().is_none_or(|(g, _)| gen_num > *g) {
                                 latest_summary = Some((gen_num, reader));
                             }
-                        }
                     }
                     Err(e) => {
                         log::warn!("Ignoring unreadable summary {}: {}", file, e);
@@ -119,13 +118,13 @@ pub fn recover_fs_to_target_with_storage(
     let fs_instance = InMemoryFS::with_clock_and_storage(clock, storage.clone());
 
     let mut last_op_time: Option<SystemTime> = None;
-    if latest_summary.is_none() {
-        if let Some((_, oldest_file)) = log_files.first() {
-            if let Ok(oldest_reader) = LogReader::open_with_storage(&storage, oldest_file) {
+    if latest_summary.is_none()
+        && let Some((_, oldest_file)) = log_files.first()
+            && let Ok(oldest_reader) = LogReader::open_with_storage(&storage, oldest_file) {
                 let created = oldest_reader.file_header().created_at;
                 last_op_time = Some(created);
-                if let Some(root_arc) = fs_instance.base.write().unwrap().get_mut(&1) {
-                    if let Node::Directory {
+                if let Some(root_arc) = fs_instance.base.write().unwrap().get_mut(&1)
+                    && let Node::Directory {
                         atime,
                         mtime,
                         ctime,
@@ -136,10 +135,7 @@ pub fn recover_fs_to_target_with_storage(
                         *mtime = created;
                         *ctime = created;
                     }
-                }
             }
-        }
-    }
 
     let mut min_log_gen = 0u64;
     let mut last_tx_id = 0u64;
@@ -176,11 +172,10 @@ pub fn recover_fs_to_target_with_storage(
             continue;
         }
 
-        if let RecoveryTarget::Generation(max_gen) = target {
-            if gen_num > max_gen {
+        if let RecoveryTarget::Generation(max_gen) = target
+            && gen_num > max_gen {
                 break;
             }
-        }
 
         let mut pending: Vec<LogRecord> = Vec::new();
         let mut committed_records_count = 0u32;
@@ -242,12 +237,11 @@ pub fn recover_fs_to_target_with_storage(
                             }
                         }
                         RecoveryTarget::Timestamp(max_time) => {
-                            if let Some(op_time) = buffered.op_time() {
-                                if op_time > max_time {
+                            if let Some(op_time) = buffered.op_time()
+                                && op_time > max_time {
                                     target_cutoff_reached = true;
                                     break;
                                 }
-                            }
                         }
                         _ => {}
                     }
@@ -621,17 +615,16 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 }
             };
 
-            if rename.parent != rename.new_parent {
-                if let Some(target_node_arc) = map.get_mut(&target_ino) {
+            if rename.parent != rename.new_parent
+                && let Some(target_node_arc) = map.get_mut(&target_ino) {
                     let target_node = Arc::make_mut(target_node_arc);
                     if let Node::Directory { parent, .. } = target_node {
                         *parent = rename.new_parent;
                     }
                 }
-            }
 
-            if let Some(dest_ino) = overwritten_ino {
-                if dest_ino != target_ino {
+            if let Some(dest_ino) = overwritten_ino
+                && dest_ino != target_ino {
                     let mut should_delete = false;
                     if let Some(dest_node_arc) = map.get_mut(&dest_ino) {
                         let dest_node = Arc::make_mut(dest_node_arc);
@@ -655,7 +648,6 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         map.remove(&dest_ino);
                     }
                 }
-            }
         }
         DecodedPayload::Setattr(setattr) => {
             let mut map = fs_instance.base.write().unwrap();

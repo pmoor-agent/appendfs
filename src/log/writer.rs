@@ -247,12 +247,11 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        if let ActiveLogState::Open(active) = &mut *state {
-            if active.generation == generation && active.current_offset > offset {
+        if let ActiveLogState::Open(active) = &mut *state
+            && active.generation == generation && active.current_offset > offset {
                 let _ = active.writer.truncate(offset);
                 active.current_offset = offset;
             }
-        }
         Ok(())
     }
 

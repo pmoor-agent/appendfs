@@ -667,8 +667,8 @@ fn test_large_directory_readdir_and_readdirplus() {
     }
     read_entries.sort();
     assert_eq!(read_entries.len(), num_files);
-    for i in 0..num_files {
-        assert_eq!(read_entries[i], format!("file_{:05}.txt", i));
+    for (i, entry) in read_entries.iter().enumerate().take(num_files) {
+        assert_eq!(entry, &format!("file_{:05}.txt", i));
     }
 
     // Test with command line `ls -la`
@@ -798,6 +798,7 @@ fn test_volume_init_mount_and_stats_flow() {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&note)
             .unwrap();
         file.write_all(b"hello appendfs volume").unwrap();
@@ -1010,7 +1011,7 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
 
     // Verify that the manifest records flushes triggered automatically by operation count!
     let manifest = fs.manifest.read().unwrap();
-    assert!(manifest.logs.len() >= 1);
+    assert!(!manifest.logs.is_empty());
     let total_records: u32 = manifest.logs.iter().map(|l| l.record_count).sum();
     assert!(
         total_records > 0,
@@ -1065,7 +1066,7 @@ fn test_background_flusher_in_mount_session() {
     // Staged ops should have been flushed to 0 by the background flusher
     assert_eq!(fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst), 0);
     let manifest = fs.manifest.read().unwrap();
-    assert!(manifest.logs.len() >= 1);
+    assert!(!manifest.logs.is_empty());
     assert!(manifest.logs[0].record_count > 0);
 
     fs.destroy();

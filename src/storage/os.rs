@@ -75,11 +75,10 @@ impl Storage for OsStorage {
         for entry in std::fs::read_dir(&self.base_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_file() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if path.is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     files.push(name.to_string());
                 }
-            }
         }
         files.sort();
         Ok(files)
@@ -119,7 +118,7 @@ impl Storage for OsStorage {
         } else {
             OpenOptions::new()
                 .create(true)
-                .write(true)
+                
                 .append(true)
                 .open(&path)?
         };

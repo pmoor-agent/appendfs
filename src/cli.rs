@@ -188,11 +188,10 @@ pub fn find_latest_generation_in_storage(storage: &dyn crate::storage::Storage) 
         for file in files {
             if file.ends_with(".log") {
                 let stem = file.trim_end_matches(".log");
-                if let Ok(gen_num) = stem.parse::<u64>() {
-                    if gen_num > max_gen {
+                if let Ok(gen_num) = stem.parse::<u64>()
+                    && gen_num > max_gen {
                         max_gen = gen_num;
                     }
-                }
             }
         }
     }

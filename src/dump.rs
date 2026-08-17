@@ -28,7 +28,7 @@ pub fn dump_file_with_storage(
     }
     reader.read_exact_at(0, &mut magic)?;
 
-    if &magic == &crate::log::record::FILE_MAGIC || filename.ends_with(".log") {
+    if magic == crate::log::record::FILE_MAGIC || filename.ends_with(".log") {
         dump_log_reader_with_path(reader.as_ref(), Some(filename), verbosity)
     } else if &magic == SUMMARY_MAGIC || filename.ends_with(".summary") {
         dump_summary_file_with_storage(storage, filename, verbosity)
@@ -138,10 +138,6 @@ impl WriteBucket {
 /// - `verbosity == 0`: High-level summary, flush counts, OpCode breakdown, and write histogram.
 /// - `verbosity == 1`: Summary + all individual records (write payloads summarized by length).
 /// - `verbosity >= 2`: Summary + all records + full hex/ASCII data dumps for writes.
-/// Reads and analyzes a single `.log` file, formatting the output based on `verbosity`:
-/// - `verbosity == 0`: High-level summary, flush counts, OpCode breakdown, and write histogram.
-/// - `verbosity == 1`: Summary + all individual records (write payloads summarized by length).
-/// - `verbosity >= 2`: Summary + all records + full hex/ASCII data dumps for writes.
 pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
     let path = path.as_ref();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -243,7 +239,7 @@ pub fn dump_log_reader_with_path(
         };
 
         let available_payload = file_len.saturating_sub(record_offset + RECORD_HEADER_SIZE as u64);
-        if (available_payload as u64) < header.payload_len as u64 {
+        if available_payload < header.payload_len as u64 {
             let mut partial = vec![0u8; available_payload as usize];
             let _ = reader.read_exact_at(record_offset + RECORD_HEADER_SIZE as u64, &mut partial);
             records.push(DumpRecordEntry::TornRecord {
@@ -433,8 +429,8 @@ pub fn dump_log_reader_with_path(
         writeln!(out, "--- Write Payload Size Histogram ---").unwrap();
         writeln!(
             out,
-            "{:<18} {:>8} {:>14}   {}",
-            "SIZE RANGE", "COUNT", "TOTAL BYTES", "DISTRIBUTION"
+            "{:<18} {:>8} {:>14}   DISTRIBUTION",
+            "SIZE RANGE", "COUNT", "TOTAL BYTES"
         )
         .unwrap();
         writeln!(out, "{:-<18} {:-<8} {:-<14}   {:-<20}", "", "", "", "").unwrap();
@@ -726,8 +722,8 @@ pub fn dump_summary_reader_with_path(
         writeln!(out, "Extents / File Distribution:").unwrap();
         writeln!(
             out,
-            "{:<24} {:>8} {:>12}   {}",
-            "EXTENTS RANGE", "FILES", "% OF FILES", "DISTRIBUTION"
+            "{:<24} {:>8} {:>12}   DISTRIBUTION",
+            "EXTENTS RANGE", "FILES", "% OF FILES"
         )
         .unwrap();
         writeln!(out, "{:-<24} {:-<8} {:-<12}   {:-<20}", "", "", "", "").unwrap();
@@ -756,8 +752,8 @@ pub fn dump_summary_reader_with_path(
             writeln!(out, "--- Top Fragmented Files ---").unwrap();
             writeln!(
                 out,
-                "{:<8} {:>12} {:>9} {:>16}   {}",
-                "INODE", "SIZE", "EXTENTS", "AVG EXTENT SIZE", "PATH"
+                "{:<8} {:>12} {:>9} {:>16}   PATH",
+                "INODE", "SIZE", "EXTENTS", "AVG EXTENT SIZE"
             )
             .unwrap();
             writeln!(
@@ -807,15 +803,14 @@ pub fn dump_summary_reader_with_path(
         writeln!(out).unwrap();
         writeln!(
             out,
-            "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
+            "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  STATUS",
             "LOG FILE",
             "RECORDS",
             "LOG SIZE",
             "DATA SIZE",
             "LIVE DATA",
             "EXTENTS",
-            "LIVE RATIO",
-            "STATUS"
+            "LIVE RATIO"
         )
         .unwrap();
         writeln!(
@@ -1183,8 +1178,8 @@ pub fn format_hexdump(data: &[u8], max_bytes: usize) -> String {
             if i == 8 {
                 out.push(' ');
             }
-            if chunk_offset + i < chunk_end {
-                let _ = write!(out, "{:02x} ", chunk[i]);
+            if let Some(&b) = chunk.get(i) {
+                let _ = write!(out, "{:02x} ", b);
             } else {
                 out.push_str("   ");
             }

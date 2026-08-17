@@ -238,8 +238,8 @@ fn verify_tree_invariants(fs: &InMemoryFS) {
 // the same order they committed live). Every other inode is fully log-derived and
 // compared exactly.
 fn normalize_for_compare(ino: u64, mut node: Node) -> Node {
-    if ino == 1 {
-        if let Node::Directory {
+    if ino == 1
+        && let Node::Directory {
             atime,
             mtime,
             ctime,
@@ -250,7 +250,6 @@ fn normalize_for_compare(ino: u64, mut node: Node) -> Node {
             *mtime = UNIX_EPOCH;
             *ctime = UNIX_EPOCH;
         }
-    }
     node
 }
 

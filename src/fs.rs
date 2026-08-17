@@ -171,13 +171,11 @@ impl InMemoryFS {
             handles.remove(&ino);
         }
         let remaining = handles.get(&ino).copied().unwrap_or(0);
-        if remaining == 0 {
-            if let Some(attr) = self.get_attr(ino) {
-                if attr.nlink == 0 {
+        if remaining == 0
+            && let Some(attr) = self.get_attr(ino)
+                && attr.nlink == 0 {
                     self.tombstone(ino);
                 }
-            }
-        }
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {
@@ -467,11 +465,10 @@ impl InMemoryFS {
 
         if let Some(arc) = self.base.read().unwrap().get(&parent) {
             let node = arc.as_ref();
-            if let Node::Directory { entries, .. } = node {
-                if let Some((_, ino)) = entries.iter().find(|(entry_name, _)| entry_name == name) {
+            if let Node::Directory { entries, .. } = node
+                && let Some((_, ino)) = entries.iter().find(|(entry_name, _)| entry_name == name) {
                     return Some(*ino);
                 }
-            }
         }
 
         None
@@ -666,6 +663,7 @@ impl InMemoryFS {
         Ok(read_buf)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn copy_extent_data(
         &self,
         dst_buf: &mut [u8],
@@ -715,8 +713,8 @@ impl InMemoryFS {
                 payload_offset,
                 length: _,
             } => {
-                if let Some(ref cache) = self.log_cache {
-                    if let Ok(reader) = cache.get_or_open(generation) {
+                if let Some(ref cache) = self.log_cache
+                    && let Ok(reader) = cache.get_or_open(generation) {
                         let disk_seek_pos = record_log_offset
                             + crate::log::RECORD_HEADER_SIZE as u64
                             + payload_offset as u64
@@ -725,7 +723,6 @@ impl InMemoryFS {
                             bytes_read = seg_len;
                         }
                     }
-                }
             }
         }
 
@@ -998,9 +995,9 @@ impl InMemoryFS {
 
             // Phase 2: Mkdir
             for &ino in &inos {
-                if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&ino) {
-                    if !base_map.contains_key(&ino) {
-                        if let Some((parent, name)) = primary_creation.get(&ino).cloned() {
+                if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&ino)
+                    && !base_map.contains_key(&ino)
+                        && let Some((parent, name)) = primary_creation.get(&ino).cloned() {
                             let op_time = d.attr_delta.ctime.unwrap_or(now);
 
                             if parent >= ino && !base_map.contains_key(&parent) {
@@ -1036,16 +1033,14 @@ impl InMemoryFS {
                                 written_count += 1;
                             }
                         }
-                    }
-                }
             }
 
             // Phase 3: Create and Symlink
             for &ino in &inos {
                 match frozen.get(&ino) {
                     Some(EntryDelta::Node(NodeDelta::File(f))) => {
-                        if !base_map.contains_key(&ino) {
-                            if let Some((parent, name)) = primary_creation.get(&ino).cloned() {
+                        if !base_map.contains_key(&ino)
+                            && let Some((parent, name)) = primary_creation.get(&ino).cloned() {
                                 let op_time = f.attr_delta.ctime.unwrap_or(now);
                                 let payload = CreatePayload {
                                     parent,
@@ -1061,11 +1056,10 @@ impl InMemoryFS {
                                 writer.append_record(OpCode::Create, ino, &bytes)?;
                                 written_count += 1;
                             }
-                        }
                     }
                     Some(EntryDelta::Node(NodeDelta::Symlink(s))) => {
-                        if !base_map.contains_key(&ino) {
-                            if let Some((parent, name)) = primary_creation.get(&ino).cloned() {
+                        if !base_map.contains_key(&ino)
+                            && let Some((parent, name)) = primary_creation.get(&ino).cloned() {
                                 let op_time = s.attr_delta.ctime.unwrap_or(now);
                                 let payload = SymlinkPayload {
                                     parent,
@@ -1081,7 +1075,6 @@ impl InMemoryFS {
                                 writer.append_record(OpCode::Symlink, ino, &bytes)?;
                                 written_count += 1;
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -1283,13 +1276,13 @@ impl InMemoryFS {
                             written_count += 1;
                         }
                     }
-                    Some(EntryDelta::Node(NodeDelta::Symlink(s))) => {
-                        if s.attr_delta.mode.is_some()
+                    Some(EntryDelta::Node(NodeDelta::Symlink(s)))
+                        if (s.attr_delta.mode.is_some()
                             || s.attr_delta.uid.is_some()
                             || s.attr_delta.gid.is_some()
                             || s.attr_delta.mtime.is_some()
-                            || s.attr_delta.ctime.is_some()
-                        {
+                            || s.attr_delta.ctime.is_some())
+                        => {
                             let op_time = s.attr_delta.ctime.or(s.attr_delta.mtime).unwrap_or(now);
                             let payload = SetattrPayload {
                                 mode: s.attr_delta.mode,
@@ -1306,7 +1299,6 @@ impl InMemoryFS {
                             writer.append_record(OpCode::Setattr, ino, &bytes)?;
                             written_count += 1;
                         }
-                    }
                     _ => {}
                 }
             }

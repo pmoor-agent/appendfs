@@ -130,15 +130,14 @@ impl VolumeStats {
         } else {
             writeln!(
                 out,
-                "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
+                "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  STATUS",
                 "LOG FILE",
                 "RECORDS",
                 "LOG SIZE",
                 "DATA SIZE",
                 "LIVE DATA",
                 "EXTENTS",
-                "LIVE RATIO",
-                "STATUS"
+                "LIVE RATIO"
             )
             .unwrap();
             writeln!(

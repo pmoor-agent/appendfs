@@ -3,10 +3,13 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, RwLock};
 
+pub type InMemoryFile = Arc<RwLock<Vec<u8>>>;
+pub type MemoryStorageMap = Arc<RwLock<HashMap<String, InMemoryFile>>>;
+
 /// In-memory storage implementation holding files in RAM.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStorage {
-    files: Arc<RwLock<HashMap<String, Arc<RwLock<Vec<u8>>>>>>,
+    files: MemoryStorageMap,
 }
 
 impl MemoryStorage {

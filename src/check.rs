@@ -593,8 +593,8 @@ pub fn check_fs_integrity(
                         ));
                     }
 
-                    if verify_data {
-                        if let Some(ref c) = cache {
+                    if verify_data
+                        && let Some(ref c) = cache {
                             let log_filename = format!("{:06}.log", generation);
                             if !c.storage().exists(&log_filename) {
                                 report.issues.push(IntegrityIssue::error(
@@ -685,7 +685,6 @@ pub fn check_fs_integrity(
                                 }
                             }
                         }
-                    }
                 }
             }
         }
@@ -719,10 +718,10 @@ pub fn check_fs_integrity(
             ));
         }
 
-        if let Some(ref c) = cache {
-            if c.storage().exists(&info.filename) {
-                if let Ok(file_len) = c.storage().file_len(&info.filename) {
-                    if file_len < info.total_bytes {
+        if let Some(ref c) = cache
+            && c.storage().exists(&info.filename)
+                && let Ok(file_len) = c.storage().file_len(&info.filename)
+                    && file_len < info.total_bytes {
                         report.issues.push(IntegrityIssue::warning(
                             "LOG_SIZE_MISMATCH",
                             None,
@@ -732,9 +731,6 @@ pub fn check_fs_integrity(
                             ),
                         ));
                     }
-                }
-            }
-        }
     }
 
     report

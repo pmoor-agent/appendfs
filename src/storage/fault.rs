@@ -112,8 +112,7 @@ impl StorageWriter for FaultStorageWriter {
                     let partial_len = (data.len() / 2).max(1);
                     let _ = self.inner.append(&data[..partial_len]);
                 }
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "simulated ENOSPC / EFBIG write failure",
                 ));
             }

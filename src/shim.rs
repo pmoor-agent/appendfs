@@ -68,6 +68,21 @@ struct ShimStatfsAttr {
 #[allow(non_camel_case_types)]
 type shim_req_t = *mut c_void;
 
+type ShimSetattrCallback = extern "C" fn(
+    req: shim_req_t,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: i64,
+    atime_sec: i64,
+    atime_nsec: u32,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+    to_set: u32,
+    userdata: *mut c_void,
+);
+
 #[repr(C)]
 struct RustLowlevelOps {
     lookup: Option<
@@ -94,22 +109,7 @@ struct RustLowlevelOps {
             userdata: *mut c_void,
         ),
     >,
-    setattr: Option<
-        extern "C" fn(
-            req: shim_req_t,
-            ino: u64,
-            mode: u32,
-            uid: u32,
-            gid: u32,
-            size: i64,
-            atime_sec: i64,
-            atime_nsec: u32,
-            mtime_sec: i64,
-            mtime_nsec: u32,
-            to_set: u32,
-            userdata: *mut c_void,
-        ),
-    >,
+    setattr: Option<ShimSetattrCallback>,
     create: Option<
         extern "C" fn(
             req: shim_req_t,
@@ -512,6 +512,7 @@ pub trait Filesystem {
     fn read(&self, req: Request, ino: u64, size: usize, offset: i64);
     fn open(&self, req: Request, ino: u64, flags: u32);
     fn write(&self, req: Request, ino: u64, buf: &[u8], offset: i64);
+    #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
         req: Request,

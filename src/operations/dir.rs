@@ -79,12 +79,12 @@ pub fn iter_dir_entries<'a>(
     };
 
     let offset = offset as usize;
-    let dot = (offset == 0).then(|| DirItem {
+    let dot = (offset == 0).then_some(DirItem {
         name: ".",
         ino,
         next_offset: 1,
     });
-    let dotdot = (offset <= 1).then(|| DirItem {
+    let dotdot = (offset <= 1).then_some(DirItem {
         name: "..",
         ino: dotdot_ino,
         next_offset: 2,
@@ -115,11 +115,10 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
 
     let mut db = shim::DirectoryBuffer::new(req, size);
     for item in iter_dir_entries(fs, ino, &entries, offset) {
-        if let Some(attr) = fs.get_attr(item.ino) {
-            if !db.add(item.name, item.ino, attr.file_type, item.next_offset) {
+        if let Some(attr) = fs.get_attr(item.ino)
+            && !db.add(item.name, item.ino, attr.file_type, item.next_offset) {
                 break;
             }
-        }
     }
     db.reply();
 }
@@ -136,11 +135,10 @@ pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset:
 
     let mut db = shim::DirectoryBufferPlus::new(req, size);
     for item in iter_dir_entries(fs, ino, &entries, offset) {
-        if let Some(attr) = fs.get_attr(item.ino) {
-            if !db.add(item.name, &attr, 1.0, 1.0, item.next_offset) {
+        if let Some(attr) = fs.get_attr(item.ino)
+            && !db.add(item.name, &attr, 1.0, 1.0, item.next_offset) {
                 break;
             }
-        }
     }
     db.reply();
 }

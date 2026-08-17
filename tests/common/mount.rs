@@ -16,11 +16,10 @@ pub fn unmount_fuse(mount_path: &str) {
             .arg("-u")
             .arg(mount_path)
             .status();
-        if let Ok(s) = status {
-            if s.success() {
+        if let Ok(s) = status
+            && s.success() {
                 return;
             }
-        }
         thread::sleep(Duration::from_millis(50));
     }
     let _ = Command::new("fusermount3")
@@ -106,12 +105,11 @@ impl TestMount {
         // Wait for FUSE mount ready
         let mut mounted = false;
         for _ in 0..200 {
-            if let Ok(meta) = fs::metadata(&mount_path) {
-                if meta.dev() != initial_dev {
+            if let Ok(meta) = fs::metadata(&mount_path)
+                && meta.dev() != initial_dev {
                     mounted = true;
                     break;
                 }
-            }
             if handle.is_finished() {
                 break;
             }
@@ -170,12 +168,11 @@ impl TestMount {
 
         let mut mounted = false;
         for _ in 0..200 {
-            if let Ok(meta) = fs::metadata(&self.mount_path) {
-                if meta.dev() != initial_dev {
+            if let Ok(meta) = fs::metadata(&self.mount_path)
+                && meta.dev() != initial_dev {
                     mounted = true;
                     break;
                 }
-            }
             if handle.is_finished() {
                 break;
             }
@@ -212,12 +209,11 @@ impl TestMount {
 
         let mut mounted = false;
         for _ in 0..200 {
-            if let Ok(meta) = fs::metadata(&self.mount_path) {
-                if meta.dev() != initial_dev {
+            if let Ok(meta) = fs::metadata(&self.mount_path)
+                && meta.dev() != initial_dev {
                     mounted = true;
                     break;
                 }
-            }
             if handle.is_finished() {
                 break;
             }
