@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 /// Default maximum log file size before rolling to next generation (1 GiB).
 pub const DEFAULT_MAX_LOG_SIZE: u64 = 1024 * 1024 * 1024;
 
+/// Default maximum staged write data in memory before triggering a flush (128 MiB).
+pub const DEFAULT_MAX_BUFFER_SIZE: usize = 128 * 1024 * 1024;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "appendfs",
@@ -64,6 +67,10 @@ pub struct MountArgs {
     /// Interval in seconds for periodic background log flushing (default: 60, 0 to disable)
     #[arg(short = 'i', long = "flush-interval", default_value_t = 60)]
     pub flush_interval: u64,
+
+    /// Threshold in bytes of dirty in-memory data before triggering an automatic flush (default: 128 MiB)
+    #[arg(short = 't', long = "flush-threshold", default_value_t = DEFAULT_MAX_BUFFER_SIZE)]
+    pub flush_threshold: usize,
 
     /// Maximum log file size in bytes before rolling to next generation (default: 1 GiB)
     #[arg(short = 's', long = "max-log-size", default_value_t = DEFAULT_MAX_LOG_SIZE)]

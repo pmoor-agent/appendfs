@@ -91,6 +91,7 @@ fn main() {
             }
 
             fs_instance.log_writer = Some(Arc::clone(&writer));
+            fs_instance.max_buffer_size = args.flush_threshold;
             fs_instance.set_log_dir(log_dir);
 
             let fs_instance = Arc::new(fs_instance);
@@ -112,8 +113,8 @@ fn main() {
             };
 
             println!(
-                "Mounting appendfs at '{:?}' with log-dir '{:?}' (active generation: {}, max-log-size: {} bytes, foreground: {})...",
-                args.mount_point, args.log_dir, next_gen, args.max_log_size, args.foreground
+                "Mounting appendfs at '{:?}' with log-dir '{:?}' (active generation: {}, flush-threshold: {} bytes, max-log-size: {} bytes, foreground: {})...",
+                args.mount_point, args.log_dir, next_gen, args.flush_threshold, args.max_log_size, args.foreground
             );
 
             let fuse_args = args.to_fuse_args();

@@ -104,7 +104,7 @@ impl InMemoryFS {
             log_writer,
             log_cache,
             staged_bytes: AtomicUsize::new(0),
-            max_buffer_size: 16 * 1024 * 1024,
+            max_buffer_size: 128 * 1024 * 1024,
             flush_lock: Mutex::new(()),
             track_atime: true,
             dir_lock: Mutex::new(()),
