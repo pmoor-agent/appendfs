@@ -1133,13 +1133,32 @@ fn test_volume_init_mount_and_stats_flow() {
     let docs = mount_path.join("docs");
     fs::create_dir(&docs).unwrap();
     let note = docs.join("note.txt");
-    fs::write(&note, "hello appendfs volume").unwrap();
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&note)
+            .unwrap();
+        file.write_all(b"hello appendfs volume").unwrap();
+        file.sync_all().unwrap();
+    }
+
+    // 3. Inspect volume with stats WHILE THE FUSE MOUNT IS ACTIVELY RUNNING
+    {
+        let live_recovered_fs = appendfs::recover_fs(&log_path).unwrap();
+        let live_stats = appendfs::VolumeStats::collect(&live_recovered_fs);
+        assert_eq!(live_stats.branch, "work");
+        assert_eq!(live_stats.total_inodes, 3);
+        assert_eq!(live_stats.directory_count, 2);
+        assert_eq!(live_stats.file_count, 1);
+        assert_eq!(live_stats.total_logical_bytes, 21);
+    }
 
     // Unmount
     unmount_fuse(&mount_path_str);
     handle.join().unwrap();
 
-    // 3. Inspect volume with stats
+    // 4. Inspect volume with stats after clean unmount
     let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
     let stats = appendfs::VolumeStats::collect(&recovered_fs);
 
