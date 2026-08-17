@@ -3,9 +3,10 @@ use crate::log::record::{
     MkdirPayload, OpCode, RECORD_HEADER_SIZE, RecordHeader, RenamePayload, RmdirPayload,
     SetattrPayload, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use crate::storage::{OsStorage, Storage, StorageReader};
+use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Represents a single deserialized log record read from a `.log` file.
@@ -66,27 +67,40 @@ impl LogRecord {
 
 /// Iterator for sequentially reading records from a `.log` generation file.
 pub struct LogReader {
-    file: File,
+    reader: Arc<dyn StorageReader>,
     header: FileHeader,
     current_offset: u64,
 }
 
 impl LogReader {
-    /// Opens a `.log` file, verifies its 24-byte `FileHeader`, and initializes the reader iterator.
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let mut file = File::open(path)?;
+    /// Opens a `.log` file from a `Storage` instance, verifies its `FileHeader`, and initializes the iterator.
+    pub fn open_with_storage(storage: &dyn Storage, filename: &str) -> io::Result<Self> {
+        let reader = storage.open_reader(filename)?;
 
         let mut header_buf = [0u8; FILE_HEADER_SIZE];
-        file.read_exact(&mut header_buf)?;
+        reader.read_exact_at(0, &mut header_buf)?;
 
         let header = FileHeader::from_bytes(&header_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Ok(Self {
-            file,
+            reader,
             header,
             current_offset: FILE_HEADER_SIZE as u64,
         })
+    }
+
+    /// Opens a `.log` file from a local filesystem path.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(parent));
+        Self::open_with_storage(&storage, &filename)
     }
 
     /// Returns the parsed `FileHeader` of this log file.
@@ -100,12 +114,17 @@ impl Iterator for LogReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         let record_offset = self.current_offset;
-        if self.file.seek(SeekFrom::Start(record_offset)).is_err() {
+        let file_len = match self.reader.len() {
+            Ok(l) => l,
+            Err(e) => return Some(Err(e)),
+        };
+
+        if record_offset >= file_len {
             return None;
         }
 
         let mut header_buf = [0u8; RECORD_HEADER_SIZE];
-        match self.file.read_exact(&mut header_buf) {
+        match self.reader.read_exact_at(record_offset, &mut header_buf) {
             Ok(()) => {}
             Err(e) => {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -121,17 +140,15 @@ impl Iterator for LogReader {
         };
 
         let mut payload = vec![0u8; header.payload_len as usize];
-        if let Err(e) = self.file.read_exact(&mut payload) {
+        if let Err(e) = self.reader.read_exact_at(
+            record_offset + RECORD_HEADER_SIZE as u64,
+            &mut payload,
+        ) {
             return Some(Err(e));
         }
 
         self.current_offset += RECORD_HEADER_SIZE as u64 + header.payload_len as u64;
 
-        // Checksum mismatch means this record's content no longer matches what was
-        // actually written - bitrot, not a torn/incomplete write (those fail as a
-        // clean UnexpectedEof instead). Still advances current_offset above so this
-        // reader stays resumable for any future caller that wants to continue past a
-        // single bad record; recover_fs itself does not - see its module docs.
         let actual_checksum = crate::log::record::checksum_payload(&payload);
         if actual_checksum != header.checksum {
             return Some(Err(io::Error::new(
@@ -157,13 +174,15 @@ mod tests {
     use crate::clock::SystemClock;
     use crate::log::record::OpCode;
     use crate::log::writer::LogWriter;
-    use tempfile::tempdir;
+    use crate::storage::MemoryStorage;
 
     #[test]
     fn test_log_reader_iteration() {
-        let dir = tempdir().unwrap();
+        let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(dir.path(), 1, &clock).unwrap();
+        let writer =
+            LogWriter::create_with_storage(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1)
+                .unwrap();
 
         writer.append_record(OpCode::Mkdir, 2, b"payload1").unwrap();
         writer
@@ -171,7 +190,7 @@ mod tests {
             .unwrap();
         writer.sync().unwrap();
 
-        let reader = LogReader::open(writer.path()).unwrap();
+        let reader = LogReader::open_with_storage(&storage, &writer.filename()).unwrap();
         assert_eq!(reader.file_header().generation, 1);
 
         let records: Vec<LogRecord> = reader.map(|r| r.unwrap()).collect();

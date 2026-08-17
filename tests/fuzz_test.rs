@@ -762,7 +762,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     writer.append_record(OpCode::Create, 2, &bytes).unwrap();
     writer.emit_flush_commit(1, &clock).unwrap();
     writer.sync().unwrap();
-    let path = writer.path();
+    let path = dir.path().join(writer.filename());
     drop(writer);
 
     // Sanity check: recovery succeeds and sees the file before any corruption.

@@ -5,43 +5,55 @@ use crate::log::record::{
 };
 use crate::log::summary::{SUMMARY_MAGIC, SummaryReader};
 use crate::node::Node;
+use crate::storage::{OsStorage, Storage, StorageReader};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
 use std::time::SystemTime;
 
-/// Dispatches dumping to either `dump_log_file` or `dump_summary_file` based on magic bytes or extension.
-pub fn dump_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
-    let path = path.as_ref();
-    let mut file = File::open(path)?;
+/// Dispatches dumping from a `Storage` instance based on magic bytes or extension.
+pub fn dump_file_with_storage(
+    storage: &dyn Storage,
+    filename: &str,
+    verbosity: u8,
+) -> io::Result<String> {
+    let reader = storage.open_reader(filename)?;
     let mut magic = [0u8; 4];
-    let n = file.read(&mut magic)?;
-    if n < 4 {
+    if reader.len()? < 4 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            format!("File {:?} is too small ({} bytes)", path, n),
+            format!("File {:?} is too small ({} bytes)", filename, reader.len()?),
         ));
     }
+    reader.read_exact_at(0, &mut magic)?;
 
-    if &magic == &crate::log::record::FILE_MAGIC
-        || path.extension().and_then(|s| s.to_str()) == Some("log")
-    {
-        dump_log_file(path, verbosity)
-    } else if &magic == SUMMARY_MAGIC
-        || path.extension().and_then(|s| s.to_str()) == Some("summary")
-    {
-        dump_summary_file(path, verbosity)
+    if &magic == &crate::log::record::FILE_MAGIC || filename.ends_with(".log") {
+        dump_log_reader_with_path(reader.as_ref(), Some(filename), verbosity)
+    } else if &magic == SUMMARY_MAGIC || filename.ends_with(".summary") {
+        dump_summary_file_with_storage(storage, filename, verbosity)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "Unrecognized file format for {:?} (expected .log with APPF magic or .summary with APPS magic)",
-                path
+                filename
             ),
         ))
     }
+}
+
+/// Dispatches dumping to either `dump_log_file` or `dump_summary_file` based on magic bytes or extension.
+pub fn dump_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
+    let path = path.as_ref();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let storage = OsStorage::new(parent);
+    dump_file_with_storage(&storage, &filename, verbosity)
 }
 
 /// Bucket for the extents per file fragmentation histogram.
@@ -126,23 +138,48 @@ impl WriteBucket {
 /// - `verbosity == 0`: High-level summary, flush counts, OpCode breakdown, and write histogram.
 /// - `verbosity == 1`: Summary + all individual records (write payloads summarized by length).
 /// - `verbosity >= 2`: Summary + all records + full hex/ASCII data dumps for writes.
+/// Reads and analyzes a single `.log` file, formatting the output based on `verbosity`:
+/// - `verbosity == 0`: High-level summary, flush counts, OpCode breakdown, and write histogram.
+/// - `verbosity == 1`: Summary + all individual records (write payloads summarized by length).
+/// - `verbosity >= 2`: Summary + all records + full hex/ASCII data dumps for writes.
 pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
     let path = path.as_ref();
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let storage = OsStorage::new(parent);
+    let reader = storage.open_reader(&filename)?;
+    dump_log_reader_with_path(reader.as_ref(), Some(&path.to_string_lossy()), verbosity)
+}
+
+/// Reads and analyzes a `.log` file from a `StorageReader`.
+pub fn dump_log_reader(reader: &dyn StorageReader, verbosity: u8) -> io::Result<String> {
+    dump_log_reader_with_path(reader, None, verbosity)
+}
+
+pub fn dump_log_reader_with_path(
+    reader: &dyn StorageReader,
+    display_path: Option<&str>,
+    verbosity: u8,
+) -> io::Result<String> {
+    let file_len = reader.len()?;
 
     if file_len < FILE_HEADER_SIZE as u64 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             format!(
                 "Log file {:?} is smaller than the 24-byte FileHeader ({} bytes)",
-                path, file_len
+                display_path.unwrap_or("<log>"),
+                file_len
             ),
         ));
     }
 
     let mut header_buf = [0u8; FILE_HEADER_SIZE];
-    file.read_exact(&mut header_buf)?;
+    reader.read_exact_at(0, &mut header_buf)?;
     let file_header = FileHeader::from_bytes(&header_buf)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -170,7 +207,7 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
         let remaining_file_bytes = file_len - current_offset;
         if remaining_file_bytes < RECORD_HEADER_SIZE as u64 {
             let mut partial = vec![0u8; remaining_file_bytes as usize];
-            let _ = file.read_exact(&mut partial);
+            let _ = reader.read_exact_at(current_offset, &mut partial);
             records.push(DumpRecordEntry::TornRecord {
                 offset: current_offset,
                 reason: format!(
@@ -184,7 +221,7 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
 
         let record_offset = current_offset;
         let mut rec_hdr_buf = [0u8; RECORD_HEADER_SIZE];
-        if let Err(e) = file.read_exact(&mut rec_hdr_buf) {
+        if let Err(e) = reader.read_exact_at(record_offset, &mut rec_hdr_buf) {
             records.push(DumpRecordEntry::TornRecord {
                 offset: record_offset,
                 reason: format!("Failed reading record header: {}", e),
@@ -208,7 +245,7 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
         let available_payload = file_len.saturating_sub(record_offset + RECORD_HEADER_SIZE as u64);
         if (available_payload as u64) < header.payload_len as u64 {
             let mut partial = vec![0u8; available_payload as usize];
-            let _ = file.read_exact(&mut partial);
+            let _ = reader.read_exact_at(record_offset + RECORD_HEADER_SIZE as u64, &mut partial);
             records.push(DumpRecordEntry::TornRecord {
                 offset: record_offset,
                 reason: format!(
@@ -221,7 +258,7 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
         }
 
         let mut payload = vec![0u8; header.payload_len as usize];
-        if let Err(e) = file.read_exact(&mut payload) {
+        if let Err(e) = reader.read_exact_at(record_offset + RECORD_HEADER_SIZE as u64, &mut payload) {
             records.push(DumpRecordEntry::TornRecord {
                 offset: record_offset,
                 reason: format!("Failed reading full payload: {}", e),
@@ -295,7 +332,11 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
 
     let mut out = String::new();
     writeln!(out, "=== appendfs Log File Dump ===").unwrap();
-    writeln!(out, "File:                {:?}", path).unwrap();
+    if let Some(p) = display_path {
+        writeln!(out, "File:                {:?}", p).unwrap();
+    } else {
+        writeln!(out, "File:                <in-memory>").unwrap();
+    }
     writeln!(out, "Generation:          {}", file_header.generation).unwrap();
     writeln!(out, "Format Version:      {}", file_header.version).unwrap();
     writeln!(
@@ -485,10 +526,33 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
 /// - `verbosity == 0`: Summary metadata, whole-file checksum, inode breakdown, extent fragmentation stats, histogram, top fragmented files, manifest table.
 /// - `verbosity == 1`: Summary + complete inode listing / directory tree.
 /// - `verbosity >= 2`: Summary + complete inode listing + detailed physical extent range mappings for all files.
+pub fn dump_summary_file_with_storage(
+    storage: &dyn Storage,
+    filename: &str,
+    verbosity: u8,
+) -> io::Result<String> {
+    let reader = SummaryReader::open_with_storage(storage, filename)?;
+    dump_summary_reader_with_path(&reader, Some(filename), verbosity)
+}
+
+/// Reads and analyzes a single `.summary` snapshot file, formatting the output based on `verbosity`.
 pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
     let path = path.as_ref();
-    let mut reader = SummaryReader::open(path)?;
-    let file_len = std::fs::metadata(path)?.len();
+    let reader = SummaryReader::open(path)?;
+    dump_summary_reader_with_path(&reader, Some(&path.to_string_lossy()), verbosity)
+}
+
+/// Reads and analyzes a `.summary` snapshot from an existing `SummaryReader`.
+pub fn dump_summary_reader(reader: &SummaryReader, verbosity: u8) -> io::Result<String> {
+    dump_summary_reader_with_path(reader, None, verbosity)
+}
+
+pub fn dump_summary_reader_with_path(
+    reader: &SummaryReader,
+    display_path: Option<&str>,
+    verbosity: u8,
+) -> io::Result<String> {
+    let file_len = reader.reader().len()?;
 
     let inodes = reader.read_all_inodes()?;
 
@@ -604,7 +668,11 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
 
     let mut out = String::new();
     writeln!(out, "=== appendfs Summary File Dump ===").unwrap();
-    writeln!(out, "File:                {:?}", path).unwrap();
+    if let Some(p) = display_path {
+        writeln!(out, "File:                {:?}", p).unwrap();
+    } else {
+        writeln!(out, "File:                <in-memory>").unwrap();
+    }
     writeln!(out, "Branch:              {}", reader.manifest.branch).unwrap();
     writeln!(out, "Generation:          {}", reader.header.generation).unwrap();
     writeln!(out, "Format Version:      {}", reader.header.version).unwrap();
@@ -1195,7 +1263,7 @@ mod tests {
             op_time: clock.now(),
         };
         let mut write_bytes = bincode::serialize(&write_m).unwrap();
-        write_bytes.extend_from_slice(&vec![0x42; 100]);
+        write_bytes.extend_from_slice(&[0x42; 100]);
         writer
             .append_record(OpCode::Write, 2, &write_bytes)
             .unwrap();

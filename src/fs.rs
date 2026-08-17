@@ -9,8 +9,8 @@ use crate::node::{
 };
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
+use crate::storage::Storage;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -86,9 +86,8 @@ impl InMemoryFS {
             }),
         );
 
-        let log_cache = log_writer.as_ref().and_then(|w| {
-            let path = w.path();
-            path.parent().map(|p| Arc::new(LogFileCache::new(p)))
+        let log_cache = log_writer.as_ref().map(|w| {
+            Arc::new(LogFileCache::with_storage(w.storage().clone()))
         });
 
         let start_gen = log_writer.as_ref().map_or(1, |w| w.generation());
@@ -121,6 +120,12 @@ impl InMemoryFS {
         }
     }
 
+    pub fn with_clock_and_storage(clock: Arc<dyn Clock>, storage: Arc<dyn Storage>) -> Self {
+        let mut fs = Self::with_clock(clock);
+        fs.set_storage(storage);
+        fs
+    }
+
     pub fn set_read_only(&self, ro: bool) {
         self.read_only
             .store(ro, std::sync::atomic::Ordering::SeqCst);
@@ -138,8 +143,12 @@ impl InMemoryFS {
         *self.recovered_time.write().unwrap() = time;
     }
 
+    pub fn set_storage(&mut self, storage: Arc<dyn Storage>) {
+        self.log_cache = Some(Arc::new(LogFileCache::with_storage(storage)));
+    }
+
     pub fn set_log_dir(&mut self, log_dir: impl AsRef<Path>) {
-        self.log_cache = Some(Arc::new(LogFileCache::new(log_dir)));
+        self.set_storage(Arc::new(crate::storage::OsStorage::new(log_dir)));
     }
 
     pub(crate) fn allocate_inode(&self) -> u64 {
@@ -707,16 +716,13 @@ impl InMemoryFS {
                 length: _,
             } => {
                 if let Some(ref cache) = self.log_cache {
-                    if let Ok(file_arc) = cache.get_or_open(generation) {
-                        let mut f = file_arc.lock().unwrap();
+                    if let Ok(reader) = cache.get_or_open(generation) {
                         let disk_seek_pos = record_log_offset
                             + crate::log::RECORD_HEADER_SIZE as u64
                             + payload_offset as u64
                             + slice_inner_offset as u64;
-                        if f.seek(SeekFrom::Start(disk_seek_pos)).is_ok() {
-                            if f.read_exact(&mut temp_buf).is_ok() {
-                                bytes_read = seg_len;
-                            }
+                        if reader.read_exact_at(disk_seek_pos, &mut temp_buf).is_ok() {
+                            bytes_read = seg_len;
                         }
                     }
                 }
@@ -1497,6 +1503,23 @@ impl InMemoryFS {
         )
     }
 
+    /// Exports a single-file summary snapshot to a custom `Storage` instance.
+    pub fn export_summary_to_storage(&self, storage: &dyn Storage) -> std::io::Result<String> {
+        self.sync_log()?;
+        let snapshot = self.snapshot_all();
+        let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
+        let last_tx_id = self.log_writer.as_ref().map_or_else(
+            || self.last_tx_id.load(Ordering::SeqCst),
+            |w| w.last_tx_id(),
+        );
+        let next_inode = self.next_inode.load(Ordering::SeqCst);
+        let manifest = self.manifest.read().unwrap().clone();
+        let now = self.clock.now();
+        crate::log::summary::export_summary_with_time_to_storage(
+            &snapshot, &manifest, storage, generation, last_tx_id, next_inode, now,
+        )
+    }
+
     pub fn sync_and_export_summary(&self) -> std::io::Result<Option<PathBuf>> {
         self.sync_log()?;
         if let Some(ref writer) = self.log_writer {
@@ -1504,13 +1527,12 @@ impl InMemoryFS {
                 // Read-only session where no log records were ever flushed or written
                 return Ok(None);
             }
-            if let Some(log_dir) = writer.path().parent() {
-                match self.export_summary(log_dir) {
-                    Ok(p) => return Ok(Some(p)),
-                    Err(e) => {
-                        log::warn!("sync_and_export_summary error: {}", e);
-                        return Err(e);
-                    }
+            let storage = writer.storage();
+            match self.export_summary_to_storage(storage.as_ref()) {
+                Ok(filename) => return Ok(Some(PathBuf::from(filename))),
+                Err(e) => {
+                    log::warn!("sync_and_export_summary error: {}", e);
+                    return Err(e);
                 }
             }
         }
@@ -2467,13 +2489,19 @@ mod tests {
 
     #[test]
     fn test_flush_io_error_retries_and_does_not_wedge() {
-        use std::os::unix::fs::PermissionsExt;
+        let mem = Arc::new(crate::storage::MemoryStorage::new());
+        let fault_storage = crate::storage::FaultStorage::new(mem);
+        let storage = Arc::new(fault_storage.clone());
 
-        let dir = tempfile::tempdir().unwrap();
+        crate::log::init_volume_with_storage(storage.clone(), Some("main")).unwrap();
+
         let clock = Arc::new(SystemClock);
-        // Set tiny max_log_size so the next flush rolls to 000002.log
-        let writer = Arc::new(LogWriter::create_with_max_size(dir.path(), 1, &*clock, 50).unwrap());
-        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        // Set tiny max_log_size (50 bytes) so the next flush rolls to 000002.log
+        let writer = Arc::new(
+            LogWriter::create_with_storage(storage.clone(), 1, &*clock, 50, 1).unwrap(),
+        );
+        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage.clone());
+        fs.log_writer = Some(writer);
 
         // 1. First batch: write data to file1 and flush (populates gen 1 past header size)
         let f1 =
@@ -2488,17 +2516,14 @@ mod tests {
                 .unwrap();
         crate::operations::read_write::write_core(&fs, f2.ino, b"second payload", 0).unwrap();
 
-        // 3. Make the log directory read-only (0o500) to induce an I/O error when rolling to 000002.log
-        let orig_perms = std::fs::metadata(dir.path()).unwrap().permissions();
-        let mut ro_perms = orig_perms.clone();
-        ro_perms.set_mode(0o500); // read-only directory
-        std::fs::set_permissions(dir.path(), ro_perms).unwrap();
+        // 3. Inject permission error on opening 000002.log to simulate I/O failure when rolling
+        fault_storage.fail_on_file("000002.log", std::io::ErrorKind::PermissionDenied);
 
         // 4. Attempt flush - should fail with I/O error on roll creation
         let flush_res = fs.flush_log();
         assert!(
             flush_res.is_err(),
-            "Expected flush_log to fail on read-only log directory"
+            "Expected flush_log to fail on simulated I/O error"
         );
 
         // Verify filesystem is NOT wedged: flushing queue still retains the batch, live mutations still work!
@@ -2514,8 +2539,8 @@ mod tests {
                 .unwrap();
         crate::operations::read_write::write_core(&fs, f3.ino, b"third payload", 0).unwrap();
 
-        // 5. Restore write permissions to the log directory
-        std::fs::set_permissions(dir.path(), orig_perms).unwrap();
+        // 5. Restore normal write access by clearing injected fault
+        fault_storage.clear_fail_on_file("000002.log");
 
         // 6. Retry flush - must succeed and drain ALL batches
         let retry_res = fs.flush_log();
@@ -2539,7 +2564,7 @@ mod tests {
         assert_eq!(&d3, b"third payload");
 
         // 7. Crash-recovery: Recover filesystem and verify all files recovered cleanly
-        let recovered = crate::log::recover_fs(dir.path()).unwrap();
+        let recovered = crate::log::recover_fs_with_storage(storage.clone()).unwrap();
         assert!(recovered.get_attr(f1.ino).is_some());
         assert!(recovered.get_attr(f2.ino).is_some());
         assert!(recovered.get_attr(f3.ino).is_some());
@@ -2553,9 +2578,20 @@ mod tests {
 
     #[test]
     fn test_flush_mid_batch_failure_rolls_back_and_retries_cleanly() {
-        let dir = tempfile::tempdir().unwrap();
+        let mem = Arc::new(crate::storage::MemoryStorage::new());
+        let fault_storage = crate::storage::FaultStorage::new(mem);
+        let storage = Arc::new(fault_storage.clone());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer = Arc::new(
+            LogWriter::create_with_storage(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+            )
+            .unwrap(),
+        );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // 1. Initial batch with 2 files flushed cleanly
@@ -2569,10 +2605,7 @@ mod tests {
         }
         fs.flush_log().unwrap();
 
-        let initial_offset = {
-            let log_file = dir.path().join("000001.log");
-            std::fs::metadata(&log_file).unwrap().len()
-        };
+        let initial_offset = storage.file_len("000001.log").unwrap();
 
         // 2. Stage a second batch with 8 files
         let mut batch2_inos = Vec::new();
@@ -2585,12 +2618,8 @@ mod tests {
             batch2_inos.push((f.ino, payload));
         }
 
-        // 3. Set fault_after_bytes slightly larger than initial_offset to force simulated write failure mid-batch
-        fs.log_writer
-            .as_ref()
-            .unwrap()
-            .fault_after_bytes
-            .store(initial_offset + 300, Ordering::SeqCst);
+        // 3. Set fault threshold slightly larger than initial_offset to force simulated ENOSPC mid-batch with partial torn write
+        fault_storage.fail_writes_after_bytes(initial_offset + 300, true);
 
         // 4. Attempt flush - MUST fail with simulated mid-record write error
         let flush_res = fs.flush_log();
@@ -2599,22 +2628,15 @@ mod tests {
             "Expected flush to fail with simulated mid-record write error"
         );
 
-        // 5. Verify the on-disk file was rolled back to initial_offset!
-        let rolled_back_len = {
-            let log_file = dir.path().join("000001.log");
-            std::fs::metadata(&log_file).unwrap().len()
-        };
+        // 5. Verify the file in storage was rolled back to initial_offset!
+        let rolled_back_len = storage.file_len("000001.log").unwrap();
         assert_eq!(
             rolled_back_len, initial_offset,
             "Log file must be rolled back to batch_start_offset on mid-batch failure"
         );
 
         // 6. Clear fault injection
-        fs.log_writer
-            .as_ref()
-            .unwrap()
-            .fault_after_bytes
-            .store(0, Ordering::SeqCst);
+        fault_storage.clear_write_limit();
 
         // 7. Retry flush - MUST succeed cleanly
         let retry_res = fs.flush_log();
@@ -2626,7 +2648,8 @@ mod tests {
         assert_eq!(fs.flushing.read().unwrap().len(), 0);
 
         // 8. Recover filesystem and verify 100% data integrity without checksum mismatches!
-        let recovered = crate::log::recover_fs(dir.path()).expect("Recovery must succeed cleanly");
+        let recovered = crate::log::recover_fs_with_storage(storage.clone())
+            .expect("Recovery must succeed cleanly");
         for ino in initial_inos {
             assert!(recovered.get_attr(ino).is_some());
             let d = crate::operations::read_write::read_core(&recovered, ino, 15, 0).unwrap();
@@ -2639,7 +2662,7 @@ mod tests {
             assert_eq!(d, payload);
         }
 
-        let report = crate::check::check_volume(dir.path(), true).unwrap();
+        let report = crate::check::check_volume_with_storage(storage, true).unwrap();
         assert!(
             report.is_clean(),
             "Integrity check must be clean: {:?}",

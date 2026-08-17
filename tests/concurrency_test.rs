@@ -303,8 +303,8 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
     // record, has no way to see that gap. That never corrupts anything (the skipped
     // number was never live-assigned to any real node, so reusing it post-recovery
     // can't collide with one); it's excluded here deliberately, not overlooked.
-    let mut written_reader = SummaryReader::open(&written_path).unwrap();
-    let mut regenerated_reader = SummaryReader::open(&regenerated_path).unwrap();
+    let written_reader = SummaryReader::open(&written_path).unwrap();
+    let regenerated_reader = SummaryReader::open(&regenerated_path).unwrap();
     let written_inodes = written_reader.read_all_inodes().unwrap();
     let regenerated_inodes = regenerated_reader.read_all_inodes().unwrap();
 

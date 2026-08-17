@@ -1,51 +1,51 @@
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader};
+use crate::storage::{OsStorage, Storage, StorageReader};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// Thread-safe cache holding open log file handles to eliminate repeated `open`/`close` syscalls.
+/// Thread-safe cache holding open log file reader handles to eliminate repeated open calls.
 pub struct LogFileCache {
-    log_dir: PathBuf,
-    cache: Mutex<HashMap<u64, Arc<Mutex<File>>>>,
+    storage: Arc<dyn Storage>,
+    cache: Mutex<HashMap<u64, Arc<dyn StorageReader>>>,
 }
 
 impl LogFileCache {
     pub fn new(log_dir: impl AsRef<Path>) -> Self {
+        let storage = Arc::new(OsStorage::new(log_dir));
+        Self::with_storage(storage)
+    }
+
+    pub fn with_storage(storage: Arc<dyn Storage>) -> Self {
         Self {
-            log_dir: log_dir.as_ref().to_path_buf(),
+            storage,
             cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Retrieves an open log file handle, verifying the `FileHeader` on first open.
-    pub fn get_or_open(&self, generation: u64) -> io::Result<Arc<Mutex<File>>> {
+    /// Retrieves an open log reader handle, verifying the `FileHeader` on first open.
+    pub fn get_or_open(&self, generation: u64) -> io::Result<Arc<dyn StorageReader>> {
         let mut guard = self.cache.lock().unwrap();
-        if let Some(file_arc) = guard.get(&generation) {
-            return Ok(Arc::clone(file_arc));
+        if let Some(reader) = guard.get(&generation) {
+            return Ok(Arc::clone(reader));
         }
 
         let filename = format!("{:06}.log", generation);
-        let path = self.log_dir.join(filename);
+        let reader = self.storage.open_reader(&filename)?;
 
-        let mut file = File::open(&path)?;
-
-        // Verify FileHeader on first open
         let mut header_buf = [0u8; FILE_HEADER_SIZE];
-        file.read_exact(&mut header_buf)?;
+        reader.read_exact_at(0, &mut header_buf)?;
 
         FileHeader::from_bytes(&header_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let file_arc = Arc::new(Mutex::new(file));
-        guard.insert(generation, Arc::clone(&file_arc));
-
-        Ok(file_arc)
+        guard.insert(generation, Arc::clone(&reader));
+        Ok(reader)
     }
 
-    pub fn log_dir(&self) -> &Path {
-        &self.log_dir
+    pub fn storage(&self) -> &Arc<dyn Storage> {
+        &self.storage
     }
 }
 
@@ -54,16 +54,18 @@ mod tests {
     use super::*;
     use crate::clock::SystemClock;
     use crate::log::writer::LogWriter;
-    use tempfile::tempdir;
+    use crate::storage::MemoryStorage;
 
     #[test]
     fn test_log_file_cache_open_and_verify() {
-        let dir = tempdir().unwrap();
+        let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(dir.path(), 1, &clock).unwrap();
+        let writer =
+            LogWriter::create_with_storage(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1)
+                .unwrap();
         writer.sync().unwrap();
 
-        let cache = LogFileCache::new(dir.path());
+        let cache = LogFileCache::with_storage(storage);
 
         // First access opens and verifies header
         let file1 = cache.get_or_open(1).unwrap();

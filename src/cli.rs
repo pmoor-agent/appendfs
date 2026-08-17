@@ -1,5 +1,4 @@
 use clap::{Args, Parser, Subcommand};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Default maximum log file size before rolling to next generation (1 GiB).
@@ -182,27 +181,26 @@ pub struct CheckArgs {
     pub verbose: u8,
 }
 
-/// Helper scanning `log_dir` for existing `.log` files to find the highest generation number.
-pub fn find_latest_generation(log_dir: impl AsRef<Path>) -> u64 {
-    let log_dir = log_dir.as_ref();
-    if !log_dir.exists() {
-        return 0;
-    }
-
+/// Helper scanning `storage` for existing `.log` files to find the highest generation number.
+pub fn find_latest_generation_in_storage(storage: &dyn crate::storage::Storage) -> u64 {
     let mut max_gen = 0u64;
-    if let Ok(entries) = fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("log") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Ok(gen_num) = stem.parse::<u64>() {
-                        if gen_num > max_gen {
-                            max_gen = gen_num;
-                        }
+    if let Ok(files) = storage.list_files() {
+        for file in files {
+            if file.ends_with(".log") {
+                let stem = file.trim_end_matches(".log");
+                if let Ok(gen_num) = stem.parse::<u64>() {
+                    if gen_num > max_gen {
+                        max_gen = gen_num;
                     }
                 }
             }
         }
     }
     max_gen
+}
+
+/// Helper scanning `log_dir` for existing `.log` files to find the highest generation number.
+pub fn find_latest_generation(log_dir: impl AsRef<Path>) -> u64 {
+    let storage = crate::storage::OsStorage::new(log_dir);
+    find_latest_generation_in_storage(&storage)
 }

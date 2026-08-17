@@ -592,7 +592,7 @@ fn test_summary_single_file_export_and_recovery() {
     assert_eq!(summary_path, summary_file_path);
 
     // Inspect summary snapshot using SummaryReader
-    let mut reader = appendfs::SummaryReader::open(&summary_path).unwrap();
+    let reader = appendfs::SummaryReader::open(&summary_path).unwrap();
     assert_eq!(reader.header.generation, 1);
     assert_eq!(reader.footer.entry_count, 4); // root (1), docs dir (2), file1 (3), file2 (4)
 

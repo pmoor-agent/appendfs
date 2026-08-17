@@ -6,7 +6,6 @@ use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode};
 use crate::log::summary::SummaryReader;
 use crate::node::Node;
 use crate::range_map::RangeMap;
-use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -58,38 +57,47 @@ pub fn recover_fs_to_target_with_clock(
     target: RecoveryTarget,
     clock: Arc<dyn Clock>,
 ) -> io::Result<InMemoryFS> {
-    let log_dir = log_dir.as_ref();
+    let storage = Arc::new(crate::storage::OsStorage::new(log_dir));
+    recover_fs_to_target_with_storage(storage, target, clock)
+}
+
+/// Rebuilds filesystem state from a custom `Storage` instance.
+pub fn recover_fs_with_storage(storage: Arc<dyn crate::storage::Storage>) -> io::Result<InMemoryFS> {
+    recover_fs_to_target_with_storage(storage, RecoveryTarget::Latest, Arc::new(SystemClock))
+}
+
+/// Rebuilds filesystem state from summary and log files in `storage` up to the specified `target` point in time.
+pub fn recover_fs_to_target_with_storage(
+    storage: Arc<dyn crate::storage::Storage>,
+    target: RecoveryTarget,
+    clock: Arc<dyn Clock>,
+) -> io::Result<InMemoryFS> {
+    let files = storage.list_files()?;
 
     // 1. Scan for eligible single-file .summary snapshots matching the target
     let mut latest_summary: Option<(u64, SummaryReader)> = None;
-    if let Ok(entries) = fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("summary") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Ok(gen_num) = stem.parse::<u64>() {
-                        match SummaryReader::open(&path) {
-                            Ok(reader) => {
-                                let eligible = match target {
-                                    RecoveryTarget::Latest => true,
-                                    RecoveryTarget::TxId(max_tx) => {
-                                        reader.header.last_tx_id <= max_tx
-                                    }
-                                    RecoveryTarget::Timestamp(max_time) => {
-                                        reader.header.created_at <= max_time
-                                    }
-                                    RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
-                                };
-                                if eligible {
-                                    if latest_summary.as_ref().map_or(true, |(g, _)| gen_num > *g) {
-                                        latest_summary = Some((gen_num, reader));
-                                    }
-                                }
+    for file in &files {
+        if file.ends_with(".summary") {
+            let stem = file.trim_end_matches(".summary");
+            if let Ok(gen_num) = stem.parse::<u64>() {
+                match SummaryReader::open_with_storage(&storage, file) {
+                    Ok(reader) => {
+                        let eligible = match target {
+                            RecoveryTarget::Latest => true,
+                            RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
+                            RecoveryTarget::Timestamp(max_time) => {
+                                reader.header.created_at <= max_time
                             }
-                            Err(e) => {
-                                log::warn!("Ignoring unreadable summary {:?}: {}", path, e);
+                            RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
+                        };
+                        if eligible {
+                            if latest_summary.as_ref().map_or(true, |(g, _)| gen_num > *g) {
+                                latest_summary = Some((gen_num, reader));
                             }
                         }
+                    }
+                    Err(e) => {
+                        log::warn!("Ignoring unreadable summary {}: {}", file, e);
                     }
                 }
             }
@@ -97,27 +105,23 @@ pub fn recover_fs_to_target_with_clock(
     }
 
     let mut log_files = Vec::new();
-    for entry in fs::read_dir(log_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("log") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if let Ok(gen_num) = stem.parse::<u64>() {
-                    log_files.push((gen_num, path));
-                }
+    for file in &files {
+        if file.ends_with(".log") {
+            let stem = file.trim_end_matches(".log");
+            if let Ok(gen_num) = stem.parse::<u64>() {
+                log_files.push((gen_num, file.clone()));
             }
         }
     }
 
     log_files.sort_by_key(|(gen_num, _)| *gen_num);
 
-    let mut fs_instance = InMemoryFS::with_clock(clock);
-    fs_instance.set_log_dir(log_dir);
+    let fs_instance = InMemoryFS::with_clock_and_storage(clock, storage.clone());
 
     let mut last_op_time: Option<SystemTime> = None;
     if latest_summary.is_none() {
-        if let Some((_, oldest_path)) = log_files.first() {
-            if let Ok(oldest_reader) = LogReader::open(oldest_path) {
+        if let Some((_, oldest_file)) = log_files.first() {
+            if let Ok(oldest_reader) = LogReader::open_with_storage(&storage, oldest_file) {
                 let created = oldest_reader.file_header().created_at;
                 last_op_time = Some(created);
                 if let Some(root_arc) = fs_instance.base.write().unwrap().get_mut(&1) {
@@ -141,7 +145,7 @@ pub fn recover_fs_to_target_with_clock(
     let mut last_tx_id = 0u64;
 
     // 2. Fast-recover from summary file if available
-    if let Some((summary_gen, mut reader)) = latest_summary {
+    if let Some((summary_gen, reader)) = latest_summary {
         log::info!(
             "Fast-recovering appendfs state from summary file (generation: {}, inodes: {}, last_tx_id: {})...",
             summary_gen,
@@ -167,7 +171,7 @@ pub fn recover_fs_to_target_with_clock(
     let mut target_cutoff_reached = false;
 
     // 3. Replay log files with generation > min_log_gen
-    for (gen_num, path) in log_files {
+    for (gen_num, filename) in log_files {
         if gen_num <= min_log_gen && min_log_gen > 0 {
             continue;
         }
@@ -182,7 +186,7 @@ pub fn recover_fs_to_target_with_clock(
         let mut committed_records_count = 0u32;
         let mut log_data_bytes = 0u64;
 
-        let reader = LogReader::open(&path)?;
+        let reader = LogReader::open_with_storage(&storage, &filename)?;
         let log_created_at = reader.file_header().created_at;
         for record_res in reader {
             let record = match record_res {
@@ -281,7 +285,7 @@ pub fn recover_fs_to_target_with_clock(
             );
         }
 
-        let log_file_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let log_file_len = storage.file_len(&filename).unwrap_or(0);
         {
             let mut manifest = fs_instance.manifest.write().unwrap();
             if manifest.get_by_generation(gen_num).is_none() {
