@@ -10,3 +10,4 @@
 - [ ] **File Locking (`flock` / `fcntl`):** Support advisory/mandatory FUSE record locking for application concurrency (e.g. SQLite, Git, office applications).
 - [ ] **Summary Catalog Exporter CLI:** Add a CLI command/utility (`appendfs catalog <summary_file>`) to parse and print a human-readable file manifest directly from a `.summary` snapshot file without mounting FUSE.
 - [ ] **Live Log Streaming:** Optional real-time log streaming transport protocol for continuous remote replication to a secondary server/cluster.
+- [ ] **Native Encryption & Key Rotation:** Envelope AEAD encryption (XChaCha20-Poly1305 / AES-256-GCM) with key rotation, Argon2id KDF, and cryptographic erasure via compaction. (See [Design Document](docs/designs/encryption_and_key_rotation.md)).
