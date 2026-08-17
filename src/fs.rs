@@ -38,6 +38,9 @@ pub struct InMemoryFS {
     pub max_buffer_size: usize,
     pub staged_ops: AtomicUsize,
     pub max_staged_ops: usize,
+    /// Maximum frozen batches allowed to queue up before mutations are refused. See
+    /// `check_flush_capacity`.
+    pub max_flush_queue_depth: usize,
     pub flush_interval: AtomicU64,
     pub(crate) flusher: Mutex<Option<BackgroundFlusher>>,
     pub flush_lock: Mutex<()>,
@@ -110,6 +113,7 @@ impl InMemoryFS {
             max_buffer_size: 128 * 1024 * 1024,
             staged_ops: AtomicUsize::new(0),
             max_staged_ops: crate::cli::DEFAULT_MAX_BUFFER_OPS,
+            max_flush_queue_depth: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_DEPTH,
             flush_interval: AtomicU64::new(0),
             flusher: Mutex::new(None),
             flush_lock: Mutex::new(()),
@@ -1367,6 +1371,34 @@ impl InMemoryFS {
         self.staged_bytes.store(0, Ordering::Relaxed);
         self.staged_ops.store(0, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Number of frozen batches currently waiting to be written to the log.
+    pub fn flush_queue_depth(&self) -> usize {
+        self.flushing.read().unwrap().len()
+    }
+
+    /// Admission control for mutating operations, called before any state is changed.
+    ///
+    /// The flush queue only drains while the log is actually writable, so on a full or
+    /// failing disk it would otherwise grow without bound while userspace still saw every
+    /// write succeed - until the mount was OOM-killed and every unflushed byte was lost.
+    /// Once `max_flush_queue_depth` batches have piled up, try to drain them synchronously;
+    /// if that still fails, refuse the mutation so the backlog stays bounded and the error
+    /// reaches userspace instead of being swallowed.
+    pub fn check_flush_capacity(&self) -> Result<(), i32> {
+        if self.log_writer.is_none() || self.flush_queue_depth() < self.max_flush_queue_depth {
+            return Ok(());
+        }
+        self.flush_log().map_err(|e| {
+            log::error!(
+                "refusing mutation: {} flush batches queued and the log is not draining: {}",
+                self.flush_queue_depth(),
+                e
+            );
+            // Surface the real errno (e.g. ENOSPC) when there is one, EIO otherwise.
+            e.raw_os_error().unwrap_or(libc::EIO)
+        })
     }
 
     /// Increments mutation counters (ops & bytes) and triggers an automatic flush if thresholds are reached.
@@ -2660,5 +2692,73 @@ mod tests {
             "Integrity check must be clean: {:?}",
             report.issues
         );
+    }
+
+    #[test]
+    fn test_flush_queue_is_bounded_and_reports_failure_when_log_stops_draining() {
+        let mem = Arc::new(crate::storage::MemoryStorage::new());
+        let fault_storage = crate::storage::FaultStorage::new(mem);
+        let storage = Arc::new(fault_storage.clone());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create_with_storage(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+            )
+            .unwrap(),
+        );
+        let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        fs.max_staged_ops = 1; // freeze a batch on every mutation
+        fs.max_flush_queue_depth = 4;
+
+        // 1. The disk fills up: nothing more can ever be appended to the log.
+        fault_storage.fail_writes_after_bytes(crate::log::record::FILE_HEADER_SIZE as u64, false);
+
+        // 2. Keep mutating well past the queue bound.
+        let mut accepted = 0;
+        let mut refused = 0;
+        let mut last_errno = 0;
+        for i in 0..50 {
+            let name = format!("f{}.txt", i);
+            match crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000) {
+                Ok(_) => accepted += 1,
+                Err(e) => {
+                    refused += 1;
+                    last_errno = e;
+                }
+            }
+        }
+
+        // 3. Userspace must be told, rather than every write silently "succeeding".
+        assert!(
+            refused > 0,
+            "mutations must start failing once the log stops draining"
+        );
+        assert_eq!(last_errno, libc::EIO, "failure must surface as an errno");
+        assert!(
+            accepted <= fs.max_flush_queue_depth,
+            "only the batches that fit in the queue may be accepted, got {}",
+            accepted
+        );
+
+        // 4. The backlog must stay bounded instead of growing with every mutation.
+        assert!(
+            fs.flush_queue_depth() <= fs.max_flush_queue_depth,
+            "flush queue must stay bounded, got {}",
+            fs.flush_queue_depth()
+        );
+
+        // 5. An explicit sync still reports the underlying failure.
+        assert!(fs.sync_log().is_err());
+
+        // 6. Once the disk recovers, the queued batches drain and mutations resume.
+        fault_storage.clear_write_limit();
+        fs.sync_log().unwrap();
+        assert_eq!(fs.flush_queue_depth(), 0);
+        crate::operations::read_write::create_core(&fs, 1, "after.txt", 0o644, 0, 1000, 1000)
+            .expect("mutations must be accepted again once the log drains");
     }
 }

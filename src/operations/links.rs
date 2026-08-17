@@ -6,6 +6,7 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
+    fs.check_flush_capacity()?;
 
     {
         let _dir_guard = fs.dir_lock.lock().unwrap();
@@ -68,6 +69,7 @@ pub fn symlink_core(
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
+    fs.check_flush_capacity()?;
 
     let attr = {
         let _dir_guard = fs.dir_lock.lock().unwrap();
@@ -161,6 +163,7 @@ pub fn rename_core(
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
+    fs.check_flush_capacity()?;
 
     {
         let _dir_guard = fs.dir_lock.lock().unwrap();
@@ -280,6 +283,7 @@ pub fn link_core(
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
+    fs.check_flush_capacity()?;
 
     {
         let _dir_guard = fs.dir_lock.lock().unwrap();

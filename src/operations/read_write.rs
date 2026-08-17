@@ -85,6 +85,7 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
+    fs.check_flush_capacity()?;
 
     if offset < 0 {
         return Err(libc::EINVAL);
@@ -154,6 +155,7 @@ pub fn setattr_core(
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
+    fs.check_flush_capacity()?;
 
     let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
     let now = fs.clock.now();
@@ -239,6 +241,7 @@ pub fn create_core(
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
+    fs.check_flush_capacity()?;
 
     let attr = {
         let _dir_guard = fs.dir_lock.lock().unwrap();

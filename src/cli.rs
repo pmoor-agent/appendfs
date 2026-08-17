@@ -10,6 +10,11 @@ pub const DEFAULT_MAX_BUFFER_SIZE: usize = 128 * 1024 * 1024;
 /// Default maximum staged mutation operations before triggering an automatic flush (10,000 ops).
 pub const DEFAULT_MAX_BUFFER_OPS: usize = 10_000;
 
+/// Default maximum number of frozen flush batches allowed to pile up before mutations are
+/// refused with ENOSPC/EIO. Bounds worst-case unflushed memory at roughly this many times
+/// `DEFAULT_MAX_BUFFER_SIZE` when the log is not draining.
+pub const DEFAULT_MAX_FLUSH_QUEUE_DEPTH: usize = 4;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "appendfs",
