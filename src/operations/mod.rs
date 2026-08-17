@@ -20,6 +20,10 @@ impl Filesystem for InMemoryFS {
         dir::readdir(self, req, ino, size, offset);
     }
 
+    fn readdirplus(&self, req: Request, ino: u64, size: usize, offset: i64) {
+        dir::readdirplus(self, req, ino, size, offset);
+    }
+
     fn read(&self, req: Request, ino: u64, size: usize, offset: i64) {
         read_write::read(self, req, ino, size, offset);
     }

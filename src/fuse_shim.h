@@ -36,6 +36,7 @@ extern "C" {
     typedef void (*rust_lookup_t)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
     typedef void (*rust_getattr_t)(shim_req_t req, uint64_t ino, void *userdata);
     typedef void (*rust_readdir_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
+    typedef void (*rust_readdirplus_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
     typedef void (*rust_read_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
     typedef void (*rust_open_t)(shim_req_t req, uint64_t ino, uint32_t flags, void *userdata);
     typedef void (*rust_write_t)(shim_req_t req, uint64_t ino, const char *buf, size_t size, int64_t off, void *userdata);
@@ -71,6 +72,7 @@ extern "C" {
         rust_lookup_t lookup;
         rust_getattr_t getattr;
         rust_readdir_t readdir;
+        rust_readdirplus_t readdirplus;
         rust_read_t read;
         rust_open_t open;
         rust_write_t write;
@@ -110,6 +112,7 @@ extern "C" {
 
     // Directory entry layout packing helper using individual fields instead of stat struct
     size_t shim_add_direntry(shim_req_t req, char *buf, size_t bufsize, const char *name, uint64_t ino, uint32_t mode, int64_t off);
+    size_t shim_add_direntry_plus(shim_req_t req, char *buf, size_t bufsize, const char *name, const shim_file_attr *attr, double attr_timeout, double entry_timeout, int64_t off);
 }
 
 #endif // FUSE_SHIM_H

@@ -49,6 +49,7 @@ extern "C" {
 typedef void (*shim_lookup_fn)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
 typedef void (*shim_getattr_fn)(shim_req_t req, uint64_t ino, void *userdata);
 typedef void (*shim_readdir_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
+typedef void (*shim_readdirplus_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
 typedef void (*shim_read_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
 typedef void (*shim_open_fn)(shim_req_t req, uint64_t ino, uint32_t flags, void *userdata);
 typedef void (*shim_write_fn)(shim_req_t req, uint64_t ino, const uint8_t *buf, size_t size, int64_t off, void *userdata);
@@ -71,6 +72,7 @@ struct RustLowlevelOps {
     shim_lookup_fn lookup;
     shim_getattr_fn getattr;
     shim_readdir_fn readdir;
+    shim_readdirplus_fn readdirplus;
     shim_read_fn read;
     shim_open_fn open;
     shim_write_fn write;
@@ -123,6 +125,16 @@ static void ll_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, s
     auto *ctx = static_cast<ShimContext*>(fuse_req_userdata(req));
     if (ctx && ctx->ops.readdir) {
         ctx->ops.readdir(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), ctx->userdata);
+    } else {
+        fuse_reply_err(req, 38);
+    }
+}
+
+static void ll_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi) {
+    (void)fi;
+    auto *ctx = static_cast<ShimContext*>(fuse_req_userdata(req));
+    if (ctx && ctx->ops.readdirplus) {
+        ctx->ops.readdirplus(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), ctx->userdata);
     } else {
         fuse_reply_err(req, 38);
     }
@@ -349,6 +361,7 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
     ll_ops.lookup = ll_lookup;
     ll_ops.getattr = ll_getattr;
     ll_ops.readdir = ll_readdir;
+    ll_ops.readdirplus = ll_readdirplus;
     ll_ops.read = ll_read;
     ll_ops.open = ll_open;
     ll_ops.write = ll_write;
@@ -510,6 +523,47 @@ size_t shim_add_direntry(shim_req_t req, char *buf, size_t bufsize, const char *
     stbuf.st_ino = ino;
     stbuf.st_mode = mode;
     return fuse_add_direntry(static_cast<fuse_req_t>(req), buf, bufsize, name, &stbuf, static_cast<off_t>(off));
+}
+
+size_t shim_add_direntry_plus(
+    shim_req_t req,
+    char *buf,
+    size_t bufsize,
+    const char *name,
+    const shim_file_attr *attr,
+    double attr_timeout,
+    double entry_timeout,
+    int64_t off
+) {
+    struct fuse_entry_param e = {};
+    if (attr) {
+        e.ino = attr->ino;
+        e.generation = 1;
+        e.attr.st_ino = attr->ino;
+        e.attr.st_mode = attr->mode;
+        e.attr.st_nlink = attr->nlink;
+        e.attr.st_uid = attr->uid;
+        e.attr.st_gid = attr->gid;
+        e.attr.st_size = attr->size;
+        e.attr.st_blocks = (attr->size > 0) ? ((attr->size + 511) / 512) : 0;
+        e.attr.st_blksize = 4096;
+        e.attr.st_atim.tv_sec = attr->atime_sec;
+        e.attr.st_atim.tv_nsec = attr->atime_nsec;
+        e.attr.st_mtim.tv_sec = attr->mtime_sec;
+        e.attr.st_mtim.tv_nsec = attr->mtime_nsec;
+        e.attr.st_ctim.tv_sec = attr->ctime_sec;
+        e.attr.st_ctim.tv_nsec = attr->ctime_nsec;
+    }
+    e.attr_timeout = attr_timeout;
+    e.entry_timeout = entry_timeout;
+    return fuse_add_direntry_plus(
+        static_cast<fuse_req_t>(req),
+        buf,
+        bufsize,
+        name,
+        &e,
+        static_cast<off_t>(off)
+    );
 }
 
 shim_fuse_ctx fuse_req_ctx_shim(shim_req_t req) {

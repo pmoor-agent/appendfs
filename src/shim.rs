@@ -77,6 +77,9 @@ struct RustLowlevelOps {
     readdir: Option<
         extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void),
     >,
+    readdirplus: Option<
+        extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void),
+    >,
     read: Option<
         extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void),
     >,
@@ -207,6 +210,43 @@ unsafe extern "C" {
         mode: u32,
         off: i64,
     ) -> usize;
+    fn shim_add_direntry_plus(
+        req: shim_req_t,
+        buf: *mut c_char,
+        bufsize: usize,
+        name: *const c_char,
+        attr: *const ShimFileAttr,
+        attr_timeout: f64,
+        entry_timeout: f64,
+        off: i64,
+    ) -> usize;
+}
+
+fn convert_file_attr(attr: &FileAttr) -> ShimFileAttr {
+    let (atime_sec, atime_nsec) = system_time_to_unix(attr.atime);
+    let (mtime_sec, mtime_nsec) = system_time_to_unix(attr.mtime);
+    let (ctime_sec, ctime_nsec) = system_time_to_unix(attr.ctime);
+
+    let mode = match attr.file_type {
+        FileType::Directory => libc::S_IFDIR | attr.perm,
+        FileType::RegularFile => libc::S_IFREG | attr.perm,
+        FileType::Symlink => libc::S_IFLNK | attr.perm,
+    };
+
+    ShimFileAttr {
+        ino: attr.ino,
+        mode,
+        nlink: attr.nlink,
+        uid: attr.uid,
+        gid: attr.gid,
+        size: attr.size,
+        atime_sec,
+        atime_nsec,
+        mtime_sec,
+        mtime_nsec,
+        ctime_sec,
+        ctime_nsec,
+    }
 }
 
 pub struct Request {
@@ -221,62 +261,14 @@ impl Request {
     }
 
     pub fn reply_entry(self, attr: &FileAttr, attr_timeout: f64, entry_timeout: f64) {
-        let (atime_sec, atime_nsec) = system_time_to_unix(attr.atime);
-        let (mtime_sec, mtime_nsec) = system_time_to_unix(attr.mtime);
-        let (ctime_sec, ctime_nsec) = system_time_to_unix(attr.ctime);
-
-        let mode = match attr.file_type {
-            FileType::Directory => libc::S_IFDIR | attr.perm,
-            FileType::RegularFile => libc::S_IFREG | attr.perm,
-            FileType::Symlink => libc::S_IFLNK | attr.perm,
-        };
-
-        let shim_attr = ShimFileAttr {
-            ino: attr.ino,
-            mode,
-            nlink: attr.nlink,
-            uid: attr.uid,
-            gid: attr.gid,
-            size: attr.size,
-            atime_sec,
-            atime_nsec,
-            mtime_sec,
-            mtime_nsec,
-            ctime_sec,
-            ctime_nsec,
-        };
-
+        let shim_attr = convert_file_attr(attr);
         unsafe {
             shim_reply_entry(self.req, &shim_attr, attr_timeout, entry_timeout);
         }
     }
 
     pub fn reply_attr(self, attr: &FileAttr, attr_timeout: f64) {
-        let (atime_sec, atime_nsec) = system_time_to_unix(attr.atime);
-        let (mtime_sec, mtime_nsec) = system_time_to_unix(attr.mtime);
-        let (ctime_sec, ctime_nsec) = system_time_to_unix(attr.ctime);
-
-        let mode = match attr.file_type {
-            FileType::Directory => libc::S_IFDIR | attr.perm,
-            FileType::RegularFile => libc::S_IFREG | attr.perm,
-            FileType::Symlink => libc::S_IFLNK | attr.perm,
-        };
-
-        let shim_attr = ShimFileAttr {
-            ino: attr.ino,
-            mode,
-            nlink: attr.nlink,
-            uid: attr.uid,
-            gid: attr.gid,
-            size: attr.size,
-            atime_sec,
-            atime_nsec,
-            mtime_sec,
-            mtime_nsec,
-            ctime_sec,
-            ctime_nsec,
-        };
-
+        let shim_attr = convert_file_attr(attr);
         unsafe {
             shim_reply_attr(self.req, &shim_attr, attr_timeout);
         }
@@ -301,31 +293,7 @@ impl Request {
     }
 
     pub fn reply_create(self, attr: &FileAttr, attr_timeout: f64, entry_timeout: f64, fh: u64) {
-        let (atime_sec, atime_nsec) = system_time_to_unix(attr.atime);
-        let (mtime_sec, mtime_nsec) = system_time_to_unix(attr.mtime);
-        let (ctime_sec, ctime_nsec) = system_time_to_unix(attr.ctime);
-
-        let mode = match attr.file_type {
-            FileType::Directory => libc::S_IFDIR | attr.perm,
-            FileType::RegularFile => libc::S_IFREG | attr.perm,
-            FileType::Symlink => libc::S_IFLNK | attr.perm,
-        };
-
-        let shim_attr = ShimFileAttr {
-            ino: attr.ino,
-            mode,
-            nlink: attr.nlink,
-            uid: attr.uid,
-            gid: attr.gid,
-            size: attr.size,
-            atime_sec,
-            atime_nsec,
-            mtime_sec,
-            mtime_nsec,
-            ctime_sec,
-            ctime_nsec,
-        };
-
+        let shim_attr = convert_file_attr(attr);
         unsafe {
             shim_reply_create(self.req, &shim_attr, attr_timeout, entry_timeout, fh);
         }
@@ -444,10 +412,68 @@ impl DirectoryBuffer {
     }
 }
 
+pub struct DirectoryBufferPlus {
+    req: Request,
+    buf: Vec<u8>,
+}
+
+impl DirectoryBufferPlus {
+    pub fn new(req: Request) -> Self {
+        Self {
+            req,
+            buf: Vec::new(),
+        }
+    }
+
+    pub fn add(
+        &mut self,
+        name: &str,
+        attr: &FileAttr,
+        attr_timeout: f64,
+        entry_timeout: f64,
+    ) {
+        let c_name = match CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let shim_attr = convert_file_attr(attr);
+        let old_size = self.buf.len();
+
+        self.buf.resize(old_size + 512, 0);
+
+        let next_off = (self.buf.len()) as i64;
+        let bytes_written = unsafe {
+            shim_add_direntry_plus(
+                self.req.req,
+                self.buf[old_size..].as_mut_ptr() as *mut c_char,
+                512,
+                c_name.as_ptr(),
+                &shim_attr,
+                attr_timeout,
+                entry_timeout,
+                next_off,
+            )
+        };
+
+        self.buf.truncate(old_size + bytes_written);
+    }
+
+    pub fn reply(self, offset: i64, size: usize) {
+        let offset = offset as usize;
+        if offset >= self.buf.len() {
+            self.req.reply_buf(&[]);
+        } else {
+            let end = std::cmp::min(offset + size, self.buf.len());
+            self.req.reply_buf(&self.buf[offset..end]);
+        }
+    }
+}
+
 pub trait Filesystem {
     fn lookup(&self, req: Request, parent: u64, name: &str);
     fn getattr(&self, req: Request, ino: u64);
     fn readdir(&self, req: Request, ino: u64, size: usize, offset: i64);
+    fn readdirplus(&self, req: Request, ino: u64, size: usize, offset: i64);
     fn read(&self, req: Request, ino: u64, size: usize, offset: i64);
     fn open(&self, req: Request, ino: u64, flags: u32);
     fn write(&self, req: Request, ino: u64, buf: &[u8], offset: i64);
@@ -510,6 +536,17 @@ extern "C" fn readdir_bridge(
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.readdir(Request { req }, ino, size, off);
+}
+
+extern "C" fn readdirplus_bridge(
+    req: shim_req_t,
+    ino: u64,
+    size: usize,
+    off: i64,
+    userdata: *mut c_void,
+) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    fs.readdirplus(Request { req }, ino, size, off);
 }
 
 extern "C" fn read_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void) {
@@ -751,6 +788,7 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
         lookup: Some(lookup_bridge),
         getattr: Some(getattr_bridge),
         readdir: Some(readdir_bridge),
+        readdirplus: Some(readdirplus_bridge),
         read: Some(read_bridge),
         open: Some(open_bridge),
         write: Some(write_bridge),

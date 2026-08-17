@@ -89,6 +89,50 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
     db.reply(offset, size);
 }
 
+pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64) {
+    log::trace!("readdirplus(ino={}, size={}, offset={})", ino, size, offset);
+    let entries = match list_dir_core(fs, ino) {
+        Ok(entries) => entries,
+        Err(e) => {
+            req.reply_err(e);
+            return;
+        }
+    };
+
+    let self_attr = match fs.get_attr(ino) {
+        Some(attr) => attr,
+        None => {
+            req.reply_err(libc::ENOENT);
+            return;
+        }
+    };
+
+    let dotdot_ino = if ino == 1 {
+        1
+    } else {
+        find_parent_inode(fs, ino).unwrap_or(1)
+    };
+    let dotdot_attr = match fs.get_attr(dotdot_ino) {
+        Some(attr) => attr,
+        None => {
+            req.reply_err(libc::ENOENT);
+            return;
+        }
+    };
+
+    let mut db = shim::DirectoryBufferPlus::new(req);
+    db.add(".", &self_attr, 1.0, 1.0);
+    db.add("..", &dotdot_attr, 1.0, 1.0);
+
+    for (name, child_ino) in &entries {
+        if let Some(attr) = fs.get_attr(*child_ino) {
+            db.add(name, &attr, 1.0, 1.0);
+        }
+    }
+
+    db.reply(offset, size);
+}
+
 pub fn mkdir_core(
     fs: &InMemoryFS,
     parent: u64,
