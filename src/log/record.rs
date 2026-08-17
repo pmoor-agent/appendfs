@@ -90,8 +90,8 @@ pub enum OpCode {
     Link = 9,
     /// Trailer written once, after every other record belonging to one
     /// flush batch. Confirms that batch is complete and safe to replay - see
-    /// `BatchCommitPayload`.
-    BatchCommit = 10,
+    /// `FlushCommitPayload`.
+    FlushCommit = 10,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -108,7 +108,7 @@ impl TryFrom<u8> for OpCode {
             7 => Ok(OpCode::Rename),
             8 => Ok(OpCode::Setattr),
             9 => Ok(OpCode::Link),
-            10 => Ok(OpCode::BatchCommit),
+            10 => Ok(OpCode::FlushCommit),
             _ => Err("Unknown operation code"),
         }
     }
@@ -126,7 +126,7 @@ impl std::fmt::Display for OpCode {
             OpCode::Rename => "Rename",
             OpCode::Setattr => "Setattr",
             OpCode::Link => "Link",
-            OpCode::BatchCommit => "BatchCommit",
+            OpCode::FlushCommit => "FlushCommit",
         };
         f.pad(name)
     }
@@ -172,12 +172,12 @@ impl RecordHeader {
     }
 }
 
-/// Payload for the `OpCode::BatchCommit` trailer written once per flush
+/// Payload for the `OpCode::FlushCommit` trailer written once per flush
 /// batch, after all of that batch's other records.
 ///
 /// Recovery buffers records as it reads them and only replays them into filesystem
-/// state once it reaches the matching `BatchCommit` for that run - a trailing group of
-/// records at end-of-file with no `BatchCommit` after them (a crash mid-flush) is
+/// state once it reaches the matching `FlushCommit` for that run - a trailing group of
+/// records at end-of-file with no `FlushCommit` after them (a crash mid-flush) is
 /// discarded rather than partially applied. `record_count` is a defensive cross-check
 /// only (this codebase has no per-record checksums yet): recovery verifies it matches
 /// the number of records actually buffered since the previous commit, and treats a
@@ -185,7 +185,7 @@ impl RecordHeader {
 ///
 /// Also carries the flush's wall-clock time, for point-in-time replay/time-travel.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BatchCommitPayload {
+pub struct FlushCommitPayload {
     #[serde(with = "crate::clock::serde_system_time")]
     pub timestamp: SystemTime,
     pub record_count: u32,

@@ -3,7 +3,7 @@ use crate::fs::InMemoryFS;
 use crate::log::extent::SharedExtentState;
 use crate::log::reader::{LogReader, LogRecord};
 use crate::log::record::{
-    BatchCommitPayload, CreatePayload, LinkPayload, MkdirPayload, OpCode, RenamePayload,
+    CreatePayload, FlushCommitPayload, LinkPayload, MkdirPayload, OpCode, RenamePayload,
     RmdirPayload, SetattrPayload, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
 use crate::log::summary::SummaryReader;
@@ -150,7 +150,7 @@ pub fn recover_fs_with_clock(
             continue;
         }
 
-        // Records are buffered here until a matching BatchCommit trailer confirms the
+        // Records are buffered here until a matching FlushCommit trailer confirms the
         // whole run is complete and safe to apply. LogWriter never rolls mid-batch (see
         // LogWriter::roll_if_needed), so a batch can never span two generation files -
         // this buffer is reset fresh per file, nothing needs to carry across the outer
@@ -183,13 +183,13 @@ pub fn recover_fs_with_clock(
                 max_inode = target_ino;
             }
 
-            if header.op_code == OpCode::BatchCommit {
+            if header.op_code == OpCode::FlushCommit {
                 let commit =
-                    bincode::deserialize::<BatchCommitPayload>(&record.payload).map_err(|e| {
+                    bincode::deserialize::<FlushCommitPayload>(&record.payload).map_err(|e| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
-                                "malformed BatchCommit payload in generation {}: {}",
+                                "malformed FlushCommit payload in generation {}: {}",
                                 gen_num, e
                             ),
                         )
@@ -204,7 +204,7 @@ pub fn recover_fs_with_clock(
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "BatchCommit record_count mismatch in generation {}: claimed {} but buffered {}",
+                            "FlushCommit record_count mismatch in generation {}: claimed {} but buffered {}",
                             gen_num,
                             commit.record_count,
                             pending.len()
@@ -287,7 +287,7 @@ pub fn recover_fs_with_clock(
 }
 
 /// Applies one already-committed log record to `fs_instance`'s in-memory state. Only
-/// ever called for records that were confirmed complete by a matching `BatchCommit` -
+/// ever called for records that were confirmed complete by a matching `FlushCommit` -
 /// see `recover_fs`.
 fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
     let header = &record.header;
@@ -787,7 +787,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 }
             }
         }
-        OpCode::BatchCommit => {
+        OpCode::FlushCommit => {
             // Never buffered/applied - recover_fs handles these directly.
         }
     }

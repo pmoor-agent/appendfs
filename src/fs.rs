@@ -800,7 +800,7 @@ impl InMemoryFS {
         writer: &LogWriter,
     ) -> std::io::Result<()> {
         // Estimate size for log rolling
-        let mut estimated_bytes: u64 = RECORD_HEADER_SIZE as u64 + 64; // BatchCommit
+        let mut estimated_bytes: u64 = RECORD_HEADER_SIZE as u64 + 64; // FlushCommit
         for entry in frozen.values() {
             match entry {
                 EntryDelta::Node(NodeDelta::File(f)) => {
@@ -1267,8 +1267,8 @@ impl InMemoryFS {
 
         drop(base_map);
 
-        // 5. Emit BatchCommit
-        writer.emit_batch_commit(written_count, &*self.clock)?;
+        // 5. Emit FlushCommit
+        writer.emit_flush_commit(written_count, &*self.clock)?;
 
         writer.flush()?;
 
@@ -1277,7 +1277,7 @@ impl InMemoryFS {
         {
             let mut manifest = self.manifest.write().unwrap();
             if let Some(entry) = manifest.get_mut_by_generation(active_gen) {
-                entry.record_count += written_count + 1; // including BatchCommit
+                entry.record_count += written_count + 1; // including FlushCommit
                 entry.total_data_bytes += flushed_data_bytes;
                 entry.total_bytes = active_offset;
             }

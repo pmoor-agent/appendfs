@@ -1,5 +1,5 @@
 use crate::log::record::{
-    BatchCommitPayload, CreatePayload, FILE_HEADER_SIZE, FileHeader, LinkPayload,
+    CreatePayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LinkPayload,
     MkdirPayload, OpCode, RECORD_HEADER_SIZE, RecordHeader,
     RenamePayload, RmdirPayload, SetattrPayload, SymlinkPayload, UnlinkPayload, WriteMeta,
     checksum_payload,
@@ -237,7 +237,7 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
             break;
         }
 
-        let is_commit = header.op_code == OpCode::BatchCommit;
+        let is_commit = header.op_code == OpCode::FlushCommit;
         let rec_idx = records.len();
         records.push(DumpRecordEntry::Valid {
             offset: record_offset,
@@ -347,7 +347,7 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
     if uncommitted_records_count > 0 {
         writeln!(
             out,
-            "Trailing Batch:      {} UNCOMMITTED records (interrupted flush before BatchCommit)",
+            "Trailing Batch:      {} UNCOMMITTED records (interrupted flush before FlushCommit)",
             uncommitted_records_count
         )
         .unwrap();
@@ -1160,8 +1160,8 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
                 writeln!(out, "      [Failed to deserialize LinkPayload]").unwrap();
             }
         }
-        OpCode::BatchCommit => {
-            if let Ok(b) = bincode::deserialize::<BatchCommitPayload>(payload) {
+        OpCode::FlushCommit => {
+            if let Ok(b) = bincode::deserialize::<FlushCommitPayload>(payload) {
                 writeln!(
                     out,
                     "      batch_record_count: {}, commit_timestamp: {}",
@@ -1170,7 +1170,7 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
                 )
                 .unwrap();
             } else {
-                writeln!(out, "      [Failed to deserialize BatchCommitPayload]").unwrap();
+                writeln!(out, "      [Failed to deserialize FlushCommitPayload]").unwrap();
             }
         }
     }
@@ -1275,7 +1275,7 @@ mod tests {
             .unwrap();
 
         // Commit batch
-        writer.emit_batch_commit(2, &clock).unwrap();
+        writer.emit_flush_commit(2, &clock).unwrap();
         drop(writer);
 
         let log_path = dir.path().join("000001.log");
@@ -1294,7 +1294,7 @@ mod tests {
         assert!(v1_dump.contains("Sequential Record Stream"));
         assert!(v1_dump.contains("Create"));
         assert!(v1_dump.contains("Write"));
-        assert!(v1_dump.contains("BatchCommit"));
+        assert!(v1_dump.contains("FlushCommit"));
         assert!(v1_dump.contains("[COMMITTED]"));
 
         // Level 2: Full Hex
@@ -1308,7 +1308,7 @@ mod tests {
         let clock = SystemClock;
         let writer = LogWriter::create(dir.path(), 1, &clock).unwrap();
 
-        // Write Create and Write records WITHOUT BatchCommit trailer
+        // Write Create and Write records WITHOUT FlushCommit trailer
         let create_p = CreatePayload {
             parent: 1,
             name: "uncommitted.txt".to_string(),

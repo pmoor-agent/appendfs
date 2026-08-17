@@ -1,7 +1,7 @@
 use crate::cli::DEFAULT_MAX_LOG_SIZE;
 use crate::clock::Clock;
 use crate::log::record::{
-    BatchCommitPayload, FILE_HEADER_SIZE, FileHeader, OpCode, RecordHeader,
+    FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCode, RecordHeader,
 };
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{self, Write};
@@ -89,7 +89,7 @@ impl LogWriter {
     ///
     /// Must be called at most once per flush batch, *before* writing any
     /// of that batch's records - never mid-batch. `append_record` itself never rolls,
-    /// so a whole batch (its records plus its `BatchCommit` trailer) always lands in
+    /// so a whole batch (its records plus its `FlushCommit` trailer) always lands in
     /// exactly one generation file, which is what lets recovery treat "buffer records
     /// since the last commit" as a purely per-file operation, never needing to carry
     /// state across a generation boundary. The tradeoff: a single large batch can push
@@ -177,11 +177,11 @@ impl LogWriter {
         Ok((tx, generation, record_log_offset))
     }
 
-    /// Emits the `OpCode::BatchCommit` trailer confirming `record_count` records
+    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records
     /// (everything since the previous commit) as a complete, replay-safe batch.
-    pub fn emit_batch_commit(&self, record_count: u32, clock: &dyn Clock) -> io::Result<u64> {
+    pub fn emit_flush_commit(&self, record_count: u32, clock: &dyn Clock) -> io::Result<u64> {
         let now = clock.now();
-        let commit_payload = BatchCommitPayload {
+        let commit_payload = FlushCommitPayload {
             timestamp: now,
             record_count,
         };
@@ -189,7 +189,7 @@ impl LogWriter {
         let payload_bytes = bincode::serialize(&commit_payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let (tx, _, _) = self.append_record(OpCode::BatchCommit, 0, &payload_bytes)?;
+        let (tx, _, _) = self.append_record(OpCode::FlushCommit, 0, &payload_bytes)?;
         Ok(tx)
     }
 
@@ -308,22 +308,22 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_batch_commit_round_trip() {
+    fn test_emit_flush_commit_round_trip() {
         let dir = tempdir().unwrap();
         let clock = SystemClock;
         let writer = LogWriter::create(dir.path(), 1, &clock).unwrap();
 
         writer.append_record(OpCode::Create, 1, b"payload").unwrap();
         writer.append_record(OpCode::Write, 1, b"more").unwrap();
-        writer.emit_batch_commit(2, &clock).unwrap();
+        writer.emit_flush_commit(2, &clock).unwrap();
 
         let records: Vec<_> = LogReader::open(writer.path())
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(records.len(), 3);
-        assert_eq!(records[2].header.op_code, OpCode::BatchCommit);
-        let payload: BatchCommitPayload = bincode::deserialize(&records[2].payload).unwrap();
+        assert_eq!(records[2].header.op_code, OpCode::FlushCommit);
+        let payload: FlushCommitPayload = bincode::deserialize(&records[2].payload).unwrap();
         assert_eq!(payload.record_count, 2);
     }
 }

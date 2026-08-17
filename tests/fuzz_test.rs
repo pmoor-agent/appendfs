@@ -961,7 +961,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     let writer = LogWriter::create(dir.path(), 1, &clock).unwrap();
 
     // Batch 1: mkdir "committed_dir" under root (ino 1), properly committed with a
-    // trailing BatchCommit - simulates a flush() call that completed successfully.
+    // trailing FlushCommit - simulates a flush() call that completed successfully.
     let mkdir_payload = MkdirPayload {
         parent: 1,
         name: "committed_dir".to_string(),
@@ -972,10 +972,10 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     };
     let bytes = bincode::serialize(&mkdir_payload).unwrap();
     writer.append_record(OpCode::Mkdir, 2, &bytes).unwrap();
-    writer.emit_batch_commit(1, &clock).unwrap();
+    writer.emit_flush_commit(1, &clock).unwrap();
 
     // Batch 2: create "should_not_exist.txt" inside root, but WITHOUT ever writing its
-    // BatchCommit trailer - simulates a crash exactly mid-flush, after the record was
+    // FlushCommit trailer - simulates a crash exactly mid-flush, after the record was
     // physically appended but before the batch was confirmed complete.
     let create_payload = CreatePayload {
         parent: 1,
@@ -987,7 +987,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     };
     let bytes = bincode::serialize(&create_payload).unwrap();
     writer.append_record(OpCode::Create, 3, &bytes).unwrap();
-    // Deliberately no emit_batch_commit() call here - this is the crash point.
+    // Deliberately no emit_flush_commit() call here - this is the crash point.
 
     writer.sync().unwrap();
     drop(writer);
@@ -1021,7 +1021,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
 fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     // Exercises the defensive record_count cross-check: since every individual
     // record's own checksum already passed by the time recovery reaches a
-    // BatchCommit, a record_count that still doesn't match what was actually
+    // FlushCommit, a record_count that still doesn't match what was actually
     // buffered can only mean a bug in the writer - not an expected crash-recovery
     // scenario - so this must hard-fail recovery entirely, not be silently discarded.
     let dir = tempfile::tempdir().unwrap();
@@ -1039,14 +1039,14 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     let bytes = bincode::serialize(&create_payload).unwrap();
     writer.append_record(OpCode::Create, 2, &bytes).unwrap();
     // Claim 2 records preceded this trailer, when only 1 actually did.
-    writer.emit_batch_commit(2, &clock).unwrap();
+    writer.emit_flush_commit(2, &clock).unwrap();
     writer.sync().unwrap();
     drop(writer);
 
     let result = recover_fs(dir.path());
     assert!(
         result.is_err(),
-        "a BatchCommit with a mismatched record_count must fail recovery hard"
+        "a FlushCommit with a mismatched record_count must fail recovery hard"
     );
 }
 
@@ -1069,7 +1069,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     };
     let bytes = bincode::serialize(&create_payload).unwrap();
     writer.append_record(OpCode::Create, 2, &bytes).unwrap();
-    writer.emit_batch_commit(1, &clock).unwrap();
+    writer.emit_flush_commit(1, &clock).unwrap();
     writer.sync().unwrap();
     let path = writer.path();
     drop(writer);

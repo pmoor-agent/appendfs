@@ -14,7 +14,7 @@ pub use flusher::BackgroundFlusher;
 pub use manifest::{GenerationLiveStats, LogFileInfo, LogManifest};
 pub use reader::{LogReader, LogRecord};
 pub use record::{
-    BatchCommitPayload, CreatePayload, FileHeader, LinkPayload, MkdirPayload, OpCode,
+    CreatePayload, FileHeader, FlushCommitPayload, LinkPayload, MkdirPayload, OpCode,
     RECORD_HEADER_SIZE, RecordHeader, RenamePayload, RmdirPayload, SetattrPayload, SymlinkPayload,
     UnlinkPayload, WriteMeta,
 };
