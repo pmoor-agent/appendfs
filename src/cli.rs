@@ -33,6 +33,10 @@ pub enum Commands {
     Stats(StatsArgs),
     /// Inspect and dump records from a single .log file
     Dump(DumpArgs),
+    /// Check volume integrity and consistency (hierarchy, link counts, extents, manifests)
+    Check(CheckArgs),
+    /// Alias for check (filesystem consistency check)
+    Fsck(CheckArgs),
 }
 
 #[derive(Args, Debug)]
@@ -110,6 +114,20 @@ impl MountArgs {
 pub struct StatsArgs {
     /// Directory path where the appendfs volume log and summary files are stored
     pub log_dir: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct CheckArgs {
+    /// Directory path where the appendfs volume log and summary files are stored
+    pub log_dir: PathBuf,
+
+    /// Deep verify physical extent payloads and BLAKE3 checksums in .log files on disk
+    #[arg(long = "verify-data", default_value_t = true, action = clap::ArgAction::Set)]
+    pub verify_data: bool,
+
+    /// Verbosity level (-v for detailed integrity check report)
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    pub verbose: u8,
 }
 
 /// Helper scanning `log_dir` for existing `.log` files to find the highest generation number.

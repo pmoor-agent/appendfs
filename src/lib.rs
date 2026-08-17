@@ -1,3 +1,4 @@
+pub mod check;
 pub mod cli;
 pub mod clock;
 pub mod dump;
@@ -10,7 +11,10 @@ pub mod range_map;
 pub mod shim;
 pub mod stats;
 
-pub use cli::{Cli, Commands, DumpArgs, InitArgs, MountArgs, StatsArgs, find_latest_generation};
+pub use check::{IntegrityIssue, IntegrityReport, IssueLevel, check_fs_integrity, check_volume};
+pub use cli::{
+    CheckArgs, Cli, Commands, DumpArgs, InitArgs, MountArgs, StatsArgs, find_latest_generation,
+};
 pub use clock::{AdvancingClock, Clock, MockClock, SystemClock, format_local_civil_time};
 pub use dump::{dump_file, dump_log_file, dump_summary_file};
 pub use fs::InMemoryFS;

@@ -126,5 +126,25 @@ fn main() {
                 }
             }
         }
+        Commands::Check(args) | Commands::Fsck(args) => {
+            let log_dir = &args.log_dir;
+            if !log_dir.exists() {
+                eprintln!("Error: Log directory '{:?}' does not exist.", log_dir);
+                std::process::exit(1);
+            }
+
+            match appendfs::check_volume(log_dir, args.verify_data) {
+                Ok(report) => {
+                    print!("{}", report.format_report(Some(log_dir), args.verbose > 0));
+                    if !report.is_clean() {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to check volume integrity at '{:?}': {}", log_dir, e);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }

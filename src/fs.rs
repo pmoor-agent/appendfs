@@ -1412,6 +1412,15 @@ impl InMemoryFS {
         result
     }
 
+    /// Performs a comprehensive, read-only integrity check of the filesystem state.
+    pub fn check_integrity(
+        &self,
+        log_dir: Option<&Path>,
+        verify_data: bool,
+    ) -> crate::check::IntegrityReport {
+        crate::check::check_fs_integrity(self, log_dir, verify_data)
+    }
+
     /// Exports a single-file summary snapshot of the current in-memory filesystem state.
     pub fn export_summary(&self, log_dir: impl AsRef<Path>) -> std::io::Result<PathBuf> {
         self.sync_log()?;

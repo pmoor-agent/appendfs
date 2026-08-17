@@ -1372,3 +1372,66 @@ fn test_background_flusher_in_mount_session() {
 
     fs.destroy();
 }
+
+#[test]
+fn test_check_volume_identifies_clean_and_orphaned_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path();
+
+    appendfs::init_volume(log_path, Some("main")).unwrap();
+
+    let mut fs = appendfs::recover_fs(log_path).unwrap();
+    let writer = std::sync::Arc::new(appendfs::LogWriter::create_lazy(
+        log_path,
+        1,
+        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+        1,
+    ));
+    fs.log_writer = Some(writer);
+    fs.set_log_dir(log_path);
+
+    // 1. Populate valid filesystem tree
+    let d = appendfs::operations::dir::mkdir_core(&fs, 1, "sub", 0o755, 1000, 1000).unwrap();
+    let f1 = appendfs::operations::read_write::create_core(&fs, d.ino, "hello.txt", 0o644, 0, 1000, 1000).unwrap();
+    appendfs::operations::read_write::write_core(&fs, f1.ino, b"integrity test data", 0).unwrap();
+    let _l = appendfs::operations::links::link_core(&fs, f1.ino, 1, "hardlink.txt").unwrap();
+
+    fs.sync_log().unwrap();
+
+    // 2. Check clean volume
+    let report = appendfs::check_volume(log_path, true).unwrap();
+    assert!(report.is_clean(), "Clean volume must pass check: {:?}", report.issues);
+    assert_eq!(report.error_count(), 0);
+    assert_eq!(report.orphaned_inodes.len(), 0);
+    assert_eq!(report.directories, 2);
+    assert_eq!(report.regular_files, 1);
+
+    let output = report.format_report(Some(log_path), true);
+    assert!(output.contains("VERDICT: CLEAN"));
+    assert!(output.contains("[PASS] Inode Reachability"));
+
+    // 3. Inject an orphaned inode into base and verify check detects it
+    let orphan_ino = 888;
+    let orphan_node = appendfs::Node::File {
+        range_map: appendfs::RangeMap::new(),
+        size: 256,
+        perm: 0o644,
+        nlink: 1,
+        uid: 1000,
+        gid: 1000,
+        atime: std::time::SystemTime::UNIX_EPOCH,
+        mtime: std::time::SystemTime::UNIX_EPOCH,
+        ctime: std::time::SystemTime::UNIX_EPOCH,
+    };
+    fs.base.write().unwrap().insert(orphan_ino, std::sync::Arc::new(appendfs::SyncNode::new(orphan_node)));
+
+    let corrupted_report = appendfs::check_fs_integrity(&fs, Some(log_path), true);
+    assert!(!corrupted_report.is_clean());
+    assert_eq!(corrupted_report.orphaned_inodes, vec![888]);
+    assert_eq!(corrupted_report.error_count(), 1);
+
+    let corrupted_output = corrupted_report.format_report(Some(log_path), false);
+    assert!(corrupted_output.contains("VERDICT: CORRUPT"));
+    assert!(corrupted_output.contains("ORPHAN_INODE"));
+    assert!(corrupted_output.contains("Inode 888"));
+}
