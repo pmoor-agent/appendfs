@@ -2,10 +2,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::fs::InMemoryFS;
 use crate::log::extent::SharedExtentState;
 use crate::log::reader::{LogReader, LogRecord};
-use crate::log::record::{
-    CreatePayload, FlushCommitPayload, LinkPayload, MkdirPayload, OpCode, RenamePayload,
-    RmdirPayload, SetattrPayload, SymlinkPayload, UnlinkPayload, WriteMeta,
-};
+use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode};
 use crate::log::summary::SummaryReader;
 use crate::node::{Node, SyncNode};
 use crate::range_map::RangeMap;
@@ -244,7 +241,7 @@ pub fn recover_fs_to_target_with_clock(
                             }
                         }
                         RecoveryTarget::Timestamp(max_time) => {
-                            if let Some(op_time) = record_op_time(&buffered) {
+                            if let Some(op_time) = buffered.op_time() {
                                 if op_time > max_time {
                                     target_cutoff_reached = true;
                                     break;
@@ -262,16 +259,10 @@ pub fn recover_fs_to_target_with_clock(
                         max_inode = target_ino;
                     }
 
-                    if buffered.header.op_code == OpCode::Write {
-                        if let Ok(meta) = bincode::deserialize::<WriteMeta>(&buffered.payload) {
-                            let meta_bytes = bincode::serialize(&meta).unwrap_or_default();
-                            if buffered.payload.len() > meta_bytes.len() {
-                                log_data_bytes +=
-                                    (buffered.payload.len() - meta_bytes.len()) as u64;
-                            }
-                        }
+                    if let Ok(DecodedPayload::Write { data, .. }) = buffered.decode() {
+                        log_data_bytes += data.len() as u64;
                     }
-                    if let Some(op_time) = record_op_time(&buffered) {
+                    if let Some(op_time) = buffered.op_time() {
                         last_op_time = Some(op_time);
                     }
                     apply_record(&fs_instance, gen_num, &buffered);
@@ -348,247 +339,222 @@ pub fn recover_fs_to_target_with_clock(
     Ok(fs_instance)
 }
 
-/// Helper extracting operation timestamp from a deserialized record payload.
-fn record_op_time(record: &LogRecord) -> Option<std::time::SystemTime> {
-    match record.header.op_code {
-        OpCode::Create => bincode::deserialize::<CreatePayload>(&record.payload)
-            .ok()
-            .map(|p| p.created_at),
-        OpCode::Mkdir => bincode::deserialize::<MkdirPayload>(&record.payload)
-            .ok()
-            .map(|p| p.created_at),
-        OpCode::Symlink => bincode::deserialize::<SymlinkPayload>(&record.payload)
-            .ok()
-            .map(|p| p.created_at),
-        OpCode::Link => bincode::deserialize::<LinkPayload>(&record.payload)
-            .ok()
-            .map(|p| p.op_time),
-        OpCode::Unlink => bincode::deserialize::<UnlinkPayload>(&record.payload)
-            .ok()
-            .map(|p| p.op_time),
-        OpCode::Rmdir => bincode::deserialize::<RmdirPayload>(&record.payload)
-            .ok()
-            .map(|p| p.op_time),
-        OpCode::Rename => bincode::deserialize::<RenamePayload>(&record.payload)
-            .ok()
-            .map(|p| p.op_time),
-        OpCode::Setattr => bincode::deserialize::<SetattrPayload>(&record.payload)
-            .ok()
-            .map(|p| p.op_time),
-        OpCode::Write => bincode::deserialize::<WriteMeta>(&record.payload)
-            .ok()
-            .map(|p| p.op_time),
-        OpCode::FlushCommit => bincode::deserialize::<FlushCommitPayload>(&record.payload)
-            .ok()
-            .map(|p| p.timestamp),
-    }
-}
-
 /// Applies one already-committed log record to `fs_instance`'s in-memory state. Only
 /// ever called for records that were confirmed complete by a matching `FlushCommit` -
 /// see `recover_fs`.
 fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
-    let header = &record.header;
-    let target_ino = header.inode;
+    let target_ino = record.header.inode;
+    let decoded = match record.decode() {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("Failed to decode record for inode {}: {}", target_ino, e);
+            return;
+        }
+    };
 
-    match header.op_code {
-        OpCode::Create => {
-            if let Ok(create) = bincode::deserialize::<CreatePayload>(&record.payload) {
-                let now = create.created_at;
-                let new_node = Arc::new(SyncNode::new(Node::File {
-                    range_map: RangeMap::new(),
-                    size: 0,
-                    perm: create.mode & 0o777,
-                    nlink: 1,
-                    uid: create.uid,
-                    gid: create.gid,
-                    atime: now,
-                    mtime: now,
-                    ctime: now,
-                }));
+    match decoded {
+        DecodedPayload::Create(create) => {
+            let now = create.created_at;
+            let new_node = Arc::new(SyncNode::new(Node::File {
+                range_map: RangeMap::new(),
+                size: 0,
+                perm: create.mode & 0o777,
+                nlink: 1,
+                uid: create.uid,
+                gid: create.gid,
+                atime: now,
+                mtime: now,
+                ctime: now,
+            }));
 
-                let mut map = fs_instance.base.write().unwrap();
-                map.insert(target_ino, new_node);
+            let mut map = fs_instance.base.write().unwrap();
+            map.insert(target_ino, new_node);
 
-                if let Some(parent_node_arc) = map.get(&create.parent) {
-                    // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                    let parent_node = unsafe { parent_node_arc.write() };
-                    if let Node::Directory {
-                        entries,
-                        mtime,
-                        ctime,
-                        ..
-                    } = parent_node
-                    {
-                        entries.push((create.name, target_ino));
-                        *mtime = now;
-                        *ctime = now;
-                    }
+            if let Some(parent_node_arc) = map.get(&create.parent) {
+                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
+                let parent_node = unsafe { parent_node_arc.write() };
+                if let Node::Directory {
+                    entries,
+                    mtime,
+                    ctime,
+                    ..
+                } = parent_node
+                {
+                    entries.push((create.name, target_ino));
+                    *mtime = now;
+                    *ctime = now;
                 }
             }
         }
-        OpCode::Mkdir => {
-            if let Ok(mkdir) = bincode::deserialize::<MkdirPayload>(&record.payload) {
-                let now = mkdir.created_at;
-                let new_node = Arc::new(SyncNode::new(Node::Directory {
-                    parent: mkdir.parent,
-                    entries: Vec::new(),
-                    perm: mkdir.mode & 0o777,
-                    nlink: 2,
-                    uid: mkdir.uid,
-                    gid: mkdir.gid,
-                    atime: now,
-                    mtime: now,
-                    ctime: now,
-                }));
+        DecodedPayload::Mkdir(mkdir) => {
+            let now = mkdir.created_at;
+            let new_node = Arc::new(SyncNode::new(Node::Directory {
+                parent: mkdir.parent,
+                entries: Vec::new(),
+                perm: mkdir.mode & 0o777,
+                nlink: 2,
+                uid: mkdir.uid,
+                gid: mkdir.gid,
+                atime: now,
+                mtime: now,
+                ctime: now,
+            }));
 
-                let mut map = fs_instance.base.write().unwrap();
-                map.insert(target_ino, new_node);
+            let mut map = fs_instance.base.write().unwrap();
+            map.insert(target_ino, new_node);
 
-                if let Some(parent_node_arc) = map.get(&mkdir.parent) {
-                    let parent_node = unsafe { parent_node_arc.write() };
-                    if let Node::Directory {
-                        entries,
-                        mtime,
-                        ctime,
-                        ..
-                    } = parent_node
-                    {
-                        entries.push((mkdir.name, target_ino));
-                        *mtime = now;
-                        *ctime = now;
-                    }
+            if let Some(parent_node_arc) = map.get(&mkdir.parent) {
+                let parent_node = unsafe { parent_node_arc.write() };
+                if let Node::Directory {
+                    entries,
+                    mtime,
+                    ctime,
+                    ..
+                } = parent_node
+                {
+                    entries.push((mkdir.name, target_ino));
+                    *mtime = now;
+                    *ctime = now;
                 }
             }
         }
-        OpCode::Write => {
-            if let Ok(write_meta) = bincode::deserialize::<WriteMeta>(&record.payload) {
-                let meta_bytes = bincode::serialize(&write_meta).unwrap();
-                let meta_size = meta_bytes.len() as u32;
-                let payload_len = record.payload.len() as u32;
-                let write_data_len = payload_len - meta_size;
+        DecodedPayload::Write { meta: write_meta, data } => {
+            let meta_size = (record.payload.len() - data.len()) as u32;
+            let write_data_len = data.len() as u32;
 
-                let shared_state = SharedExtentState::new_disk(
-                    gen_num,
-                    record.record_log_offset,
-                    meta_size,
-                    write_data_len,
-                );
+            let shared_state = SharedExtentState::new_disk(
+                gen_num,
+                record.record_log_offset,
+                meta_size,
+                write_data_len,
+            );
 
-                let map = fs_instance.base.read().unwrap();
-                if let Some(node_arc) = map.get(&target_ino) {
-                    let node = unsafe { node_arc.write() };
-                    if let Node::File {
-                        range_map,
-                        size,
-                        mtime,
-                        ctime,
-                        ..
-                    } = node
-                    {
-                        let end_offset = write_meta.file_offset + write_data_len as u64;
-                        if end_offset > *size {
-                            *size = end_offset;
+            let map = fs_instance.base.read().unwrap();
+            if let Some(node_arc) = map.get(&target_ino) {
+                let node = unsafe { node_arc.write() };
+                if let Node::File {
+                    range_map,
+                    size,
+                    mtime,
+                    ctime,
+                    ..
+                } = node
+                {
+                    let end_offset = write_meta.file_offset + write_data_len as u64;
+                    if end_offset > *size {
+                        *size = end_offset;
+                    }
+                    let now = write_meta.op_time;
+                    *mtime = now;
+                    *ctime = now;
+                    range_map.insert(
+                        write_meta.file_offset,
+                        write_data_len as u64,
+                        shared_state,
+                    );
+                }
+            }
+        }
+        DecodedPayload::Unlink(unlink) => {
+            let now = unlink.op_time;
+            let mut map = fs_instance.base.write().unwrap();
+            if let Some(parent_node_arc) = map.get(&unlink.parent) {
+                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
+                let parent_node = unsafe { parent_node_arc.write() };
+                if let Node::Directory {
+                    entries,
+                    mtime,
+                    ctime,
+                    ..
+                } = parent_node
+                {
+                    entries.retain(|(name, ino)| !(name == &unlink.name && *ino == target_ino));
+                    *mtime = now;
+                    *ctime = now;
+                }
+            }
+
+            let mut should_delete = false;
+            if let Some(child_node_arc) = map.get(&target_ino) {
+                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
+                let child_node = unsafe { child_node_arc.write() };
+                match child_node {
+                    Node::File { nlink, ctime, .. } | Node::Symlink { nlink, ctime, .. } => {
+                        if *nlink > 0 {
+                            *nlink -= 1;
+                            *ctime = now;
                         }
-                        let now = write_meta.op_time;
-                        *mtime = now;
-                        *ctime = now;
-                        range_map.insert(
-                            write_meta.file_offset,
-                            write_data_len as u64,
-                            shared_state,
-                        );
-                    }
-                }
-            }
-        }
-        OpCode::Unlink => {
-            if let Ok(unlink) = bincode::deserialize::<UnlinkPayload>(&record.payload) {
-                let now = unlink.op_time;
-                let mut map = fs_instance.base.write().unwrap();
-                if let Some(parent_node_arc) = map.get(&unlink.parent) {
-                    // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                    let parent_node = unsafe { parent_node_arc.write() };
-                    if let Node::Directory {
-                        entries,
-                        mtime,
-                        ctime,
-                        ..
-                    } = parent_node
-                    {
-                        entries.retain(|(name, ino)| !(name == &unlink.name && *ino == target_ino));
-                        *mtime = now;
-                        *ctime = now;
-                    }
-                }
-
-                let mut should_delete = false;
-                if let Some(child_node_arc) = map.get(&target_ino) {
-                    // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                    let child_node = unsafe { child_node_arc.write() };
-                    match child_node {
-                        Node::File { nlink, ctime, .. } | Node::Symlink { nlink, ctime, .. } => {
-                            if *nlink > 0 {
-                                *nlink -= 1;
-                                *ctime = now;
-                            }
-                            if *nlink == 0 {
-                                should_delete = true;
-                            }
-                        }
-                        // Directories carry a fixed nlink=2 for life (see mkdir_core)
-                        // and can't be hardlinked, so live's unlink_core rejects them
-                        // with EISDIR before ever staging an Unlink record - this arm
-                        // only exists for defensiveness against pre-fix logs.
-                        Node::Directory { .. } => {
+                        if *nlink == 0 {
                             should_delete = true;
                         }
                     }
-                }
-                if should_delete {
-                    map.remove(&target_ino);
-                }
-            }
-        }
-        OpCode::Rmdir => {
-            if let Ok(rmdir) = bincode::deserialize::<RmdirPayload>(&record.payload) {
-                let now = rmdir.op_time;
-                let mut map = fs_instance.base.write().unwrap();
-                if let Some(parent_node_arc) = map.get(&rmdir.parent) {
-                    // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                    let parent_node = unsafe { parent_node_arc.write() };
-                    if let Node::Directory {
-                        entries,
-                        mtime,
-                        ctime,
-                        ..
-                    } = parent_node
-                    {
-                        entries.retain(|(name, ino)| !(name == &rmdir.name && *ino == target_ino));
-                        *mtime = now;
-                        *ctime = now;
+                    Node::Directory { .. } => {
+                        should_delete = true;
                     }
                 }
+            }
+            if should_delete {
                 map.remove(&target_ino);
             }
         }
-        OpCode::Symlink => {
-            if let Ok(symlink) = bincode::deserialize::<SymlinkPayload>(&record.payload) {
-                let now = symlink.created_at;
-                let new_node = Arc::new(SyncNode::new(Node::Symlink {
-                    target: symlink.target,
-                    nlink: 1,
-                    uid: symlink.uid,
-                    gid: symlink.gid,
-                    atime: now,
-                    mtime: now,
-                    ctime: now,
-                }));
+        DecodedPayload::Rmdir(rmdir) => {
+            let now = rmdir.op_time;
+            let mut map = fs_instance.base.write().unwrap();
+            if let Some(parent_node_arc) = map.get(&rmdir.parent) {
+                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
+                let parent_node = unsafe { parent_node_arc.write() };
+                if let Node::Directory {
+                    entries,
+                    mtime,
+                    ctime,
+                    ..
+                } = parent_node
+                {
+                    entries.retain(|(name, ino)| !(name == &rmdir.name && *ino == target_ino));
+                    *mtime = now;
+                    *ctime = now;
+                }
+            }
+            map.remove(&target_ino);
+        }
+        DecodedPayload::Symlink(symlink) => {
+            let now = symlink.created_at;
+            let new_node = Arc::new(SyncNode::new(Node::Symlink {
+                target: symlink.target,
+                nlink: 1,
+                uid: symlink.uid,
+                gid: symlink.gid,
+                atime: now,
+                mtime: now,
+                ctime: now,
+            }));
 
-                let mut map = fs_instance.base.write().unwrap();
-                map.insert(target_ino, new_node);
+            let mut map = fs_instance.base.write().unwrap();
+            map.insert(target_ino, new_node);
 
-                if let Some(parent_node_arc) = map.get(&symlink.parent) {
+            if let Some(parent_node_arc) = map.get(&symlink.parent) {
+                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
+                let parent_node = unsafe { parent_node_arc.write() };
+                if let Node::Directory {
+                    entries,
+                    mtime,
+                    ctime,
+                    ..
+                } = parent_node
+                {
+                    entries.push((symlink.name, target_ino));
+                    *mtime = now;
+                    *ctime = now;
+                }
+            }
+        }
+        DecodedPayload::Rename(rename) => {
+            let now = rename.op_time;
+            let mut map = fs_instance.base.write().unwrap();
+
+            let overwritten_ino = if rename.parent == rename.new_parent {
+                let mut overwritten = None;
+                if let Some(parent_node_arc) = map.get(&rename.parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let parent_node = unsafe { parent_node_arc.write() };
                     if let Node::Directory {
@@ -598,258 +564,41 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         ..
                     } = parent_node
                     {
-                        entries.push((symlink.name, target_ino));
+                        if let Some(dest_pos) =
+                            entries.iter().position(|(n, ino)| n == &rename.new_name && *ino != target_ino)
+                        {
+                            overwritten = Some(entries.remove(dest_pos).1);
+                        }
+                        if let Some(src_pos) =
+                            entries.iter().position(|(n, ino)| n == &rename.name && *ino == target_ino)
+                        {
+                            entries[src_pos].0 = rename.new_name.clone();
+                        }
                         *mtime = now;
                         *ctime = now;
                     }
                 }
-            }
-        }
-        OpCode::Rename => {
-            if let Ok(rename) = bincode::deserialize::<RenamePayload>(&record.payload) {
-                let now = rename.op_time;
-                let mut map = fs_instance.base.write().unwrap();
-
-                // Live's rename_core treats same-parent renames differently from
-                // cross-parent ones: same-parent does an in-place rename of the
-                // existing Vec entry (preserving its position - a self-rename to the
-                // same name is the only case that skips logging entirely, so replay
-                // never has to special-case it here), while cross-parent always
-                // removes from the source Vec and pushes onto the destination Vec.
-                // Replaying both cases as an unconditional remove-then-push (as this
-                // used to do) reaches the same *set* of directory entries either way,
-                // but silently reorders same-parent-renamed entries within their Vec -
-                // invisible to comparisons that sort entries first, but a real
-                // divergence from live, and the reason two logically-identical
-                // filesystems could still export non-byte-identical .summary files.
-                let overwritten_ino = if rename.parent == rename.new_parent {
-                    let mut overwritten = None;
-                    if let Some(parent_node_arc) = map.get(&rename.parent) {
-                        // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                        let parent_node = unsafe { parent_node_arc.write() };
-                        if let Node::Directory {
-                            entries,
-                            mtime,
-                            ctime,
-                            ..
-                        } = parent_node
-                        {
-                            if let Some(dest_pos) =
-                                entries.iter().position(|(n, ino)| n == &rename.new_name && *ino != target_ino)
-                            {
-                                overwritten = Some(entries.remove(dest_pos).1);
-                            }
-                            if let Some(src_pos) =
-                                entries.iter().position(|(n, ino)| n == &rename.name && *ino == target_ino)
-                            {
-                                entries[src_pos].0 = rename.new_name.clone();
-                            }
-                            *mtime = now;
-                            *ctime = now;
-                        }
-                    }
-                    overwritten
-                } else {
-                    // Remove source entry
-                    if let Some(parent_node_arc) = map.get(&rename.parent) {
-                        // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                        let parent_node = unsafe { parent_node_arc.write() };
-                        if let Node::Directory {
-                            entries,
-                            mtime,
-                            ctime,
-                            ..
-                        } = parent_node
-                        {
-                            entries.retain(|(name, ino)| !(name == &rename.name && *ino == target_ino));
-                            *mtime = now;
-                            *ctime = now;
-                        }
-                    }
-
-                    // Add new entry, capturing any destination inode it clobbers
-                    if let Some(newparent_node_arc) = map.get(&rename.new_parent) {
-                        // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                        let newparent_node = unsafe { newparent_node_arc.write() };
-                        if let Node::Directory {
-                            entries,
-                            mtime,
-                            ctime,
-                            ..
-                        } = newparent_node
-                        {
-                            let overwritten = entries
-                                .iter()
-                                .position(|(name, ino)| name == &rename.new_name && *ino != target_ino)
-                                .map(|pos| entries.remove(pos).1);
-                            entries.push((rename.new_name.clone(), target_ino));
-                            *mtime = now;
-                            *ctime = now;
-                            overwritten
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                if rename.parent != rename.new_parent {
-                    if let Some(target_node_arc) = map.get(&target_ino) {
-                        let target_node = unsafe { target_node_arc.write() };
-                        if let Node::Directory { parent, .. } = target_node {
-                            *parent = rename.new_parent;
-                        }
-                    }
-                }
-
-                // Mirror live rename's overwrite semantics: the clobbered destination
-                // inode loses a link and is reclaimed once its nlink reaches zero.
-                // Without this, replayed renames-that-overwrite leak the old inode.
-                if let Some(dest_ino) = overwritten_ino {
-                    if dest_ino != target_ino {
-                        let mut should_delete = false;
-                        if let Some(dest_node_arc) = map.get(&dest_ino) {
-                            // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                            let dest_node = unsafe { dest_node_arc.write() };
-                            match dest_node {
-                                Node::File { nlink, ctime, .. }
-                                | Node::Symlink { nlink, ctime, .. } => {
-                                    if *nlink > 0 {
-                                        *nlink -= 1;
-                                        *ctime = now;
-                                    }
-                                    if *nlink == 0 {
-                                        should_delete = true;
-                                    }
-                                }
-                                // Directories carry a fixed nlink=2 for life (see
-                                // mkdir_core) and can't be hardlinked, so the one entry
-                                // just overwritten was necessarily their only reference -
-                                // mirrors live rename_core's overwrite-reclaim fix.
-                                Node::Directory { .. } => {
-                                    should_delete = true;
-                                }
-                            }
-                        }
-                        if should_delete {
-                            map.remove(&dest_ino);
-                        }
-                    }
-                }
-            }
-        }
-        OpCode::Setattr => {
-            if let Ok(setattr) = bincode::deserialize::<SetattrPayload>(&record.payload) {
-                let map = fs_instance.base.read().unwrap();
-                if let Some(node_arc) = map.get(&target_ino) {
+                overwritten
+            } else {
+                // Remove source entry
+                if let Some(parent_node_arc) = map.get(&rename.parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                    let node = unsafe { node_arc.write() };
-                    let now = setattr.op_time;
-                    // Mirrors live: ctime only moves when this call actually changed
-                    // something, never on a to_set with no applicable bits. (atime from reads never moves ctime).
-
-                    match node {
-                        Node::File {
-                            range_map,
-                            perm,
-                            uid,
-                            gid,
-                            size,
-                            atime,
-                            mtime,
-                            ctime,
-                            ..
-                        } => {
-                            if let Some(m) = setattr.mode {
-                                *perm = m;
-                            }
-                            if let Some(u) = setattr.uid {
-                                *uid = u;
-                            }
-                            if let Some(g) = setattr.gid {
-                                *gid = g;
-                            }
-                            if let Some(s) = setattr.size {
-                                // Mirrors the live setattr handler: shrinking must
-                                // actually remove/trim range map entries beyond the
-                                // new size, or replayed state would diverge from live
-                                // (live now trims; replay used to just move the size
-                                // marker, same as the bug this whole fix addresses).
-                                if s < *size {
-                                    range_map.truncate(s);
-                                }
-                                *size = s;
-                                // Mirrors live: a size change touches mtime too, not
-                                // just ctime (POSIX truncate semantics) - unlike
-                                // mode/uid/gid, which only ever touch ctime.
-                                *mtime = now;
-                            }
-                            if let Some(t) = setattr.atime {
-                                *atime = t;
-                            }
-                            if let Some(t) = setattr.mtime {
-                                *mtime = t;
-                            }
-                            *ctime = now;
-                        }
-                        Node::Directory {
-                            perm,
-                            uid,
-                            gid,
-                            atime,
-                            mtime,
-                            ctime,
-                            ..
-                        } => {
-                            if let Some(m) = setattr.mode {
-                                *perm = m;
-                            }
-                            if let Some(u) = setattr.uid {
-                                *uid = u;
-                            }
-                            if let Some(g) = setattr.gid {
-                                *gid = g;
-                            }
-                            if let Some(t) = setattr.atime {
-                                *atime = t;
-                            }
-                            if let Some(t) = setattr.mtime {
-                                *mtime = t;
-                            }
-                            *ctime = now;
-                        }
-                        Node::Symlink {
-                            uid,
-                            gid,
-                            atime,
-                            mtime,
-                            ctime,
-                            ..
-                        } => {
-                            if let Some(u) = setattr.uid {
-                                *uid = u;
-                            }
-                            if let Some(g) = setattr.gid {
-                                *gid = g;
-                            }
-                            if let Some(t) = setattr.atime {
-                                *atime = t;
-                            }
-                            if let Some(t) = setattr.mtime {
-                                *mtime = t;
-                            }
-                            *ctime = now;
-                        }
+                    let parent_node = unsafe { parent_node_arc.write() };
+                    if let Node::Directory {
+                        entries,
+                        mtime,
+                        ctime,
+                        ..
+                    } = parent_node
+                    {
+                        entries.retain(|(name, ino)| !(name == &rename.name && *ino == target_ino));
+                        *mtime = now;
+                        *ctime = now;
                     }
                 }
-            }
-        }
-        OpCode::Link => {
-            if let Ok(link) = bincode::deserialize::<LinkPayload>(&record.payload) {
-                let now = link.op_time;
-                let map = fs_instance.base.write().unwrap();
-                if let Some(newparent_node_arc) = map.get(&link.new_parent) {
+
+                // Add new entry, capturing any destination inode it clobbers
+                if let Some(newparent_node_arc) = map.get(&rename.new_parent) {
                     // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
                     let newparent_node = unsafe { newparent_node_arc.write() };
                     if let Node::Directory {
@@ -859,35 +608,192 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         ..
                     } = newparent_node
                     {
-                        entries.push((link.new_name, target_ino));
+                        let overwritten = entries
+                            .iter()
+                            .position(|(name, ino)| name == &rename.new_name && *ino != target_ino)
+                            .map(|pos| entries.remove(pos).1);
+                        entries.push((rename.new_name.clone(), target_ino));
                         *mtime = now;
                         *ctime = now;
+                        overwritten
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if rename.parent != rename.new_parent {
+                if let Some(target_node_arc) = map.get(&target_ino) {
+                    let target_node = unsafe { target_node_arc.write() };
+                    if let Node::Directory { parent, .. } = target_node {
+                        *parent = rename.new_parent;
                     }
                 }
+            }
 
-                if let Some(node_arc) = map.get(&target_ino) {
-                    // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
-                    let node = unsafe { node_arc.write() };
-                    match node {
-                        Node::File { nlink, ctime, .. } => {
-                            *nlink += 1;
-                            *ctime = now;
+            if let Some(dest_ino) = overwritten_ino {
+                if dest_ino != target_ino {
+                    let mut should_delete = false;
+                    if let Some(dest_node_arc) = map.get(&dest_ino) {
+                        // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
+                        let dest_node = unsafe { dest_node_arc.write() };
+                        match dest_node {
+                            Node::File { nlink, ctime, .. }
+                            | Node::Symlink { nlink, ctime, .. } => {
+                                if *nlink > 0 {
+                                    *nlink -= 1;
+                                    *ctime = now;
+                                }
+                                if *nlink == 0 {
+                                    should_delete = true;
+                                }
+                            }
+                            Node::Directory { .. } => {
+                                should_delete = true;
+                            }
                         }
-                        Node::Symlink { nlink, ctime, .. } => {
-                            *nlink += 1;
-                            *ctime = now;
-                        }
-                        Node::Directory { nlink, ctime, .. } => {
-                            *nlink += 1;
-                            *ctime = now;
-                        }
+                    }
+                    if should_delete {
+                        map.remove(&dest_ino);
                     }
                 }
             }
         }
-        OpCode::FlushCommit => {
-            // Never buffered/applied - recover_fs handles these directly.
+        DecodedPayload::Setattr(setattr) => {
+            let map = fs_instance.base.read().unwrap();
+            if let Some(node_arc) = map.get(&target_ino) {
+                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
+                let node = unsafe { node_arc.write() };
+                let now = setattr.op_time;
+
+                match node {
+                    Node::File {
+                        range_map,
+                        perm,
+                        uid,
+                        gid,
+                        size,
+                        atime,
+                        mtime,
+                        ctime,
+                        ..
+                    } => {
+                        if let Some(m) = setattr.mode {
+                            *perm = m;
+                        }
+                        if let Some(u) = setattr.uid {
+                            *uid = u;
+                        }
+                        if let Some(g) = setattr.gid {
+                            *gid = g;
+                        }
+                        if let Some(s) = setattr.size {
+                            if s < *size {
+                                range_map.truncate(s);
+                            }
+                            *size = s;
+                            *mtime = now;
+                        }
+                        if let Some(t) = setattr.atime {
+                            *atime = t;
+                        }
+                        if let Some(t) = setattr.mtime {
+                            *mtime = t;
+                        }
+                        *ctime = now;
+                    }
+                    Node::Directory {
+                        perm,
+                        uid,
+                        gid,
+                        atime,
+                        mtime,
+                        ctime,
+                        ..
+                    } => {
+                        if let Some(m) = setattr.mode {
+                            *perm = m;
+                        }
+                        if let Some(u) = setattr.uid {
+                            *uid = u;
+                        }
+                        if let Some(g) = setattr.gid {
+                            *gid = g;
+                        }
+                        if let Some(t) = setattr.atime {
+                            *atime = t;
+                        }
+                        if let Some(t) = setattr.mtime {
+                            *mtime = t;
+                        }
+                        *ctime = now;
+                    }
+                    Node::Symlink {
+                        uid,
+                        gid,
+                        atime,
+                        mtime,
+                        ctime,
+                        ..
+                    } => {
+                        if let Some(u) = setattr.uid {
+                            *uid = u;
+                        }
+                        if let Some(g) = setattr.gid {
+                            *gid = g;
+                        }
+                        if let Some(t) = setattr.atime {
+                            *atime = t;
+                        }
+                        if let Some(t) = setattr.mtime {
+                            *mtime = t;
+                        }
+                        *ctime = now;
+                    }
+                }
+            }
         }
+        DecodedPayload::Link(link) => {
+            let now = link.op_time;
+            let map = fs_instance.base.write().unwrap();
+            if let Some(newparent_node_arc) = map.get(&link.new_parent) {
+                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
+                let newparent_node = unsafe { newparent_node_arc.write() };
+                if let Node::Directory {
+                    entries,
+                    mtime,
+                    ctime,
+                    ..
+                } = newparent_node
+                {
+                    entries.push((link.new_name, target_ino));
+                    *mtime = now;
+                    *ctime = now;
+                }
+            }
+
+            if let Some(node_arc) = map.get(&target_ino) {
+                // SAFETY: Single-threaded pre-mount recovery phase; no concurrent LockPool access.
+                let node = unsafe { node_arc.write() };
+                match node {
+                    Node::File { nlink, ctime, .. } => {
+                        *nlink += 1;
+                        *ctime = now;
+                    }
+                    Node::Symlink { nlink, ctime, .. } => {
+                        *nlink += 1;
+                        *ctime = now;
+                    }
+                    Node::Directory { nlink, ctime, .. } => {
+                        *nlink += 1;
+                        *ctime = now;
+                    }
+                }
+            }
+        }
+        DecodedPayload::FlushCommit(_) => {}
     }
 }
 

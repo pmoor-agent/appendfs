@@ -5,52 +5,25 @@
 // reproducibility of a specific interleaving - it's shaking out data races and lock
 // misuse around the striped `lock_pool` / `SyncNode` unsafe-cell design that a
 // single-threaded fuzz test structurally cannot exercise.
-use appendfs::InMemoryFS;
-use appendfs::LogWriter;
+mod common;
 use appendfs::clock::{Clock, SystemClock};
-use appendfs::log::{SummaryReader, recover_fs};
+use appendfs::log::{recover_fs, SummaryReader};
 use appendfs::node::Node;
 use appendfs::operations::dir::{list_dir_core, mkdir_core, rmdir_core};
 use appendfs::operations::links::{
     link_core, readlink_core, rename_core, symlink_core, unlink_core,
 };
 use appendfs::operations::read_write::{
-    FUSE_SET_ATTR_SIZE, create_core, getattr_core, read_core, setattr_core, write_core,
+    create_core, getattr_core, read_core, setattr_core, write_core, FUSE_SET_ATTR_SIZE,
 };
 use appendfs::shim::FileType;
+use appendfs::InMemoryFS;
+use appendfs::LogWriter;
+use common::TestRng;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-struct Rng {
-    state: u64,
-}
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 { 0xDEADBEEFCAFEBABE } else { seed },
-        }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
-    }
-
-    // Inclusive on both ends.
-    fn gen_range(&mut self, min: usize, max: usize) -> usize {
-        if min >= max {
-            return min;
-        }
-        min + (self.next_u64() as usize % (max - min + 1))
-    }
-}
 
 const UID: u32 = 1000;
 const GID: u32 = 1000;
@@ -59,7 +32,7 @@ const OPS_PER_THREAD: usize = 400;
 const DIR_NAMES: [&str; 4] = ["d0", "d1", "d2", "d3"];
 const FILE_NAMES: [&str; 4] = ["f0", "f1", "f2", "f3"];
 
-fn pick_entry(fs: &InMemoryFS, dir_ino: u64, rng: &mut Rng) -> Option<(String, u64)> {
+fn pick_entry(fs: &InMemoryFS, dir_ino: u64, rng: &mut TestRng) -> Option<(String, u64)> {
     match list_dir_core(fs, dir_ino) {
         Ok(entries) if !entries.is_empty() => {
             let idx = rng.gen_range(0, entries.len() - 1);
@@ -73,7 +46,7 @@ fn pick_entry(fs: &InMemoryFS, dir_ino: u64, rng: &mut Rng) -> Option<(String, u
 // sometimes a subdirectory discovered inside one of them, so nesting (and therefore
 // multi-hop ancestor walks during directory rename's loop-prevention check) emerges
 // organically as threads race to create/rename/remove entries.
-fn pick_target_dir(fs: &InMemoryFS, shared: &[u64], rng: &mut Rng) -> u64 {
+fn pick_target_dir(fs: &InMemoryFS, shared: &[u64], rng: &mut TestRng) -> u64 {
     let base = shared[rng.gen_range(0, shared.len() - 1)];
     if rng.gen_range(0, 1) == 0 {
         return base;
@@ -94,7 +67,7 @@ fn pick_target_dir(fs: &InMemoryFS, shared: &[u64], rng: &mut Rng) -> u64 {
 }
 
 fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
-    let mut rng = Rng::new(seed);
+    let mut rng = TestRng::new(seed);
     for _ in 0..OPS_PER_THREAD {
         let dir_a = pick_target_dir(&fs, &shared_dirs, &mut rng);
         let dir_b = pick_target_dir(&fs, &shared_dirs, &mut rng);

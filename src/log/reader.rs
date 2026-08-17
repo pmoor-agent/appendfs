@@ -1,7 +1,12 @@
-use crate::log::record::{FILE_HEADER_SIZE, FileHeader, RECORD_HEADER_SIZE, RecordHeader};
+use crate::log::record::{
+    CreatePayload, DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LinkPayload,
+    MkdirPayload, OpCode, RECORD_HEADER_SIZE, RecordHeader, RenamePayload, RmdirPayload,
+    SetattrPayload, SymlinkPayload, UnlinkPayload, WriteMeta,
+};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::time::SystemTime;
 
 /// Represents a single deserialized log record read from a `.log` file.
 #[derive(Debug, Clone)]
@@ -9,6 +14,54 @@ pub struct LogRecord {
     pub header: RecordHeader,
     pub payload: Vec<u8>,
     pub record_log_offset: u64,
+}
+
+impl LogRecord {
+    /// Decodes the raw binary payload into a strongly-typed `DecodedPayload`.
+    pub fn decode(&self) -> Result<DecodedPayload<'_>, bincode::Error> {
+        match self.header.op_code {
+            OpCode::Create => {
+                bincode::deserialize::<CreatePayload>(&self.payload).map(DecodedPayload::Create)
+            }
+            OpCode::Mkdir => {
+                bincode::deserialize::<MkdirPayload>(&self.payload).map(DecodedPayload::Mkdir)
+            }
+            OpCode::Write => {
+                let meta = bincode::deserialize::<WriteMeta>(&self.payload)?;
+                let meta_bytes = bincode::serialize(&meta)?;
+                let data_offset = meta_bytes.len().min(self.payload.len());
+                Ok(DecodedPayload::Write {
+                    meta,
+                    data: &self.payload[data_offset..],
+                })
+            }
+            OpCode::Unlink => {
+                bincode::deserialize::<UnlinkPayload>(&self.payload).map(DecodedPayload::Unlink)
+            }
+            OpCode::Rmdir => {
+                bincode::deserialize::<RmdirPayload>(&self.payload).map(DecodedPayload::Rmdir)
+            }
+            OpCode::Symlink => {
+                bincode::deserialize::<SymlinkPayload>(&self.payload).map(DecodedPayload::Symlink)
+            }
+            OpCode::Rename => {
+                bincode::deserialize::<RenamePayload>(&self.payload).map(DecodedPayload::Rename)
+            }
+            OpCode::Setattr => {
+                bincode::deserialize::<SetattrPayload>(&self.payload).map(DecodedPayload::Setattr)
+            }
+            OpCode::Link => {
+                bincode::deserialize::<LinkPayload>(&self.payload).map(DecodedPayload::Link)
+            }
+            OpCode::FlushCommit => bincode::deserialize::<FlushCommitPayload>(&self.payload)
+                .map(DecodedPayload::FlushCommit),
+        }
+    }
+
+    /// Extracts the timestamp associated with this record.
+    pub fn op_time(&self) -> Option<SystemTime> {
+        self.decode().ok().and_then(|d| d.op_time())
+    }
 }
 
 /// Iterator for sequentially reading records from a `.log` generation file.

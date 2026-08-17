@@ -60,6 +60,49 @@ pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, i3
     fs.list_directory(ino).ok_or(libc::ENOENT)
 }
 
+pub struct DirItem<'a> {
+    pub name: &'a str,
+    pub ino: u64,
+    pub next_offset: i64,
+}
+
+pub fn iter_dir_entries<'a>(
+    fs: &InMemoryFS,
+    ino: u64,
+    entries: &'a [(String, u64)],
+    offset: i64,
+) -> impl Iterator<Item = DirItem<'a>> {
+    let dotdot_ino = if ino == 1 {
+        1
+    } else {
+        find_parent_inode(fs, ino).unwrap_or(1)
+    };
+
+    let offset = offset as usize;
+    let dot = (offset == 0).then(|| DirItem {
+        name: ".",
+        ino,
+        next_offset: 1,
+    });
+    let dotdot = (offset <= 1).then(|| DirItem {
+        name: "..",
+        ino: dotdot_ino,
+        next_offset: 2,
+    });
+    let start_entry_idx = offset.saturating_sub(2);
+    let rest = entries
+        .iter()
+        .enumerate()
+        .skip(start_entry_idx)
+        .map(|(idx, (name, child_ino))| DirItem {
+            name: name.as_str(),
+            ino: *child_ino,
+            next_offset: (idx + 3) as i64,
+        });
+
+    dot.into_iter().chain(dotdot).chain(rest)
+}
+
 pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64) {
     log::trace!("readdir(ino={}, size={}, offset={})", ino, size, offset);
     let entries = match list_dir_core(fs, ino) {
@@ -70,38 +113,14 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
         }
     };
 
-    let dotdot_ino = if ino == 1 {
-        1
-    } else {
-        find_parent_inode(fs, ino).unwrap_or(1)
-    };
-
     let mut db = shim::DirectoryBuffer::new(req, size);
-
-    let offset = offset as usize;
-    if offset == 0 {
-        if !db.add(".", ino, FileType::Directory, 1) {
-            db.reply();
-            return;
-        }
-    }
-    if offset <= 1 {
-        if !db.add("..", dotdot_ino, FileType::Directory, 2) {
-            db.reply();
-            return;
-        }
-    }
-
-    let start_entry_idx = offset.saturating_sub(2);
-    for (idx, (name, child_ino)) in entries.iter().enumerate().skip(start_entry_idx) {
-        let next_off = (idx + 3) as i64;
-        if let Some(attr) = fs.get_attr(*child_ino) {
-            if !db.add(name, *child_ino, attr.file_type, next_off) {
+    for item in iter_dir_entries(fs, ino, &entries, offset) {
+        if let Some(attr) = fs.get_attr(item.ino) {
+            if !db.add(item.name, item.ino, attr.file_type, item.next_offset) {
                 break;
             }
         }
     }
-
     db.reply();
 }
 
@@ -115,53 +134,14 @@ pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset:
         }
     };
 
-    let self_attr = match fs.get_attr(ino) {
-        Some(attr) => attr,
-        None => {
-            req.reply_err(libc::ENOENT);
-            return;
-        }
-    };
-
-    let dotdot_ino = if ino == 1 {
-        1
-    } else {
-        find_parent_inode(fs, ino).unwrap_or(1)
-    };
-    let dotdot_attr = match fs.get_attr(dotdot_ino) {
-        Some(attr) => attr,
-        None => {
-            req.reply_err(libc::ENOENT);
-            return;
-        }
-    };
-
     let mut db = shim::DirectoryBufferPlus::new(req, size);
-
-    let offset = offset as usize;
-    if offset == 0 {
-        if !db.add(".", &self_attr, 1.0, 1.0, 1) {
-            db.reply();
-            return;
-        }
-    }
-    if offset <= 1 {
-        if !db.add("..", &dotdot_attr, 1.0, 1.0, 2) {
-            db.reply();
-            return;
-        }
-    }
-
-    let start_entry_idx = offset.saturating_sub(2);
-    for (idx, (name, child_ino)) in entries.iter().enumerate().skip(start_entry_idx) {
-        let next_off = (idx + 3) as i64;
-        if let Some(attr) = fs.get_attr(*child_ino) {
-            if !db.add(name, &attr, 1.0, 1.0, next_off) {
+    for item in iter_dir_entries(fs, ino, &entries, offset) {
+        if let Some(attr) = fs.get_attr(item.ino) {
+            if !db.add(item.name, &attr, 1.0, 1.0, item.next_offset) {
                 break;
             }
         }
     }
-
     db.reply();
 }
 

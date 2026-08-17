@@ -1,8 +1,6 @@
 use crate::log::record::{
-    CreatePayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LinkPayload,
-    MkdirPayload, OpCode, RECORD_HEADER_SIZE, RecordHeader,
-    RenamePayload, RmdirPayload, SetattrPayload, SymlinkPayload, UnlinkPayload, WriteMeta,
-    checksum_payload,
+    checksum_payload, DecodedPayload, FileHeader, OpCode, RecordHeader, FILE_HEADER_SIZE,
+    RECORD_HEADER_SIZE,
 };
 use crate::log::summary::{SummaryReader, SUMMARY_MAGIC};
 use crate::log::ExtentState;
@@ -254,19 +252,20 @@ pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String
             op_counts[op_idx].payload_bytes += header.payload_len as u64;
         }
 
-        if header.op_code == OpCode::Write {
-            let mut cursor = std::io::Cursor::new(&payload);
-            if let Ok(_meta) = bincode::deserialize_from::<_, WriteMeta>(&mut cursor) {
-                let meta_bytes = cursor.position() as usize;
-                let data_len = payload.len().saturating_sub(meta_bytes) as u64;
-                for b in &mut write_buckets {
-                    if b.matches(data_len) {
-                        b.add(data_len);
-                        break;
-                    }
+        let log_rec = crate::log::reader::LogRecord {
+            header,
+            payload: payload.clone(),
+            record_log_offset: record_offset,
+        };
+        if let Ok(DecodedPayload::Write { data, .. }) = log_rec.decode() {
+            let data_len = data.len() as u64;
+            for b in &mut write_buckets {
+                if b.matches(data_len) {
+                    b.add(data_len);
+                    break;
                 }
-                total_data_bytes += data_len;
             }
+            total_data_bytes += data_len;
         }
 
         if is_commit {
@@ -988,186 +987,154 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
 }
 
 fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump_data_hex: bool) {
-    match opcode {
-        OpCode::Create => {
-            if let Ok(c) = bincode::deserialize::<CreatePayload>(payload) {
-                writeln!(
-                    out,
-                    "      parent: {}, name: {:?}, mode: 0o{:o}, uid: {}, gid: {}, created_at: {}",
-                    c.parent,
-                    c.name,
-                    c.mode,
-                    c.uid,
-                    c.gid,
-                    format_system_time(c.created_at)
-                )
-                .unwrap();
-            } else {
-                writeln!(out, "      [Failed to deserialize CreatePayload]").unwrap();
-            }
+    let dummy_header = crate::log::record::RecordHeader {
+        op_code: opcode,
+        tx_id: 0,
+        inode: 0,
+        payload_len: payload.len() as u32,
+        checksum: [0; crate::log::record::RECORD_CHECKSUM_SIZE],
+    };
+    let dummy_record = crate::log::reader::LogRecord {
+        header: dummy_header,
+        payload: payload.to_vec(),
+        record_log_offset: 0,
+    };
+    match dummy_record.decode() {
+        Ok(crate::log::record::DecodedPayload::Create(c)) => {
+            writeln!(
+                out,
+                "      parent: {}, name: {:?}, mode: 0o{:o}, uid: {}, gid: {}, created_at: {}",
+                c.parent,
+                c.name,
+                c.mode,
+                c.uid,
+                c.gid,
+                format_system_time(c.created_at)
+            )
+            .unwrap();
         }
-        OpCode::Mkdir => {
-            if let Ok(m) = bincode::deserialize::<MkdirPayload>(payload) {
-                writeln!(
-                    out,
-                    "      parent: {}, name: {:?}, mode: 0o{:o}, uid: {}, gid: {}, created_at: {}",
-                    m.parent,
-                    m.name,
-                    m.mode,
-                    m.uid,
-                    m.gid,
-                    format_system_time(m.created_at)
-                )
-                .unwrap();
-            } else {
-                writeln!(out, "      [Failed to deserialize MkdirPayload]").unwrap();
-            }
+        Ok(crate::log::record::DecodedPayload::Mkdir(m)) => {
+            writeln!(
+                out,
+                "      parent: {}, name: {:?}, mode: 0o{:o}, uid: {}, gid: {}, created_at: {}",
+                m.parent,
+                m.name,
+                m.mode,
+                m.uid,
+                m.gid,
+                format_system_time(m.created_at)
+            )
+            .unwrap();
         }
-        OpCode::Write => {
-            let mut cursor = std::io::Cursor::new(payload);
-            if let Ok(w) = bincode::deserialize_from::<_, WriteMeta>(&mut cursor) {
-                let meta_bytes = cursor.position() as usize;
-                let data_slice = if payload.len() >= meta_bytes {
-                    &payload[meta_bytes..]
-                } else {
-                    &[]
-                };
-                writeln!(
-                    out,
-                    "      file_offset: {}, data_len: {}, op_time: {}",
-                    w.file_offset,
-                    format_bytes(data_slice.len() as u64),
-                    format_system_time(w.op_time)
-                )
-                .unwrap();
+        Ok(crate::log::record::DecodedPayload::Write { meta: w, data }) => {
+            writeln!(
+                out,
+                "      file_offset: {}, data_len: {}, op_time: {}",
+                w.file_offset,
+                format_bytes(data.len() as u64),
+                format_system_time(w.op_time)
+            )
+            .unwrap();
 
-                if dump_data_hex && !data_slice.is_empty() {
-                    out.push_str(&format_hexdump(data_slice, 256));
-                }
-            } else {
-                writeln!(out, "      [Failed to deserialize WriteMeta]").unwrap();
+            if dump_data_hex && !data.is_empty() {
+                out.push_str(&format_hexdump(data, 256));
             }
         }
-        OpCode::Unlink => {
-            if let Ok(u) = bincode::deserialize::<UnlinkPayload>(payload) {
-                writeln!(
-                    out,
-                    "      parent: {}, name: {:?}, op_time: {}",
-                    u.parent,
-                    u.name,
-                    format_system_time(u.op_time)
-                )
-                .unwrap();
-            } else {
-                writeln!(out, "      [Failed to deserialize UnlinkPayload]").unwrap();
-            }
+        Ok(crate::log::record::DecodedPayload::Unlink(u)) => {
+            writeln!(
+                out,
+                "      parent: {}, name: {:?}, op_time: {}",
+                u.parent,
+                u.name,
+                format_system_time(u.op_time)
+            )
+            .unwrap();
         }
-        OpCode::Rmdir => {
-            if let Ok(r) = bincode::deserialize::<RmdirPayload>(payload) {
-                writeln!(
-                    out,
-                    "      parent: {}, name: {:?}, op_time: {}",
-                    r.parent,
-                    r.name,
-                    format_system_time(r.op_time)
-                )
-                .unwrap();
-            } else {
-                writeln!(out, "      [Failed to deserialize RmdirPayload]").unwrap();
-            }
+        Ok(crate::log::record::DecodedPayload::Rmdir(r)) => {
+            writeln!(
+                out,
+                "      parent: {}, name: {:?}, op_time: {}",
+                r.parent,
+                r.name,
+                format_system_time(r.op_time)
+            )
+            .unwrap();
         }
-        OpCode::Symlink => {
-            if let Ok(s) = bincode::deserialize::<SymlinkPayload>(payload) {
-                writeln!(
-                    out,
-                    "      parent: {}, name: {:?}, target: {:?}, uid: {}, gid: {}, created_at: {}",
-                    s.parent,
-                    s.name,
-                    s.target,
-                    s.uid,
-                    s.gid,
-                    format_system_time(s.created_at)
-                )
-                .unwrap();
-            } else {
-                writeln!(out, "      [Failed to deserialize SymlinkPayload]").unwrap();
-            }
+        Ok(crate::log::record::DecodedPayload::Symlink(s)) => {
+            writeln!(
+                out,
+                "      parent: {}, name: {:?}, target: {:?}, uid: {}, gid: {}, created_at: {}",
+                s.parent,
+                s.name,
+                s.target,
+                s.uid,
+                s.gid,
+                format_system_time(s.created_at)
+            )
+            .unwrap();
         }
-        OpCode::Rename => {
-            if let Ok(r) = bincode::deserialize::<RenamePayload>(payload) {
-                writeln!(
-                    out,
-                    "      parent: {}, name: {:?} -> new_parent: {}, new_name: {:?}, op_time: {}",
-                    r.parent,
-                    r.name,
-                    r.new_parent,
-                    r.new_name,
-                    format_system_time(r.op_time)
-                )
-                .unwrap();
-            } else {
-                writeln!(out, "      [Failed to deserialize RenamePayload]").unwrap();
-            }
+        Ok(crate::log::record::DecodedPayload::Rename(r)) => {
+            writeln!(
+                out,
+                "      parent: {}, name: {:?} -> new_parent: {}, new_name: {:?}, op_time: {}",
+                r.parent,
+                r.name,
+                r.new_parent,
+                r.new_name,
+                format_system_time(r.op_time)
+            )
+            .unwrap();
         }
-        OpCode::Setattr => {
-            if let Ok(s) = bincode::deserialize::<SetattrPayload>(payload) {
-                let mut changes = Vec::new();
-                if let Some(m) = s.mode {
-                    changes.push(format!("mode: 0o{:o}", m));
-                }
-                if let Some(u) = s.uid {
-                    changes.push(format!("uid: {}", u));
-                }
-                if let Some(g) = s.gid {
-                    changes.push(format!("gid: {}", g));
-                }
-                if let Some(sz) = s.size {
-                    changes.push(format!("size: {}", sz));
-                }
-                if let Some(a) = s.atime {
-                    changes.push(format!("atime: {}", format_system_time(a)));
-                }
-                if let Some(m) = s.mtime {
-                    changes.push(format!("mtime: {}", format_system_time(m)));
-                }
-                writeln!(
-                    out,
-                    "      changes: [{}], op_time: {}",
-                    changes.join(", "),
-                    format_system_time(s.op_time)
-                )
-                .unwrap();
-            } else {
-                writeln!(out, "      [Failed to deserialize SetattrPayload]").unwrap();
+        Ok(crate::log::record::DecodedPayload::Setattr(s)) => {
+            let mut changes = Vec::new();
+            if let Some(m) = s.mode {
+                changes.push(format!("mode: 0o{:o}", m));
             }
+            if let Some(u) = s.uid {
+                changes.push(format!("uid: {}", u));
+            }
+            if let Some(g) = s.gid {
+                changes.push(format!("gid: {}", g));
+            }
+            if let Some(sz) = s.size {
+                changes.push(format!("size: {}", sz));
+            }
+            if let Some(a) = s.atime {
+                changes.push(format!("atime: {}", format_system_time(a)));
+            }
+            if let Some(m) = s.mtime {
+                changes.push(format!("mtime: {}", format_system_time(m)));
+            }
+            writeln!(
+                out,
+                "      changes: [{}], op_time: {}",
+                changes.join(", "),
+                format_system_time(s.op_time)
+            )
+            .unwrap();
         }
-        OpCode::Link => {
-            if let Ok(l) = bincode::deserialize::<LinkPayload>(payload) {
-                writeln!(
-                    out,
-                    "      target_ino: {}, new_parent: {}, new_name: {:?}, op_time: {}",
-                    l.ino,
-                    l.new_parent,
-                    l.new_name,
-                    format_system_time(l.op_time)
-                )
-                .unwrap();
-            } else {
-                writeln!(out, "      [Failed to deserialize LinkPayload]").unwrap();
-            }
+        Ok(crate::log::record::DecodedPayload::Link(l)) => {
+            writeln!(
+                out,
+                "      target_ino: {}, new_parent: {}, new_name: {:?}, op_time: {}",
+                l.ino,
+                l.new_parent,
+                l.new_name,
+                format_system_time(l.op_time)
+            )
+            .unwrap();
         }
-        OpCode::FlushCommit => {
-            if let Ok(b) = bincode::deserialize::<FlushCommitPayload>(payload) {
-                writeln!(
-                    out,
-                    "      batch_record_count: {}, commit_timestamp: {}",
-                    b.record_count,
-                    format_system_time(b.timestamp)
-                )
-                .unwrap();
-            } else {
-                writeln!(out, "      [Failed to deserialize FlushCommitPayload]").unwrap();
-            }
+        Ok(crate::log::record::DecodedPayload::FlushCommit(b)) => {
+            writeln!(
+                out,
+                "      batch_record_count: {}, commit_timestamp: {}",
+                b.record_count,
+                format_system_time(b.timestamp)
+            )
+            .unwrap();
+        }
+        Err(_) => {
+            writeln!(out, "      [Failed to deserialize {}Payload]", opcode).unwrap();
         }
     }
 }
@@ -1236,6 +1203,7 @@ fn format_system_time(time: SystemTime) -> String {
 mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
+    use crate::log::record::{CreatePayload, WriteMeta};
     use crate::log::LogWriter;
     use tempfile::tempdir;
 

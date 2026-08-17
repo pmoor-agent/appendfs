@@ -1,3 +1,5 @@
+mod common;
+use common::TestMount;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -7,71 +9,18 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-fn unmount_fuse(mount_path: &str) {
-    for _ in 0..50 {
-        if let Ok(s) = Command::new("fusermount3")
-            .arg("-u")
-            .arg(mount_path)
-            .status()
-        {
-            if s.success() {
-                return;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let _ = Command::new("fusermount3")
-        .arg("-u")
-        .arg("-z")
-        .arg(mount_path)
-        .status();
-}
-
 #[test]
 fn test_fuse_filesystem() {
-    let fs = appendfs::InMemoryFS::new();
-
-    // Create a unique temporary directory under /tmp
-    let temp_dir = tempfile::Builder::new()
+    let log_dir = tempfile::Builder::new()
+        .prefix("appendfs_test_log_")
+        .tempdir()
+        .unwrap();
+    let mount_dir = tempfile::Builder::new()
         .prefix("appendfs_test_")
         .tempdir()
         .unwrap();
-    let mount_path = temp_dir.path().to_path_buf();
-    let mount_path_str = mount_path.to_str().unwrap().to_string();
-
-    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
-
-    // Record initial device ID of mount_path BEFORE spawning mount thread
-    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-
-    // Spawn FUSE mounting in a background thread
-    let mount_path_clone = mount_path.clone();
-    let handle = thread::spawn(move || {
-        let args = vec![
-            "test_fs".to_string(),
-            mount_path_clone.to_str().unwrap().to_string(),
-            "-f".to_string(), // foreground
-        ];
-        if let Err(e) = appendfs::mount(args, fs) {
-            eprintln!("FUSE mount error: {}", e);
-        }
-    });
-
-    // Wait for FUSE to be mounted by monitoring the device ID change
-    let mut mounted = false;
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path) {
-            if meta.dev() != initial_dev {
-                mounted = true;
-                break;
-            }
-        }
-        if handle.is_finished() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(mounted, "FUSE mount timed out or device ID did not change");
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, appendfs::InMemoryFS::new(), false);
+    let mount_path = mount.path().to_path_buf();
 
     // Perform directory listing verification (should be empty initially)
     let entries: Vec<String> = fs::read_dir(&mount_path)
@@ -85,7 +34,7 @@ fn test_fuse_filesystem() {
     );
 
     // Verify statfs / statvfs reports root inode count (1)
-    let path_c = std::ffi::CString::new(mount_path_str.as_str()).unwrap();
+    let path_c = std::ffi::CString::new(mount.path_str()).unwrap();
     let mut statvfs_buf: libc::statvfs = unsafe { std::mem::zeroed() };
     let res = unsafe { libc::statvfs(path_c.as_ptr(), &mut statvfs_buf) };
     assert_eq!(res, 0);
@@ -118,125 +67,141 @@ fn test_fuse_filesystem() {
     assert!(mtime_1 >= std::time::UNIX_EPOCH);
 
     let custom_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    let f = fs::OpenOptions::new()
+    let utimes_res = unsafe {
+        let path_c = std::ffi::CString::new(file_hello.to_str().unwrap()).unwrap();
+        let times = [
+            libc::timeval {
+                tv_sec: 1_700_000_000,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: 1_700_000_000,
+                tv_usec: 0,
+            },
+        ];
+        libc::utimes(path_c.as_ptr(), times.as_ptr())
+    };
+    assert_eq!(utimes_res, 0);
+
+    let updated_meta_time = fs::metadata(&file_hello).unwrap();
+    assert_eq!(updated_meta_time.modified().unwrap(), custom_time);
+
+    // Verify truncate / write at offset
+    let file = fs::OpenOptions::new()
         .write(true)
         .open(&file_hello)
         .unwrap();
-    let times = fs::FileTimes::new().set_modified(custom_time);
-    f.set_times(times).unwrap();
-    drop(f);
-
-    let meta_touched = fs::metadata(&file_hello).unwrap();
-    assert_eq!(meta_touched.modified().unwrap(), custom_time);
-
-    // Write/Overwrite verification (with truncation)
-    let new_content = "Integration test overwrite!";
-    fs::write(&file_hello, new_content).unwrap();
-    let content_after_write = fs::read_to_string(&file_hello).unwrap();
-    assert_eq!(content_after_write, new_content);
-
-    // Append verification
-    let append_content = "\nAppended line.";
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(&file_hello)
-        .unwrap();
-    use std::io::Write;
-    file.write_all(append_content.as_bytes()).unwrap();
+    file.set_len(5).unwrap();
     drop(file);
+    assert_eq!(fs::metadata(&file_hello).unwrap().len(), 5);
+    assert_eq!(fs::read_to_string(&file_hello).unwrap(), "Hello");
 
-    let content_after_append = fs::read_to_string(&file_hello).unwrap();
-    assert_eq!(
-        content_after_append,
-        format!("{}{}", new_content, append_content)
-    );
+    // Write beyond current size (create a sparse gap)
+    {
+        use std::io::Seek;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&file_hello)
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start(10)).unwrap();
+        file.write_all(b"world!").unwrap();
+    }
+    assert_eq!(fs::metadata(&file_hello).unwrap().len(), 16);
+    let bytes = fs::read(&file_hello).unwrap();
+    assert_eq!(&bytes[0..5], b"Hello");
+    assert_eq!(&bytes[5..10], &[0, 0, 0, 0, 0]); // sparse zero-fill
+    assert_eq!(&bytes[10..16], b"world!");
 
-    // Symlink verification
-    let file_link = mount_path.join("hello_link.txt");
-    std::os::unix::fs::symlink("hello.txt", &file_link).unwrap();
-    assert!(file_link.exists());
+    // Create a directory (subdir)
+    let sub_dir = mount_path.join("subdir");
+    assert!(!sub_dir.exists());
+    fs::create_dir(&sub_dir).unwrap();
+    assert!(sub_dir.exists());
+    assert!(sub_dir.is_dir());
 
-    // Verify readlink returns the target string
-    let target = fs::read_link(&file_link).unwrap();
-    assert_eq!(target.to_str().unwrap(), "hello.txt");
+    // Create nested file (subdir/nested.txt)
+    let nested_file = sub_dir.join("nested.txt");
+    fs::write(&nested_file, "nested content").unwrap();
+    assert!(nested_file.exists());
+    assert_eq!(fs::read_to_string(&nested_file).unwrap(), "nested content");
 
-    // Verify resolved read retrieves hello.txt's contents
-    let link_content = fs::read_to_string(&file_link).unwrap();
-    assert_eq!(link_content, format!("{}{}", new_content, append_content));
+    // Test directory listing of root
+    let root_entries: Vec<String> = fs::read_dir(&mount_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
+        .collect();
+    assert!(root_entries.contains(&"hello.txt".to_string()));
+    assert!(root_entries.contains(&"subdir".to_string()));
 
-    // Delete the symlink
-    fs::remove_file(&file_link).unwrap();
-    assert!(!file_link.exists());
+    // Test directory listing of subdir
+    let sub_entries: Vec<String> = fs::read_dir(&sub_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(sub_entries, vec!["nested.txt".to_string()]);
 
-    // Rename and Relocate verification
-    // Create a subdirectory rename_dir
-    let rename_dir = mount_path.join("rename_dir");
-    fs::create_dir(&rename_dir).unwrap();
-    assert!(rename_dir.is_dir());
-
-    // Local rename: move hello.txt to rename_dir/test_rename.txt
-    let test_rename = rename_dir.join("test_rename.txt");
-    fs::rename(&file_hello, &test_rename).unwrap();
+    // Test rename (hello.txt -> hello_renamed.txt)
+    let file_renamed = mount_path.join("hello_renamed.txt");
+    fs::rename(&file_hello, &file_renamed).unwrap();
     assert!(!file_hello.exists());
-    assert!(test_rename.exists());
-    let renamed_content = fs::read_to_string(&test_rename).unwrap();
+    assert!(file_renamed.exists());
+    assert_eq!(fs::read(&file_renamed).unwrap(), bytes);
+
+    // Test moving across directories (hello_renamed.txt -> subdir/moved.txt)
+    let file_moved = sub_dir.join("moved.txt");
+    fs::rename(&file_renamed, &file_moved).unwrap();
+    assert!(!file_renamed.exists());
+    assert!(file_moved.exists());
+    assert_eq!(fs::read(&file_moved).unwrap(), bytes);
+
+    // Test symlink (subdir/sym -> moved.txt)
+    let symlink_path = sub_dir.join("sym");
+    std::os::unix::fs::symlink("moved.txt", &symlink_path).unwrap();
+    assert!(symlink_path.exists());
     assert_eq!(
-        renamed_content,
-        format!("{}{}", new_content, append_content)
+        fs::read_link(&symlink_path).unwrap(),
+        std::path::PathBuf::from("moved.txt")
     );
+    assert_eq!(fs::read(&symlink_path).unwrap(), bytes);
 
-    // Move across directories: move rename_dir/test_rename.txt to root/test_moved.txt
-    let test_moved = mount_path.join("test_moved.txt");
-    fs::rename(&test_rename, &test_moved).unwrap();
-    assert!(!test_rename.exists());
-    assert!(test_moved.exists());
-    let moved_content = fs::read_to_string(&test_moved).unwrap();
-    assert_eq!(moved_content, renamed_content);
-
-    // Self-rename: renaming a path onto itself is a POSIX no-op success, not an
-    // overwrite. Note: the kernel VFS resolves both paths to the same dentry and
-    // short-circuits before issuing a FUSE request, so this never actually reaches
-    // our rename() handler — it's a smoke check on rename()'s no-op contract, not
-    // a regression guard for the same-parent/same-name overwrite path internally.
-    fs::rename(&test_moved, &test_moved).unwrap();
-    assert!(test_moved.exists());
-    let self_renamed_content = fs::read_to_string(&test_moved).unwrap();
-    assert_eq!(self_renamed_content, moved_content);
-
-    // Cleanup moved file and directory
-    fs::remove_file(&test_moved).unwrap();
-    assert!(!test_moved.exists());
-    fs::remove_dir(&rename_dir).unwrap();
-    assert!(!rename_dir.exists());
-    // 12. Hard Link verification
-    let file_hello = mount_path.join("hello.txt");
-    fs::write(&file_hello, "Hello, Hard Link!").unwrap();
-
-    // Create hard link hello_hard.txt
+    // Test hard link (subdir/moved.txt -> hello_hard.txt in root)
     let file_hard = mount_path.join("hello_hard.txt");
-    fs::hard_link(&file_hello, &file_hard).unwrap();
+    fs::hard_link(&file_moved, &file_hard).unwrap();
     assert!(file_hard.exists());
+    let meta_moved = fs::metadata(&file_moved).unwrap();
+    let meta_hard = fs::metadata(&file_hard).unwrap();
+    assert_eq!(meta_moved.ino(), meta_hard.ino());
+    assert_eq!(meta_moved.nlink(), 2);
+    assert_eq!(meta_hard.nlink(), 2);
 
-    // Verify both read the same content
-    let hello_content = fs::read_to_string(&file_hello).unwrap();
-    let hard_content = fs::read_to_string(&file_hard).unwrap();
-    assert_eq!(hello_content, "Hello, Hard Link!");
-    assert_eq!(hard_content, "Hello, Hard Link!");
-
-    // Verify metadata nlink is 2
-    use std::os::unix::fs::MetadataExt;
-    let meta_hello = fs::metadata(&file_hello).unwrap();
-    assert_eq!(meta_hello.nlink(), 2);
-
-    // Modify through the hard link and assert changes reflect in original
+    // Write through hard link, read from original
     fs::write(&file_hard, "Modified via link!").unwrap();
     assert_eq!(
-        fs::read_to_string(&file_hello).unwrap(),
+        fs::read_to_string(&file_moved).unwrap(),
         "Modified via link!"
     );
 
-    // Unlink original hello.txt
-    fs::remove_file(&file_hello).unwrap();
+    // Test unlink nested file
+    fs::remove_file(&nested_file).unwrap();
+    assert!(!nested_file.exists());
+
+    // Test unlink symlink
+    fs::remove_file(&symlink_path).unwrap();
+    assert!(!symlink_path.exists());
+
+    // Test rmdir failure on non-empty directory
+    let rmdir_err = fs::remove_dir(&sub_dir);
+    assert!(rmdir_err.is_err());
+
+    // Remove moved.txt to make subdir empty
+    fs::remove_file(&file_moved).unwrap();
+    assert!(!file_moved.exists());
+
+    // Test rmdir success on empty directory
+    fs::remove_dir(&sub_dir).unwrap();
+    assert!(!sub_dir.exists());
+
+    // Assert hello.txt is gone
     assert!(!file_hello.exists());
 
     // Assert hello_hard.txt still exists, has nlink 1, and can be read/written
@@ -259,7 +224,7 @@ fn test_fuse_filesystem() {
     // Verify fsyncdir support using opendir/dirfd/fsync (the only way to trigger FUSE fsyncdir)
     {
         use std::ffi::CString;
-        let dir_path = CString::new(mount_path.to_str().unwrap()).unwrap();
+        let dir_path = CString::new(mount.path_str()).unwrap();
         unsafe {
             let dirp = libc::opendir(dir_path.as_ptr());
             assert!(!dirp.is_null(), "opendir failed");
@@ -314,9 +279,7 @@ fn test_fuse_filesystem() {
         );
     }
 
-    // Clean up: unmount using fusermount3
-    unmount_fuse(&mount_path_str);
-    handle.join().unwrap();
+    mount.unmount();
 }
 
 #[test]
@@ -334,38 +297,8 @@ fn test_fuse_with_log_writer() {
         .prefix("appendfs_log_mount_")
         .tempdir()
         .unwrap();
-    let mount_path = mount_dir.path().to_path_buf();
-    let mount_path_str = mount_path.to_str().unwrap().to_string();
-
-    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
-    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-
-    let mount_path_clone = mount_path.clone();
-    let handle = thread::spawn(move || {
-        let args = vec![
-            "test_log_fs".to_string(),
-            mount_path_clone.to_str().unwrap().to_string(),
-            "-f".to_string(),
-        ];
-        if let Err(e) = appendfs::mount(args, fs) {
-            eprintln!("FUSE mount error: {}", e);
-        }
-    });
-
-    let mut mounted = false;
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path) {
-            if meta.dev() != initial_dev {
-                mounted = true;
-                break;
-            }
-        }
-        if handle.is_finished() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(mounted, "FUSE mount timed out");
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, fs, false);
+    let mount_path = mount.path().to_path_buf();
 
     // Perform operations on mounted filesystem
     let sub_dir = mount_path.join("docs");
@@ -384,7 +317,7 @@ fn test_fuse_with_log_writer() {
     drop(file);
 
     // Verify .log file exists in log_dir and has size > FILE_HEADER_SIZE (24 bytes)
-    let log_file_path = log_dir.path().join("000001.log");
+    let log_file_path = mount.log_path.join("000001.log");
     assert!(log_file_path.exists());
     let log_size = fs::metadata(&log_file_path).unwrap().len();
     assert!(
@@ -393,172 +326,56 @@ fn test_fuse_with_log_writer() {
         log_size
     );
 
-    // Clean up FUSE
-    unmount_fuse(&mount_path_str);
-    handle.join().unwrap();
+    mount.unmount();
 }
 
 #[test]
 fn test_recovery_after_remount() {
-    let clock = appendfs::SystemClock;
-    let log_dir = tempfile::Builder::new()
-        .prefix("appendfs_recovery_log_dir_")
-        .tempdir()
-        .unwrap();
+    let mut mount = TestMount::new_rw();
+    let mount_path = mount.path().to_path_buf();
 
-    let log_path = log_dir.path().to_path_buf();
+    // Perform mutations
+    let sub_dir = mount_path.join("photos");
+    fs::create_dir(&sub_dir).unwrap();
 
-    // Initial session: mount filesystem and perform mutations
-    {
-        let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1, &clock).unwrap());
-        let fs = appendfs::InMemoryFS::with_log(Arc::clone(&writer));
+    let photo1 = sub_dir.join("vacation.png");
+    fs::write(&photo1, "RAW_PHOTO_DATA_123456789").unwrap();
 
-        let mount_dir = tempfile::Builder::new()
-            .prefix("appendfs_recovery_mount1_")
-            .tempdir()
-            .unwrap();
-        let mount_path = mount_dir.path().to_path_buf();
-        let mount_path_str = mount_path.to_str().unwrap().to_string();
+    let symlink_path = mount_path.join("fav_photo.png");
+    std::os::unix::fs::symlink("photos/vacation.png", &symlink_path).unwrap();
 
-        fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
-        let initial_dev = fs::metadata(&mount_path).unwrap().dev();
+    // Flush and sync to disk
+    let f = fs::OpenOptions::new().write(true).open(&photo1).unwrap();
+    f.sync_data().unwrap();
+    drop(f);
 
-        let mount_path_clone = mount_path.clone();
-        let handle = thread::spawn(move || {
-            let args = vec![
-                "test_rec1".to_string(),
-                mount_path_clone.to_str().unwrap().to_string(),
-                "-f".to_string(),
-            ];
-            let _ = appendfs::mount(args, fs);
-        });
-
-        for _ in 0..200 {
-            if let Ok(meta) = fs::metadata(&mount_path) {
-                if meta.dev() != initial_dev {
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        // Perform mutations
-        let sub_dir = mount_path.join("photos");
-        fs::create_dir(&sub_dir).unwrap();
-
-        let photo1 = sub_dir.join("vacation.png");
-        fs::write(&photo1, "RAW_PHOTO_DATA_123456789").unwrap();
-
-        let symlink_path = mount_path.join("fav_photo.png");
-        std::os::unix::fs::symlink("photos/vacation.png", &symlink_path).unwrap();
-
-        // Flush and sync to disk
-        let f = fs::OpenOptions::new().write(true).open(&photo1).unwrap();
-        f.sync_data().unwrap();
-        drop(f);
-
-        // Unmount first session
-        unmount_fuse(&mount_path_str);
-        handle.join().unwrap();
-    }
-
-    // Recovery session: recover filesystem state purely from log_dir
-    let mut recovered_fs = appendfs::recover_fs(&log_path).unwrap();
-
-    // Attach a new LogWriter for generation 2 on the recovered instance
-    let writer2 = Arc::new(appendfs::LogWriter::create(&log_path, 2, &clock).unwrap());
-    recovered_fs.log_writer = Some(writer2);
-
-    let mount_dir2 = tempfile::Builder::new()
-        .prefix("appendfs_recovery_mount2_")
-        .tempdir()
-        .unwrap();
-    let mount_path2 = mount_dir2.path().to_path_buf();
-    let mount_path_str2 = mount_path2.to_str().unwrap().to_string();
-
-    fs::set_permissions(&mount_path2, fs::Permissions::from_mode(0o755)).unwrap();
-    let initial_dev2 = fs::metadata(&mount_path2).unwrap().dev();
-
-    let mount_path_clone2 = mount_path2.clone();
-    let handle2 = thread::spawn(move || {
-        let args = vec![
-            "test_rec2".to_string(),
-            mount_path_clone2.to_str().unwrap().to_string(),
-            "-f".to_string(),
-        ];
-        let _ = appendfs::mount(args, recovered_fs);
-    });
-
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path2) {
-            if meta.dev() != initial_dev2 {
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    // Remount generation 2
+    mount.remount_rw();
 
     // Verify recovered filesystem contents
-    let recovered_photo = mount_path2.join("photos").join("vacation.png");
+    let recovered_photo = mount.path().join("photos").join("vacation.png");
     assert!(recovered_photo.exists());
     let data = fs::read_to_string(&recovered_photo).unwrap();
     assert_eq!(data, "RAW_PHOTO_DATA_123456789");
 
-    let recovered_symlink = mount_path2.join("fav_photo.png");
+    let recovered_symlink = mount.path().join("fav_photo.png");
     assert!(recovered_symlink.exists());
     let target = fs::read_link(&recovered_symlink).unwrap();
     assert_eq!(target.to_str().unwrap(), "photos/vacation.png");
-
-    // Clean up FUSE mount 2
-    unmount_fuse(&mount_path_str2);
-    handle2.join().unwrap();
 }
 
 #[test]
 fn test_fuse_stress() {
-    let fs = appendfs::InMemoryFS::new();
-
-    // Create a unique temporary directory under /tmp
-    let temp_dir = tempfile::Builder::new()
+    let log_dir = tempfile::Builder::new()
+        .prefix("appendfs_stress_log_")
+        .tempdir()
+        .unwrap();
+    let mount_dir = tempfile::Builder::new()
         .prefix("appendfs_test_")
         .tempdir()
         .unwrap();
-    let mount_path = temp_dir.path().to_path_buf();
-    let mount_path_str = mount_path.to_str().unwrap().to_string();
-
-    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
-
-    // Record initial device ID of mount_path BEFORE spawning mount thread
-    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-
-    // Spawn FUSE mounting in a background thread
-    let mount_path_clone = mount_path.clone();
-    let handle = thread::spawn(move || {
-        let args = vec![
-            "test_fs_stress".to_string(),
-            mount_path_clone.to_str().unwrap().to_string(),
-            "-f".to_string(), // foreground
-        ];
-        if let Err(e) = appendfs::mount(args, fs) {
-            eprintln!("FUSE mount error: {}", e);
-        }
-    });
-
-    // Wait for FUSE to be mounted by monitoring the device ID change
-    let mut mounted = false;
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path) {
-            if meta.dev() != initial_dev {
-                mounted = true;
-                break;
-            }
-        }
-        if handle.is_finished() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(mounted, "FUSE mount timed out or device ID did not change");
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, appendfs::InMemoryFS::new(), false);
+    let mount_path = mount.path().to_path_buf();
 
     // Create 4 subdirectories for the threads
     for i in 0..4 {
@@ -641,9 +458,7 @@ fn test_fuse_stress() {
         assert!(!subdir.exists());
     }
 
-    // Clean up FUSE: unmount using fusermount3
-    unmount_fuse(&mount_path_str);
-    handle.join().unwrap();
+    mount.unmount();
 }
 
 #[test]
@@ -668,36 +483,10 @@ fn test_log_rolling() {
         .prefix("appendfs_rolling_mount_")
         .tempdir()
         .unwrap();
-    let mount_path = mount_dir.path().to_path_buf();
-    let mount_path_str = mount_path.to_str().unwrap().to_string();
-
-    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
-    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-
-    let mount_path_clone = mount_path.clone();
-    let handle = thread::spawn(move || {
-        let args = vec![
-            "test_rolling".to_string(),
-            mount_path_clone.to_str().unwrap().to_string(),
-            "-f".to_string(),
-        ];
-        let _ = appendfs::mount(args, fs_instance);
-    });
-
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path) {
-            if meta.dev() != initial_dev {
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, fs_instance, false);
+    let mount_path = mount.path().to_path_buf();
 
     // Write enough data to force multiple generation rolls (512 bytes threshold).
-    // Each write is followed by an explicit fsync: LogWriter now only ever rolls
-    // *between* flush batches, never mid-batch, so triggering a separate flush per
-    // write (rather than letting them all land in one batch at unmount) is what
-    // actually exercises rolling here.
     for i in 1..=5 {
         let file_path = mount_path.join(format!("chunk_{}.txt", i));
         let content = format!("LOG_ROLLING_PAYLOAD_{}_DATA_{}", i, "X".repeat(200));
@@ -717,10 +506,9 @@ fn test_log_rolling() {
     }
 
     // Unmount initial filesystem to trigger unmount log sync
-    unmount_fuse(&mount_path_str);
-    handle.join().unwrap();
+    mount.unmount();
 
-    // Count generated .log files in log_dir
+    // Count generated .log files in log_path
     let mut log_files = Vec::new();
     for entry in fs::read_dir(&log_path).unwrap() {
         let entry = entry.unwrap();
@@ -738,47 +526,25 @@ fn test_log_rolling() {
 
     // Verify recovery across all rolled generation log files
     let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
-
     let mount_dir_rec = tempfile::Builder::new()
         .prefix("appendfs_rolling_rec_mount_")
         .tempdir()
         .unwrap();
-    let mount_path_rec = mount_dir_rec.path().to_path_buf();
-    let mount_path_rec_str = mount_path_rec.to_str().unwrap().to_string();
-
-    fs::set_permissions(&mount_path_rec, fs::Permissions::from_mode(0o755)).unwrap();
-    let initial_dev_rec = fs::metadata(&mount_path_rec).unwrap().dev();
-
-    let mount_path_rec_clone = mount_path_rec.clone();
-    let handle_rec = thread::spawn(move || {
-        let args = vec![
-            "test_rolling_rec".to_string(),
-            mount_path_rec_clone.to_str().unwrap().to_string(),
-            "-f".to_string(),
-        ];
-        let _ = appendfs::mount(args, recovered_fs);
-    });
-
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path_rec) {
-            if meta.dev() != initial_dev_rec {
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    let dummy_log = tempfile::Builder::new()
+        .prefix("appendfs_dummy_log_")
+        .tempdir()
+        .unwrap();
+    let mut mount_rec = TestMount::mount_custom(dummy_log, mount_dir_rec, recovered_fs, false);
 
     for i in 1..=5 {
-        let file_path = mount_path_rec.join(format!("chunk_{}.txt", i));
+        let file_path = mount_rec.path().join(format!("chunk_{}.txt", i));
         let expected_content = format!("LOG_ROLLING_PAYLOAD_{}_DATA_{}", i, "X".repeat(200));
         assert!(file_path.exists());
         let read_back = fs::read_to_string(&file_path).unwrap();
         assert_eq!(read_back, expected_content);
     }
 
-    // Unmount recovered filesystem
-    unmount_fuse(&mount_path_rec_str);
-    handle_rec.join().unwrap();
+    mount_rec.unmount();
 }
 
 #[test]
@@ -801,30 +567,8 @@ fn test_summary_single_file_export_and_recovery() {
         .prefix("appendfs_summary_mount_")
         .tempdir()
         .unwrap();
-    let mount_path = mount_dir.path().to_path_buf();
-    let mount_path_str = mount_path.to_str().unwrap().to_string();
-
-    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
-    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-
-    let mount_path_clone = mount_path.clone();
-    let handle = thread::spawn(move || {
-        let args = vec![
-            "test_summary".to_string(),
-            mount_path_clone.to_str().unwrap().to_string(),
-            "-f".to_string(),
-        ];
-        let _ = appendfs::mount(args, fs_instance);
-    });
-
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path) {
-            if meta.dev() != initial_dev {
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, fs_instance, false);
+    let mount_path = mount.path().to_path_buf();
 
     // Populate filesystem with initial structure
     let docs_dir = mount_path.join("docs");
@@ -837,8 +581,7 @@ fn test_summary_single_file_export_and_recovery() {
     fs::write(&file2, "SNAPSHOT_FILE_2_CONTENT").unwrap();
 
     // Unmount initial filesystem to flush log buffer to disk
-    unmount_fuse(&mount_path_str);
-    handle.join().unwrap();
+    mount.unmount();
 
     // Recover filesystem state from log and export single-file summary snapshot (000001.summary)
     let summary_file_path = log_path.join("000001.summary");
@@ -860,89 +603,48 @@ fn test_summary_single_file_export_and_recovery() {
         assert!(node_opt.is_some());
     }
 
-    // Verify recovery: recover_fs should fast-load state from 000001.summary and replay file3.txt
+    // Verify recovery: recover_fs should fast-load state from 000001.summary
     let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
 
     let mount_dir_rec = tempfile::Builder::new()
         .prefix("appendfs_summary_rec_mount_")
         .tempdir()
         .unwrap();
-    let mount_path_rec = mount_dir_rec.path().to_path_buf();
-    let mount_path_rec_str = mount_path_rec.to_str().unwrap().to_string();
+    let dummy_log_rec = tempfile::Builder::new()
+        .prefix("appendfs_dummy_log_")
+        .tempdir()
+        .unwrap();
+    let mut mount_rec = TestMount::mount_custom(dummy_log_rec, mount_dir_rec, recovered_fs, false);
 
-    fs::set_permissions(&mount_path_rec, fs::Permissions::from_mode(0o755)).unwrap();
-    let initial_dev_rec = fs::metadata(&mount_path_rec).unwrap().dev();
-
-    let mount_path_rec_clone = mount_path_rec.clone();
-    let handle_rec = thread::spawn(move || {
-        let args = vec![
-            "test_summary_rec".to_string(),
-            mount_path_rec_clone.to_str().unwrap().to_string(),
-            "-f".to_string(),
-        ];
-        let _ = appendfs::mount(args, recovered_fs);
-    });
-
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path_rec) {
-            if meta.dev() != initial_dev_rec {
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    let rec_file1 = mount_path_rec.join("docs").join("file1.txt");
+    let rec_file1 = mount_rec.path().join("docs").join("file1.txt");
     assert!(rec_file1.exists());
     assert_eq!(
         fs::read_to_string(&rec_file1).unwrap(),
         "SNAPSHOT_FILE_1_CONTENT"
     );
 
-    let rec_file2 = mount_path_rec.join("docs").join("file2.txt");
+    let rec_file2 = mount_rec.path().join("docs").join("file2.txt");
     assert!(rec_file2.exists());
     assert_eq!(
         fs::read_to_string(&rec_file2).unwrap(),
         "SNAPSHOT_FILE_2_CONTENT"
     );
 
-    // Unmount recovered filesystem
-    unmount_fuse(&mount_path_rec_str);
-    handle_rec.join().unwrap();
+    mount_rec.unmount();
 }
 
 #[test]
 fn test_large_directory_readdir_and_readdirplus() {
-    let fs = appendfs::InMemoryFS::new();
-
+    let dummy_log = tempfile::Builder::new()
+        .prefix("appendfs_dummy_log_")
+        .tempdir()
+        .unwrap();
     let temp_dir = tempfile::Builder::new()
         .prefix("appendfs_large_dir_")
         .tempdir()
         .unwrap();
-    let mount_path = temp_dir.path().to_path_buf();
-    let mount_path_str = mount_path.to_str().unwrap().to_string();
-
-    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
-    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-
-    let mount_path_clone = mount_path.clone();
-    let handle = thread::spawn(move || {
-        let args = vec![
-            "test_large_dir".to_string(),
-            mount_path_clone.to_str().unwrap().to_string(),
-            "-f".to_string(),
-        ];
-        let _ = appendfs::mount(args, fs);
-    });
-
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path) {
-            if meta.dev() != initial_dev {
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    let mut mount = TestMount::mount_custom(dummy_log, temp_dir, appendfs::InMemoryFS::new(), false);
+    let mount_path = mount.path().to_path_buf();
 
     let large_dir = mount_path.join("large_dir");
     fs::create_dir(&large_dir).unwrap();
@@ -979,8 +681,7 @@ fn test_large_directory_readdir_and_readdirplus() {
     assert!(stdout.contains("file_00000.txt"));
     assert!(stdout.contains("file_01499.txt"));
 
-    unmount_fuse(&mount_path_str);
-    handle.join().unwrap();
+    mount.unmount();
 }
 
 #[test]
@@ -1002,30 +703,8 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
         .prefix("appendfs_manifest_mount_")
         .tempdir()
         .unwrap();
-    let mount_path = temp_dir.path().to_path_buf();
-    let mount_path_str = mount_path.to_str().unwrap().to_string();
-
-    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
-    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-
-    let mount_path_clone = mount_path.clone();
-    let handle = thread::spawn(move || {
-        let args = vec![
-            "test_manifest".to_string(),
-            mount_path_clone.to_str().unwrap().to_string(),
-            "-f".to_string(),
-        ];
-        let _ = appendfs::mount(args, fs);
-    });
-
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path) {
-            if meta.dev() != initial_dev {
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    let mut mount = TestMount::mount_custom(log_dir, temp_dir, fs, false);
+    let mount_path = mount.path().to_path_buf();
 
     // Helper function to write and fsync
     let write_and_sync = |path: &std::path::Path, data: &[u8]| {
@@ -1055,8 +734,7 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
     // Overwrite file1 completely with 500 bytes -> gen 1 now has 0 live bytes!
     write_and_sync(&file1, &vec![0x99; 500]);
 
-    unmount_fuse(&mount_path_str);
-    handle.join().unwrap();
+    mount.unmount();
 
     // Recover filesystem
     let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
@@ -1104,30 +782,12 @@ fn test_volume_init_mount_and_stats_flow() {
         .prefix("appendfs_init_mount_")
         .tempdir()
         .unwrap();
-    let mount_path = temp_dir.path().to_path_buf();
-    let mount_path_str = mount_path.to_str().unwrap().to_string();
-
-    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
-    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-
-    let mount_path_clone = mount_path.clone();
-    let handle = thread::spawn(move || {
-        let args = vec![
-            "test_init_mount".to_string(),
-            mount_path_clone.to_str().unwrap().to_string(),
-            "-f".to_string(),
-        ];
-        let _ = appendfs::mount(args, fs_instance);
-    });
-
-    for _ in 0..200 {
-        if let Ok(meta) = fs::metadata(&mount_path) {
-            if meta.dev() != initial_dev {
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    let dummy_log = tempfile::Builder::new()
+        .prefix("appendfs_dummy_log_")
+        .tempdir()
+        .unwrap();
+    let mut mount = TestMount::mount_custom(dummy_log, temp_dir, fs_instance, false);
+    let mount_path = mount.path().to_path_buf();
 
     // Create a directory and file
     let docs = mount_path.join("docs");
@@ -1155,8 +815,7 @@ fn test_volume_init_mount_and_stats_flow() {
     }
 
     // Unmount
-    unmount_fuse(&mount_path_str);
-    handle.join().unwrap();
+    mount.unmount();
 
     // 4. Inspect volume with stats after clean unmount
     let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
@@ -1438,198 +1097,66 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
 
 #[test]
 fn test_mount_ro_rejects_mutations_and_enables_point_in_time_time_travel() {
-    let log_dir = tempfile::tempdir().unwrap();
-    let mount_dir = tempfile::tempdir().unwrap();
-    let log_path = log_dir.path();
-    let mount_path = mount_dir.path().to_path_buf();
-
-    // 1. Initialize volume
-    appendfs::init_volume(log_path, Some("main")).unwrap();
+    let mut mount = TestMount::new_rw();
+    let mount_path = mount.path().to_path_buf();
+    let log_path = mount.log_path.clone();
 
     // 2. RW Mount: create directory and file (Tx 1 & 2)
-    {
-        let mut fs_instance = appendfs::recover_fs(log_path).unwrap();
-        let next_gen = fs_instance.manifest.read().unwrap().next_generation;
-        let writer = Arc::new(appendfs::LogWriter::create_lazy(log_path, next_gen, 1024 * 1024, 1));
-        fs_instance.log_writer = Some(Arc::clone(&writer));
-        fs_instance.set_log_dir(log_path);
-
-        let m_path = mount_path.clone();
-        let handle = thread::spawn(move || {
-            let fuse_args = vec![
-                "appendfs".to_string(),
-                m_path.to_str().unwrap().to_string(),
-                "-f".to_string(),
-            ];
-            appendfs::mount(fuse_args, fs_instance).unwrap();
-        });
-
-        // Wait for FUSE mount
-        let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-        let mut mounted = false;
-        for _ in 0..100 {
-            if let Ok(meta) = fs::metadata(&mount_path) {
-                if meta.dev() != initial_dev {
-                    mounted = true;
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(mounted, "Mount 1 timed out");
-
-        let step1_dir = mount_path.join("step1");
-        fs::create_dir(&step1_dir).unwrap();
-        let file1 = step1_dir.join("file1.txt");
-        fs::write(&file1, "version 1 content").unwrap();
-
-        // Unmount
-        unmount_fuse(mount_path.to_str().unwrap());
-        handle.join().unwrap();
-    }
+    let step1_dir = mount_path.join("step1");
+    fs::create_dir(&step1_dir).unwrap();
+    let file1 = step1_dir.join("file1.txt");
+    fs::write(&file1, "version 1 content").unwrap();
 
     // 3. RW Mount 2: append changes (Tx 3 & 4)
-    {
-        let mut fs_instance = appendfs::recover_fs(log_path).unwrap();
-        let next_gen = fs_instance.manifest.read().unwrap().next_generation;
-        let writer = Arc::new(appendfs::LogWriter::create_lazy(
-            log_path,
-            next_gen,
-            1024 * 1024,
-            fs_instance.last_tx_id.load(std::sync::atomic::Ordering::SeqCst) + 1,
-        ));
-        fs_instance.log_writer = Some(Arc::clone(&writer));
-        fs_instance.set_log_dir(log_path);
+    mount.remount_rw();
 
-        let m_path = mount_path.clone();
-        let handle = thread::spawn(move || {
-            let fuse_args = vec![
-                "appendfs".to_string(),
-                m_path.to_str().unwrap().to_string(),
-                "-f".to_string(),
-            ];
-            appendfs::mount(fuse_args, fs_instance).unwrap();
-        });
+    let step2_dir = mount.path().join("step2");
+    fs::create_dir(&step2_dir).unwrap();
+    let file2 = step2_dir.join("file2.txt");
+    fs::write(&file2, "version 2 content").unwrap();
 
-        let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-        let mut mounted = false;
-        for _ in 0..100 {
-            if let Ok(meta) = fs::metadata(&mount_path) {
-                if meta.dev() != initial_dev {
-                    mounted = true;
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(mounted, "Mount 2 timed out");
-
-        let step2_dir = mount_path.join("step2");
-        fs::create_dir(&step2_dir).unwrap();
-        let file2 = step2_dir.join("file2.txt");
-        fs::write(&file2, "version 2 content").unwrap();
-
-        unmount_fuse(mount_path.to_str().unwrap());
-        handle.join().unwrap();
-    }
+    mount.unmount();
 
     // Count summary and log files before RO mount
-    let files_before_ro: Vec<String> = fs::read_dir(log_path)
+    let mut files_before_ro: Vec<String> = fs::read_dir(&log_path)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
         .collect();
+    files_before_ro.sort();
 
     // 4. RO Mount (Latest state)
-    {
-        let mut fs_instance = appendfs::recover_fs_to_target(log_path, appendfs::RecoveryTarget::Latest).unwrap();
-        fs_instance.set_log_dir(log_path);
-        fs_instance.set_read_only(true);
+    mount.remount_ro(appendfs::RecoveryTarget::Latest);
 
-        let m_path = mount_path.clone();
-        let handle = thread::spawn(move || {
-            let fuse_args = vec![
-                "appendfs".to_string(),
-                m_path.to_str().unwrap().to_string(),
-                "-f".to_string(),
-            ];
-            appendfs::mount_ro(fuse_args, fs_instance).unwrap();
-        });
+    // Read operations must succeed
+    let file1 = mount.path().join("step1/file1.txt");
+    assert_eq!(fs::read_to_string(&file1).unwrap(), "version 1 content");
+    let file2 = mount.path().join("step2/file2.txt");
+    assert_eq!(fs::read_to_string(&file2).unwrap(), "version 2 content");
 
-        let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-        let mut mounted = false;
-        for _ in 0..100 {
-            if let Ok(meta) = fs::metadata(&mount_path) {
-                if meta.dev() != initial_dev {
-                    mounted = true;
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(mounted, "RO Mount timed out");
+    // Mutation operations must fail with EROFS / PermissionDenied
+    assert!(fs::write(&file1, "tampered").is_err(), "Write on RO mount must fail");
+    assert!(fs::create_dir(mount.path().join("forbidden_dir")).is_err(), "Mkdir on RO mount must fail");
+    assert!(fs::remove_file(&file1).is_err(), "Unlink on RO mount must fail");
 
-        // Read operations must succeed
-        let file1 = mount_path.join("step1/file1.txt");
-        assert_eq!(fs::read_to_string(&file1).unwrap(), "version 1 content");
-        let file2 = mount_path.join("step2/file2.txt");
-        assert_eq!(fs::read_to_string(&file2).unwrap(), "version 2 content");
-
-        // Mutation operations must fail with EROFS / PermissionDenied
-        assert!(fs::write(&file1, "tampered").is_err(), "Write on RO mount must fail");
-        assert!(fs::create_dir(mount_path.join("forbidden_dir")).is_err(), "Mkdir on RO mount must fail");
-        assert!(fs::remove_file(&file1).is_err(), "Unlink on RO mount must fail");
-
-        unmount_fuse(mount_path.to_str().unwrap());
-        handle.join().unwrap();
-    }
+    mount.unmount();
 
     // Verify RO mount never created/modified summary or log files
-    let files_after_ro: Vec<String> = fs::read_dir(log_path)
+    let mut files_after_ro: Vec<String> = fs::read_dir(&log_path)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
         .collect();
+    files_after_ro.sort();
     assert_eq!(files_before_ro, files_after_ro, "RO mount must never write to disk files");
 
     // 5. RO Mount with Point-in-Time Historical Recovery (TxId cutoff before step2)
-    {
-        // Replay up to TxId(4) which is before step2 creation
-        let mut fs_instance = appendfs::recover_fs_to_target(log_path, appendfs::RecoveryTarget::TxId(4)).unwrap();
-        fs_instance.set_log_dir(log_path);
-        fs_instance.set_read_only(true);
+    mount.remount_ro(appendfs::RecoveryTarget::TxId(4));
 
-        let m_path = mount_path.clone();
-        let handle = thread::spawn(move || {
-            let fuse_args = vec![
-                "appendfs".to_string(),
-                m_path.to_str().unwrap().to_string(),
-                "-f".to_string(),
-            ];
-            appendfs::mount_ro(fuse_args, fs_instance).unwrap();
-        });
+    // step1 exists
+    let file1 = mount.path().join("step1/file1.txt");
+    assert!(file1.exists(), "step1/file1.txt must exist at historical point-in-time");
+    assert_eq!(fs::read_to_string(&file1).unwrap(), "version 1 content");
 
-        let initial_dev = fs::metadata(&mount_path).unwrap().dev();
-        let mut mounted = false;
-        for _ in 0..100 {
-            if let Ok(meta) = fs::metadata(&mount_path) {
-                if meta.dev() != initial_dev {
-                    mounted = true;
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(mounted, "Point-in-time RO Mount timed out");
-
-        // step1 exists
-        let file1 = mount_path.join("step1/file1.txt");
-        assert!(file1.exists(), "step1/file1.txt must exist at historical point-in-time");
-        assert_eq!(fs::read_to_string(&file1).unwrap(), "version 1 content");
-
-        // step2 does NOT exist at this historical point in time
-        let step2 = mount_path.join("step2");
-        assert!(!step2.exists(), "step2 must NOT exist at historical point-in-time");
-
-        unmount_fuse(mount_path.to_str().unwrap());
-        handle.join().unwrap();
-    }
+    // step2 does NOT exist at this historical point in time
+    let step2 = mount.path().join("step2");
+    assert!(!step2.exists(), "step2 must NOT exist at historical point-in-time");
 }

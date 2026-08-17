@@ -317,6 +317,39 @@ pub struct LinkPayload {
     pub op_time: SystemTime,
 }
 
+/// Unified typed representation of any decoded log record payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedPayload<'a> {
+    Create(CreatePayload),
+    Mkdir(MkdirPayload),
+    Write { meta: WriteMeta, data: &'a [u8] },
+    Unlink(UnlinkPayload),
+    Rmdir(RmdirPayload),
+    Symlink(SymlinkPayload),
+    Rename(RenamePayload),
+    Setattr(SetattrPayload),
+    Link(LinkPayload),
+    FlushCommit(FlushCommitPayload),
+}
+
+impl DecodedPayload<'_> {
+    /// Extracts the timestamp associated with this operation (either creation time, operation time, or flush timestamp).
+    pub fn op_time(&self) -> Option<SystemTime> {
+        match self {
+            DecodedPayload::Create(p) => Some(p.created_at),
+            DecodedPayload::Mkdir(p) => Some(p.created_at),
+            DecodedPayload::Write { meta, .. } => Some(meta.op_time),
+            DecodedPayload::Unlink(p) => Some(p.op_time),
+            DecodedPayload::Rmdir(p) => Some(p.op_time),
+            DecodedPayload::Symlink(p) => Some(p.created_at),
+            DecodedPayload::Rename(p) => Some(p.op_time),
+            DecodedPayload::Setattr(p) => Some(p.op_time),
+            DecodedPayload::Link(p) => Some(p.op_time),
+            DecodedPayload::FlushCommit(p) => Some(p.timestamp),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
