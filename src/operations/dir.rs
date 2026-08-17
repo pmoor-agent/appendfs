@@ -76,17 +76,33 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
         find_parent_inode(fs, ino).unwrap_or(1)
     };
 
-    let mut db = shim::DirectoryBuffer::new(req);
-    db.add(".", ino, FileType::Directory);
-    db.add("..", dotdot_ino, FileType::Directory);
+    let mut db = shim::DirectoryBuffer::new(req, size);
 
-    for (name, child_ino) in &entries {
-        if let Some(attr) = fs.get_attr(*child_ino) {
-            db.add(name, *child_ino, attr.file_type);
+    let offset = offset as usize;
+    if offset == 0 {
+        if !db.add(".", ino, FileType::Directory, 1) {
+            db.reply();
+            return;
+        }
+    }
+    if offset <= 1 {
+        if !db.add("..", dotdot_ino, FileType::Directory, 2) {
+            db.reply();
+            return;
         }
     }
 
-    db.reply(offset, size);
+    let start_entry_idx = offset.saturating_sub(2);
+    for (idx, (name, child_ino)) in entries.iter().enumerate().skip(start_entry_idx) {
+        let next_off = (idx + 3) as i64;
+        if let Some(attr) = fs.get_attr(*child_ino) {
+            if !db.add(name, *child_ino, attr.file_type, next_off) {
+                break;
+            }
+        }
+    }
+
+    db.reply();
 }
 
 pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64) {
@@ -120,17 +136,33 @@ pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset:
         }
     };
 
-    let mut db = shim::DirectoryBufferPlus::new(req);
-    db.add(".", &self_attr, 1.0, 1.0);
-    db.add("..", &dotdot_attr, 1.0, 1.0);
+    let mut db = shim::DirectoryBufferPlus::new(req, size);
 
-    for (name, child_ino) in &entries {
-        if let Some(attr) = fs.get_attr(*child_ino) {
-            db.add(name, &attr, 1.0, 1.0);
+    let offset = offset as usize;
+    if offset == 0 {
+        if !db.add(".", &self_attr, 1.0, 1.0, 1) {
+            db.reply();
+            return;
+        }
+    }
+    if offset <= 1 {
+        if !db.add("..", &dotdot_attr, 1.0, 1.0, 2) {
+            db.reply();
+            return;
         }
     }
 
-    db.reply(offset, size);
+    let start_entry_idx = offset.saturating_sub(2);
+    for (idx, (name, child_ino)) in entries.iter().enumerate().skip(start_entry_idx) {
+        let next_off = (idx + 3) as i64;
+        if let Some(attr) = fs.get_attr(*child_ino) {
+            if !db.add(name, &attr, 1.0, 1.0, next_off) {
+                break;
+            }
+        }
+    }
+
+    db.reply();
 }
 
 pub fn mkdir_core(

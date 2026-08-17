@@ -910,3 +910,75 @@ fn test_summary_single_file_export_and_recovery() {
     unmount_fuse(&mount_path_rec_str);
     handle_rec.join().unwrap();
 }
+
+#[test]
+fn test_large_directory_readdir_and_readdirplus() {
+    let fs = appendfs::InMemoryFS::new();
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("appendfs_large_dir_")
+        .tempdir()
+        .unwrap();
+    let mount_path = temp_dir.path().to_path_buf();
+    let mount_path_str = mount_path.to_str().unwrap().to_string();
+
+    fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
+    let initial_dev = fs::metadata(&mount_path).unwrap().dev();
+
+    let mount_path_clone = mount_path.clone();
+    let handle = thread::spawn(move || {
+        let args = vec![
+            "test_large_dir".to_string(),
+            mount_path_clone.to_str().unwrap().to_string(),
+            "-f".to_string(),
+        ];
+        let _ = appendfs::mount(args, fs);
+    });
+
+    for _ in 0..200 {
+        if let Ok(meta) = fs::metadata(&mount_path) {
+            if meta.dev() != initial_dev {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let large_dir = mount_path.join("large_dir");
+    fs::create_dir(&large_dir).unwrap();
+
+    let num_files = 1500;
+    for i in 0..num_files {
+        let file_path = large_dir.join(format!("file_{:05}.txt", i));
+        fs::write(&file_path, format!("data_{}", i)).unwrap();
+    }
+
+    // Test readdir / readdirplus with standard Rust read_dir
+    let mut read_entries = Vec::new();
+    for entry in fs::read_dir(&large_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        let meta = entry.metadata().unwrap();
+        assert!(meta.is_file());
+        read_entries.push(name);
+    }
+    read_entries.sort();
+    assert_eq!(read_entries.len(), num_files);
+    for i in 0..num_files {
+        assert_eq!(read_entries[i], format!("file_{:05}.txt", i));
+    }
+
+    // Test with command line `ls -la`
+    let output = Command::new("ls")
+        .arg("-la")
+        .arg(&large_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("file_00000.txt"));
+    assert!(stdout.contains("file_01499.txt"));
+
+    unmount_fuse(&mount_path_str);
+    handle.join().unwrap();
+}

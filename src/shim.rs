@@ -359,38 +359,52 @@ unsafe extern "C" {
 pub struct DirectoryBuffer {
     req: Request,
     buf: Vec<u8>,
+    max_size: usize,
+    full: bool,
 }
 
 impl DirectoryBuffer {
-    pub fn new(req: Request) -> Self {
+    pub fn new(req: Request, max_size: usize) -> Self {
         Self {
             req,
-            buf: Vec::new(),
+            buf: Vec::with_capacity(max_size),
+            max_size,
+            full: false,
         }
     }
 
-    pub fn add(&mut self, name: &str, ino: u64, file_type: FileType) {
+    pub fn is_full(&self) -> bool {
+        self.full
+    }
+
+    pub fn add(&mut self, name: &str, ino: u64, file_type: FileType, next_off: i64) -> bool {
+        if self.full {
+            return false;
+        }
+        let c_name = match CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
         let mode = match file_type {
             FileType::Directory => libc::S_IFDIR,
             FileType::RegularFile => libc::S_IFREG,
             FileType::Symlink => libc::S_IFLNK,
         };
 
-        let c_name = match CString::new(name) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let old_size = self.buf.len();
+        let current_len = self.buf.len();
+        let remaining = self.max_size.saturating_sub(current_len);
+        if remaining == 0 {
+            self.full = true;
+            return false;
+        }
 
-        // 256 bytes for dirent structure buffer space
-        self.buf.resize(old_size + 512, 0);
+        self.buf.resize(self.max_size, 0);
 
-        let next_off = (self.buf.len()) as i64;
-        let bytes_written = unsafe {
+        let needed = unsafe {
             shim_add_direntry(
                 self.req.req,
-                self.buf[old_size..].as_mut_ptr() as *mut c_char,
-                512,
+                self.buf[current_len..].as_mut_ptr() as *mut c_char,
+                remaining,
                 c_name.as_ptr(),
                 ino,
                 mode,
@@ -398,31 +412,40 @@ impl DirectoryBuffer {
             )
         };
 
-        self.buf.truncate(old_size + bytes_written);
+        if needed <= remaining {
+            self.buf.truncate(current_len + needed);
+            true
+        } else {
+            self.buf.truncate(current_len);
+            self.full = true;
+            false
+        }
     }
 
-    pub fn reply(self, offset: i64, size: usize) {
-        let offset = offset as usize;
-        if offset >= self.buf.len() {
-            self.req.reply_buf(&[]);
-        } else {
-            let end = std::cmp::min(offset + size, self.buf.len());
-            self.req.reply_buf(&self.buf[offset..end]);
-        }
+    pub fn reply(self) {
+        self.req.reply_buf(&self.buf);
     }
 }
 
 pub struct DirectoryBufferPlus {
     req: Request,
     buf: Vec<u8>,
+    max_size: usize,
+    full: bool,
 }
 
 impl DirectoryBufferPlus {
-    pub fn new(req: Request) -> Self {
+    pub fn new(req: Request, max_size: usize) -> Self {
         Self {
             req,
-            buf: Vec::new(),
+            buf: Vec::with_capacity(max_size),
+            max_size,
+            full: false,
         }
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.full
     }
 
     pub fn add(
@@ -431,22 +454,31 @@ impl DirectoryBufferPlus {
         attr: &FileAttr,
         attr_timeout: f64,
         entry_timeout: f64,
-    ) {
+        next_off: i64,
+    ) -> bool {
+        if self.full {
+            return false;
+        }
         let c_name = match CString::new(name) {
             Ok(c) => c,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let shim_attr = convert_file_attr(attr);
-        let old_size = self.buf.len();
 
-        self.buf.resize(old_size + 512, 0);
+        let current_len = self.buf.len();
+        let remaining = self.max_size.saturating_sub(current_len);
+        if remaining == 0 {
+            self.full = true;
+            return false;
+        }
 
-        let next_off = (self.buf.len()) as i64;
-        let bytes_written = unsafe {
+        self.buf.resize(self.max_size, 0);
+
+        let needed = unsafe {
             shim_add_direntry_plus(
                 self.req.req,
-                self.buf[old_size..].as_mut_ptr() as *mut c_char,
-                512,
+                self.buf[current_len..].as_mut_ptr() as *mut c_char,
+                remaining,
                 c_name.as_ptr(),
                 &shim_attr,
                 attr_timeout,
@@ -455,17 +487,18 @@ impl DirectoryBufferPlus {
             )
         };
 
-        self.buf.truncate(old_size + bytes_written);
+        if needed <= remaining {
+            self.buf.truncate(current_len + needed);
+            true
+        } else {
+            self.buf.truncate(current_len);
+            self.full = true;
+            false
+        }
     }
 
-    pub fn reply(self, offset: i64, size: usize) {
-        let offset = offset as usize;
-        if offset >= self.buf.len() {
-            self.req.reply_buf(&[]);
-        } else {
-            let end = std::cmp::min(offset + size, self.buf.len());
-            self.req.reply_buf(&self.buf[offset..end]);
-        }
+    pub fn reply(self) {
+        self.req.reply_buf(&self.buf);
     }
 }
 
