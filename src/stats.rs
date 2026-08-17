@@ -109,12 +109,16 @@ impl VolumeStats {
             format_bytes(self.total_disk_bytes)
         )
         .unwrap();
-        writeln!(
-            out,
-            "Overall Live Ratio:  {:.1}%",
-            self.overall_live_ratio * 100.0
-        )
-        .unwrap();
+        if self.total_data_bytes > 0 {
+            writeln!(
+                out,
+                "Overall Live Ratio:  {:.1}%",
+                self.overall_live_ratio * 100.0
+            )
+            .unwrap();
+        } else {
+            writeln!(out, "Overall Live Ratio:  N/A (no data payload)").unwrap();
+        }
         writeln!(out).unwrap();
 
         if self.generations.is_empty() {
@@ -145,17 +149,13 @@ impl VolumeStats {
             .unwrap();
 
             for g in &self.generations {
-                let status = if g.live_bytes == 0 && g.total_data_bytes > 0 {
-                    "Dead (0% - Reclaimable)"
-                } else if g.live_ratio < 0.30 && g.total_data_bytes > 0 {
-                    "Compaction Candidate"
-                } else if g.live_ratio < 0.70 {
-                    "Fragmented"
-                } else {
-                    "Healthy"
-                };
+                let (status, ratio_str) = format_generation_status(
+                    g.total_data_bytes,
+                    g.live_bytes,
+                    g.live_ratio,
+                    g.record_count,
+                );
 
-                let ratio_str = format!("{:.1}%", g.live_ratio * 100.0);
                 writeln!(
                     out,
                     "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
@@ -173,6 +173,35 @@ impl VolumeStats {
         }
 
         out
+    }
+}
+
+/// Determines the status label and live ratio display string for a log generation.
+pub fn format_generation_status(
+    total_data_bytes: u64,
+    live_bytes: u64,
+    live_ratio: f64,
+    record_count: u32,
+) -> (&'static str, String) {
+    if total_data_bytes == 0 {
+        let status = if record_count == 0 {
+            "Empty"
+        } else {
+            "Metadata Only"
+        };
+        (status, "N/A".to_string())
+    } else {
+        let ratio_str = format!("{:.1}%", live_ratio * 100.0);
+        let status = if live_bytes == 0 {
+            "Dead (0% - Reclaimable)"
+        } else if live_ratio < 0.30 {
+            "Compaction Candidate"
+        } else if live_ratio < 0.70 {
+            "Fragmented"
+        } else {
+            "Healthy"
+        };
+        (status, ratio_str)
     }
 }
 
@@ -207,5 +236,19 @@ mod tests {
         let text = stats.display_text();
         assert!(text.contains("Branch:              main"));
         assert!(text.contains("Total Inodes:        1"));
+        assert!(text.contains("Overall Live Ratio:  N/A"));
+    }
+
+    #[test]
+    fn test_format_generation_status() {
+        // Zero data bytes
+        assert_eq!(format_generation_status(0, 0, 0.0, 0), ("Empty", "N/A".to_string()));
+        assert_eq!(format_generation_status(0, 0, 0.0, 10), ("Metadata Only", "N/A".to_string()));
+
+        // Non-zero data bytes
+        assert_eq!(format_generation_status(1000, 0, 0.0, 10), ("Dead (0% - Reclaimable)", "0.0%".to_string()));
+        assert_eq!(format_generation_status(1000, 200, 0.20, 10), ("Compaction Candidate", "20.0%".to_string()));
+        assert_eq!(format_generation_status(1000, 500, 0.50, 10), ("Fragmented", "50.0%".to_string()));
+        assert_eq!(format_generation_status(1000, 950, 0.95, 10), ("Healthy", "95.0%".to_string()));
     }
 }

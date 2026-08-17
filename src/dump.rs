@@ -818,16 +818,12 @@ pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<St
             } else {
                 0.0
             };
-            let status = if live_bytes == 0 && g.total_data_bytes > 0 {
-                "Dead (0% - Reclaimable)"
-            } else if live_ratio < 0.30 && g.total_data_bytes > 0 {
-                "Compaction Candidate"
-            } else if live_ratio < 0.70 {
-                "Fragmented"
-            } else {
-                "Healthy"
-            };
-            let ratio_str = format!("{:.1}%", live_ratio * 100.0);
+            let (status, ratio_str) = crate::stats::format_generation_status(
+                g.total_data_bytes,
+                live_bytes,
+                live_ratio,
+                g.record_count,
+            );
             writeln!(
                 out,
                 "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
