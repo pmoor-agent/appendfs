@@ -33,30 +33,33 @@ pub fn read_core(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Result<
     fs.read_file_data(ino, offset as u64, size)
 }
 
-pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64) {
+pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
+    log::trace!("read(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
+    let handle = match fs.get_file_handle(fh) {
+        Some(h) => h,
+        None => {
+            req.reply_err(libc::EBADF);
+            return;
+        }
+    };
+    if handle.ino != ino {
+        req.reply_err(libc::EBADF);
+        return;
+    }
     match read_core(fs, ino, size, offset) {
         Ok(buf) => req.reply_buf(&buf),
         Err(e) => req.reply_err(e),
     }
 }
 
-pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
-    log::trace!("open(ino={}, flags=0x{:x})", ino, flags);
-    let attr = match fs.get_attr(ino) {
-        Some(a) => a,
-        None => {
-            req.reply_err(libc::ENOENT);
-            return;
-        }
-    };
+pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
+    let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
     if attr.file_type != FileType::RegularFile {
-        req.reply_err(libc::EISDIR);
-        return;
+        return Err(libc::EISDIR);
     }
 
     if fs.is_read_only() && (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0 {
-        req.reply_err(libc::EROFS);
-        return;
+        return Err(libc::EROFS);
     }
 
     let fh = fs.open_file_handle(ino, flags);
@@ -65,7 +68,15 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
         let now = fs.clock.now();
         let _ = setattr_core(fs, ino, 0, 0, 0, 0, now, now, FUSE_SET_ATTR_SIZE | FUSE_SET_ATTR_MTIME);
     }
-    req.reply_open(fh);
+    Ok(fh)
+}
+
+pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
+    log::trace!("open(ino={}, flags=0x{:x})", ino, flags);
+    match open_core(fs, ino, flags) {
+        Ok(fh) => req.reply_open(fh),
+        Err(e) => req.reply_err(e),
+    }
 }
 
 pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
@@ -126,7 +137,19 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
     Ok(buf.len())
 }
 
-pub fn write(fs: &InMemoryFS, req: Request, ino: u64, buf: &[u8], offset: i64) {
+pub fn write(fs: &InMemoryFS, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64) {
+    log::trace!("write(ino={}, len={}, offset={}, fh={})", ino, buf.len(), offset, fh);
+    let handle = match fs.get_file_handle(fh) {
+        Some(h) => h,
+        None => {
+            req.reply_err(libc::EBADF);
+            return;
+        }
+    };
+    if handle.ino != ino {
+        req.reply_err(libc::EBADF);
+        return;
+    }
     match write_core(fs, ino, buf, offset) {
         Ok(count) => req.reply_write(count),
         Err(e) => req.reply_err(e),
@@ -328,14 +351,29 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
     }
 }
 
-pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool) {
-    log::trace!("fsync(ino={}, datasync={})", ino, datasync);
+pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
+    log::trace!("fsync(ino={}, datasync={}, fh={})", ino, datasync, fh);
+    if fh != 0 {
+        match fs.get_file_handle(fh) {
+            Some(h) if h.ino == ino => {}
+            _ => {
+                req.reply_err(libc::EBADF);
+                return;
+            }
+        }
+    }
     let _ = fs.sync_log();
     req.reply_err(0);
 }
 
+pub fn release_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
+    fs.release_file_handle(fh, ino)
+}
+
 pub fn release(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
     log::trace!("release(ino={}, fh={})", ino, fh);
-    fs.release_file_handle(fh, ino);
-    req.reply_err(0);
+    match release_core(fs, ino, fh) {
+        Ok(()) => req.reply_err(0),
+        Err(e) => req.reply_err(e),
+    }
 }

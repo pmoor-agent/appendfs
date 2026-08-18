@@ -91,10 +91,11 @@ struct RustLowlevelOps {
     readdir: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void)>,
     readdirplus:
         Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void)>,
-    read: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void)>,
+    read: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void)>,
     open: Option<extern "C" fn(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void)>,
-    write:
-        Option<extern "C" fn(req: shim_req_t, ino: u64, buf: *const u8, size: usize, off: i64, userdata: *mut c_void)>,
+    write: Option<
+        extern "C" fn(req: shim_req_t, ino: u64, buf: *const u8, size: usize, off: i64, fh: u64, userdata: *mut c_void),
+    >,
     setattr: Option<ShimSetattrCallback>,
     create: Option<
         extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, mode: u32, flags: u32, userdata: *mut c_void),
@@ -118,7 +119,7 @@ struct RustLowlevelOps {
     >,
     link:
         Option<extern "C" fn(req: shim_req_t, ino: u64, newparent: u64, newname: *const c_char, userdata: *mut c_void)>,
-    fsync: Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void)>,
+    fsync: Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, fh: u64, userdata: *mut c_void)>,
     release: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void)>,
     releasedir: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void)>,
     fsyncdir: Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void)>,
@@ -451,9 +452,9 @@ pub trait Filesystem {
     fn opendir(&self, req: Request, ino: u64, flags: u32);
     fn readdir(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64);
     fn readdirplus(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64);
-    fn read(&self, req: Request, ino: u64, size: usize, offset: i64);
+    fn read(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64);
     fn open(&self, req: Request, ino: u64, flags: u32);
-    fn write(&self, req: Request, ino: u64, buf: &[u8], offset: i64);
+    fn write(&self, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64);
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
@@ -475,7 +476,7 @@ pub trait Filesystem {
     fn readlink(&self, req: Request, ino: u64);
     fn rename(&self, req: Request, parent: u64, name: &str, newparent: u64, newname: &str);
     fn link(&self, req: Request, ino: u64, newparent: u64, newname: &str);
-    fn fsync(&self, req: Request, ino: u64, datasync: bool);
+    fn fsync(&self, req: Request, ino: u64, datasync: bool, fh: u64);
     fn release(&self, req: Request, ino: u64, fh: u64);
     fn releasedir(&self, req: Request, ino: u64, fh: u64);
     fn fsyncdir(&self, req: Request, ino: u64, datasync: bool);
@@ -515,9 +516,9 @@ extern "C" fn readdirplus_bridge(req: shim_req_t, ino: u64, size: usize, off: i6
     fs.readdirplus(Request { req }, ino, size, off, fh);
 }
 
-extern "C" fn read_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void) {
+extern "C" fn read_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.read(Request { req }, ino, size, off);
+    fs.read(Request { req }, ino, size, off, fh);
 }
 
 extern "C" fn open_bridge(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void) {
@@ -525,10 +526,18 @@ extern "C" fn open_bridge(req: shim_req_t, ino: u64, flags: u32, userdata: *mut 
     fs.open(Request { req }, ino, flags);
 }
 
-extern "C" fn write_bridge(req: shim_req_t, ino: u64, buf: *const u8, size: usize, off: i64, userdata: *mut c_void) {
+extern "C" fn write_bridge(
+    req: shim_req_t,
+    ino: u64,
+    buf: *const u8,
+    size: usize,
+    off: i64,
+    fh: u64,
+    userdata: *mut c_void,
+) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let buf_slice = unsafe { std::slice::from_raw_parts(buf, size) };
-    fs.write(Request { req }, ino, buf_slice, off);
+    fs.write(Request { req }, ino, buf_slice, off, fh);
 }
 
 extern "C" fn setattr_bridge(
@@ -674,9 +683,9 @@ extern "C" fn link_bridge(req: shim_req_t, ino: u64, newparent: u64, newname: *c
     fs.link(Request { req }, ino, newparent, newname_str);
 }
 
-extern "C" fn fsync_bridge(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void) {
+extern "C" fn fsync_bridge(req: shim_req_t, ino: u64, datasync: c_int, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.fsync(Request { req }, ino, datasync != 0);
+    fs.fsync(Request { req }, ino, datasync != 0, fh);
 }
 
 extern "C" fn release_bridge(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void) {

@@ -13,10 +13,10 @@ use appendfs::clock::{Clock, SystemClock};
 use appendfs::log::record::DecodedPayload;
 use appendfs::log::{LogReader, SummaryReader, recover_fs};
 use appendfs::node::Node;
-use appendfs::operations::dir::{list_dir_core, mkdir_core, rmdir_core};
+use appendfs::operations::dir::{list_dir_core, mkdir_core, opendir_core, releasedir_core, rmdir_core};
 use appendfs::operations::links::{link_core, readlink_core, rename_core, symlink_core, unlink_core};
 use appendfs::operations::read_write::{
-    FUSE_SET_ATTR_SIZE, create_core, getattr_core, read_core, setattr_core, write_core,
+    FUSE_SET_ATTR_SIZE, create_core, getattr_core, open_core, read_core, release_core, setattr_core, write_core,
 };
 use appendfs::shim::FileType;
 use common::TestRng;
@@ -124,6 +124,22 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                         }
                         Err(_) => {}
                     }
+                }
+            }
+            8 => {
+                // Exercise opendir snapshotting & releasedir concurrently with active mutations
+                if let Ok(fh) = opendir_core(&fs, dir_a, 0) {
+                    let _ = fs.get_dir_handle(fh);
+                    let _ = releasedir_core(&fs, dir_a, fh);
+                }
+            }
+            9 => {
+                // Exercise open handle allocation, read, and release concurrently
+                if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
+                    && let Ok(fh) = open_core(&fs, ino, 0)
+                {
+                    let _ = read_core(&fs, ino, 64, 0);
+                    let _ = release_core(&fs, ino, fh);
                 }
             }
             _ => {
@@ -567,6 +583,22 @@ fn run_concurrent_stress(seed: u64) {
 
     verify_tree_invariants(&fs, &log_dir, seed);
     verify_log_replay_matches_live(&fs, &log_dir, seed);
+
+    assert!(
+        fs.dir_handles.read().unwrap().is_empty(),
+        "seed {}: leaked dir handles",
+        seed
+    );
+    assert!(
+        fs.file_handles.read().unwrap().is_empty(),
+        "seed {}: leaked file handles",
+        seed
+    );
+    assert!(
+        fs.open_counts.read().unwrap().is_empty(),
+        "seed {}: leaked open_counts",
+        seed
+    );
 }
 
 #[test]

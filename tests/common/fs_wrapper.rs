@@ -213,6 +213,22 @@ impl TestFS {
         appendfs::operations::links::rename_core(&self.fs, parent, name, newparent, newname)
     }
 
+    pub fn opendir(&self, ino: u64) -> Result<u64, i32> {
+        appendfs::operations::dir::opendir_core(&self.fs, ino, 0)
+    }
+
+    pub fn releasedir(&self, ino: u64, fh: u64) -> Result<(), i32> {
+        appendfs::operations::dir::releasedir_core(&self.fs, ino, fh)
+    }
+
+    pub fn open(&self, ino: u64, flags: u32) -> Result<u64, i32> {
+        appendfs::operations::read_write::open_core(&self.fs, ino, flags)
+    }
+
+    pub fn release(&self, ino: u64, fh: u64) -> Result<(), i32> {
+        appendfs::operations::read_write::release_core(&self.fs, ino, fh)
+    }
+
     pub fn get_tree_snapshot(&self) -> HashMap<u64, SnapshotNode> {
         let mut snapshot = HashMap::new();
         let mut visited = std::collections::HashSet::new();

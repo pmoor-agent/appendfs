@@ -186,32 +186,27 @@ impl InMemoryFS {
         self.file_handles.read().unwrap().get(&fh).copied()
     }
 
-    pub fn release_file_handle(&self, fh: u64, ino: u64) {
-        let target_ino = if fh != 0 {
-            self.file_handles
-                .write()
-                .unwrap()
-                .remove(&fh)
-                .map(|h| h.ino)
-                .unwrap_or(ino)
-        } else {
-            ino
-        };
+    pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
+        let handle = self.file_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;
+        if handle.ino != ino {
+            return Err(libc::EBADF);
+        }
 
         let mut counts = self.open_counts.write().unwrap();
-        if let Some(count) = counts.get_mut(&target_ino) {
+        if let Some(count) = counts.get_mut(&ino) {
             *count = count.saturating_sub(1);
         }
-        if counts.get(&target_ino) == Some(&0) {
-            counts.remove(&target_ino);
+        if counts.get(&ino) == Some(&0) {
+            counts.remove(&ino);
         }
-        let remaining = counts.get(&target_ino).copied().unwrap_or(0);
+        let remaining = counts.get(&ino).copied().unwrap_or(0);
         if remaining == 0
-            && let Some(attr) = self.get_attr(target_ino)
+            && let Some(attr) = self.get_attr(ino)
             && attr.nlink == 0
         {
-            self.tombstone(target_ino);
+            self.tombstone(ino);
         }
+        Ok(())
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {
@@ -219,13 +214,13 @@ impl InMemoryFS {
     }
 
     /// Convenience helper for direct programmatic / test usage without an explicit `fh`.
-    pub fn open_handle(&self, ino: u64) {
-        *self.open_counts.write().unwrap().entry(ino).or_insert(0) += 1;
+    pub fn open_handle(&self, ino: u64) -> u64 {
+        self.open_file_handle(ino, 0)
     }
 
     /// Convenience helper for direct programmatic / test usage without an explicit `fh`.
-    pub fn release_handle(&self, ino: u64) {
-        self.release_file_handle(0, ino);
+    pub fn release_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
+        self.release_file_handle(fh, ino)
     }
 
     // --- Directory Handle Snapshot Management ---
@@ -245,8 +240,9 @@ impl InMemoryFS {
         self.dir_handles.read().unwrap().get(&fh).cloned()
     }
 
-    pub fn release_dir_handle(&self, fh: u64) {
-        self.dir_handles.write().unwrap().remove(&fh);
+    pub fn release_dir_handle(&self, fh: u64) -> Result<(), i32> {
+        self.dir_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;
+        Ok(())
     }
 
     // --- In-Memory Delta Layer Mutations ---
@@ -2981,12 +2977,13 @@ mod tests {
         assert_eq!(snap2[1].0, "charlie.txt");
 
         // 6. Release fh1
-        fs.release_dir_handle(fh1);
+        assert_eq!(fs.release_dir_handle(fh1), Ok(()));
         assert!(fs.get_dir_handle(fh1).is_none());
         assert!(fs.get_dir_handle(fh2).is_some());
+        assert_eq!(fs.release_dir_handle(fh1), Err(libc::EBADF));
 
         // 7. Release fh2
-        fs.release_dir_handle(fh2);
+        assert_eq!(fs.release_dir_handle(fh2), Ok(()));
         assert!(fs.get_dir_handle(fh2).is_none());
 
         // 8. open_dir_handle on a non-directory returns None
@@ -3018,14 +3015,15 @@ mod tests {
         assert_eq!(fs.get_attr(ino).unwrap().nlink, 0);
 
         // 4. Release first handle
-        fs.release_file_handle(fh1, ino);
+        assert_eq!(fs.release_file_handle(fh1, ino), Ok(()));
         assert!(fs.get_file_handle(fh1).is_none());
         assert!(fs.get_file_handle(fh2).is_some());
         assert_eq!(fs.open_count(ino), 1);
         assert!(fs.get_attr(ino).is_some());
+        assert_eq!(fs.release_file_handle(fh1, ino), Err(libc::EBADF));
 
         // 5. Release second handle -> count drops to 0, inode gets tombstoned
-        fs.release_file_handle(fh2, ino);
+        assert_eq!(fs.release_file_handle(fh2, ino), Ok(()));
         assert!(fs.get_file_handle(fh2).is_none());
         assert_eq!(fs.open_count(ino), 0);
         assert!(

@@ -28,16 +28,16 @@ impl Filesystem for InMemoryFS {
         dir::readdirplus(self, req, ino, size, offset, fh);
     }
 
-    fn read(&self, req: Request, ino: u64, size: usize, offset: i64) {
-        read_write::read(self, req, ino, size, offset);
+    fn read(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
+        read_write::read(self, req, ino, size, offset, fh);
     }
 
     fn open(&self, req: Request, ino: u64, flags: u32) {
         read_write::open(self, req, ino, flags);
     }
 
-    fn write(&self, req: Request, ino: u64, buf: &[u8], offset: i64) {
-        read_write::write(self, req, ino, buf, offset);
+    fn write(&self, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64) {
+        read_write::write(self, req, ino, buf, offset, fh);
     }
 
     fn setattr(
@@ -87,8 +87,8 @@ impl Filesystem for InMemoryFS {
         links::link(self, req, ino, newparent, newname);
     }
 
-    fn fsync(&self, req: Request, ino: u64, datasync: bool) {
-        read_write::fsync(self, req, ino, datasync);
+    fn fsync(&self, req: Request, ino: u64, datasync: bool, fh: u64) {
+        read_write::fsync(self, req, ino, datasync, fh);
     }
 
     fn release(&self, req: Request, ino: u64, fh: u64) {

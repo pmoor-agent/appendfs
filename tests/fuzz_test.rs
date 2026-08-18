@@ -33,6 +33,26 @@ fn test_differential_fuzzing_and_crash_recovery() {
         let mut active_dirs = vec![1u64];
         let mut active_files = Vec::<u64>::new();
 
+        struct FuzzDirHandle {
+            ino: u64,
+            fh1: u64,
+            fh2: u64,
+            fh3: u64,
+            fh4: u64,
+            expected_snapshot: Vec<(String, u64)>,
+        }
+
+        struct FuzzFileHandle {
+            ino: u64,
+            fh1: u64,
+            fh2: u64,
+            fh3: u64,
+            fh4: u64,
+        }
+
+        let mut open_dir_handles: Vec<FuzzDirHandle> = Vec::new();
+        let mut open_file_handles: Vec<FuzzFileHandle> = Vec::new();
+
         // Crash/remount checkpoints land at random steps rather than a fixed cadence,
         // so recovery gets exercised against varied in-flight-batch states (whatever
         // happened to be staged/flushed at that particular random moment) instead of
@@ -53,7 +73,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
             // run would coincide, and a missing timestamp update would be
             // indistinguishable from a correct one.
             clock.advance(Duration::from_secs(1));
-            let op_choice = prng.gen_range(0, 11);
+            let op_choice = prng.gen_range(0, 15);
             match op_choice {
                 0 => {
                     // Create directory
@@ -328,7 +348,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         assert_eq!(res1, res4, "readlink result mismatch (baseline vs crash)");
                     }
                 }
-                _ => {
+                10 => {
                     // Read file & verify consistency across active instances
                     if !active_files.is_empty() {
                         let ino = active_files[prng.gen_range(0, active_files.len() - 1)];
@@ -342,11 +362,130 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         assert_eq!(res1, res4);
                     }
                 }
+                11 => {
+                    // Opendir: snapshot directory entries and hold open across mutations
+                    let ino = active_dirs[prng.gen_range(0, active_dirs.len() - 1)];
+                    let res1 = fs_baseline.opendir(ino);
+                    let res2 = fs_micro.opendir(ino);
+                    let res3 = fs_remount.opendir(ino);
+                    let res4 = fs_crash.opendir(ino);
+
+                    assert_eq!(res1.is_ok(), res2.is_ok());
+                    assert_eq!(res1.is_ok(), res3.is_ok());
+                    assert_eq!(res1.is_ok(), res4.is_ok());
+
+                    if let (Ok(fh1), Ok(fh2), Ok(fh3), Ok(fh4)) = (res1, res2, res3, res4) {
+                        let snap1 = fs_baseline.fs.get_dir_handle(fh1).expect("baseline dir handle");
+                        let snap2 = fs_micro.fs.get_dir_handle(fh2).expect("micro dir handle");
+                        let snap3 = fs_remount.fs.get_dir_handle(fh3).expect("remount dir handle");
+                        let snap4 = fs_crash.fs.get_dir_handle(fh4).expect("crash dir handle");
+
+                        assert_eq!(&*snap1, &*snap2, "opendir snapshot mismatch (baseline vs micro)");
+                        assert_eq!(&*snap1, &*snap3, "opendir snapshot mismatch (baseline vs remount)");
+                        assert_eq!(&*snap1, &*snap4, "opendir snapshot mismatch (baseline vs crash)");
+
+                        open_dir_handles.push(FuzzDirHandle {
+                            ino,
+                            fh1,
+                            fh2,
+                            fh3,
+                            fh4,
+                            expected_snapshot: (*snap1).clone(),
+                        });
+                    }
+                }
+                12 => {
+                    // Releasedir: verify that the open snapshot remained isolated from all
+                    // intervening mutations, then release
+                    if !open_dir_handles.is_empty() {
+                        let idx = prng.gen_range(0, open_dir_handles.len() - 1);
+                        let h = open_dir_handles.remove(idx);
+
+                        let snap1 = fs_baseline.fs.get_dir_handle(h.fh1).expect("baseline handle");
+                        let snap2 = fs_micro.fs.get_dir_handle(h.fh2).expect("micro handle");
+                        let snap3 = fs_remount.fs.get_dir_handle(h.fh3).expect("remount handle");
+                        let snap4 = fs_crash.fs.get_dir_handle(h.fh4).expect("crash handle");
+
+                        assert_eq!(&*snap1, &h.expected_snapshot, "Snapshot isolation violated in baseline");
+                        assert_eq!(&*snap2, &h.expected_snapshot, "Snapshot isolation violated in micro");
+                        assert_eq!(&*snap3, &h.expected_snapshot, "Snapshot isolation violated in remount");
+                        assert_eq!(&*snap4, &h.expected_snapshot, "Snapshot isolation violated in crash");
+
+                        let res1 = fs_baseline.releasedir(h.ino, h.fh1);
+                        let res2 = fs_micro.releasedir(h.ino, h.fh2);
+                        let res3 = fs_remount.releasedir(h.ino, h.fh3);
+                        let res4 = fs_crash.releasedir(h.ino, h.fh4);
+
+                        assert_eq!(res1, res2);
+                        assert_eq!(res1, res3);
+                        assert_eq!(res1, res4);
+                    }
+                }
+                13 => {
+                    // Open file
+                    if !active_files.is_empty() {
+                        let ino = active_files[prng.gen_range(0, active_files.len() - 1)];
+                        let res1 = fs_baseline.open(ino, libc::O_RDWR as u32);
+                        let res2 = fs_micro.open(ino, libc::O_RDWR as u32);
+                        let res3 = fs_remount.open(ino, libc::O_RDWR as u32);
+                        let res4 = fs_crash.open(ino, libc::O_RDWR as u32);
+
+                        assert_eq!(res1.is_ok(), res2.is_ok());
+                        assert_eq!(res1.is_ok(), res3.is_ok());
+                        assert_eq!(res1.is_ok(), res4.is_ok());
+
+                        if let (Ok(fh1), Ok(fh2), Ok(fh3), Ok(fh4)) = (res1, res2, res3, res4) {
+                            open_file_handles.push(FuzzFileHandle {
+                                ino,
+                                fh1,
+                                fh2,
+                                fh3,
+                                fh4,
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    // Release file
+                    if !open_file_handles.is_empty() {
+                        let idx = prng.gen_range(0, open_file_handles.len() - 1);
+                        let h = open_file_handles.remove(idx);
+
+                        let res1 = fs_baseline.release(h.ino, h.fh1);
+                        let res2 = fs_micro.release(h.ino, h.fh2);
+                        let res3 = fs_remount.release(h.ino, h.fh3);
+                        let res4 = fs_crash.release(h.ino, h.fh4);
+
+                        assert_eq!(res1, res2);
+                        assert_eq!(res1, res3);
+                        assert_eq!(res1, res4);
+                    }
+                }
             }
 
             // At each randomly-drawn checkpoint step, simulate clean remount & unclean
             // crash recovery.
             if checkpoints.contains(&step) {
+                // Drain open handles before remounting so all instances start recovery
+                // cleanly without in-flight userspace descriptors
+                for h in open_dir_handles.drain(..) {
+                    let snap1 = fs_baseline.fs.get_dir_handle(h.fh1).expect("baseline handle");
+                    assert_eq!(
+                        &*snap1, &h.expected_snapshot,
+                        "Snapshot isolation violated before checkpoint"
+                    );
+                    let _ = fs_baseline.releasedir(h.ino, h.fh1);
+                    let _ = fs_micro.releasedir(h.ino, h.fh2);
+                    let _ = fs_remount.releasedir(h.ino, h.fh3);
+                    let _ = fs_crash.releasedir(h.ino, h.fh4);
+                }
+                for h in open_file_handles.drain(..) {
+                    let _ = fs_baseline.release(h.ino, h.fh1);
+                    let _ = fs_micro.release(h.ino, h.fh2);
+                    let _ = fs_remount.release(h.ino, h.fh3);
+                    let _ = fs_crash.release(h.ino, h.fh4);
+                }
+
                 // Fail a flush partway through writing this batch, then clear the fault.
                 // The batch stays queued and is retried; if that retry ever leaves the log
                 // in a state recovery can't read - a torn record, a duplicated one - the
@@ -580,6 +719,37 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 }
             }
         }
+
+        assert!(
+            fs_baseline.fs.dir_handles.read().unwrap().is_empty(),
+            "seed {}: dir handle leak in baseline",
+            seed
+        );
+        assert!(
+            fs_baseline.fs.file_handles.read().unwrap().is_empty(),
+            "seed {}: file handle leak in baseline",
+            seed
+        );
+        assert!(
+            fs_baseline.fs.open_counts.read().unwrap().is_empty(),
+            "seed {}: open_counts leak in baseline",
+            seed
+        );
+        assert!(
+            fs_micro.fs.dir_handles.read().unwrap().is_empty(),
+            "seed {}: dir handle leak in micro",
+            seed
+        );
+        assert!(
+            fs_micro.fs.file_handles.read().unwrap().is_empty(),
+            "seed {}: file handle leak in micro",
+            seed
+        );
+        assert!(
+            fs_micro.fs.open_counts.read().unwrap().is_empty(),
+            "seed {}: open_counts leak in micro",
+            seed
+        );
 
         // The injection above is only worth anything if it actually fires. Without this,
         // a future change to batching or thresholds could quietly stop producing failures
