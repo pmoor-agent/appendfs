@@ -831,12 +831,9 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
     // 2. Simulate Mount 1: Read-only mount session
     {
         let mut fs = appendfs::recover_fs(log_path).unwrap();
-        let writer = std::sync::Arc::new(appendfs::LogWriter::create_lazy(
-            log_path,
-            1,
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-        ));
+        let writer = std::sync::Arc::new(
+            appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        );
         fs.log_writer = Some(writer);
         fs.set_log_dir(log_path);
 
@@ -847,22 +844,21 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
         // Drop fs (simulating unmount)
     }
 
-    // Assert that the log directory remains 100% clean and untouched!
-    let files_after_ro: Vec<_> = std::fs::read_dir(log_path)
+    // Assert that the log directory remains 100% clean and untouched (ignoring .lock)!
+    let mut files_after_ro: Vec<_> = std::fs::read_dir(log_path)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|f| f != ".lock")
         .collect();
+    files_after_ro.sort();
     assert_eq!(files_after_ro, vec!["000000.summary"]);
 
     // 3. Simulate Mount 2: Mutation session
     {
         let mut fs = appendfs::recover_fs(log_path).unwrap();
-        let writer = std::sync::Arc::new(appendfs::LogWriter::create_lazy(
-            log_path,
-            1,
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-        ));
+        let writer = std::sync::Arc::new(
+            appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        );
         fs.log_writer = Some(writer);
         fs.set_log_dir(log_path);
 
@@ -880,6 +876,7 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
     let mut files_after_write: Vec<_> = std::fs::read_dir(log_path)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|f| f != ".lock")
         .collect();
     files_after_write.sort();
     assert_eq!(
@@ -902,12 +899,9 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
     appendfs::init_volume(log_path, Some("main")).unwrap();
 
     let mut fs = appendfs::recover_fs(log_path).unwrap();
-    let writer = std::sync::Arc::new(appendfs::LogWriter::create_lazy(
-        log_path,
-        1,
-        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-        1,
-    ));
+    let writer = std::sync::Arc::new(
+        appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+    );
     fs.log_writer = Some(writer);
     fs.set_log_dir(log_path);
     // Set threshold to 10 operations
@@ -946,12 +940,9 @@ fn test_background_flusher_in_mount_session() {
     appendfs::init_volume(log_path, Some("main")).unwrap();
 
     let mut fs = appendfs::recover_fs(log_path).unwrap();
-    let writer = std::sync::Arc::new(appendfs::LogWriter::create_lazy(
-        log_path,
-        1,
-        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-        1,
-    ));
+    let writer = std::sync::Arc::new(
+        appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+    );
     fs.log_writer = Some(writer);
     fs.set_log_dir(log_path);
     // Set 1-second flush interval and high op threshold so automatic threshold does not trigger
@@ -989,12 +980,9 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
     appendfs::init_volume(log_path, Some("main")).unwrap();
 
     let mut fs = appendfs::recover_fs(log_path).unwrap();
-    let writer = std::sync::Arc::new(appendfs::LogWriter::create_lazy(
-        log_path,
-        1,
-        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-        1,
-    ));
+    let writer = std::sync::Arc::new(
+        appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+    );
     fs.log_writer = Some(writer);
     fs.set_log_dir(log_path);
 
@@ -1117,4 +1105,45 @@ fn test_mount_ro_rejects_mutations_and_enables_point_in_time_time_travel() {
     // step2 does NOT exist at this historical point in time
     let step2 = mount.path().join("step2");
     assert!(!step2.exists(), "step2 must NOT exist at historical point-in-time");
+}
+
+#[test]
+fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path();
+
+    appendfs::init_volume(log_path, Some("main")).unwrap();
+
+    // 1. First RW Mount: acquires exclusive lock
+    let mut fs1 = appendfs::recover_fs(log_path).unwrap();
+    let writer1 = appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1)
+        .expect("First RW mount must successfully acquire exclusive volume lock");
+    fs1.log_writer = Some(std::sync::Arc::new(writer1));
+    fs1.set_log_dir(log_path);
+
+    // 2. Second concurrent RW Mount attempt: must fail with WouldBlock
+    let err = appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap_err();
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock,
+        "Second RW mount must fail with WouldBlock"
+    );
+    assert!(
+        err.to_string().contains("already locked in read-write mode"),
+        "Error message should clearly explain volume lock collision: {}",
+        err
+    );
+
+    // 3. Concurrent RO Mount/Recovery: must succeed even while RW is actively mounted!
+    let ro_fs = appendfs::recover_fs_to_target(log_path, appendfs::RecoveryTarget::Latest)
+        .expect("RO recovery must succeed concurrently while RW mount is active");
+    assert!(ro_fs.list_directory(1).is_some());
+
+    // 4. Drop first RW mount (unmount / release lock)
+    drop(fs1);
+
+    // 5. Subsequent RW Mount: must now succeed cleanly
+    let writer2 = appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1)
+        .expect("Subsequent RW mount must succeed after previous RW mount is dropped");
+    drop(writer2);
 }

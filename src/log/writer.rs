@@ -44,6 +44,16 @@ pub struct LogWriter {
     tx_id: AtomicU64,
     storage: Arc<dyn Storage>,
     max_log_size: u64,
+    _lock: Option<Box<dyn crate::storage::StorageLock>>,
+}
+
+impl std::fmt::Debug for LogWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogWriter")
+            .field("tx_id", &self.tx_id.load(Ordering::Relaxed))
+            .field("max_log_size", &self.max_log_size)
+            .finish()
+    }
 }
 
 impl LogWriter {
@@ -82,17 +92,24 @@ impl LogWriter {
         max_log_size: u64,
         start_tx_id: u64,
     ) -> io::Result<Self> {
+        let lock = storage.acquire_exclusive_lock()?;
         let active_file = open_generation_file(&storage, generation, clock)?;
         Ok(Self {
             active_state: Mutex::new(ActiveLogState::Open(active_file)),
             tx_id: AtomicU64::new(start_tx_id),
             storage,
             max_log_size,
+            _lock: Some(lock),
         })
     }
 
     /// Creates a lazy log writer that does NOT create a `.log` file on disk until the first write.
-    pub fn create_lazy(log_dir: impl AsRef<Path>, generation: u64, max_log_size: u64, start_tx_id: u64) -> Self {
+    pub fn create_lazy(
+        log_dir: impl AsRef<Path>,
+        generation: u64,
+        max_log_size: u64,
+        start_tx_id: u64,
+    ) -> io::Result<Self> {
         let storage = Arc::new(OsStorage::new(log_dir));
         Self::create_lazy_with_storage(storage, generation, max_log_size, start_tx_id)
     }
@@ -103,13 +120,15 @@ impl LogWriter {
         generation: u64,
         max_log_size: u64,
         start_tx_id: u64,
-    ) -> Self {
-        Self {
+    ) -> io::Result<Self> {
+        let lock = storage.acquire_exclusive_lock()?;
+        Ok(Self {
             active_state: Mutex::new(ActiveLogState::Unopened { generation }),
             tx_id: AtomicU64::new(start_tx_id),
             storage,
             max_log_size,
-        }
+            _lock: Some(lock),
+        })
     }
 
     /// Returns the underlying storage instance.
@@ -383,7 +402,7 @@ mod tests {
     fn test_lazy_log_writer_creates_no_file_until_first_write() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create_lazy_with_storage(storage.clone(), 1, DEFAULT_MAX_LOG_SIZE, 1);
+        let writer = LogWriter::create_lazy_with_storage(storage.clone(), 1, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
         assert!(!writer.is_open());
         assert_eq!(writer.generation(), 1);

@@ -77,6 +77,7 @@ impl Storage for OsStorage {
             let path = entry.path();
             if path.is_file()
                 && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name != ".lock"
             {
                 files.push(name.to_string());
             }
@@ -121,4 +122,57 @@ impl Storage for OsStorage {
             file: options.open(&path)?,
         }))
     }
+
+    fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn crate::storage::StorageLock>> {
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+
+        create_dir_all(&self.base_dir)?;
+        let lock_path = self.full_path(".lock");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
+                let mut pid_buf = String::new();
+                let _ = file.read_to_string(&mut pid_buf);
+                let pid_str = pid_buf.trim();
+                let msg = if !pid_str.is_empty() {
+                    format!(
+                        "Volume at '{}' is already locked in read-write mode by PID {}",
+                        self.base_dir.display(),
+                        pid_str
+                    )
+                } else {
+                    format!(
+                        "Volume at '{}' is already locked in read-write mode",
+                        self.base_dir.display()
+                    )
+                };
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, msg));
+            }
+            return Err(err);
+        }
+
+        // Write our own PID into the lock file for diagnostics
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        let _ = writeln!(file, "{}", std::process::id());
+        let _ = file.flush();
+
+        Ok(Box::new(OsLock { _file: file }))
+    }
 }
+
+#[derive(Debug)]
+pub struct OsLock {
+    _file: File,
+}
+
+impl crate::storage::StorageLock for OsLock {}

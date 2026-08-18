@@ -65,6 +65,11 @@ pub enum WriteMode {
     Overwrite,
 }
 
+/// RAII guard representing an active exclusive lock on the storage volume.
+///
+/// Releasing or dropping this guard unlocks the storage volume.
+pub trait StorageLock: Send + Sync + std::fmt::Debug {}
+
 /// Volume log storage container interface.
 pub trait Storage: Send + Sync {
     /// Lists all file names in the volume (e.g. `["000001.log", "000001.summary"]`).
@@ -91,6 +96,12 @@ pub trait Storage: Send + Sync {
     /// Opens a file for writing, starting from empty at offset 0. `mode` decides whether an
     /// existing file is an error or is discarded.
     fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>>;
+
+    /// Attempts to acquire an exclusive lock on this storage volume.
+    ///
+    /// Fails with `ErrorKind::WouldBlock` (or similar) if another process or writer already holds
+    /// an exclusive lock on the volume.
+    fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn StorageLock>>;
 }
 
 impl<T: StorageReader + ?Sized> StorageReader for Arc<T> {
@@ -131,6 +142,10 @@ impl<T: Storage + ?Sized> Storage for Arc<T> {
     fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>> {
         (**self).open_writer(name, mode)
     }
+
+    fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn StorageLock>> {
+        (**self).acquire_exclusive_lock()
+    }
 }
 
 impl<T: Storage + ?Sized> Storage for &T {
@@ -160,6 +175,10 @@ impl<T: Storage + ?Sized> Storage for &T {
 
     fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>> {
         (**self).open_writer(name, mode)
+    }
+
+    fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn StorageLock>> {
+        (**self).acquire_exclusive_lock()
     }
 }
 
@@ -300,5 +319,38 @@ mod tests {
 
         let fault_dir = tempfile::tempdir().unwrap();
         assert_write_mode_contract(&FaultStorage::new(Arc::new(OsStorage::new(fault_dir.path()))));
+    }
+
+    #[test]
+    fn test_exclusive_locking_for_every_backend() {
+        // 1. MemoryStorage
+        let mem = MemoryStorage::new();
+        let lock1 = mem.acquire_exclusive_lock().unwrap();
+        let err = mem.acquire_exclusive_lock().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(lock1);
+        let lock2 = mem.acquire_exclusive_lock().unwrap();
+        drop(lock2);
+
+        // 2. OsStorage
+        let dir = tempfile::tempdir().unwrap();
+        let os1 = OsStorage::new(dir.path());
+        let os2 = OsStorage::new(dir.path());
+        let os_lock1 = os1.acquire_exclusive_lock().unwrap();
+        let err = os2.acquire_exclusive_lock().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(os_lock1);
+        let os_lock2 = os2.acquire_exclusive_lock().unwrap();
+        drop(os_lock2);
+
+        // 3. FaultStorage
+        let fault_dir = tempfile::tempdir().unwrap();
+        let fault = FaultStorage::new(Arc::new(OsStorage::new(fault_dir.path())));
+        let f_lock1 = fault.acquire_exclusive_lock().unwrap();
+        let err = fault.acquire_exclusive_lock().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(f_lock1);
+        let f_lock2 = fault.acquire_exclusive_lock().unwrap();
+        drop(f_lock2);
     }
 }

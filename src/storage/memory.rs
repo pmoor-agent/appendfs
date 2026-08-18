@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, RwLock};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub type InMemoryFile = Arc<RwLock<Vec<u8>>>;
 pub type MemoryStorageMap = Arc<RwLock<HashMap<String, InMemoryFile>>>;
 
@@ -10,12 +12,14 @@ pub type MemoryStorageMap = Arc<RwLock<HashMap<String, InMemoryFile>>>;
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStorage {
     files: MemoryStorageMap,
+    locked: Arc<AtomicBool>,
 }
 
 impl MemoryStorage {
     pub fn new() -> Self {
         Self {
             files: Arc::new(RwLock::new(HashMap::new())),
+            locked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -148,4 +152,34 @@ impl Storage for MemoryStorage {
 
         Ok(Box::new(MemoryStorageWriter { buffer }))
     }
+
+    fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn crate::storage::StorageLock>> {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Ok(Box::new(MemoryLock {
+                locked: Arc::clone(&self.locked),
+            }))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "MemoryStorage is already locked in read-write mode",
+            ))
+        }
+    }
 }
+
+#[derive(Debug)]
+pub struct MemoryLock {
+    locked: Arc<AtomicBool>,
+}
+
+impl Drop for MemoryLock {
+    fn drop(&mut self) {
+        self.locked.store(false, Ordering::SeqCst);
+    }
+}
+
+impl crate::storage::StorageLock for MemoryLock {}

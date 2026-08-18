@@ -63,7 +63,13 @@ fn main() {
 
             let start_tx = fs_instance.last_tx_id.load(std::sync::atomic::Ordering::SeqCst) + 1;
 
-            let writer = Arc::new(LogWriter::create_lazy(log_dir, next_gen, args.max_log_size, start_tx));
+            let writer = match LogWriter::create_lazy(log_dir, next_gen, args.max_log_size, start_tx) {
+                Ok(w) => Arc::new(w),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
 
             fs_instance.log_writer = Some(Arc::clone(&writer));
             fs_instance.max_buffer_size = args.flush_threshold;

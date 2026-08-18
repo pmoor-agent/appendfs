@@ -170,4 +170,8 @@ impl Storage for FaultStorage {
             write_partial_on_fail: Arc::clone(&self.write_partial_on_fail),
         }))
     }
+
+    fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn crate::storage::StorageLock>> {
+        self.inner.acquire_exclusive_lock()
+    }
 }
