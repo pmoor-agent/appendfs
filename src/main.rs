@@ -11,20 +11,24 @@ fn main() {
     match cli.command {
         Commands::Init(args) => {
             println!(
-                "Initializing appendfs volume at '{:?}' (branch: {})...",
-                args.log_dir, args.branch
+                "Initializing appendfs volume at '{}' (branch: {})...",
+                args.log_dir.display(),
+                args.branch
             );
             match init_volume(&args.log_dir, Some(&args.branch)) {
                 Ok(summary_path) => {
                     println!("Initialized empty appendfs volume successfully!");
-                    println!("  Log Directory:   {:?}", args.log_dir);
-                    println!("  Summary File:    {:?}", summary_path.file_name().unwrap_or_default());
+                    println!("  Log Directory:   {}", args.log_dir.display());
+                    println!(
+                        "  Summary File:    {}",
+                        summary_path.file_name().unwrap_or_default().to_string_lossy()
+                    );
                     println!("  Branch:          {}", args.branch);
                     println!("  Root Inode:      1 (/)");
                     println!("  Next Generation: 1 (000001.log)");
                 }
                 Err(e) => {
-                    eprintln!("Failed to initialize volume in '{:?}': {}", args.log_dir, e);
+                    eprintln!("Failed to initialize volume in '{}': {}", args.log_dir.display(), e);
                     std::process::exit(1);
                 }
             }
@@ -32,16 +36,22 @@ fn main() {
         Commands::Mount(args) => {
             let log_dir = &args.log_dir;
             if !log_dir.exists() {
-                eprintln!("Error: Log directory '{:?}' does not exist.", log_dir);
-                eprintln!("Run 'appendfs init {:?}' to create a new volume first.", log_dir);
+                eprintln!("Error: Log directory '{}' does not exist.", log_dir.display());
+                eprintln!(
+                    "Run 'appendfs init {}' to create a new volume first.",
+                    log_dir.display()
+                );
                 std::process::exit(1);
             }
 
-            println!("Recovering appendfs state from log directory '{:?}'...", log_dir);
+            println!(
+                "Recovering appendfs state from log directory '{}'...",
+                log_dir.display()
+            );
             let mut fs_instance = match recover_fs(log_dir) {
                 Ok(fs) => fs,
                 Err(e) => {
-                    eprintln!("Failed to recover volume from '{:?}': {}", log_dir, e);
+                    eprintln!("Failed to recover volume from '{}': {}", log_dir.display(), e);
                     std::process::exit(1);
                 }
             };
@@ -66,9 +76,9 @@ fn main() {
             let fs_instance = Arc::new(fs_instance);
 
             println!(
-                "Mounting appendfs at '{:?}' with log-dir '{:?}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, foreground: {})...",
-                args.mount_point,
-                args.log_dir,
+                "Mounting appendfs at '{}' with log-dir '{}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, foreground: {})...",
+                args.mount_point.display(),
+                args.log_dir.display(),
                 next_gen,
                 args.flush_threshold,
                 args.flush_threshold_ops,
@@ -86,7 +96,7 @@ fn main() {
         Commands::MountRo(args) | Commands::Mountro(args) => {
             let log_dir = &args.log_dir;
             if !log_dir.exists() {
-                eprintln!("Error: Log directory '{:?}' does not exist.", log_dir);
+                eprintln!("Error: Log directory '{}' does not exist.", log_dir.display());
                 std::process::exit(1);
             }
 
@@ -107,13 +117,14 @@ fn main() {
             };
 
             println!(
-                "Recovering appendfs state (read-only, target: {:?}) from '{:?}'...",
-                target, log_dir
+                "Recovering appendfs state (read-only, target: {:?}) from '{}'...",
+                target,
+                log_dir.display()
             );
             let mut fs_instance = match appendfs::recover_fs_to_target(log_dir, target) {
                 Ok(fs) => fs,
                 Err(e) => {
-                    eprintln!("Failed to recover volume from '{:?}': {}", log_dir, e);
+                    eprintln!("Failed to recover volume from '{}': {}", log_dir.display(), e);
                     std::process::exit(1);
                 }
             };
@@ -134,8 +145,10 @@ fn main() {
                 effective_gen, effective_tx_id, effective_time_str
             );
             println!(
-                "Mounting appendfs (read-only) at '{:?}' with log-dir '{:?}' (foreground: {})...",
-                args.mount_point, args.log_dir, args.foreground
+                "Mounting appendfs (read-only) at '{}' with log-dir '{}' (foreground: {})...",
+                args.mount_point.display(),
+                args.log_dir.display(),
+                args.foreground
             );
 
             let fs_instance = Arc::new(fs_instance);
@@ -148,14 +161,14 @@ fn main() {
         Commands::Stats(args) => {
             let log_dir = &args.log_dir;
             if !log_dir.exists() {
-                eprintln!("Error: Log directory '{:?}' does not exist.", log_dir);
+                eprintln!("Error: Log directory '{}' does not exist.", log_dir.display());
                 std::process::exit(1);
             }
 
             let fs = match recover_fs(log_dir) {
                 Ok(fs) => fs,
                 Err(e) => {
-                    eprintln!("Failed to inspect volume from '{:?}': {}", log_dir, e);
+                    eprintln!("Failed to inspect volume from '{}': {}", log_dir.display(), e);
                     std::process::exit(1);
                 }
             };
@@ -166,14 +179,14 @@ fn main() {
         Commands::Dump(args) => {
             let file_path = &args.file;
             if !file_path.exists() {
-                eprintln!("Error: File '{:?}' does not exist.", file_path);
+                eprintln!("Error: File '{}' does not exist.", file_path.display());
                 std::process::exit(1);
             }
 
             match appendfs::dump_file(file_path, args.verbose) {
                 Ok(output) => print!("{}", output),
                 Err(e) => {
-                    eprintln!("Error dumping file '{:?}': {}", file_path, e);
+                    eprintln!("Error dumping file '{}': {}", file_path.display(), e);
                     std::process::exit(1);
                 }
             }
@@ -181,7 +194,7 @@ fn main() {
         Commands::Check(args) | Commands::Fsck(args) => {
             let log_dir = &args.log_dir;
             if !log_dir.exists() {
-                eprintln!("Error: Log directory '{:?}' does not exist.", log_dir);
+                eprintln!("Error: Log directory '{}' does not exist.", log_dir.display());
                 std::process::exit(1);
             }
 
@@ -193,7 +206,7 @@ fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to check volume integrity at '{:?}': {}", log_dir, e);
+                    eprintln!("Failed to check volume integrity at '{}': {}", log_dir.display(), e);
                     std::process::exit(1);
                 }
             }
