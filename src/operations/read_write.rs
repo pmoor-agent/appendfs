@@ -117,7 +117,17 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
         if let EntryDelta::Node(NodeDelta::File(f)) = entry {
             f.extents
                 .insert(file_offset, write_len, shared_state.clone());
-            let current_size = f.size.unwrap_or(attr.size as u64);
+            // `f.size` is only `Some` here if an earlier op in this same live batch
+            // already touched this file - otherwise this delta was just freshly
+            // inserted above, possibly because a flush froze the previous one out from
+            // under us in the window between the unlocked `get_attr` above and this
+            // lock. In that case `attr.size` (read before the lock) can be stale - e.g.
+            // a concurrent truncate that landed in that flush - so re-resolve the
+            // current size from below `live` instead of trusting it.
+            let current_size = f
+                .size
+                .or_else(|| fs.attr_below_live(ino).map(|a| a.size as u64))
+                .unwrap_or(attr.size as u64);
             f.size = Some(std::cmp::max(current_size, file_offset + write_len));
             f.attr_delta.mtime = Some(now);
             f.attr_delta.ctime = Some(now);

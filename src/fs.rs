@@ -309,12 +309,21 @@ impl InMemoryFS {
             None => {}
         }
 
-        // Inode not in live yet - query existing type from lower layers without re-acquiring live lock
+        // Inode not in live yet - query existing type from lower layers without re-acquiring live lock.
+        // A tombstone found in `flushing` is authoritative and must NOT fall through to
+        // `base`: `base` still holds the pre-delete node until that tombstone's batch is
+        // folded, and since inode numbers are never reused, a tombstone anywhere below
+        // `live` means this inode is gone for good. Collapsing "explicitly tombstoned"
+        // and "not found at all" into the same `None` (as a bare `Option<FileType>`
+        // would) made this fall through to `base` and resurrect the inode - exactly the
+        // live-side counterpart of the `live`-tombstone case handled above.
         let mut file_type = None;
+        let mut found_in_flushing = false;
         {
             let flushing_read = self.flushing.read().unwrap();
             for flushing_map in flushing_read.iter().rev() {
                 if let Some(entry) = flushing_map.get(&ino) {
+                    found_in_flushing = true;
                     match entry {
                         EntryDelta::Tombstone => {
                             file_type = None;
@@ -336,7 +345,7 @@ impl InMemoryFS {
                 }
             }
         }
-        if file_type.is_none() {
+        if file_type.is_none() && !found_in_flushing {
             file_type = self
                 .base
                 .read()
@@ -410,38 +419,35 @@ impl InMemoryFS {
 
     // --- Overlay Query & Resolution Methods ---
 
-    /// Resolves full `FileAttr` for an inode across `live` -> `flushing` -> `base`.
-    pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
-        let mut attr: Option<FileAttr> = self
-            .base
+    /// Resolves full `FileAttr` for an inode across `flushing` -> `base`, deliberately
+    /// skipping `live`. Used by mutators that already hold `live`'s write lock and need
+    /// the authoritative pre-live state *as of right now* - unlike a `get_attr` call
+    /// made before taking that lock, which can go stale if a flush freezes `live` out
+    /// from under the caller in the window between the read and the lock acquisition.
+    ///
+    /// Reads `flushing` *before* `base`, even though `base` is logically the older
+    /// layer: `fold_flushed_batch` writes a batch's delta into `base` and only pops it
+    /// out of `flushing` afterward, so a batch is briefly visible in both places at
+    /// once, never in neither. Reading `base` first (as this used to) can straddle that
+    /// transition - a `base` read that lands *before* the fold's write, followed by a
+    /// `flushing` read that lands *after* the pop, sees neither the old value (base
+    /// hadn't been touched... it had, we just read too early) nor the new one, silently
+    /// dropping the update. Reading `flushing` first closes the gap: if a batch is
+    /// already gone from `flushing` by the time we check, the fold that removed it
+    /// happened-before that observation, and the fold's `base` write happened-before
+    /// its own pop - so by transitivity our later `base` read is guaranteed fresh.
+    pub fn attr_below_live(&self, ino: u64) -> Option<FileAttr> {
+        let flushing_entries: Vec<EntryDelta> = self
+            .flushing
             .read()
             .unwrap()
-            .get(&ino)
-            .map(|arc| node_to_attr(ino, arc.as_ref()));
+            .iter()
+            .filter_map(|batch| batch.get(&ino).cloned())
+            .collect();
+        let base_node = self.base.read().unwrap().get(&ino).cloned();
 
-        {
-            let flushing_read = self.flushing.read().unwrap();
-            for flushing_map in flushing_read.iter() {
-                if let Some(entry) = flushing_map.get(&ino) {
-                    match entry {
-                        EntryDelta::Tombstone => {
-                            attr = None;
-                        }
-                        EntryDelta::Node(delta) => {
-                            if let Some(ref mut a) = attr {
-                                apply_node_delta(a, delta);
-                            } else {
-                                let mut a = delta_to_initial_attr(ino, delta);
-                                apply_node_delta(&mut a, delta);
-                                attr = Some(a);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(entry) = self.live.read().unwrap().get(&ino) {
+        let mut attr: Option<FileAttr> = base_node.map(|arc| node_to_attr(ino, arc.as_ref()));
+        for entry in &flushing_entries {
             match entry {
                 EntryDelta::Tombstone => {
                     attr = None;
@@ -452,6 +458,37 @@ impl InMemoryFS {
                     } else {
                         let mut a = delta_to_initial_attr(ino, delta);
                         apply_node_delta(&mut a, delta);
+                        attr = Some(a);
+                    }
+                }
+            }
+        }
+
+        attr
+    }
+
+    /// Resolves full `FileAttr` for an inode across `live` -> `flushing` -> `base`.
+    ///
+    /// Reads `live` before delegating to `attr_below_live` for the same reason that
+    /// function reads `flushing` before `base`: `begin_flush` empties `live` into
+    /// `flushing` in two separate lock acquisitions, so a `live` read landing in that
+    /// gap must be followed by a `flushing`/`base` read that is guaranteed to already
+    /// see it - which is exactly what reading `live` first, then delegating, gives us.
+    pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
+        let live_entry = self.live.read().unwrap().get(&ino).cloned();
+        let mut attr = self.attr_below_live(ino);
+
+        if let Some(entry) = live_entry {
+            match entry {
+                EntryDelta::Tombstone => {
+                    attr = None;
+                }
+                EntryDelta::Node(delta) => {
+                    if let Some(ref mut a) = attr {
+                        apply_node_delta(a, &delta);
+                    } else {
+                        let mut a = delta_to_initial_attr(ino, &delta);
+                        apply_node_delta(&mut a, &delta);
                         attr = Some(a);
                     }
                 }
@@ -516,6 +553,25 @@ impl InMemoryFS {
             return None;
         }
 
+        // Clone newest-layer-first (live, then flushing, then base) before applying any
+        // of them, so a concurrent `begin_flush`/`fold_flushed_batch` transition can't
+        // be caught mid-move and silently drop a directory-entry change - see
+        // `attr_below_live`'s comment for the full argument.
+        let live_dir: Option<DirectoryDelta> = match self.live.read().unwrap().get(&parent) {
+            Some(EntryDelta::Node(NodeDelta::Directory(d))) => Some(d.clone()),
+            _ => None,
+        };
+        let flushing_dirs: Vec<DirectoryDelta> = self
+            .flushing
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|batch| match batch.get(&parent) {
+                Some(EntryDelta::Node(NodeDelta::Directory(d))) => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
+
         let mut map: HashMap<String, u64> = HashMap::new();
 
         if let Some(arc) = self.base.read().unwrap().get(&parent) {
@@ -527,23 +583,16 @@ impl InMemoryFS {
             }
         }
 
-        {
-            let flushing_read = self.flushing.read().unwrap();
-            for flushing_map in flushing_read.iter() {
-                if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = flushing_map.get(&parent) {
-                    for name in &d.removed {
-                        map.remove(name);
-                    }
-                    for (name, child_ino) in &d.added {
-                        map.insert(name.clone(), *child_ino);
-                    }
-                }
+        for d in &flushing_dirs {
+            for name in &d.removed {
+                map.remove(name);
+            }
+            for (name, child_ino) in &d.added {
+                map.insert(name.clone(), *child_ino);
             }
         }
 
-        if let Some(EntryDelta::Node(NodeDelta::Directory(d))) =
-            self.live.read().unwrap().get(&parent)
-        {
+        if let Some(d) = &live_dir {
             for name in &d.removed {
                 map.remove(name);
             }
@@ -770,32 +819,40 @@ impl InMemoryFS {
     }
 
     /// Merges all layers into a consolidated snapshot map.
+    ///
+    /// Clones `live`, then `flushing`, then `base` - newest layer first - before
+    /// applying any of them, for the same reason `get_attr`/`attr_below_live` do:
+    /// `begin_flush` and `fold_flushed_batch` each move data one layer down (never up)
+    /// in two separate lock acquisitions, so cloning oldest-first can straddle a
+    /// transition and silently miss the batch that moved. Cloning newest-first closes
+    /// that gap - see `attr_below_live`'s comment for the full happens-before argument.
+    /// The clones are then applied in the normal oldest-to-newest logical order.
     pub fn snapshot_all(&self) -> HashMap<u64, Arc<Node>> {
+        let live_snapshot: HashMap<u64, EntryDelta> = self.live.read().unwrap().clone();
+        let flushing_snapshot: VecDeque<HashMap<u64, EntryDelta>> =
+            self.flushing.read().unwrap().clone();
         let mut result: HashMap<u64, Arc<Node>> = self.base.read().unwrap().clone();
 
-        {
-            let flushing_read = self.flushing.read().unwrap();
-            for flushing_map in flushing_read.iter() {
-                for (ino, entry) in flushing_map {
-                    match entry {
-                        EntryDelta::Tombstone => {
-                            result.remove(ino);
-                        }
-                        EntryDelta::Node(delta) => {
-                            if let Some(existing_arc) = result.get(ino).cloned() {
-                                let mut node_clone = (*existing_arc).clone();
-                                apply_delta_to_node(&mut node_clone, delta);
-                                result.insert(*ino, Arc::new(node_clone));
-                            } else {
-                                result.insert(*ino, Arc::new(delta_to_node(delta)));
-                            }
+        for flushing_map in flushing_snapshot.iter() {
+            for (ino, entry) in flushing_map {
+                match entry {
+                    EntryDelta::Tombstone => {
+                        result.remove(ino);
+                    }
+                    EntryDelta::Node(delta) => {
+                        if let Some(existing_arc) = result.get(ino).cloned() {
+                            let mut node_clone = (*existing_arc).clone();
+                            apply_delta_to_node(&mut node_clone, delta);
+                            result.insert(*ino, Arc::new(node_clone));
+                        } else {
+                            result.insert(*ino, Arc::new(delta_to_node(delta)));
                         }
                     }
                 }
             }
         }
 
-        for (ino, entry) in self.live.read().unwrap().iter() {
+        for (ino, entry) in live_snapshot.iter() {
             match entry {
                 EntryDelta::Tombstone => {
                     result.remove(ino);
@@ -1162,13 +1219,14 @@ impl InMemoryFS {
                 }
             }
             let mut emitted = vec![false; renames_to_emit.len()];
-            let mut order: Vec<usize> = Vec::with_capacity(renames_to_emit.len());
+            let mut ordered_renames: Vec<(u64, u64, String, u64, String, SystemTime)> =
+                Vec::with_capacity(renames_to_emit.len());
             loop {
                 let mut progressed = false;
                 for idx in 0..renames_to_emit.len() {
                     if !emitted[idx] && predecessor[idx].is_none_or(|p| emitted[p]) {
                         emitted[idx] = true;
-                        order.push(idx);
+                        ordered_renames.push(renames_to_emit[idx].clone());
                         progressed = true;
                     }
                 }
@@ -1176,18 +1234,46 @@ impl InMemoryFS {
                     break;
                 }
             }
-            // Anything left is a dependency cycle (names swapped among themselves), which
-            // has no correct emission order; fall back to discovery order for those.
-            for idx in 0..renames_to_emit.len() {
-                if !emitted[idx] {
-                    order.push(idx);
+            // Anything left is a dependency cycle (names swapped among themselves) - since
+            // each name has exactly one occupant, every node has at most one predecessor,
+            // so an unresolved component can only be a simple cycle, never a general DAG.
+            // A plain sequence of Renames structurally cannot represent a cycle: whichever
+            // one replays first finds its destination still occupied by a sibling that, in
+            // live, had already moved on - and recovery's rename-overwrite semantics then
+            // deletes that sibling for real (decrementing its nlink for a link it no longer
+            // held), corrupting its link count and, once its remaining real links are later
+            // unlinked, dropping it from the fs entirely even though live still has it.
+            //
+            // Break each cycle the same way Phase 2 breaks Mkdir ordering cycles: reroute
+            // one member through a scratch name under root. That member's first hop (into
+            // scratch) frees its source without needing anything freed first, which lets
+            // the rest of the cycle proceed in dependency order; its second hop (scratch to
+            // the real destination) runs last, once whichever rename frees that name has run.
+            let mut visited = vec![false; renames_to_emit.len()];
+            for start in 0..renames_to_emit.len() {
+                if emitted[start] || visited[start] {
+                    continue;
                 }
+                let mut cycle = Vec::new();
+                let mut cur = start;
+                while !emitted[cur] && !visited[cur] {
+                    visited[cur] = true;
+                    cycle.push(cur);
+                    cur = predecessor[cur].expect("unresolved rename must be part of a cycle");
+                }
+                let breaker = cycle[0];
+                let (child_ino, parent, name, new_parent, new_name, op_time) =
+                    renames_to_emit[breaker].clone();
+                let tmp_name = format!(".agy_tmp_rename_{}", child_ino);
+                ordered_renames.push((child_ino, parent, name, 1, tmp_name.clone(), op_time));
+                emitted[breaker] = true;
+                for &idx in cycle[1..].iter().rev() {
+                    emitted[idx] = true;
+                    ordered_renames.push(renames_to_emit[idx].clone());
+                }
+                ordered_renames.push((child_ino, 1, tmp_name, new_parent, new_name, op_time));
             }
 
-            let ordered_renames: Vec<_> = order
-                .into_iter()
-                .map(|idx| renames_to_emit[idx].clone())
-                .collect();
             for (child_ino, parent, name, new_parent, new_name, op_time) in ordered_renames {
                 let payload = RenamePayload {
                     parent,
