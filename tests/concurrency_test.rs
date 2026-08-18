@@ -19,6 +19,7 @@ use appendfs::operations::locks::{flock_core, getlk_core, setlk_core};
 use appendfs::operations::read_write::{
     FUSE_SET_ATTR_SIZE, create_core, getattr_core, open_core, read_core, release_core, setattr_core, write_core,
 };
+use appendfs::operations::xattr::{getxattr_core, listxattr_core, removexattr_core, setxattr_core};
 use appendfs::shim::{FileType, ShimFlock};
 use common::TestRng;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -33,6 +34,7 @@ const NUM_THREADS: usize = 8;
 const OPS_PER_THREAD: usize = 400;
 const DIR_NAMES: [&str; 4] = ["d0", "d1", "d2", "d3"];
 const FILE_NAMES: [&str; 4] = ["f0", "f1", "f2", "f3"];
+const XATTR_NAMES: [&str; 3] = ["user.a", "user.b", "user.c"];
 
 fn pick_entry(fs: &InMemoryFS, dir_ino: u64, rng: &mut TestRng) -> Option<(String, u64)> {
     match list_dir_core(fs, dir_ino) {
@@ -73,7 +75,11 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
     for _ in 0..OPS_PER_THREAD {
         let dir_a = pick_target_dir(&fs, &shared_dirs, &mut rng);
         let dir_b = pick_target_dir(&fs, &shared_dirs, &mut rng);
-        match rng.gen_range(0, 8) {
+        // Upper bound must stay >= the highest explicit arm below, with room left over
+        // for the catch-all rename arm (`_`) to still be reachable - arms 9-11 were
+        // silently dead code until this bound was widened alongside the new xattr arm,
+        // since `gen_range(0, 8)` never produced anything past 8.
+        match rng.gen_range(0, 13) {
             0 => {
                 let name = DIR_NAMES[rng.gen_range(0, DIR_NAMES.len() - 1)];
                 let _ = mkdir_core(&fs, dir_a, name, 0o755, UID, GID);
@@ -180,6 +186,41 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                     let _ = setlk_core(&fs, ino, fh, seed, lock, false);
                     let _ = getlk_core(&fs, ino, fh, seed, lock);
                     let _ = release_core(&fs, ino, fh);
+                }
+            }
+            12 => {
+                // Exercise xattr set/get/list/remove concurrently, on either a
+                // directory or a file/symlink inside it - this fs doesn't restrict
+                // xattrs by node type. Small fixed name pool so concurrent
+                // set/replace/remove races over the same name happen naturally,
+                // matching DIR_NAMES/FILE_NAMES above.
+                let target = if rng.gen_range(0, 1) == 0 {
+                    Some(dir_a)
+                } else {
+                    pick_entry(&fs, dir_a, &mut rng).map(|(_, ino)| ino)
+                };
+                if let Some(ino) = target {
+                    let name = XATTR_NAMES[rng.gen_range(0, XATTR_NAMES.len() - 1)];
+                    match rng.gen_range(0, 3) {
+                        0 => {
+                            let value = vec![b'z'; rng.gen_range(0, 32)];
+                            let flags = match rng.gen_range(0, 2) {
+                                0 => 0,
+                                1 => libc::XATTR_CREATE,
+                                _ => libc::XATTR_REPLACE,
+                            };
+                            let _ = setxattr_core(&fs, ino, name, &value, flags);
+                        }
+                        1 => {
+                            let _ = removexattr_core(&fs, ino, name);
+                        }
+                        2 => {
+                            let _ = getxattr_core(&fs, ino, name, 0);
+                        }
+                        _ => {
+                            let _ = listxattr_core(&fs, ino, 0);
+                        }
+                    }
                 }
             }
             _ => {

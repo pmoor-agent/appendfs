@@ -445,6 +445,71 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         }
                     }
                 }
+                14 => {
+                    // Xattr: setxattr/getxattr/listxattr/removexattr in a random
+                    // combination, targeting either a file or a directory - this fs
+                    // doesn't restrict xattrs by node type. Small fixed name pool so
+                    // create/replace/remove races over the same name happen naturally,
+                    // mirroring the name pools the create/mkdir cases above use.
+                    let mut candidates = active_files.clone();
+                    candidates.extend_from_slice(&active_dirs);
+                    if !candidates.is_empty() {
+                        let ino = candidates[prng.gen_range(0, candidates.len() - 1)];
+                        let names = ["user.a", "user.b", "user.c"];
+                        let name = names[prng.gen_range(0, names.len() - 1)];
+
+                        match prng.gen_range(0, 3) {
+                            0 => {
+                                let value_len = prng.gen_range(0, 32);
+                                let value: Vec<u8> = (0..value_len).map(|i| ((step + i) % 256) as u8).collect();
+                                let flags = match prng.gen_range(0, 2) {
+                                    0 => 0,
+                                    1 => libc::XATTR_CREATE,
+                                    _ => libc::XATTR_REPLACE,
+                                };
+
+                                let res1 = fs_baseline.setxattr(ino, name, &value, flags);
+                                let res2 = fs_micro.setxattr(ino, name, &value, flags);
+                                let res3 = fs_remount.setxattr(ino, name, &value, flags);
+                                let res4 = fs_crash.setxattr(ino, name, &value, flags);
+
+                                assert_eq!(res1, res2, "setxattr result mismatch (baseline vs micro)");
+                                assert_eq!(res1, res3, "setxattr result mismatch (baseline vs remount)");
+                                assert_eq!(res1, res4, "setxattr result mismatch (baseline vs crash)");
+                            }
+                            1 => {
+                                let res1 = fs_baseline.removexattr(ino, name);
+                                let res2 = fs_micro.removexattr(ino, name);
+                                let res3 = fs_remount.removexattr(ino, name);
+                                let res4 = fs_crash.removexattr(ino, name);
+
+                                assert_eq!(res1, res2, "removexattr result mismatch (baseline vs micro)");
+                                assert_eq!(res1, res3, "removexattr result mismatch (baseline vs remount)");
+                                assert_eq!(res1, res4, "removexattr result mismatch (baseline vs crash)");
+                            }
+                            2 => {
+                                let res1 = fs_baseline.getxattr(ino, name);
+                                let res2 = fs_micro.getxattr(ino, name);
+                                let res3 = fs_remount.getxattr(ino, name);
+                                let res4 = fs_crash.getxattr(ino, name);
+
+                                assert_eq!(res1, res2, "getxattr result mismatch (baseline vs micro)");
+                                assert_eq!(res1, res3, "getxattr result mismatch (baseline vs remount)");
+                                assert_eq!(res1, res4, "getxattr result mismatch (baseline vs crash)");
+                            }
+                            _ => {
+                                let res1 = fs_baseline.listxattr(ino);
+                                let res2 = fs_micro.listxattr(ino);
+                                let res3 = fs_remount.listxattr(ino);
+                                let res4 = fs_crash.listxattr(ino);
+
+                                assert_eq!(res1, res2, "listxattr result mismatch (baseline vs micro)");
+                                assert_eq!(res1, res3, "listxattr result mismatch (baseline vs remount)");
+                                assert_eq!(res1, res4, "listxattr result mismatch (baseline vs crash)");
+                            }
+                        }
+                    }
+                }
                 _ => {
                     // Release file
                     if !open_file_handles.is_empty() {
@@ -520,10 +585,26 @@ fn test_differential_fuzzing_and_crash_recovery() {
 
                     match (snap, micro_snap, remount_snap, crash_snap) {
                         (
-                            SnapshotNode::Directory { attr: a1, entries: e1 },
-                            SnapshotNode::Directory { attr: a2, entries: e2 },
-                            SnapshotNode::Directory { attr: a3, entries: e3 },
-                            SnapshotNode::Directory { attr: a4, entries: e4 },
+                            SnapshotNode::Directory {
+                                attr: a1,
+                                entries: e1,
+                                xattrs: x1,
+                            },
+                            SnapshotNode::Directory {
+                                attr: a2,
+                                entries: e2,
+                                xattrs: x2,
+                            },
+                            SnapshotNode::Directory {
+                                attr: a3,
+                                entries: e3,
+                                xattrs: x3,
+                            },
+                            SnapshotNode::Directory {
+                                attr: a4,
+                                entries: e4,
+                                xattrs: x4,
+                            },
                         ) => {
                             // Exact Vec order, not just set-equality: live rename does
                             // an in-place update for same-parent renames (preserving
@@ -572,12 +653,35 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 "Directory mtime/ctime mismatch at inode {} (baseline vs crash)",
                                 ino
                             );
+                            assert_eq!(x1, x2, "Directory xattrs mismatch at inode {} (baseline vs micro)", ino);
+                            assert_eq!(
+                                x1, x3,
+                                "Directory xattrs mismatch at inode {} (baseline vs remount)",
+                                ino
+                            );
+                            assert_eq!(x1, x4, "Directory xattrs mismatch at inode {} (baseline vs crash)", ino);
                         }
                         (
-                            SnapshotNode::File { attr: a1, content: c1 },
-                            SnapshotNode::File { attr: a2, content: c2 },
-                            SnapshotNode::File { attr: a3, content: c3 },
-                            SnapshotNode::File { attr: a4, content: c4 },
+                            SnapshotNode::File {
+                                attr: a1,
+                                content: c1,
+                                xattrs: x1,
+                            },
+                            SnapshotNode::File {
+                                attr: a2,
+                                content: c2,
+                                xattrs: x2,
+                            },
+                            SnapshotNode::File {
+                                attr: a3,
+                                content: c3,
+                                xattrs: x3,
+                            },
+                            SnapshotNode::File {
+                                attr: a4,
+                                content: c4,
+                                xattrs: x4,
+                            },
                         ) => {
                             assert_eq!(c1, c2, "Content mismatch at inode {} (baseline vs micro)", ino);
                             assert_eq!(c1, c3, "Content mismatch at inode {} (baseline vs remount)", ino);
@@ -650,12 +754,31 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 "File mtime/ctime mismatch at inode {} (baseline vs crash)",
                                 ino
                             );
+                            assert_eq!(x1, x2, "File xattrs mismatch at inode {} (baseline vs micro)", ino);
+                            assert_eq!(x1, x3, "File xattrs mismatch at inode {} (baseline vs remount)", ino);
+                            assert_eq!(x1, x4, "File xattrs mismatch at inode {} (baseline vs crash)", ino);
                         }
                         (
-                            SnapshotNode::Symlink { attr: a1, target: t1 },
-                            SnapshotNode::Symlink { attr: a2, target: t2 },
-                            SnapshotNode::Symlink { attr: a3, target: t3 },
-                            SnapshotNode::Symlink { attr: a4, target: t4 },
+                            SnapshotNode::Symlink {
+                                attr: a1,
+                                target: t1,
+                                xattrs: x1,
+                            },
+                            SnapshotNode::Symlink {
+                                attr: a2,
+                                target: t2,
+                                xattrs: x2,
+                            },
+                            SnapshotNode::Symlink {
+                                attr: a3,
+                                target: t3,
+                                xattrs: x3,
+                            },
+                            SnapshotNode::Symlink {
+                                attr: a4,
+                                target: t4,
+                                xattrs: x4,
+                            },
                         ) => {
                             assert_eq!(t1, t2, "Symlink target mismatch at inode {} (baseline vs micro)", ino);
                             assert_eq!(t1, t3, "Symlink target mismatch at inode {} (baseline vs remount)", ino);
@@ -713,6 +836,9 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 "Symlink mtime/ctime mismatch at inode {} (baseline vs crash)",
                                 ino
                             );
+                            assert_eq!(x1, x2, "Symlink xattrs mismatch at inode {} (baseline vs micro)", ino);
+                            assert_eq!(x1, x3, "Symlink xattrs mismatch at inode {} (baseline vs remount)", ino);
+                            assert_eq!(x1, x4, "Symlink xattrs mismatch at inode {} (baseline vs crash)", ino);
                         }
                         _ => panic!("Node type mismatch for inode {}", ino),
                     }

@@ -255,19 +255,43 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
         fs.add_dir_entry(newparent, newname, source_ino, now);
         if src_is_dir && parent != newparent {
             fs.update_dir_parent(source_ino, newparent);
-            fs.update_attr_delta(
-                parent,
-                AttrDelta {
-                    nlink: Some(parent_attr.nlink.saturating_sub(1)),
-                    ctime: Some(now),
-                    ..Default::default()
-                },
-            );
-            if !dest_was_dir {
+        }
+        if src_is_dir {
+            // Two independent effects on subdirectory counts, composed rather than
+            // handled as one combined case: moving to a different parent costs `parent`
+            // a subdirectory and gains `newparent` one; clobbering an existing empty
+            // directory at the destination costs `newparent` a subdirectory, regardless
+            // of whether that's the same directory as `parent`. Handling them as a
+            // single "cross-parent move, minus a same-parent-rename special case" (as
+            // this used to) missed the case where they're `parent == newparent` *and*
+            // dest_was_dir: renaming a directory onto an existing empty sibling in the
+            // same parent removes a subdirectory (the clobbered sibling) without adding
+            // one (the source was already counted), and nothing here applied that half
+            // when the "cross-parent" condition gating the whole block was false.
+            let mut parent_delta: i64 = 0;
+            let mut newparent_delta: i64 = 0;
+            if parent != newparent {
+                parent_delta -= 1;
+                newparent_delta += 1;
+            }
+            if dest_was_dir {
+                newparent_delta -= 1;
+            }
+            if parent_delta != 0 {
+                fs.update_attr_delta(
+                    parent,
+                    AttrDelta {
+                        nlink: Some((parent_attr.nlink as i64 + parent_delta) as u32),
+                        ctime: Some(now),
+                        ..Default::default()
+                    },
+                );
+            }
+            if newparent_delta != 0 {
                 fs.update_attr_delta(
                     newparent,
                     AttrDelta {
-                        nlink: Some(newparent_attr.nlink + 1),
+                        nlink: Some((newparent_attr.nlink as i64 + newparent_delta) as u32),
                         ctime: Some(now),
                         ..Default::default()
                     },

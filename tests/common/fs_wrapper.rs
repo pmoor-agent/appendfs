@@ -18,17 +18,21 @@ pub enum SnapshotNode {
     Directory {
         attr: FileAttr,
         entries: Vec<(String, u64)>,
+        xattrs: HashMap<String, Vec<u8>>,
     },
     File {
         attr: FileAttr,
         content: Vec<u8>,
+        xattrs: HashMap<String, Vec<u8>>,
     },
     Symlink {
         attr: FileAttr,
         target: String,
+        xattrs: HashMap<String, Vec<u8>>,
     },
     Special {
         attr: FileAttr,
+        xattrs: HashMap<String, Vec<u8>>,
     },
 }
 
@@ -232,6 +236,67 @@ impl TestFS {
         appendfs::operations::read_write::release_core(&self.fs, ino, fh)
     }
 
+    pub fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<(), i32> {
+        appendfs::operations::xattr::setxattr_core(&self.fs, ino, name, value, flags)
+    }
+
+    /// Runs the real two-phase getxattr protocol (query size, then fetch with that
+    /// size) rather than just requesting a large fixed buffer, so this exercises the
+    /// same size/ERANGE path a real xattr syscall would.
+    pub fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, i32> {
+        use appendfs::operations::xattr::GetxattrResult;
+        match appendfs::operations::xattr::getxattr_core(&self.fs, ino, name, 0)? {
+            // A 0-length value is indistinguishable from "just tell me the size" at
+            // size 0 - same ambiguity a real getxattr(2) caller has - so short-circuit
+            // instead of re-querying with size 0 and hitting that same branch again.
+            GetxattrResult::Size(0) => Ok(Vec::new()),
+            GetxattrResult::Size(size) => {
+                match appendfs::operations::xattr::getxattr_core(&self.fs, ino, name, size)? {
+                    GetxattrResult::Data(data) => Ok(data),
+                    GetxattrResult::Size(_) => unreachable!("size query answered with another size"),
+                }
+            }
+            GetxattrResult::Data(_) => unreachable!("size-0 query returned data"),
+        }
+    }
+
+    pub fn removexattr(&self, ino: u64, name: &str) -> Result<(), i32> {
+        appendfs::operations::xattr::removexattr_core(&self.fs, ino, name)
+    }
+
+    /// Same two-phase size-then-data protocol as `getxattr`; returns the decoded,
+    /// null-separated attribute names.
+    pub fn listxattr(&self, ino: u64) -> Result<Vec<String>, i32> {
+        use appendfs::operations::xattr::ListxattrResult;
+        let buf = match appendfs::operations::xattr::listxattr_core(&self.fs, ino, 0)? {
+            // See the same-value comment in `getxattr` - size 0 has no second call to make.
+            ListxattrResult::Size(0) => Vec::new(),
+            ListxattrResult::Size(size) => match appendfs::operations::xattr::listxattr_core(&self.fs, ino, size)? {
+                ListxattrResult::Data(data) => data,
+                ListxattrResult::Size(_) => unreachable!("size query answered with another size"),
+            },
+            ListxattrResult::Data(data) => data,
+        };
+        Ok(buf
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect())
+    }
+
+    /// Resolves the full set of an inode's xattrs (name -> value) for snapshot
+    /// comparison, via the same public getxattr/listxattr path a real caller would use.
+    fn xattr_snapshot(&self, ino: u64) -> HashMap<String, Vec<u8>> {
+        let names = self.listxattr(ino).unwrap_or_default();
+        names
+            .into_iter()
+            .filter_map(|name| {
+                let value = self.getxattr(ino, &name).ok()?;
+                Some((name, value))
+            })
+            .collect()
+    }
+
     pub fn get_tree_snapshot(&self) -> HashMap<u64, SnapshotNode> {
         let mut snapshot = HashMap::new();
         let mut visited = std::collections::HashSet::new();
@@ -245,6 +310,7 @@ impl TestFS {
                 Err(_) => continue,
             };
 
+            let xattrs = self.xattr_snapshot(ino);
             match attr.file_type {
                 FileType::Directory => {
                     let entries = appendfs::operations::dir::list_dir_core(&self.fs, ino).unwrap_or_default();
@@ -253,21 +319,18 @@ impl TestFS {
                             queue.push_back(*child_ino);
                         }
                     }
-                    snapshot.insert(ino, SnapshotNode::Directory { attr, entries });
+                    snapshot.insert(ino, SnapshotNode::Directory { attr, entries, xattrs });
                 }
                 FileType::RegularFile => {
                     let content = self.read(ino, 0, attr.size as usize).unwrap_or_default();
-                    snapshot.insert(ino, SnapshotNode::File { attr, content });
+                    snapshot.insert(ino, SnapshotNode::File { attr, content, xattrs });
                 }
                 FileType::Symlink => {
                     let target = appendfs::operations::links::readlink_core(&self.fs, ino).unwrap_or_default();
-                    snapshot.insert(ino, SnapshotNode::Symlink { attr, target });
+                    snapshot.insert(ino, SnapshotNode::Symlink { attr, target, xattrs });
                 }
-                FileType::NamedPipe
-                | FileType::CharDevice
-                | FileType::BlockDevice
-                | FileType::Socket => {
-                    snapshot.insert(ino, SnapshotNode::Special { attr });
+                FileType::NamedPipe | FileType::CharDevice | FileType::BlockDevice | FileType::Socket => {
+                    snapshot.insert(ino, SnapshotNode::Special { attr, xattrs });
                 }
             }
         }
