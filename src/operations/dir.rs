@@ -129,9 +129,13 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
         }
     };
 
+    let items: Vec<DirItem> = iter_dir_entries(fs, ino, &entries, offset).collect();
+    let inos: Vec<u64> = items.iter().map(|item| item.ino).collect();
+    let attrs = fs.get_attrs_batch(&inos);
+
     let mut db = shim::DirectoryBuffer::new(req, size);
-    for item in iter_dir_entries(fs, ino, &entries, offset) {
-        if let Some(attr) = fs.get_attr(item.ino)
+    for item in items {
+        if let Some(attr) = attrs.get(&item.ino)
             && !db.add(item.name, item.ino, attr.file_type, item.next_offset)
         {
             break;
@@ -150,10 +154,14 @@ pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset:
         }
     };
 
+    let items: Vec<DirItem> = iter_dir_entries(fs, ino, &entries, offset).collect();
+    let inos: Vec<u64> = items.iter().map(|item| item.ino).collect();
+    let attrs = fs.get_attrs_batch(&inos);
+
     let mut db = shim::DirectoryBufferPlus::new(req, size);
-    for item in iter_dir_entries(fs, ino, &entries, offset) {
-        if let Some(attr) = fs.get_attr(item.ino)
-            && !db.add(item.name, &attr, 1.0, 1.0, item.next_offset)
+    for item in items {
+        if let Some(attr) = attrs.get(&item.ino)
+            && !db.add(item.name, attr, 1.0, 1.0, item.next_offset)
         {
             break;
         }

@@ -541,6 +541,62 @@ impl InMemoryFS {
         attr
     }
 
+    /// Resolves full `FileAttr`s for a slice of inode IDs across `live` -> `flushing` -> `base`
+    /// in a single atomic snapshot pass while holding all three layer read locks concurrently.
+    pub fn get_attrs_batch(&self, inos: &[u64]) -> HashMap<u64, FileAttr> {
+        let live = self.live.read().unwrap();
+        let flushing = self.flushing.read().unwrap();
+        let base = self.base.read().unwrap();
+
+        let mut result = HashMap::with_capacity(inos.len());
+
+        for &ino in inos {
+            // 1. Check base
+            let base_node = base.get(&ino);
+            let mut attr = base_node.map(|arc| node_to_attr(ino, arc.as_ref()));
+
+            // 2. Apply flushing deltas (oldest to newest)
+            for batch in flushing.iter() {
+                if let Some(entry) = batch.get(&ino) {
+                    match entry {
+                        EntryDelta::Tombstone => attr = None,
+                        EntryDelta::Node(delta) => {
+                            if let Some(ref mut a) = attr {
+                                apply_node_delta(a, delta);
+                            } else {
+                                let mut a = delta_to_initial_attr(ino, delta);
+                                apply_node_delta(&mut a, delta);
+                                attr = Some(a);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Apply live delta
+            if let Some(entry) = live.get(&ino) {
+                match entry {
+                    EntryDelta::Tombstone => attr = None,
+                    EntryDelta::Node(delta) => {
+                        if let Some(ref mut a) = attr {
+                            apply_node_delta(a, delta);
+                        } else {
+                            let mut a = delta_to_initial_attr(ino, delta);
+                            apply_node_delta(&mut a, delta);
+                            attr = Some(a);
+                        }
+                    }
+                }
+            }
+
+            if let Some(a) = attr {
+                result.insert(ino, a);
+            }
+        }
+
+        result
+    }
+
     /// Looks up a child entry by `name` inside `parent` directory across layers.
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
         if let Some(entry) = self.live.read().unwrap().get(&parent) {
@@ -3030,5 +3086,48 @@ mod tests {
             fs.get_attr(ino).is_none(),
             "Unlinked file with 0 handles must be tombstoned"
         );
+    }
+
+    #[test]
+    fn test_get_attrs_batch_across_layers() {
+        let fs = InMemoryFS::new();
+
+        // 1. Create file1 in live -> freeze to flushing -> fold to base
+        let attr1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.begin_flush();
+        let batch = fs.flushing.write().unwrap().pop_front().unwrap();
+        fs.fold_flushed_batch(batch);
+
+        // 2. Create file2 in live -> freeze to flushing (stays in flushing)
+        let attr2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.begin_flush();
+
+        // 3. Create file3 in live (stays in live)
+        let attr3 = crate::operations::read_write::create_core(&fs, 1, "file3.txt", 0o644, 0, 1000, 1000).unwrap();
+
+        // 4. Create and unlink file4 (tombstoned)
+        let attr4 = crate::operations::read_write::create_core(&fs, 1, "file4.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::links::unlink_core(&fs, 1, "file4.txt").unwrap();
+
+        // Inode 999 does not exist
+        let inos = vec![1, attr1.ino, attr2.ino, attr3.ino, attr4.ino, 999];
+        let batch_map = fs.get_attrs_batch(&inos);
+
+        // Verify root, file1, file2, file3 are present with matching attributes
+        assert!(batch_map.contains_key(&1));
+        assert_eq!(batch_map.get(&1).unwrap(), &fs.get_attr(1).unwrap());
+
+        assert!(batch_map.contains_key(&attr1.ino));
+        assert_eq!(batch_map.get(&attr1.ino).unwrap(), &fs.get_attr(attr1.ino).unwrap());
+
+        assert!(batch_map.contains_key(&attr2.ino));
+        assert_eq!(batch_map.get(&attr2.ino).unwrap(), &fs.get_attr(attr2.ino).unwrap());
+
+        assert!(batch_map.contains_key(&attr3.ino));
+        assert_eq!(batch_map.get(&attr3.ino).unwrap(), &fs.get_attr(attr3.ino).unwrap());
+
+        // Tombstoned inode 4 and non-existent inode 999 must NOT be present
+        assert!(!batch_map.contains_key(&attr4.ino));
+        assert!(!batch_map.contains_key(&999));
     }
 }
