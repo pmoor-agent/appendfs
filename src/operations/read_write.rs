@@ -314,6 +314,7 @@ pub fn create_core(
                 atime: Some(now),
                 mtime: Some(now),
                 ctime: Some(now),
+                created_at: Some(now),
                 xattrs: None,
             },
         });

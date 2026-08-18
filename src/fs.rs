@@ -1311,6 +1311,7 @@ impl InMemoryFS {
             };
 
             // 1. Build map of added entries: for each new inode, record its primary creation parent
+            let mut used_tmp_root = false;
             let mut primary_creation: HashMap<u64, (u64, String)> = HashMap::new();
             let mut all_added: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
             for &parent_ino in &inos {
@@ -1418,7 +1419,7 @@ impl InMemoryFS {
                     && !base_map.contains_key(&ino)
                     && let Some((parent, name)) = primary_creation.get(&ino).cloned()
                 {
-                    let op_time = d.attr_delta.ctime.unwrap_or(now);
+                    let op_time = d.attr_delta.created_at.or(d.attr_delta.ctime).unwrap_or(now);
 
                     if parent >= ino && !base_map.contains_key(&parent) {
                         let tmp_name = format!(".agy_tmp_{}", ino);
@@ -1436,6 +1437,7 @@ impl InMemoryFS {
                         written_count += 1;
 
                         renames_to_emit.push((ino, 1, tmp_name, parent, name, op_time));
+                        used_tmp_root = true;
                     } else {
                         let payload = MkdirPayload {
                             parent,
@@ -1460,7 +1462,7 @@ impl InMemoryFS {
                         if !base_map.contains_key(&ino)
                             && let Some((parent, name)) = primary_creation.get(&ino).cloned()
                         {
-                            let op_time = f.attr_delta.ctime.unwrap_or(now);
+                            let op_time = f.attr_delta.created_at.or(f.attr_delta.ctime).unwrap_or(now);
                             let payload = CreatePayload {
                                 parent,
                                 name,
@@ -1479,7 +1481,7 @@ impl InMemoryFS {
                         if !base_map.contains_key(&ino)
                             && let Some((parent, name)) = primary_creation.get(&ino).cloned()
                         {
-                            let op_time = s.attr_delta.ctime.unwrap_or(now);
+                            let op_time = s.attr_delta.created_at.or(s.attr_delta.ctime).unwrap_or(now);
                             let payload = SymlinkPayload {
                                 parent,
                                 name,
@@ -1498,7 +1500,7 @@ impl InMemoryFS {
                         if !base_map.contains_key(&ino)
                             && let Some((parent, name)) = primary_creation.get(&ino).cloned()
                         {
-                            let op_time = s.attr_delta.ctime.unwrap_or(now);
+                            let op_time = s.attr_delta.created_at.or(s.attr_delta.ctime).unwrap_or(now);
                             let payload = MknodPayload {
                                 parent,
                                 name,
@@ -1518,7 +1520,7 @@ impl InMemoryFS {
                         if !base_map.contains_key(&ino)
                             && let Some((parent, name)) = primary_creation.get(&ino).cloned()
                         {
-                            let op_time = s.attr_delta.ctime.unwrap_or(now);
+                            let op_time = s.attr_delta.created_at.or(s.attr_delta.ctime).unwrap_or(now);
                             let payload = MknodPayload {
                                 parent,
                                 name,
@@ -1538,7 +1540,7 @@ impl InMemoryFS {
                         if !base_map.contains_key(&ino)
                             && let Some((parent, name)) = primary_creation.get(&ino).cloned()
                         {
-                            let op_time = s.attr_delta.ctime.unwrap_or(now);
+                            let op_time = s.attr_delta.created_at.or(s.attr_delta.ctime).unwrap_or(now);
                             let payload = MknodPayload {
                                 parent,
                                 name,
@@ -1558,7 +1560,7 @@ impl InMemoryFS {
                         if !base_map.contains_key(&ino)
                             && let Some((parent, name)) = primary_creation.get(&ino).cloned()
                         {
-                            let op_time = s.attr_delta.ctime.unwrap_or(now);
+                            let op_time = s.attr_delta.created_at.or(s.attr_delta.ctime).unwrap_or(now);
                             let payload = MknodPayload {
                                 parent,
                                 name,
@@ -1650,6 +1652,7 @@ impl InMemoryFS {
                 let (child_ino, parent, name, new_parent, new_name, op_time) = renames_to_emit[breaker].clone();
                 let tmp_name = format!(".agy_tmp_rename_{}", child_ino);
                 ordered_renames.push((child_ino, parent, name, 1, tmp_name.clone(), op_time));
+                used_tmp_root = true;
                 emitted[breaker] = true;
                 for &idx in cycle[1..].iter().rev() {
                     emitted[idx] = true;
@@ -1697,7 +1700,7 @@ impl InMemoryFS {
                             | Some(EntryDelta::Node(NodeDelta::Socket(s))) => s.attr_delta.ctime,
                             _ => None,
                         };
-                        let op_time = child_ctime.or(d.attr_delta.mtime).unwrap_or(now);
+                        let op_time = d.attr_delta.mtime.or(d.attr_delta.ctime).or(child_ctime).unwrap_or(now);
                         let payload = LinkPayload {
                             ino: child_ino,
                             new_parent: parent_ino,
@@ -1932,6 +1935,30 @@ impl InMemoryFS {
                         written_count += 1;
                     }
                     _ => {}
+                }
+            }
+
+            if used_tmp_root {
+                let root_has_explicit_attr = match frozen.get(&1) {
+                    Some(EntryDelta::Node(NodeDelta::Directory(d))) => {
+                        d.attr_delta.mtime.is_some() || d.attr_delta.ctime.is_some()
+                    }
+                    _ => false,
+                };
+                if !root_has_explicit_attr && let Some(root_node) = base_map.get(&1) {
+                    let payload = SetattrPayload {
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                        size: None,
+                        atime: Some(root_node.meta.atime),
+                        mtime: Some(root_node.meta.mtime),
+                        op_time: root_node.meta.ctime,
+                    };
+                    let bytes = bincode::serialize(&payload)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    writer.append_record(OpCode::Setattr, 1, &bytes)?;
+                    written_count += 1;
                 }
             }
 

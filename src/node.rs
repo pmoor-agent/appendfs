@@ -238,6 +238,8 @@ pub struct AttrDelta {
     pub mtime: Option<SystemTime>,
     #[serde(default, with = "crate::clock::serde_system_time_opt")]
     pub ctime: Option<SystemTime>,
+    #[serde(default, with = "crate::clock::serde_system_time_opt")]
+    pub created_at: Option<SystemTime>,
     #[serde(default)]
     pub xattrs: Option<std::collections::HashMap<String, Option<Vec<u8>>>>,
 }

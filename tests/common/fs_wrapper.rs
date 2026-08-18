@@ -353,10 +353,15 @@ impl TestFS {
         let temp_dir = self._temp_dir.clone();
         let clock = self.fs.clock.clone();
         let fault = self.fault.clone();
+        let next_inode = self.fs.next_inode.load(Ordering::SeqCst);
         let _ = self.fs.sync_log();
         self.fs.log_writer = None;
         drop(self);
-        Self::recover_into(&log_dir, temp_dir, clock, fault)
+        let rec = Self::recover_into(&log_dir, temp_dir, clock, fault);
+        rec.fs
+            .next_inode
+            .store(rec.fs.next_inode.load(Ordering::SeqCst).max(next_inode), Ordering::SeqCst);
+        rec
     }
 
     /// Replays `log_dir` into a fresh instance and opens the next generation for writing.

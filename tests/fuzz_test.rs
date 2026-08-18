@@ -9,7 +9,9 @@ use std::time::{Duration, SystemTime};
 
 #[test]
 fn test_differential_fuzzing_and_crash_recovery() {
-    for seed in 1..=5 {
+    let seeds = common::fuzz_seeds(5);
+    let steps = common::fuzz_steps(200);
+    for seed in 1..=seeds {
         println!("=== RUNNING DIFFERENTIAL STRESS TEST WITH SEED {} ===", seed);
         let mut prng = TestRng::new(seed);
 
@@ -58,20 +60,17 @@ fn test_differential_fuzzing_and_crash_recovery() {
         // happened to be staged/flushed at that particular random moment) instead of
         // always the same handful of points every run. Drawn up front, before the step
         // loop's own op selection, so the two random streams don't interleave in a way
-        // that's confusing to reason about. Step 200 is always included so the final
+        // that's confusing to reason about. Step is always included at the end so the final
         // state is guaranteed to get validated even if no random draw lands there.
         let num_random_checkpoints = 3;
-        let mut checkpoints: Vec<usize> = (0..num_random_checkpoints).map(|_| prng.gen_range(1, 199)).collect();
-        checkpoints.push(200);
+        let max_cp = steps.saturating_sub(1).max(1);
+        let mut checkpoints: Vec<usize> = (0..num_random_checkpoints).map(|_| prng.gen_range(1, max_cp)).collect();
+        checkpoints.push(steps);
         checkpoints.sort_unstable();
         checkpoints.dedup();
         println!("    checkpoints for seed {}: {:?}", seed, checkpoints);
 
-        for step in 1..=200 {
-            // Advance before each step so consecutive operations land at genuinely
-            // different timestamps - otherwise every ctime/mtime/atime in the whole
-            // run would coincide, and a missing timestamp update would be
-            // indistinguishable from a correct one.
+        for step in 1..=steps {
             clock.advance(Duration::from_secs(1));
             let op_choice = prng.gen_range(0, 15);
             match op_choice {
@@ -1332,7 +1331,9 @@ fn test_summary_export_is_deterministic() {
     // atime is fully log-derived, like every other field), exports its summary, then
     // reprocesses just the raw .log files from scratch (ignoring any summary shortcut)
     // and asserts the two summaries are byte-for-byte identical.
-    for seed in 1..=5 {
+    let seeds = common::fuzz_seeds(5);
+    let steps = common::fuzz_steps(150);
+    for seed in 1..=seeds {
         let mut prng = TestRng::new(seed);
         let start = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let clock = AdvancingClock::new(start);
@@ -1343,7 +1344,7 @@ fn test_summary_export_is_deterministic() {
         let mut dirs = vec![1u64];
         let mut files = Vec::<u64>::new(); // files and symlinks - anything read/write/link-able
 
-        for step in 1..=150usize {
+        for step in 1..=steps {
             clock.advance(Duration::from_secs(1));
             match prng.gen_range(0, 8) {
                 0 => {

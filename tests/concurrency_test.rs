@@ -31,7 +31,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const UID: u32 = 1000;
 const GID: u32 = 1000;
 const NUM_THREADS: usize = 8;
-const OPS_PER_THREAD: usize = 400;
+fn ops_per_thread() -> usize {
+    common::fuzz_steps(400)
+}
 const DIR_NAMES: [&str; 4] = ["d0", "d1", "d2", "d3"];
 const FILE_NAMES: [&str; 4] = ["f0", "f1", "f2", "f3"];
 const XATTR_NAMES: [&str; 3] = ["user.a", "user.b", "user.c"];
@@ -72,7 +74,7 @@ fn pick_target_dir(fs: &InMemoryFS, shared: &[u64], rng: &mut TestRng) -> u64 {
 
 fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
     let mut rng = TestRng::new(seed);
-    for _ in 0..OPS_PER_THREAD {
+    for _ in 0..ops_per_thread() {
         let dir_a = pick_target_dir(&fs, &shared_dirs, &mut rng);
         let dir_b = pick_target_dir(&fs, &shared_dirs, &mut rng);
         // Upper bound must stay >= the highest explicit arm below, with room left over
@@ -236,7 +238,7 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
 /// Dedicated lock worker hammering BSD flock and POSIX range locks across files
 fn lock_worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
     let mut rng = TestRng::new(seed);
-    for _ in 0..OPS_PER_THREAD {
+    for _ in 0..ops_per_thread() {
         let dir = pick_target_dir(&fs, &shared_dirs, &mut rng);
         if let Some((_, ino)) = pick_entry(&fs, dir, &mut rng)
             && let Ok(fh) = open_core(&fs, ino, 0)
@@ -738,9 +740,9 @@ fn run_concurrent_stress(seed: u64) {
 
 #[test]
 fn test_concurrent_stress() {
-    // Matches this project's established sweep style (see tests/fuzz_test.rs): a small
-    // committed seed count for normal CI runs, widened temporarily for one-off sweeps.
-    for seed in 1..=5u64 {
+    // Default 5 seeds for fast CI/local runs; override with FUZZ_SEEDS=<n> for stress sweeps.
+    let seeds = common::fuzz_seeds(5);
+    for seed in 1..=seeds {
         run_concurrent_stress(seed);
     }
 }
