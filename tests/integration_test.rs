@@ -1209,9 +1209,33 @@ fn test_fuse_flock_and_posix_locks() {
     let ret_fcntl = unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_SETLK, &fl) };
     assert_eq!(ret_fcntl, 0, "fcntl(f1, F_SETLK, F_WRLCK) should succeed");
 
+    // 7. Test blocking POSIX fcntl range locking across processes (F_SETLKW)
+    let py_script = format!(
+        r#"
+import fcntl, sys
+with open("{}", "r+") as f:
+    fcntl.lockf(f, fcntl.LOCK_EX, 10, 0, 0)
+"#,
+        file_path.display()
+    );
+
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&py_script)
+        .spawn()
+        .unwrap();
+
+    // Verify child process is blocked while f1 holds write lock
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(child.try_wait().unwrap(), None, "Child process should be blocked on F_SETLKW");
+
+    // Unlock f1 -> child process should unblock and exit
     fl.l_type = libc::F_UNLCK as i16;
     let ret_fcntl_un = unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_SETLK, &fl) };
     assert_eq!(ret_fcntl_un, 0, "fcntl(f1, F_SETLK, F_UNLCK) should succeed");
+
+    let status = child.wait().unwrap();
+    assert!(status.success(), "Child process should exit successfully after acquiring lock");
 }
 
 #[test]

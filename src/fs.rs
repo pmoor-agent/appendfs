@@ -13,7 +13,7 @@ use crate::storage::Storage;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +55,11 @@ pub struct InMemoryFS {
     /// Active open directory handle snapshots keyed by allocated file handle ID (`fh`).
     pub dir_handles: RwLock<DirectoryHandleMap>,
     /// Active whole-file BSD flock locks keyed by inode number.
-    pub flock_table: RwLock<HashMap<u64, FlockState>>,
+    pub flock_table: Mutex<HashMap<u64, FlockState>>,
+    pub flock_cond: Condvar,
     /// Active POSIX byte-range record locks keyed by inode number.
-    pub range_lock_table: RwLock<HashMap<u64, Vec<RangeLock>>>,
+    pub range_lock_table: Mutex<HashMap<u64, Vec<RangeLock>>>,
+    pub range_lock_cond: Condvar,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
     pub open_counts: RwLock<HashMap<u64, u32>>,
     /// Atomic counter for allocating unique file and directory handle IDs (`fh`).
@@ -124,8 +126,10 @@ impl InMemoryFS {
             live: RwLock::new(HashMap::new()),
             file_handles: RwLock::new(HashMap::new()),
             dir_handles: RwLock::new(HashMap::new()),
-            flock_table: RwLock::new(HashMap::new()),
-            range_lock_table: RwLock::new(HashMap::new()),
+            flock_table: Mutex::new(HashMap::new()),
+            flock_cond: Condvar::new(),
+            range_lock_table: Mutex::new(HashMap::new()),
+            range_lock_cond: Condvar::new(),
             open_counts: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             manifest,
@@ -212,7 +216,8 @@ impl InMemoryFS {
         if counts.get(&ino) == Some(&0) {
             counts.remove(&ino);
             // Clean up POSIX range locks if all handles on inode are closed
-            self.range_lock_table.write().unwrap().remove(&ino);
+            self.range_lock_table.lock().unwrap().remove(&ino);
+            self.range_lock_cond.notify_all();
         }
         let remaining = counts.get(&ino).copied().unwrap_or(0);
         if remaining == 0
@@ -225,7 +230,7 @@ impl InMemoryFS {
     }
 
     pub fn release_flock(&self, ino: u64, fh: u64) {
-        let mut table = self.flock_table.write().unwrap();
+        let mut table = self.flock_table.lock().unwrap();
         if let Some(state) = table.get_mut(&ino) {
             match state {
                 FlockState::Shared(set) => {
@@ -240,6 +245,7 @@ impl InMemoryFS {
                     }
                 }
             }
+            self.flock_cond.notify_all();
         }
     }
 

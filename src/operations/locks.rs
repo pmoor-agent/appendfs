@@ -47,54 +47,66 @@ pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32)
     }
 
     // 2. Extract operation flags
-    let _non_blocking = (op & libc::LOCK_NB) != 0;
+    let non_blocking = (op & libc::LOCK_NB) != 0;
     let base_op = op & !libc::LOCK_NB;
 
-    let mut table = fs.flock_table.write().unwrap();
+    let mut table = fs.flock_table.lock().unwrap();
     match base_op {
-        libc::LOCK_SH => match table.get_mut(&ino) {
-            None => {
-                let mut set = HashSet::new();
-                set.insert(fh);
-                table.insert(ino, FlockState::Shared(set));
-                Ok(())
-            }
-            Some(FlockState::Shared(set)) => {
-                set.insert(fh);
-                Ok(())
-            }
-            Some(FlockState::Exclusive(holder)) => {
-                if *holder == fh {
-                    // Downgrade exclusive -> shared
+        libc::LOCK_SH => loop {
+            match table.get_mut(&ino) {
+                None => {
                     let mut set = HashSet::new();
                     set.insert(fh);
                     table.insert(ino, FlockState::Shared(set));
-                    Ok(())
-                } else {
-                    Err(libc::EWOULDBLOCK)
+                    fs.flock_cond.notify_all();
+                    return Ok(());
+                }
+                Some(FlockState::Shared(set)) => {
+                    set.insert(fh);
+                    return Ok(());
+                }
+                Some(FlockState::Exclusive(holder)) => {
+                    if *holder == fh {
+                        // Downgrade exclusive -> shared
+                        let mut set = HashSet::new();
+                        set.insert(fh);
+                        table.insert(ino, FlockState::Shared(set));
+                        fs.flock_cond.notify_all();
+                        return Ok(());
+                    } else if non_blocking {
+                        return Err(libc::EWOULDBLOCK);
+                    } else {
+                        table = fs.flock_cond.wait(table).unwrap();
+                    }
                 }
             }
         },
-        libc::LOCK_EX => match table.get_mut(&ino) {
-            None => {
-                table.insert(ino, FlockState::Exclusive(fh));
-                Ok(())
-            }
-            Some(FlockState::Shared(set)) => {
-                if set.len() == 1 && set.contains(&fh) {
-                    // Upgrade shared -> exclusive
+        libc::LOCK_EX => loop {
+            match table.get_mut(&ino) {
+                None => {
                     table.insert(ino, FlockState::Exclusive(fh));
-                    Ok(())
-                } else {
-                    Err(libc::EWOULDBLOCK)
+                    return Ok(());
                 }
-            }
-            Some(FlockState::Exclusive(holder)) => {
-                if *holder == fh {
-                    // Idempotent re-acquisition by same handle
-                    Ok(())
-                } else {
-                    Err(libc::EWOULDBLOCK)
+                Some(FlockState::Shared(set)) => {
+                    if set.len() == 1 && set.contains(&fh) {
+                        // Upgrade shared -> exclusive
+                        table.insert(ino, FlockState::Exclusive(fh));
+                        return Ok(());
+                    } else if non_blocking {
+                        return Err(libc::EWOULDBLOCK);
+                    } else {
+                        table = fs.flock_cond.wait(table).unwrap();
+                    }
+                }
+                Some(FlockState::Exclusive(holder)) => {
+                    if *holder == fh {
+                        // Idempotent re-acquisition by same handle
+                        return Ok(());
+                    } else if non_blocking {
+                        return Err(libc::EWOULDBLOCK);
+                    } else {
+                        table = fs.flock_cond.wait(table).unwrap();
+                    }
                 }
             }
         },
@@ -113,6 +125,7 @@ pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32)
                         }
                     }
                 }
+                fs.flock_cond.notify_all();
             }
             Ok(())
         }
@@ -180,7 +193,7 @@ pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: Shi
     let (start, end) = normalize_range(fs, ino, &lock)?;
     let req_type = lock.lock_type;
 
-    let table = fs.range_lock_table.read().unwrap();
+    let table = fs.range_lock_table.lock().unwrap();
     if let Some(ranges) = table.get(&ino) {
         for r in ranges {
             if ranges_overlap(start, end, r.start, r.end)
@@ -215,7 +228,7 @@ pub fn setlk_core(
     fh: u64,
     lock_owner: u64,
     lock: ShimFlock,
-    _sleep: bool,
+    sleep: bool,
 ) -> Result<(), i32> {
     let handle = fs.get_file_handle(fh).ok_or(libc::EBADF)?;
     if handle.ino != ino {
@@ -225,61 +238,80 @@ pub fn setlk_core(
     let (start, end) = normalize_range(fs, ino, &lock)?;
     let req_type = lock.lock_type;
 
-    let mut table = fs.range_lock_table.write().unwrap();
-    let ranges = table.entry(ino).or_default();
+    let mut table = fs.range_lock_table.lock().unwrap();
 
     if req_type == libc::F_RDLCK as i16 || req_type == libc::F_WRLCK as i16 {
-        // 1. Check for conflicts with other owners
-        for r in ranges.iter() {
-            if r.owner != lock_owner
-                && ranges_overlap(start, end, r.start, r.end)
-                && (req_type == libc::F_WRLCK as i16 || r.lock_type == libc::F_WRLCK as i16)
-            {
-                return Err(libc::EWOULDBLOCK);
-            }
-        }
+        loop {
+            let ranges = table.entry(ino).or_default();
 
-        // 2. Remove/modify existing ranges belonging to THIS owner that overlap with [start, end)
-        let mut new_ranges = Vec::new();
-        for r in ranges.drain(..) {
-            if r.owner == lock_owner && ranges_overlap(start, end, r.start, r.end) {
-                if r.start < start {
-                    new_ranges.push(RangeLock {
-                        lock_type: r.lock_type,
-                        start: r.start,
-                        end: start,
-                        owner: r.owner,
-                        pid: r.pid,
-                    });
+            // 1. Check for conflicts with other owners
+            let mut conflict = false;
+            for r in ranges.iter() {
+                if r.owner != lock_owner
+                    && ranges_overlap(start, end, r.start, r.end)
+                    && (req_type == libc::F_WRLCK as i16 || r.lock_type == libc::F_WRLCK as i16)
+                {
+                    conflict = true;
+                    break;
                 }
-                if r.end > end {
-                    new_ranges.push(RangeLock {
-                        lock_type: r.lock_type,
-                        start: end,
-                        end: r.end,
-                        owner: r.owner,
-                        pid: r.pid,
-                    });
-                }
-            } else {
-                new_ranges.push(r);
             }
+
+            if conflict {
+                if !sleep {
+                    return Err(libc::EWOULDBLOCK);
+                } else {
+                    table = fs.range_lock_cond.wait(table).unwrap();
+                    continue;
+                }
+            }
+
+            // 2. Remove/modify existing ranges belonging to THIS owner that overlap with [start, end)
+            let mut new_ranges = Vec::new();
+            for r in ranges.drain(..) {
+                if r.owner == lock_owner && ranges_overlap(start, end, r.start, r.end) {
+                    if r.start < start {
+                        new_ranges.push(RangeLock {
+                            lock_type: r.lock_type,
+                            start: r.start,
+                            end: start,
+                            owner: r.owner,
+                            pid: r.pid,
+                        });
+                    }
+                    if r.end > end {
+                        new_ranges.push(RangeLock {
+                            lock_type: r.lock_type,
+                            start: end,
+                            end: r.end,
+                            owner: r.owner,
+                            pid: r.pid,
+                        });
+                    }
+                } else {
+                    new_ranges.push(r);
+                }
+            }
+
+            // 3. Add new range lock
+            new_ranges.push(RangeLock {
+                lock_type: req_type,
+                start,
+                end,
+                owner: lock_owner,
+                pid: lock.pid,
+            });
+
+            // 4. Coalesce adjacent or overlapping ranges with same owner and lock_type
+            coalesce_ranges(&mut new_ranges);
+            let ranges_ref = table.entry(ino).or_default();
+            *ranges_ref = new_ranges;
+
+            // 5. Notify any other waiting lock requests
+            fs.range_lock_cond.notify_all();
+            return Ok(());
         }
-
-        // 3. Add new range lock
-        new_ranges.push(RangeLock {
-            lock_type: req_type,
-            start,
-            end,
-            owner: lock_owner,
-            pid: lock.pid,
-        });
-
-        // 4. Coalesce adjacent or overlapping ranges with same owner and lock_type
-        coalesce_ranges(&mut new_ranges);
-        *ranges = new_ranges;
-        Ok(())
     } else if req_type == libc::F_UNLCK as i16 {
+        let ranges = table.entry(ino).or_default();
         let mut new_ranges = Vec::new();
         for r in ranges.drain(..) {
             if r.owner == lock_owner && ranges_overlap(start, end, r.start, r.end) {
@@ -305,7 +337,14 @@ pub fn setlk_core(
                 new_ranges.push(r);
             }
         }
-        *ranges = new_ranges;
+        if new_ranges.is_empty() {
+            table.remove(&ino);
+        } else {
+            *ranges = new_ranges;
+        }
+
+        // Notify waiting lock requests that ranges have been unlocked
+        fs.range_lock_cond.notify_all();
         Ok(())
     } else {
         Err(libc::EINVAL)
@@ -315,6 +354,10 @@ pub fn setlk_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_flock_shared_concurrent_and_exclusive_exclusion() {
@@ -329,17 +372,29 @@ mod tests {
         assert_eq!(flock_core(&fs, ino, fh1, 100, libc::LOCK_SH), Ok(()));
         assert_eq!(flock_core(&fs, ino, fh2, 200, libc::LOCK_SH), Ok(()));
 
-        // 2. Exclusive lock fails while shared locks held
-        assert_eq!(flock_core(&fs, ino, fh1, 100, libc::LOCK_EX), Err(libc::EWOULDBLOCK));
-        assert_eq!(flock_core(&fs, ino, fh2, 200, libc::LOCK_EX), Err(libc::EWOULDBLOCK));
+        // 2. Exclusive lock fails with non-blocking while shared locks held
+        assert_eq!(
+            flock_core(&fs, ino, fh1, 100, libc::LOCK_EX | libc::LOCK_NB),
+            Err(libc::EWOULDBLOCK)
+        );
+        assert_eq!(
+            flock_core(&fs, ino, fh2, 200, libc::LOCK_EX | libc::LOCK_NB),
+            Err(libc::EWOULDBLOCK)
+        );
 
         // 3. Unlock fh2 -> fh1 can now upgrade to exclusive!
         assert_eq!(flock_core(&fs, ino, fh2, 200, libc::LOCK_UN), Ok(()));
         assert_eq!(flock_core(&fs, ino, fh1, 100, libc::LOCK_EX), Ok(()));
 
         // 4. fh2 cannot acquire shared or exclusive while fh1 holds exclusive
-        assert_eq!(flock_core(&fs, ino, fh2, 200, libc::LOCK_SH), Err(libc::EWOULDBLOCK));
-        assert_eq!(flock_core(&fs, ino, fh2, 200, libc::LOCK_EX), Err(libc::EWOULDBLOCK));
+        assert_eq!(
+            flock_core(&fs, ino, fh2, 200, libc::LOCK_SH | libc::LOCK_NB),
+            Err(libc::EWOULDBLOCK)
+        );
+        assert_eq!(
+            flock_core(&fs, ino, fh2, 200, libc::LOCK_EX | libc::LOCK_NB),
+            Err(libc::EWOULDBLOCK)
+        );
 
         // 5. Downgrade fh1 from exclusive to shared
         assert_eq!(flock_core(&fs, ino, fh1, 100, libc::LOCK_SH), Ok(()));
@@ -349,7 +404,7 @@ mod tests {
         // 6. Release handle cleans up locks
         assert_eq!(fs.release_file_handle(fh1, ino), Ok(()));
         assert_eq!(fs.release_file_handle(fh2, ino), Ok(()));
-        assert!(fs.flock_table.read().unwrap().get(&ino).is_none());
+        assert!(fs.flock_table.lock().unwrap().get(&ino).is_none());
     }
 
     #[test]
@@ -410,11 +465,70 @@ mod tests {
         };
         assert_eq!(setlk_core(&fs, ino, fh1, owner1, unlock1, false), Ok(()));
 
-        let table = fs.range_lock_table.read().unwrap();
+        let table = fs.range_lock_table.lock().unwrap();
         let ranges = table.get(&ino).unwrap();
         let owner1_ranges: Vec<_> = ranges.iter().filter(|r| r.owner == owner1).collect();
         assert_eq!(owner1_ranges.len(), 2);
         assert_eq!((owner1_ranges[0].start, owner1_ranges[0].end), (0, 25));
         assert_eq!((owner1_ranges[1].start, owner1_ranges[1].end), (75, 100));
+    }
+
+    #[test]
+    fn test_posix_blocking_range_lock_setlkw() {
+        let fs = Arc::new(InMemoryFS::new());
+        let attr = crate::operations::read_write::create_core(&fs, 1, "test_block.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino = attr.ino;
+
+        let fh1 = fs.open_file_handle(ino, libc::O_RDWR as u32);
+        let fh2 = fs.open_file_handle(ino, libc::O_RDWR as u32);
+
+        let owner1 = 5001;
+        let owner2 = 5002;
+
+        // Owner 1 acquires exclusive write lock on [0..100)
+        let wlock1 = ShimFlock {
+            lock_type: libc::F_WRLCK as i16,
+            whence: libc::SEEK_SET as i16,
+            start: 0,
+            len: 100,
+            pid: 100,
+        };
+        assert_eq!(setlk_core(&fs, ino, fh1, owner1, wlock1, false), Ok(()));
+
+        let acquired = Arc::new(AtomicBool::new(false));
+        let acquired_clone = Arc::clone(&acquired);
+        let fs_clone = Arc::clone(&fs);
+
+        // Spawn Thread 2 trying to acquire conflicting write lock with sleep = true (F_SETLKW)
+        let handle = thread::spawn(move || {
+            let wlock2 = ShimFlock {
+                lock_type: libc::F_WRLCK as i16,
+                whence: libc::SEEK_SET as i16,
+                start: 50,
+                len: 100,
+                pid: 200,
+            };
+            let res = setlk_core(&fs_clone, ino, fh2, owner2, wlock2, true);
+            assert_eq!(res, Ok(()));
+            acquired_clone.store(true, Ordering::SeqCst);
+        });
+
+        // Verify Thread 2 is blocked while Owner 1 holds lock
+        thread::sleep(Duration::from_millis(50));
+        assert!(!acquired.load(Ordering::SeqCst), "Thread 2 should be blocked on F_SETLKW");
+
+        // Owner 1 unlocks [0..100)
+        let unlock1 = ShimFlock {
+            lock_type: libc::F_UNLCK as i16,
+            whence: libc::SEEK_SET as i16,
+            start: 0,
+            len: 100,
+            pid: 100,
+        };
+        assert_eq!(setlk_core(&fs, ino, fh1, owner1, unlock1, false), Ok(()));
+
+        // Thread 2 should now unblock and acquire the lock
+        handle.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst), "Thread 2 should have acquired the lock after unblocking");
     }
 }
