@@ -622,6 +622,10 @@ pub fn dump_summary_reader_with_path(
                         path: p,
                     });
                 }
+                NodeKind::Fifo
+                | NodeKind::CharDevice { .. }
+                | NodeKind::BlockDevice { .. }
+                | NodeKind::Socket => {}
             }
         }
     }
@@ -911,6 +915,64 @@ pub fn dump_summary_reader_with_path(
                             }
                         }
                     }
+                    NodeKind::Fifo => {
+                        writeln!(
+                            out,
+                            "#{:<5} [Inode {:<5}] FIFO       {:?} (mode 0o{:o}, uid {}, gid {}, mtime: {})",
+                            i + 1,
+                            ino,
+                            path_str,
+                            node.meta.perm,
+                            node.meta.uid,
+                            node.meta.gid,
+                            format_system_time(node.meta.mtime)
+                        )
+                        .unwrap();
+                    }
+                    NodeKind::CharDevice { rdev } => {
+                        writeln!(
+                            out,
+                            "#{:<5} [Inode {:<5}] CharDev    {:?} (rdev 0x{:x}, mode 0o{:o}, uid {}, gid {}, mtime: {})",
+                            i + 1,
+                            ino,
+                            path_str,
+                            rdev,
+                            node.meta.perm,
+                            node.meta.uid,
+                            node.meta.gid,
+                            format_system_time(node.meta.mtime)
+                        )
+                        .unwrap();
+                    }
+                    NodeKind::BlockDevice { rdev } => {
+                        writeln!(
+                            out,
+                            "#{:<5} [Inode {:<5}] BlockDev   {:?} (rdev 0x{:x}, mode 0o{:o}, uid {}, gid {}, mtime: {})",
+                            i + 1,
+                            ino,
+                            path_str,
+                            rdev,
+                            node.meta.perm,
+                            node.meta.uid,
+                            node.meta.gid,
+                            format_system_time(node.meta.mtime)
+                        )
+                        .unwrap();
+                    }
+                    NodeKind::Socket => {
+                        writeln!(
+                            out,
+                            "#{:<5} [Inode {:<5}] Socket     {:?} (mode 0o{:o}, uid {}, gid {}, mtime: {})",
+                            i + 1,
+                            ino,
+                            path_str,
+                            node.meta.perm,
+                            node.meta.uid,
+                            node.meta.gid,
+                            format_system_time(node.meta.mtime)
+                        )
+                        .unwrap();
+                    }
                 }
             }
         }
@@ -1063,6 +1125,20 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
                 "      batch_record_count: {}, commit_timestamp: {}",
                 b.record_count,
                 format_system_time(b.timestamp)
+            )
+            .unwrap();
+        }
+        Ok(crate::log::record::DecodedPayload::Mknod(m)) => {
+            writeln!(
+                out,
+                "      parent: {}, name: {:?}, mode: 0o{:o}, rdev: 0x{:x}, uid: {}, gid: {}, created_at: {}",
+                m.parent,
+                m.name,
+                m.mode,
+                m.rdev,
+                m.uid,
+                m.gid,
+                format_system_time(m.created_at)
             )
             .unwrap();
         }

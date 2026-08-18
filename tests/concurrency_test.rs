@@ -296,7 +296,11 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
             FileType::Symlink => {
                 readlink_core(fs, ino).unwrap_or_else(|e| panic!("readlink({}) failed: {}", ino, e));
             }
-            FileType::RegularFile => {}
+            FileType::RegularFile
+            | FileType::NamedPipe
+            | FileType::CharDevice
+            | FileType::BlockDevice
+            | FileType::Socket => {}
         }
     }
 

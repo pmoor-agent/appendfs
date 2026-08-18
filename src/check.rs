@@ -260,6 +260,10 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                 report.total_data_bytes += *size;
             }
             NodeKind::Symlink { .. } => report.symlinks += 1,
+            NodeKind::Fifo
+            | NodeKind::CharDevice { .. }
+            | NodeKind::BlockDevice { .. }
+            | NodeKind::Socket => {}
         }
     }
 
@@ -416,7 +420,12 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                     next_ancestors.insert(*child_ino);
                                     queue.push_back((*child_ino, next_ancestors));
                                 }
-                                NodeKind::File { .. } | NodeKind::Symlink { .. } => {
+                                NodeKind::File { .. }
+                                | NodeKind::Symlink { .. }
+                                | NodeKind::Fifo
+                                | NodeKind::CharDevice { .. }
+                                | NodeKind::BlockDevice { .. }
+                                | NodeKind::Socket => {
                                     reachable.insert(*child_ino);
                                 }
                             }
@@ -445,6 +454,10 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                 }
                 NodeKind::File { size, .. } => format!("RegularFile with {} bytes", size),
                 NodeKind::Symlink { target, .. } => format!("Symlink -> '{}'", target),
+                NodeKind::Fifo => "FIFO".to_string(),
+                NodeKind::CharDevice { rdev } => format!("CharDevice (rdev=0x{:x})", rdev),
+                NodeKind::BlockDevice { rdev } => format!("BlockDevice (rdev=0x{:x})", rdev),
+                NodeKind::Socket => "Socket".to_string(),
             };
             report.issues.push(IntegrityIssue::error(
                 "ORPHAN_INODE",

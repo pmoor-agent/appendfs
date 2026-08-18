@@ -48,6 +48,14 @@ pub enum NodeKind {
     Symlink {
         target: String,
     },
+    Fifo,
+    CharDevice {
+        rdev: u32,
+    },
+    BlockDevice {
+        rdev: u32,
+    },
+    Socket,
 }
 
 /// In-memory filesystem node with unified metadata and type-specific kind.
@@ -85,6 +93,34 @@ impl Node {
         }
     }
 
+    pub fn new_fifo(perm: u32, uid: u32, gid: u32, time: SystemTime) -> Self {
+        Self {
+            meta: InodeMeta::new(perm, 1, uid, gid, time),
+            kind: NodeKind::Fifo,
+        }
+    }
+
+    pub fn new_char_device(perm: u32, uid: u32, gid: u32, rdev: u32, time: SystemTime) -> Self {
+        Self {
+            meta: InodeMeta::new(perm, 1, uid, gid, time),
+            kind: NodeKind::CharDevice { rdev },
+        }
+    }
+
+    pub fn new_block_device(perm: u32, uid: u32, gid: u32, rdev: u32, time: SystemTime) -> Self {
+        Self {
+            meta: InodeMeta::new(perm, 1, uid, gid, time),
+            kind: NodeKind::BlockDevice { rdev },
+        }
+    }
+
+    pub fn new_socket(perm: u32, uid: u32, gid: u32, time: SystemTime) -> Self {
+        Self {
+            meta: InodeMeta::new(perm, 1, uid, gid, time),
+            kind: NodeKind::Socket,
+        }
+    }
+
     pub fn is_dir(&self) -> bool {
         matches!(self.kind, NodeKind::Directory { .. })
     }
@@ -97,11 +133,45 @@ impl Node {
         matches!(self.kind, NodeKind::Symlink { .. })
     }
 
+    pub fn is_fifo(&self) -> bool {
+        matches!(self.kind, NodeKind::Fifo)
+    }
+
+    pub fn is_char_device(&self) -> bool {
+        matches!(self.kind, NodeKind::CharDevice { .. })
+    }
+
+    pub fn is_block_device(&self) -> bool {
+        matches!(self.kind, NodeKind::BlockDevice { .. })
+    }
+
+    pub fn is_socket(&self) -> bool {
+        matches!(self.kind, NodeKind::Socket)
+    }
+
+    pub fn is_special(&self) -> bool {
+        matches!(
+            self.kind,
+            NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket
+        )
+    }
+
+    pub fn rdev(&self) -> u32 {
+        match self.kind {
+            NodeKind::CharDevice { rdev } | NodeKind::BlockDevice { rdev } => rdev,
+            _ => 0,
+        }
+    }
+
     pub fn file_type(&self) -> FileType {
         match self.kind {
             NodeKind::Directory { .. } => FileType::Directory,
             NodeKind::File { .. } => FileType::RegularFile,
             NodeKind::Symlink { .. } => FileType::Symlink,
+            NodeKind::Fifo => FileType::NamedPipe,
+            NodeKind::CharDevice { .. } => FileType::CharDevice,
+            NodeKind::BlockDevice { .. } => FileType::BlockDevice,
+            NodeKind::Socket => FileType::Socket,
         }
     }
 
@@ -166,11 +236,21 @@ pub struct SymlinkDelta {
     pub attr_delta: AttrDelta,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SpecialDelta {
+    pub rdev: u32,
+    pub attr_delta: AttrDelta,
+}
+
 #[derive(Debug, Clone)]
 pub enum NodeDelta {
     Directory(DirectoryDelta),
     File(FileDelta),
     Symlink(SymlinkDelta),
+    Fifo(SpecialDelta),
+    CharDevice(SpecialDelta),
+    BlockDevice(SpecialDelta),
+    Socket(SpecialDelta),
 }
 
 #[derive(Debug, Clone)]

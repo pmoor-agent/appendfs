@@ -92,6 +92,7 @@ pub enum OpCode {
     /// flush batch. Confirms that batch is complete and safe to replay - see
     /// `FlushCommitPayload`.
     FlushCommit = 10,
+    Mknod = 11,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -109,6 +110,7 @@ impl TryFrom<u8> for OpCode {
             8 => Ok(OpCode::Setattr),
             9 => Ok(OpCode::Link),
             10 => Ok(OpCode::FlushCommit),
+            11 => Ok(OpCode::Mknod),
             _ => Err("Unknown operation code"),
         }
     }
@@ -127,6 +129,7 @@ impl std::fmt::Display for OpCode {
             OpCode::Setattr => "Setattr",
             OpCode::Link => "Link",
             OpCode::FlushCommit => "FlushCommit",
+            OpCode::Mknod => "Mknod",
         };
         f.pad(name)
     }
@@ -317,6 +320,21 @@ pub struct LinkPayload {
     pub op_time: SystemTime,
 }
 
+/// Structured metadata payload for special node creation operations (`OP_MKNOD`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MknodPayload {
+    pub parent: u64,
+    pub name: String,
+    pub mode: u32,
+    pub rdev: u32,
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub gid: u32,
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub created_at: SystemTime,
+}
+
 /// Unified typed representation of any decoded log record payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedPayload<'a> {
@@ -330,6 +348,7 @@ pub enum DecodedPayload<'a> {
     Setattr(SetattrPayload),
     Link(LinkPayload),
     FlushCommit(FlushCommitPayload),
+    Mknod(MknodPayload),
 }
 
 impl DecodedPayload<'_> {
@@ -346,6 +365,7 @@ impl DecodedPayload<'_> {
             DecodedPayload::Setattr(p) => Some(p.op_time),
             DecodedPayload::Link(p) => Some(p.op_time),
             DecodedPayload::FlushCommit(p) => Some(p.timestamp),
+            DecodedPayload::Mknod(p) => Some(p.created_at),
         }
     }
 }

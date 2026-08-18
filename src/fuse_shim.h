@@ -13,6 +13,7 @@ struct shim_file_attr {
   uint32_t nlink;
   uint32_t uid;
   uint32_t gid;
+  uint32_t rdev;
   int64_t size;
   int64_t atime_sec;
   uint32_t atime_nsec;
@@ -54,6 +55,8 @@ typedef void (*rust_setattr_t)(shim_req_t req, uint64_t ino, uint32_t mode, uint
                                uint32_t to_set, void *userdata);
 typedef void (*rust_create_t)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, uint32_t flags,
                               void *userdata);
+typedef void (*rust_mknod_t)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, uint32_t rdev,
+                             void *userdata);
 typedef void (*rust_unlink_t)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
 typedef void (*rust_mkdir_t)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, void *userdata);
 typedef void (*rust_rmdir_t)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
@@ -86,6 +89,7 @@ struct rust_lowlevel_ops {
   rust_write_t write;
   rust_setattr_t setattr;
   rust_create_t create;
+  rust_mknod_t mknod;
   rust_unlink_t unlink;
   rust_mkdir_t mkdir;
   rust_rmdir_t rmdir;

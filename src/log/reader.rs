@@ -1,7 +1,7 @@
 use crate::log::record::{
-    CreatePayload, DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LinkPayload, MkdirPayload, OpCode,
-    RECORD_HEADER_SIZE, RecordHeader, RenamePayload, RmdirPayload, SetattrPayload, SymlinkPayload, UnlinkPayload,
-    WriteMeta,
+    CreatePayload, DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LinkPayload, MkdirPayload,
+    MknodPayload, OpCode, RECORD_HEADER_SIZE, RecordHeader, RenamePayload, RmdirPayload, SetattrPayload, SymlinkPayload,
+    UnlinkPayload, WriteMeta,
 };
 use crate::storage::{OsStorage, Storage, StorageReader};
 use std::io;
@@ -41,6 +41,7 @@ impl LogRecord {
             OpCode::FlushCommit => {
                 bincode::deserialize::<FlushCommitPayload>(&self.payload).map(DecodedPayload::FlushCommit)
             }
+            OpCode::Mknod => bincode::deserialize::<MknodPayload>(&self.payload).map(DecodedPayload::Mknod),
         }
     }
 

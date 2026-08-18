@@ -1,11 +1,11 @@
 use crate::clock::{Clock, SystemClock};
 use crate::log::{
     BackgroundFlusher, CreatePayload, ExtentState, GenerationLiveStats, LinkPayload, LogFileCache, LogManifest,
-    LogWriter, MkdirPayload, OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload, SetattrPayload,
+    LogWriter, MkdirPayload, MknodPayload, OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload, SetattrPayload,
     SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
 use crate::node::{
-    AttrDelta, DirectoryDelta, EntryDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind, SymlinkDelta,
+    AttrDelta, DirectoryDelta, EntryDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta, SymlinkDelta,
 };
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
@@ -385,6 +385,10 @@ impl InMemoryFS {
                     NodeDelta::Directory(d) => merge_attr_delta(&mut d.attr_delta, &delta),
                     NodeDelta::File(f) => merge_attr_delta(&mut f.attr_delta, &delta),
                     NodeDelta::Symlink(s) => merge_attr_delta(&mut s.attr_delta, &delta),
+                    NodeDelta::Fifo(s)
+                    | NodeDelta::CharDevice(s)
+                    | NodeDelta::BlockDevice(s)
+                    | NodeDelta::Socket(s) => merge_attr_delta(&mut s.attr_delta, &delta),
                 }
                 return;
             }
@@ -423,6 +427,22 @@ impl InMemoryFS {
                             file_type = Some(FileType::Symlink);
                             break;
                         }
+                        EntryDelta::Node(NodeDelta::Fifo(_)) => {
+                            file_type = Some(FileType::NamedPipe);
+                            break;
+                        }
+                        EntryDelta::Node(NodeDelta::CharDevice(_)) => {
+                            file_type = Some(FileType::CharDevice);
+                            break;
+                        }
+                        EntryDelta::Node(NodeDelta::BlockDevice(_)) => {
+                            file_type = Some(FileType::BlockDevice);
+                            break;
+                        }
+                        EntryDelta::Node(NodeDelta::Socket(_)) => {
+                            file_type = Some(FileType::Socket);
+                            break;
+                        }
                     }
                 }
             }
@@ -459,6 +479,42 @@ impl InMemoryFS {
                     ino,
                     EntryDelta::Node(NodeDelta::Symlink(SymlinkDelta {
                         target: None,
+                        attr_delta: delta,
+                    })),
+                );
+            }
+            Some(FileType::NamedPipe) => {
+                live.insert(
+                    ino,
+                    EntryDelta::Node(NodeDelta::Fifo(SpecialDelta {
+                        rdev: 0,
+                        attr_delta: delta,
+                    })),
+                );
+            }
+            Some(FileType::CharDevice) => {
+                live.insert(
+                    ino,
+                    EntryDelta::Node(NodeDelta::CharDevice(SpecialDelta {
+                        rdev: 0,
+                        attr_delta: delta,
+                    })),
+                );
+            }
+            Some(FileType::BlockDevice) => {
+                live.insert(
+                    ino,
+                    EntryDelta::Node(NodeDelta::BlockDevice(SpecialDelta {
+                        rdev: 0,
+                        attr_delta: delta,
+                    })),
+                );
+            }
+            Some(FileType::Socket) => {
+                live.insert(
+                    ino,
+                    EntryDelta::Node(NodeDelta::Socket(SpecialDelta {
+                        rdev: 0,
                         attr_delta: delta,
                     })),
                 );
@@ -1064,6 +1120,14 @@ impl InMemoryFS {
                 EntryDelta::Node(NodeDelta::Symlink(_)) => {
                     estimated_bytes += RECORD_HEADER_SIZE as u64 + 128;
                 }
+                EntryDelta::Node(
+                    NodeDelta::Fifo(_)
+                    | NodeDelta::CharDevice(_)
+                    | NodeDelta::BlockDevice(_)
+                    | NodeDelta::Socket(_),
+                ) => {
+                    estimated_bytes += RECORD_HEADER_SIZE as u64 + 128;
+                }
                 EntryDelta::Tombstone => {
                     estimated_bytes += RECORD_HEADER_SIZE as u64 + 64;
                 }
@@ -1250,7 +1314,7 @@ impl InMemoryFS {
                 }
             }
 
-            // Phase 3: Create and Symlink
+            // Phase 3: Create, Symlink, and Mknod
             for &ino in &inos {
                 match frozen.get(&ino) {
                     Some(EntryDelta::Node(NodeDelta::File(f))) => {
@@ -1288,6 +1352,86 @@ impl InMemoryFS {
                             let bytes = bincode::serialize(&payload)
                                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                             writer.append_record(OpCode::Symlink, ino, &bytes)?;
+                            written_count += 1;
+                        }
+                    }
+                    Some(EntryDelta::Node(NodeDelta::Fifo(s))) => {
+                        if !base_map.contains_key(&ino)
+                            && let Some((parent, name)) = primary_creation.get(&ino).cloned()
+                        {
+                            let op_time = s.attr_delta.ctime.unwrap_or(now);
+                            let payload = MknodPayload {
+                                parent,
+                                name,
+                                mode: (s.attr_delta.mode.unwrap_or(0o644) & 0o7777) | libc::S_IFIFO,
+                                rdev: 0,
+                                uid: s.attr_delta.uid.unwrap_or(0),
+                                gid: s.attr_delta.gid.unwrap_or(0),
+                                created_at: op_time,
+                            };
+                            let bytes = bincode::serialize(&payload)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                            writer.append_record(OpCode::Mknod, ino, &bytes)?;
+                            written_count += 1;
+                        }
+                    }
+                    Some(EntryDelta::Node(NodeDelta::CharDevice(s))) => {
+                        if !base_map.contains_key(&ino)
+                            && let Some((parent, name)) = primary_creation.get(&ino).cloned()
+                        {
+                            let op_time = s.attr_delta.ctime.unwrap_or(now);
+                            let payload = MknodPayload {
+                                parent,
+                                name,
+                                mode: (s.attr_delta.mode.unwrap_or(0o660) & 0o7777) | libc::S_IFCHR,
+                                rdev: s.rdev,
+                                uid: s.attr_delta.uid.unwrap_or(0),
+                                gid: s.attr_delta.gid.unwrap_or(0),
+                                created_at: op_time,
+                            };
+                            let bytes = bincode::serialize(&payload)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                            writer.append_record(OpCode::Mknod, ino, &bytes)?;
+                            written_count += 1;
+                        }
+                    }
+                    Some(EntryDelta::Node(NodeDelta::BlockDevice(s))) => {
+                        if !base_map.contains_key(&ino)
+                            && let Some((parent, name)) = primary_creation.get(&ino).cloned()
+                        {
+                            let op_time = s.attr_delta.ctime.unwrap_or(now);
+                            let payload = MknodPayload {
+                                parent,
+                                name,
+                                mode: (s.attr_delta.mode.unwrap_or(0o660) & 0o7777) | libc::S_IFBLK,
+                                rdev: s.rdev,
+                                uid: s.attr_delta.uid.unwrap_or(0),
+                                gid: s.attr_delta.gid.unwrap_or(0),
+                                created_at: op_time,
+                            };
+                            let bytes = bincode::serialize(&payload)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                            writer.append_record(OpCode::Mknod, ino, &bytes)?;
+                            written_count += 1;
+                        }
+                    }
+                    Some(EntryDelta::Node(NodeDelta::Socket(s))) => {
+                        if !base_map.contains_key(&ino)
+                            && let Some((parent, name)) = primary_creation.get(&ino).cloned()
+                        {
+                            let op_time = s.attr_delta.ctime.unwrap_or(now);
+                            let payload = MknodPayload {
+                                parent,
+                                name,
+                                mode: (s.attr_delta.mode.unwrap_or(0o777) & 0o7777) | libc::S_IFSOCK,
+                                rdev: 0,
+                                uid: s.attr_delta.uid.unwrap_or(0),
+                                gid: s.attr_delta.gid.unwrap_or(0),
+                                created_at: op_time,
+                            };
+                            let bytes = bincode::serialize(&payload)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                            writer.append_record(OpCode::Mknod, ino, &bytes)?;
                             written_count += 1;
                         }
                     }
@@ -1408,6 +1552,10 @@ impl InMemoryFS {
                             Some(EntryDelta::Node(NodeDelta::File(f))) => f.attr_delta.ctime,
                             Some(EntryDelta::Node(NodeDelta::Symlink(s))) => s.attr_delta.ctime,
                             Some(EntryDelta::Node(NodeDelta::Directory(cd))) => cd.attr_delta.ctime,
+                            Some(EntryDelta::Node(NodeDelta::Fifo(s)))
+                            | Some(EntryDelta::Node(NodeDelta::CharDevice(s)))
+                            | Some(EntryDelta::Node(NodeDelta::BlockDevice(s)))
+                            | Some(EntryDelta::Node(NodeDelta::Socket(s))) => s.attr_delta.ctime,
                             _ => None,
                         };
                         let op_time = child_ctime.or(d.attr_delta.mtime).unwrap_or(now);
@@ -1602,6 +1750,32 @@ impl InMemoryFS {
                             || s.attr_delta.gid.is_some()
                             || s.attr_delta.mtime.is_some()
                             || s.attr_delta.ctime.is_some()) =>
+                    {
+                        let op_time = s.attr_delta.ctime.or(s.attr_delta.mtime).unwrap_or(now);
+                        let payload = SetattrPayload {
+                            mode: s.attr_delta.mode,
+                            uid: s.attr_delta.uid,
+                            gid: s.attr_delta.gid,
+                            size: None,
+                            atime: s.attr_delta.atime,
+                            mtime: s.attr_delta.mtime,
+                            op_time,
+                        };
+                        let bytes = bincode::serialize(&payload)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        writer.append_record(OpCode::Setattr, ino, &bytes)?;
+                        written_count += 1;
+                    }
+                    Some(
+                        EntryDelta::Node(NodeDelta::Fifo(s))
+                        | EntryDelta::Node(NodeDelta::CharDevice(s))
+                        | EntryDelta::Node(NodeDelta::BlockDevice(s))
+                        | EntryDelta::Node(NodeDelta::Socket(s)),
+                    ) if (s.attr_delta.mode.is_some()
+                        || s.attr_delta.uid.is_some()
+                        || s.attr_delta.gid.is_some()
+                        || s.attr_delta.mtime.is_some()
+                        || s.attr_delta.ctime.is_some()) =>
                     {
                         let op_time = s.attr_delta.ctime.or(s.attr_delta.mtime).unwrap_or(now);
                         let payload = SetattrPayload {
@@ -1885,10 +2059,14 @@ impl Default for InMemoryFS {
 // --- Helper Functions ---
 
 fn node_to_attr(ino: u64, node: &Node) -> FileAttr {
-    let (file_type, size, perm) = match &node.kind {
-        NodeKind::Directory { .. } => (FileType::Directory, 0, node.meta.perm),
-        NodeKind::File { size, .. } => (FileType::RegularFile, *size as i64, node.meta.perm),
-        NodeKind::Symlink { target } => (FileType::Symlink, target.len() as i64, 0o777),
+    let (file_type, size, perm, rdev) = match &node.kind {
+        NodeKind::Directory { .. } => (FileType::Directory, 0, node.meta.perm, 0),
+        NodeKind::File { size, .. } => (FileType::RegularFile, *size as i64, node.meta.perm, 0),
+        NodeKind::Symlink { target } => (FileType::Symlink, target.len() as i64, 0o777, 0),
+        NodeKind::Fifo => (FileType::NamedPipe, 0, node.meta.perm, 0),
+        NodeKind::CharDevice { rdev } => (FileType::CharDevice, 0, node.meta.perm, *rdev),
+        NodeKind::BlockDevice { rdev } => (FileType::BlockDevice, 0, node.meta.perm, *rdev),
+        NodeKind::Socket => (FileType::Socket, 0, node.meta.perm, 0),
     };
     FileAttr {
         ino,
@@ -1897,6 +2075,7 @@ fn node_to_attr(ino: u64, node: &Node) -> FileAttr {
         nlink: node.meta.nlink,
         uid: node.meta.uid,
         gid: node.meta.gid,
+        rdev,
         size,
         atime: node.meta.atime,
         mtime: node.meta.mtime,
@@ -1914,6 +2093,7 @@ fn delta_to_initial_attr(ino: u64, delta: &NodeDelta) -> FileAttr {
                 nlink: d.attr_delta.nlink.unwrap_or(2),
                 uid: d.attr_delta.uid.unwrap_or(0),
                 gid: d.attr_delta.gid.unwrap_or(0),
+                rdev: 0,
                 size: 0,
                 atime: d.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: d.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
@@ -1930,6 +2110,7 @@ fn delta_to_initial_attr(ino: u64, delta: &NodeDelta) -> FileAttr {
                 nlink: f.attr_delta.nlink.unwrap_or(1),
                 uid: f.attr_delta.uid.unwrap_or(0),
                 gid: f.attr_delta.gid.unwrap_or(0),
+                rdev: 0,
                 size: f.size.unwrap_or(0) as i64,
                 atime: f.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: f.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
@@ -1946,7 +2127,76 @@ fn delta_to_initial_attr(ino: u64, delta: &NodeDelta) -> FileAttr {
                 nlink: s.attr_delta.nlink.unwrap_or(1),
                 uid: s.attr_delta.uid.unwrap_or(0),
                 gid: s.attr_delta.gid.unwrap_or(0),
+                rdev: 0,
                 size: s.target.as_ref().map_or(0, |t| t.len() as i64),
+                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            apply_attr_delta(&mut attr, &s.attr_delta);
+            attr
+        }
+        NodeDelta::Fifo(s) => {
+            let mut attr = FileAttr {
+                ino,
+                file_type: FileType::NamedPipe,
+                perm: s.attr_delta.mode.unwrap_or(0o644),
+                nlink: s.attr_delta.nlink.unwrap_or(1),
+                uid: s.attr_delta.uid.unwrap_or(0),
+                gid: s.attr_delta.gid.unwrap_or(0),
+                rdev: 0,
+                size: 0,
+                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            apply_attr_delta(&mut attr, &s.attr_delta);
+            attr
+        }
+        NodeDelta::CharDevice(s) => {
+            let mut attr = FileAttr {
+                ino,
+                file_type: FileType::CharDevice,
+                perm: s.attr_delta.mode.unwrap_or(0o660),
+                nlink: s.attr_delta.nlink.unwrap_or(1),
+                uid: s.attr_delta.uid.unwrap_or(0),
+                gid: s.attr_delta.gid.unwrap_or(0),
+                rdev: s.rdev,
+                size: 0,
+                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            apply_attr_delta(&mut attr, &s.attr_delta);
+            attr
+        }
+        NodeDelta::BlockDevice(s) => {
+            let mut attr = FileAttr {
+                ino,
+                file_type: FileType::BlockDevice,
+                perm: s.attr_delta.mode.unwrap_or(0o660),
+                nlink: s.attr_delta.nlink.unwrap_or(1),
+                uid: s.attr_delta.uid.unwrap_or(0),
+                gid: s.attr_delta.gid.unwrap_or(0),
+                rdev: s.rdev,
+                size: 0,
+                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            apply_attr_delta(&mut attr, &s.attr_delta);
+            attr
+        }
+        NodeDelta::Socket(s) => {
+            let mut attr = FileAttr {
+                ino,
+                file_type: FileType::Socket,
+                perm: s.attr_delta.mode.unwrap_or(0o777),
+                nlink: s.attr_delta.nlink.unwrap_or(1),
+                uid: s.attr_delta.uid.unwrap_or(0),
+                gid: s.attr_delta.gid.unwrap_or(0),
+                rdev: 0,
+                size: 0,
                 atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
                 ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
@@ -1970,6 +2220,12 @@ fn apply_node_delta(attr: &mut FileAttr, delta: &NodeDelta) {
             if let Some(ref t) = s.target {
                 attr.size = t.len() as i64;
             }
+            apply_attr_delta(attr, &s.attr_delta);
+        }
+        NodeDelta::Fifo(s)
+        | NodeDelta::CharDevice(s)
+        | NodeDelta::BlockDevice(s)
+        | NodeDelta::Socket(s) => {
             apply_attr_delta(attr, &s.attr_delta);
         }
     }
@@ -2057,6 +2313,12 @@ fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
             }
             node.apply_attr_delta(&s.attr_delta);
         }
+        (NodeKind::Fifo, NodeDelta::Fifo(s))
+        | (NodeKind::CharDevice { .. }, NodeDelta::CharDevice(s))
+        | (NodeKind::BlockDevice { .. }, NodeDelta::BlockDevice(s))
+        | (NodeKind::Socket, NodeDelta::Socket(s)) => {
+            node.apply_attr_delta(&s.attr_delta);
+        }
         _ => {}
     }
 }
@@ -2120,6 +2382,66 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
                 kind: NodeKind::Symlink {
                     target: s.target.clone().unwrap_or_default(),
                 },
+            }
+        }
+        NodeDelta::Fifo(s) => {
+            let meta = InodeMeta {
+                perm: s.attr_delta.mode.unwrap_or(0o644) & 0o7777,
+                nlink: s.attr_delta.nlink.unwrap_or(1),
+                uid: s.attr_delta.uid.unwrap_or(0),
+                gid: s.attr_delta.gid.unwrap_or(0),
+                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            Node {
+                meta,
+                kind: NodeKind::Fifo,
+            }
+        }
+        NodeDelta::CharDevice(s) => {
+            let meta = InodeMeta {
+                perm: s.attr_delta.mode.unwrap_or(0o660) & 0o7777,
+                nlink: s.attr_delta.nlink.unwrap_or(1),
+                uid: s.attr_delta.uid.unwrap_or(0),
+                gid: s.attr_delta.gid.unwrap_or(0),
+                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            Node {
+                meta,
+                kind: NodeKind::CharDevice { rdev: s.rdev },
+            }
+        }
+        NodeDelta::BlockDevice(s) => {
+            let meta = InodeMeta {
+                perm: s.attr_delta.mode.unwrap_or(0o660) & 0o7777,
+                nlink: s.attr_delta.nlink.unwrap_or(1),
+                uid: s.attr_delta.uid.unwrap_or(0),
+                gid: s.attr_delta.gid.unwrap_or(0),
+                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            Node {
+                meta,
+                kind: NodeKind::BlockDevice { rdev: s.rdev },
+            }
+        }
+        NodeDelta::Socket(s) => {
+            let meta = InodeMeta {
+                perm: s.attr_delta.mode.unwrap_or(0o777) & 0o7777,
+                nlink: s.attr_delta.nlink.unwrap_or(1),
+                uid: s.attr_delta.uid.unwrap_or(0),
+                gid: s.attr_delta.gid.unwrap_or(0),
+                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            Node {
+                meta,
+                kind: NodeKind::Socket,
             }
         }
     }

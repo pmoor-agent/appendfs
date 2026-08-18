@@ -2,6 +2,7 @@ pub mod dir;
 pub mod links;
 pub mod locks;
 pub mod read_write;
+pub mod special;
 pub mod statfs;
 
 use crate::fs::InMemoryFS;
@@ -58,6 +59,10 @@ impl Filesystem for InMemoryFS {
 
     fn create(&self, req: Request, parent: u64, name: &str, mode: u32, flags: u32) {
         read_write::create(self, req, parent, name, mode, flags);
+    }
+
+    fn mknod(&self, req: Request, parent: u64, name: &str, mode: u32, rdev: u32) {
+        special::mknod(self, req, parent, name, mode, rdev);
     }
 
     fn unlink(&self, req: Request, parent: u64, name: &str) {

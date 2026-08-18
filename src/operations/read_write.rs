@@ -327,6 +327,7 @@ pub fn create_core(
             nlink: 1,
             uid,
             gid,
+            rdev: 0,
             size: 0,
             atime: now,
             mtime: now,

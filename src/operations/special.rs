@@ -1,0 +1,173 @@
+use crate::fs::InMemoryFS;
+use crate::node::{AttrDelta, FileDelta, NodeDelta, SpecialDelta};
+use crate::range_map::RangeMap;
+use crate::shim::{FileAttr, FileType, Request};
+
+pub fn mknod_core(
+    fs: &InMemoryFS,
+    parent: u64,
+    name: &str,
+    mode: u32,
+    rdev: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<FileAttr, i32> {
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+    fs.check_flush_capacity()?;
+
+    let attr = {
+        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let now = fs.clock.now();
+        log::trace!(
+            "mknod(parent={}, name={}, mode=0o{:o}, rdev={}, uid={}, gid={})",
+            parent,
+            name,
+            mode,
+            rdev,
+            uid,
+            gid
+        );
+
+        if name.len() > 255 {
+            return Err(libc::ENAMETOOLONG);
+        }
+
+        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        if parent_attr.file_type != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
+
+        if fs.lookup_child(parent, name).is_some() {
+            return Err(libc::EEXIST);
+        }
+
+        let file_type_bits = mode & libc::S_IFMT;
+        let perm = mode & 0o7777;
+        let new_ino = fs.allocate_inode();
+
+        let attr_delta = AttrDelta {
+            mode: Some(perm),
+            nlink: Some(1),
+            uid: Some(uid),
+            gid: Some(gid),
+            atime: Some(now),
+            mtime: Some(now),
+            ctime: Some(now),
+        };
+
+        let (new_delta, file_type, actual_rdev) = match file_type_bits {
+            libc::S_IFIFO => (
+                NodeDelta::Fifo(SpecialDelta { rdev: 0, attr_delta }),
+                FileType::NamedPipe,
+                0,
+            ),
+            libc::S_IFCHR => (
+                NodeDelta::CharDevice(SpecialDelta { rdev, attr_delta }),
+                FileType::CharDevice,
+                rdev,
+            ),
+            libc::S_IFBLK => (
+                NodeDelta::BlockDevice(SpecialDelta { rdev, attr_delta }),
+                FileType::BlockDevice,
+                rdev,
+            ),
+            libc::S_IFSOCK => (
+                NodeDelta::Socket(SpecialDelta { rdev: 0, attr_delta }),
+                FileType::Socket,
+                0,
+            ),
+            _ => (
+                NodeDelta::File(FileDelta {
+                    extents: RangeMap::new(),
+                    size: Some(0),
+                    truncate_mask: None,
+                    attr_delta,
+                }),
+                FileType::RegularFile,
+                0,
+            ),
+        };
+
+        fs.insert_new_node(new_ino, new_delta);
+        fs.add_dir_entry(parent, name, new_ino, now);
+
+        FileAttr {
+            ino: new_ino,
+            file_type,
+            perm,
+            nlink: 1,
+            uid,
+            gid,
+            rdev: actual_rdev,
+            size: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        }
+    };
+
+    fs.notify_mutation(0);
+    Ok(attr)
+}
+
+pub fn mknod(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32, rdev: u32) {
+    let uid = req.uid();
+    let gid = req.gid();
+    match mknod_core(fs, parent, name, mode, rdev, uid, gid) {
+        Ok(attr) => req.reply_entry(&attr, 1.0, 1.0),
+        Err(e) => req.reply_err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::SystemClock;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_mknod_special_file_types() {
+        let fs = InMemoryFS::with_clock(Arc::new(SystemClock));
+
+        // 1. Create a FIFO
+        let fifo_attr = mknod_core(&fs, 1, "test_fifo", libc::S_IFIFO | 0o644, 0, 1000, 1000).unwrap();
+        assert_eq!(fifo_attr.file_type, FileType::NamedPipe);
+        assert_eq!(fifo_attr.perm, 0o644);
+        assert_eq!(fifo_attr.rdev, 0);
+
+        // 2. Create a Character Device
+        let chr_attr = mknod_core(&fs, 1, "test_chr", libc::S_IFCHR | 0o660, 0x1234, 1000, 1000).unwrap();
+        assert_eq!(chr_attr.file_type, FileType::CharDevice);
+        assert_eq!(chr_attr.perm, 0o660);
+        assert_eq!(chr_attr.rdev, 0x1234);
+
+        // 3. Create a Block Device
+        let blk_attr = mknod_core(&fs, 1, "test_blk", libc::S_IFBLK | 0o660, 0x5678, 1000, 1000).unwrap();
+        assert_eq!(blk_attr.file_type, FileType::BlockDevice);
+        assert_eq!(blk_attr.perm, 0o660);
+        assert_eq!(blk_attr.rdev, 0x5678);
+
+        // 4. Create a Socket
+        let sock_attr = mknod_core(&fs, 1, "test_sock", libc::S_IFSOCK | 0o777, 0, 1000, 1000).unwrap();
+        assert_eq!(sock_attr.file_type, FileType::Socket);
+        assert_eq!(sock_attr.perm, 0o777);
+        assert_eq!(sock_attr.rdev, 0);
+
+        // 5. Lookups verify attributes persist across get_attr
+        let queried_fifo = fs.get_attr(fifo_attr.ino).unwrap();
+        assert_eq!(queried_fifo.file_type, FileType::NamedPipe);
+
+        let queried_chr = fs.get_attr(chr_attr.ino).unwrap();
+        assert_eq!(queried_chr.file_type, FileType::CharDevice);
+        assert_eq!(queried_chr.rdev, 0x1234);
+
+        let queried_blk = fs.get_attr(blk_attr.ino).unwrap();
+        assert_eq!(queried_blk.file_type, FileType::BlockDevice);
+        assert_eq!(queried_blk.rdev, 0x5678);
+
+        let queried_sock = fs.get_attr(sock_attr.ino).unwrap();
+        assert_eq!(queried_sock.file_type, FileType::Socket);
+    }
+}

@@ -1213,3 +1213,105 @@ fn test_fuse_flock_and_posix_locks() {
     let ret_fcntl_un = unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_SETLK, &fl) };
     assert_eq!(ret_fcntl_un, 0, "fcntl(f1, F_SETLK, F_UNLCK) should succeed");
 }
+
+#[test]
+fn test_special_file_types_and_recovery() {
+    use std::os::unix::net::UnixListener;
+
+    let clock: Arc<dyn appendfs::Clock> = Arc::new(appendfs::SystemClock);
+    let log_dir = tempfile::Builder::new().prefix("appendfs_spec_log_").tempdir().unwrap();
+    let log_path = log_dir.path().to_path_buf();
+
+    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1, &*clock).unwrap());
+    let mut fs_instance = appendfs::InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
+    fs_instance.set_log_dir(&log_path);
+
+    let mount_dir = tempfile::Builder::new().prefix("appendfs_spec_mnt_").tempdir().unwrap();
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, fs_instance, false);
+    let mount_path = mount.path().to_path_buf();
+
+    // 1.1 Create FIFO via mkfifo
+    let fifo_path = mount_path.join("test_fifo");
+    let c_fifo = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+    let ret = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o644) };
+    assert_eq!(ret, 0, "mkfifo should succeed");
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let ret_stat = unsafe { libc::lstat(c_fifo.as_ptr(), &mut st) };
+    assert_eq!(ret_stat, 0);
+    assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFIFO);
+    assert_eq!(st.st_mode & 0o777, 0o644);
+    assert_eq!(st.st_nlink, 1);
+    assert_eq!(st.st_size, 0);
+
+    // 1.2 Create UNIX Domain Socket via bind()
+    let sock_path = mount_path.join("test_sock.sock");
+    let listener = UnixListener::bind(&sock_path).expect("UnixListener::bind should succeed");
+    drop(listener);
+
+    let c_sock = std::ffi::CString::new(sock_path.to_str().unwrap()).unwrap();
+    let mut st_sock: libc::stat = unsafe { std::mem::zeroed() };
+    let ret_stat_sock = unsafe { libc::lstat(c_sock.as_ptr(), &mut st_sock) };
+    assert_eq!(ret_stat_sock, 0);
+    assert_eq!(st_sock.st_mode & libc::S_IFMT, libc::S_IFSOCK);
+    assert_eq!(st_sock.st_nlink, 1);
+
+    // 1.3 Hardlink FIFO
+    let linked_fifo_path = mount_path.join("linked_fifo");
+    fs::hard_link(&fifo_path, &linked_fifo_path).unwrap();
+
+    let mut st_link: libc::stat = unsafe { std::mem::zeroed() };
+    let ret_stat_link = unsafe { libc::lstat(c_fifo.as_ptr(), &mut st_link) };
+    assert_eq!(ret_stat_link, 0);
+    assert_eq!(st_link.st_nlink, 2);
+
+    // 1.4 Rename socket
+    let renamed_sock_path = mount_path.join("renamed_sock.sock");
+    fs::rename(&sock_path, &renamed_sock_path).unwrap();
+    assert!(!sock_path.exists());
+    assert!(renamed_sock_path.exists());
+
+    // 1.5 Flush and unmount
+    mount.unmount();
+
+    // 2. Recover filesystem and verify special nodes survived
+    let recovered_fs = appendfs::log::recover_fs(&log_path).expect("recover_fs should succeed");
+    let remount_dir = tempfile::Builder::new().prefix("appendfs_spec_remount_").tempdir().unwrap();
+    let log_dir_keep = tempfile::tempdir().unwrap();
+
+    let remount = TestMount::mount_custom(log_dir_keep, remount_dir, recovered_fs, false);
+    let remount_path = remount.path().to_path_buf();
+
+    // Verify FIFO
+    let fifo_path = remount_path.join("test_fifo");
+    let c_fifo = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let ret_stat = unsafe { libc::lstat(c_fifo.as_ptr(), &mut st) };
+    assert_eq!(ret_stat, 0);
+    assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFIFO);
+    assert_eq!(st.st_nlink, 2);
+
+    // Verify linked FIFO
+    let linked_fifo_path = remount_path.join("linked_fifo");
+    let c_linked = std::ffi::CString::new(linked_fifo_path.to_str().unwrap()).unwrap();
+    let mut st_l: libc::stat = unsafe { std::mem::zeroed() };
+    let ret_stat_l = unsafe { libc::lstat(c_linked.as_ptr(), &mut st_l) };
+    assert_eq!(ret_stat_l, 0);
+    assert_eq!(st_l.st_ino, st.st_ino);
+
+    // Verify renamed socket
+    let renamed_sock_path = remount_path.join("renamed_sock.sock");
+    let c_sock = std::ffi::CString::new(renamed_sock_path.to_str().unwrap()).unwrap();
+    let mut st_s: libc::stat = unsafe { std::mem::zeroed() };
+    let ret_stat_s = unsafe { libc::lstat(c_sock.as_ptr(), &mut st_s) };
+    assert_eq!(ret_stat_s, 0);
+    assert_eq!(st_s.st_mode & libc::S_IFMT, libc::S_IFSOCK);
+
+    // Unlink one FIFO link and verify nlink decrements
+    fs::remove_file(&fifo_path).unwrap();
+    let mut st_after: libc::stat = unsafe { std::mem::zeroed() };
+    let ret_after = unsafe { libc::lstat(c_linked.as_ptr(), &mut st_after) };
+    assert_eq!(ret_after, 0);
+    assert_eq!(st_after.st_nlink, 1);
+}
+

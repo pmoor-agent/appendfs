@@ -18,6 +18,7 @@ struct shim_file_attr {
   uint32_t nlink;
   uint32_t uid;
   uint32_t gid;
+  uint32_t rdev;
   int64_t size;
   int64_t atime_sec;
   uint32_t atime_nsec;
@@ -69,6 +70,8 @@ typedef void (*shim_setattr_fn)(shim_req_t req, uint64_t ino, uint32_t mode, uin
                                 uint32_t to_set, void *userdata);
 typedef void (*shim_create_fn)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, uint32_t flags,
                                void *userdata);
+typedef void (*shim_mknod_fn)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, uint32_t rdev,
+                              void *userdata);
 typedef void (*shim_unlink_fn)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
 typedef void (*shim_mkdir_fn)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, void *userdata);
 typedef void (*shim_rmdir_fn)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
@@ -101,6 +104,7 @@ struct RustLowlevelOps {
   shim_write_fn write;
   shim_setattr_fn setattr;
   shim_create_fn create;
+  shim_mknod_fn mknod;
   shim_unlink_fn unlink;
   shim_mkdir_fn mkdir;
   shim_rmdir_fn rmdir;
@@ -232,6 +236,16 @@ static void ll_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
   if (ctx && ctx->ops.create) {
     ctx->ops.create(static_cast<shim_req_t>(req), parent, name, static_cast<uint32_t>(mode), fi ? fi->flags : 0,
                     ctx->userdata);
+  } else {
+    fuse_reply_err(req, 38);
+  }
+}
+
+static void ll_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev_t rdev) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.mknod) {
+    ctx->ops.mknod(static_cast<shim_req_t>(req), parent, name, static_cast<uint32_t>(mode),
+                   static_cast<uint32_t>(rdev), ctx->userdata);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -472,6 +486,7 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   ll_ops.write = ll_write;
   ll_ops.setattr = ll_setattr;
   ll_ops.create = ll_create;
+  ll_ops.mknod = ll_mknod;
   ll_ops.unlink = ll_unlink;
   ll_ops.mkdir = ll_mkdir;
   ll_ops.rmdir = ll_rmdir;
@@ -527,6 +542,7 @@ int shim_reply_entry(shim_req_t req, const shim_file_attr *attr, double attr_tim
     e.attr.st_nlink = attr->nlink;
     e.attr.st_uid = attr->uid;
     e.attr.st_gid = attr->gid;
+    e.attr.st_rdev = attr->rdev;
     e.attr.st_size = attr->size;
     e.attr.st_blocks = (attr->size > 0) ? ((attr->size + 511) / 512) : 0;
     e.attr.st_blksize = 4096;
@@ -550,6 +566,7 @@ int shim_reply_attr(shim_req_t req, const shim_file_attr *attr, double attr_time
     stbuf.st_nlink = attr->nlink;
     stbuf.st_uid = attr->uid;
     stbuf.st_gid = attr->gid;
+    stbuf.st_rdev = attr->rdev;
     stbuf.st_size = attr->size;
     stbuf.st_blocks = (attr->size > 0) ? ((attr->size + 511) / 512) : 0;
     stbuf.st_blksize = 4096;

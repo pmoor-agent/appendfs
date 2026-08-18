@@ -27,6 +27,9 @@ pub enum SnapshotNode {
         attr: FileAttr,
         target: String,
     },
+    Special {
+        attr: FileAttr,
+    },
 }
 
 /// Builds the active `LogWriter`, routing it through `fault` when this instance was
@@ -259,6 +262,12 @@ impl TestFS {
                 FileType::Symlink => {
                     let target = appendfs::operations::links::readlink_core(&self.fs, ino).unwrap_or_default();
                     snapshot.insert(ino, SnapshotNode::Symlink { attr, target });
+                }
+                FileType::NamedPipe
+                | FileType::CharDevice
+                | FileType::BlockDevice
+                | FileType::Socket => {
+                    snapshot.insert(ino, SnapshotNode::Special { attr });
                 }
             }
         }

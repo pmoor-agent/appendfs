@@ -120,6 +120,7 @@ pub fn symlink_core(
             nlink: 1,
             uid,
             gid,
+            rdev: 0,
             size: target.len() as i64,
             atime: now,
             mtime: now,

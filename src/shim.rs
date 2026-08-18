@@ -4,11 +4,15 @@ use std::os::raw::c_void;
 use std::time::SystemTime;
 
 // High-level safe representation of file types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileType {
     Directory,
     RegularFile,
     Symlink,
+    NamedPipe,
+    CharDevice,
+    BlockDevice,
+    Socket,
 }
 
 // High-level safe representation of file attributes
@@ -20,6 +24,7 @@ pub struct FileAttr {
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
+    pub rdev: u32,
     pub size: i64,
     pub atime: SystemTime,
     pub mtime: SystemTime,
@@ -45,6 +50,7 @@ struct ShimFileAttr {
     nlink: u32,
     uid: u32,
     gid: u32,
+    rdev: u32,
     size: i64,
     atime_sec: i64,
     atime_nsec: u32,
@@ -109,6 +115,9 @@ struct RustLowlevelOps {
     setattr: Option<ShimSetattrCallback>,
     create: Option<
         extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, mode: u32, flags: u32, userdata: *mut c_void),
+    >,
+    mknod: Option<
+        extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, mode: u32, rdev: u32, userdata: *mut c_void),
     >,
     unlink: Option<extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void)>,
     mkdir: Option<extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, mode: u32, userdata: *mut c_void)>,
@@ -208,6 +217,10 @@ fn convert_file_attr(attr: &FileAttr) -> ShimFileAttr {
         FileType::Directory => libc::S_IFDIR | attr.perm,
         FileType::RegularFile => libc::S_IFREG | attr.perm,
         FileType::Symlink => libc::S_IFLNK | attr.perm,
+        FileType::NamedPipe => libc::S_IFIFO | attr.perm,
+        FileType::CharDevice => libc::S_IFCHR | attr.perm,
+        FileType::BlockDevice => libc::S_IFBLK | attr.perm,
+        FileType::Socket => libc::S_IFSOCK | attr.perm,
     };
 
     ShimFileAttr {
@@ -216,6 +229,7 @@ fn convert_file_attr(attr: &FileAttr) -> ShimFileAttr {
         nlink: attr.nlink,
         uid: attr.uid,
         gid: attr.gid,
+        rdev: attr.rdev,
         size: attr.size,
         atime_sec,
         atime_nsec,
@@ -372,6 +386,10 @@ impl DirectoryBuffer {
             FileType::Directory => libc::S_IFDIR,
             FileType::RegularFile => libc::S_IFREG,
             FileType::Symlink => libc::S_IFLNK,
+            FileType::NamedPipe => libc::S_IFIFO,
+            FileType::CharDevice => libc::S_IFCHR,
+            FileType::BlockDevice => libc::S_IFBLK,
+            FileType::Socket => libc::S_IFSOCK,
         };
 
         let current_len = self.buf.len();
@@ -501,6 +519,7 @@ pub trait Filesystem {
         to_set: u32,
     );
     fn create(&self, req: Request, parent: u64, name: &str, mode: u32, flags: u32);
+    fn mknod(&self, req: Request, parent: u64, name: &str, mode: u32, rdev: u32);
     fn unlink(&self, req: Request, parent: u64, name: &str);
     fn mkdir(&self, req: Request, parent: u64, name: &str, mode: u32);
     fn rmdir(&self, req: Request, parent: u64, name: &str);
@@ -612,6 +631,25 @@ extern "C" fn create_bridge(
         }
     };
     fs.create(Request { req }, parent, name_str, mode, flags);
+}
+
+extern "C" fn mknod_bridge(
+    req: shim_req_t,
+    parent: u64,
+    name: *const c_char,
+    mode: u32,
+    rdev: u32,
+    userdata: *mut c_void,
+) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::EINVAL);
+            return;
+        }
+    };
+    fs.mknod(Request { req }, parent, name_str, mode, rdev);
 }
 
 extern "C" fn unlink_bridge(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void) {
@@ -817,6 +855,7 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
         write: Some(write_bridge),
         setattr: Some(setattr_bridge),
         create: Some(create_bridge),
+        mknod: Some(mknod_bridge),
         unlink: Some(unlink_bridge),
         mkdir: Some(mkdir_bridge),
         rmdir: Some(rmdir_bridge),

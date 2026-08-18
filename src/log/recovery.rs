@@ -593,6 +593,39 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 node.meta.ctime = now;
             }
         }
+        DecodedPayload::Mknod(mknod) => {
+            let now = mknod.created_at;
+            let file_type_bits = mknod.mode & libc::S_IFMT;
+            let perm = mknod.mode & 0o7777;
+
+            let kind = match file_type_bits {
+                libc::S_IFIFO => NodeKind::Fifo,
+                libc::S_IFCHR => NodeKind::CharDevice { rdev: mknod.rdev },
+                libc::S_IFBLK => NodeKind::BlockDevice { rdev: mknod.rdev },
+                libc::S_IFSOCK => NodeKind::Socket,
+                _ => NodeKind::File {
+                    range_map: RangeMap::new(),
+                    size: 0,
+                },
+            };
+
+            let new_node = Arc::new(Node {
+                meta: InodeMeta::new(perm, 1, mknod.uid, mknod.gid, now),
+                kind,
+            });
+
+            let mut map = fs_instance.base.write().unwrap();
+            map.insert(target_ino, new_node);
+
+            if let Some(parent_node_arc) = map.get_mut(&mknod.parent) {
+                let parent_node = Arc::make_mut(parent_node_arc);
+                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
+                    entries.push((mknod.name, target_ino));
+                    parent_node.meta.mtime = now;
+                    parent_node.meta.ctime = now;
+                }
+            }
+        }
         DecodedPayload::FlushCommit(_) => {}
     }
 }

@@ -29,7 +29,7 @@ pub use log::{
     export_summary_with_time_to_storage, init_volume, init_volume_with_storage, recover_fs, recover_fs_to_target,
     recover_fs_to_target_with_clock, recover_fs_to_target_with_storage, recover_fs_with_clock, recover_fs_with_storage,
 };
-pub use node::{InodeMeta, Node, NodeKind};
+pub use node::{InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta};
 pub use range_map::{RangeEntry, RangeMap, RangeValue};
 pub use stats::VolumeStats;
 pub use storage::{FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter, WriteMode};
