@@ -4,6 +4,7 @@ pub mod locks;
 pub mod read_write;
 pub mod special;
 pub mod statfs;
+pub mod xattr;
 
 use crate::fs::InMemoryFS;
 use crate::shim::{Filesystem, Request, ShimFlock};
@@ -123,5 +124,35 @@ impl Filesystem for InMemoryFS {
 
     fn setlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
         locks::setlk(self, req, ino, fh, lock_owner, lock, sleep);
+    }
+
+    fn getxattr(&self, req: Request, ino: u64, name: &str, size: usize) {
+        match xattr::getxattr_core(self, ino, name, size) {
+            Ok(xattr::GetxattrResult::Size(sz)) => req.reply_xattr(sz),
+            Ok(xattr::GetxattrResult::Data(data)) => req.reply_buf(&data),
+            Err(err) => req.reply_err(err),
+        }
+    }
+
+    fn setxattr(&self, req: Request, ino: u64, name: &str, value: &[u8], flags: i32) {
+        match xattr::setxattr_core(self, ino, name, value, flags) {
+            Ok(()) => req.reply_err(0),
+            Err(err) => req.reply_err(err),
+        }
+    }
+
+    fn listxattr(&self, req: Request, ino: u64, size: usize) {
+        match xattr::listxattr_core(self, ino, size) {
+            Ok(xattr::ListxattrResult::Size(sz)) => req.reply_xattr(sz),
+            Ok(xattr::ListxattrResult::Data(data)) => req.reply_buf(&data),
+            Err(err) => req.reply_err(err),
+        }
+    }
+
+    fn removexattr(&self, req: Request, ino: u64, name: &str) {
+        match xattr::removexattr_core(self, ino, name) {
+            Ok(()) => req.reply_err(0),
+            Err(err) => req.reply_err(err),
+        }
     }
 }

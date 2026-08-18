@@ -15,7 +15,8 @@ pub use manifest::{GenerationLiveStats, LogFileInfo, LogManifest};
 pub use reader::{LogReader, LogRecord};
 pub use record::{
     CreatePayload, FileHeader, FlushCommitPayload, LinkPayload, MkdirPayload, MknodPayload, OpCode, RECORD_HEADER_SIZE,
-    RecordHeader, RenamePayload, RmdirPayload, SetattrPayload, SymlinkPayload, UnlinkPayload, WriteMeta,
+    RecordHeader, RemovexattrPayload, RenamePayload, RmdirPayload, SetattrPayload, SetxattrPayload, SymlinkPayload,
+    UnlinkPayload, WriteMeta,
 };
 pub use recovery::{
     RecoveryTarget, recover_fs, recover_fs_to_target, recover_fs_to_target_with_clock,

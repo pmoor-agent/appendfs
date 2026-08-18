@@ -90,6 +90,11 @@ typedef void (*shim_getlk_fn)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_
                               void *userdata);
 typedef void (*shim_setlk_fn)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner,
                               const struct shim_flock *lock, int sleep, void *userdata);
+typedef void (*shim_getxattr_fn)(shim_req_t req, uint64_t ino, const char *name, size_t size, void *userdata);
+typedef void (*shim_setxattr_fn)(shim_req_t req, uint64_t ino, const char *name, const char *value, size_t size,
+                                 int flags, void *userdata);
+typedef void (*shim_listxattr_fn)(shim_req_t req, uint64_t ino, size_t size, void *userdata);
+typedef void (*shim_removexattr_fn)(shim_req_t req, uint64_t ino, const char *name, void *userdata);
 typedef void (*shim_init_fn)(void *userdata);
 typedef void (*shim_destroy_fn)(void *userdata);
 
@@ -120,6 +125,10 @@ struct RustLowlevelOps {
   shim_flock_fn flock;
   shim_getlk_fn getlk;
   shim_setlk_fn setlk;
+  shim_getxattr_fn getxattr;
+  shim_setxattr_fn setxattr;
+  shim_listxattr_fn listxattr;
+  shim_removexattr_fn removexattr;
   shim_init_fn init;
   shim_destroy_fn destroy;
 };
@@ -410,6 +419,42 @@ static void ll_setlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, 
   }
 }
 
+static void ll_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.getxattr && name) {
+    ctx->ops.getxattr(static_cast<shim_req_t>(req), ino, name, size, ctx->userdata);
+  } else {
+    fuse_reply_err(req, 38);
+  }
+}
+
+static void ll_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.setxattr && name) {
+    ctx->ops.setxattr(static_cast<shim_req_t>(req), ino, name, value, size, flags, ctx->userdata);
+  } else {
+    fuse_reply_err(req, 38);
+  }
+}
+
+static void ll_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.listxattr) {
+    ctx->ops.listxattr(static_cast<shim_req_t>(req), ino, size, ctx->userdata);
+  } else {
+    fuse_reply_err(req, 38);
+  }
+}
+
+static void ll_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.removexattr && name) {
+    ctx->ops.removexattr(static_cast<shim_req_t>(req), ino, name, ctx->userdata);
+  } else {
+    fuse_reply_err(req, 38);
+  }
+}
+
 static void ll_init(void *userdata, struct fuse_conn_info *conn) {
   (void)conn;
   auto *ctx = static_cast<ShimContext *>(userdata);
@@ -502,6 +547,10 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   ll_ops.flock = ll_flock;
   ll_ops.getlk = ll_getlk;
   ll_ops.setlk = ll_setlk;
+  ll_ops.getxattr = ll_getxattr;
+  ll_ops.setxattr = ll_setxattr;
+  ll_ops.listxattr = ll_listxattr;
+  ll_ops.removexattr = ll_removexattr;
 
   se = fuse_session_new(&args, &ll_ops, sizeof(ll_ops), &ctx);
   if (se == nullptr) {
@@ -651,6 +700,10 @@ int shim_reply_lock(shim_req_t req, const struct shim_flock *lock) {
   fl.l_len = lock->len;
   fl.l_pid = lock->pid;
   return fuse_reply_lock(static_cast<fuse_req_t>(req), &fl);
+}
+
+int shim_reply_xattr(shim_req_t req, size_t count) {
+  return fuse_reply_xattr(static_cast<fuse_req_t>(req), count);
 }
 
 size_t shim_add_direntry(shim_req_t req, char *buf, size_t bufsize, const char *name, uint64_t ino, uint32_t mode,

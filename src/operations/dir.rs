@@ -213,6 +213,7 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
                 atime: Some(now),
                 mtime: Some(now),
                 ctime: Some(now),
+                xattrs: None,
             },
         });
 

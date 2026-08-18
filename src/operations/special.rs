@@ -55,6 +55,7 @@ pub fn mknod_core(
             atime: Some(now),
             mtime: Some(now),
             ctime: Some(now),
+            xattrs: None,
         };
 
         let (new_delta, file_type, actual_rdev) = match file_type_bits {

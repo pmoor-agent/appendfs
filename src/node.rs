@@ -1,6 +1,8 @@
 use crate::log::SharedExtentState;
 use crate::range_map::RangeMap;
 use crate::shim::FileType;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,8 @@ pub struct InodeMeta {
     pub mtime: SystemTime,
     #[serde(with = "crate::clock::serde_system_time")]
     pub ctime: SystemTime,
+    #[serde(default)]
+    pub xattrs: Option<Arc<BTreeMap<String, Vec<u8>>>>,
 }
 
 impl InodeMeta {
@@ -30,6 +34,7 @@ impl InodeMeta {
             atime: time,
             mtime: time,
             ctime: time,
+            xattrs: None,
         }
     }
 }
@@ -100,14 +105,14 @@ impl Node {
         }
     }
 
-    pub fn new_char_device(perm: u32, uid: u32, gid: u32, rdev: u32, time: SystemTime) -> Self {
+    pub fn new_char_device(rdev: u32, perm: u32, uid: u32, gid: u32, time: SystemTime) -> Self {
         Self {
             meta: InodeMeta::new(perm, 1, uid, gid, time),
             kind: NodeKind::CharDevice { rdev },
         }
     }
 
-    pub fn new_block_device(perm: u32, uid: u32, gid: u32, rdev: u32, time: SystemTime) -> Self {
+    pub fn new_block_device(rdev: u32, perm: u32, uid: u32, gid: u32, time: SystemTime) -> Self {
         Self {
             meta: InodeMeta::new(perm, 1, uid, gid, time),
             kind: NodeKind::BlockDevice { rdev },
@@ -197,6 +202,27 @@ impl Node {
         if let Some(ctime) = delta.ctime {
             self.meta.ctime = ctime;
         }
+        if let Some(ref xattr_changes) = delta.xattrs {
+            let mut map = match self.meta.xattrs.take() {
+                Some(arc) => (*arc).clone(),
+                None => BTreeMap::new(),
+            };
+            for (key, val_opt) in xattr_changes {
+                match val_opt {
+                    Some(val) => {
+                        map.insert(key.clone(), val.clone());
+                    }
+                    None => {
+                        map.remove(key);
+                    }
+                }
+            }
+            if map.is_empty() {
+                self.meta.xattrs = None;
+            } else {
+                self.meta.xattrs = Some(Arc::new(map));
+            }
+        }
     }
 }
 
@@ -212,6 +238,8 @@ pub struct AttrDelta {
     pub mtime: Option<SystemTime>,
     #[serde(default, with = "crate::clock::serde_system_time_opt")]
     pub ctime: Option<SystemTime>,
+    #[serde(default)]
+    pub xattrs: Option<std::collections::HashMap<String, Option<Vec<u8>>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -253,7 +281,34 @@ pub enum NodeDelta {
     Socket(SpecialDelta),
 }
 
+impl NodeDelta {
+    pub fn attr_delta(&self) -> &AttrDelta {
+        match self {
+            NodeDelta::Directory(d) => &d.attr_delta,
+            NodeDelta::File(f) => &f.attr_delta,
+            NodeDelta::Symlink(s) => &s.attr_delta,
+            NodeDelta::Fifo(s)
+            | NodeDelta::CharDevice(s)
+            | NodeDelta::BlockDevice(s)
+            | NodeDelta::Socket(s) => &s.attr_delta,
+        }
+    }
+
+    pub fn attr_delta_mut(&mut self) -> &mut AttrDelta {
+        match self {
+            NodeDelta::Directory(d) => &mut d.attr_delta,
+            NodeDelta::File(f) => &mut f.attr_delta,
+            NodeDelta::Symlink(s) => &mut s.attr_delta,
+            NodeDelta::Fifo(s)
+            | NodeDelta::CharDevice(s)
+            | NodeDelta::BlockDevice(s)
+            | NodeDelta::Socket(s) => &mut s.attr_delta,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum EntryDelta {
     Node(NodeDelta),
     Tombstone,

@@ -158,6 +158,21 @@ struct RustLowlevelOps {
             userdata: *mut c_void,
         ),
     >,
+    getxattr:
+        Option<extern "C" fn(req: shim_req_t, ino: u64, name: *const c_char, size: usize, userdata: *mut c_void)>,
+    setxattr: Option<
+        extern "C" fn(
+            req: shim_req_t,
+            ino: u64,
+            name: *const c_char,
+            value: *const u8,
+            size: usize,
+            flags: c_int,
+            userdata: *mut c_void,
+        ),
+    >,
+    listxattr: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, userdata: *mut c_void)>,
+    removexattr: Option<extern "C" fn(req: shim_req_t, ino: u64, name: *const c_char, userdata: *mut c_void)>,
     init: Option<extern "C" fn(userdata: *mut c_void)>,
     destroy: Option<extern "C" fn(userdata: *mut c_void)>,
 }
@@ -186,6 +201,7 @@ unsafe extern "C" {
     fn shim_reply_readlink(req: shim_req_t, link: *const c_char) -> c_int;
     fn shim_reply_statfs(req: shim_req_t, attr: *const ShimStatfsAttr) -> c_int;
     fn shim_reply_lock(req: shim_req_t, lock: *const ShimFlock) -> c_int;
+    fn shim_reply_xattr(req: shim_req_t, count: usize) -> c_int;
 
     fn shim_add_direntry(
         req: shim_req_t,
@@ -321,6 +337,12 @@ impl Request {
     pub fn reply_lock(self, lock: &ShimFlock) {
         unsafe {
             shim_reply_lock(self.req, lock);
+        }
+    }
+
+    pub fn reply_xattr(self, count: usize) {
+        unsafe {
+            shim_reply_xattr(self.req, count);
         }
     }
 
@@ -535,6 +557,10 @@ pub trait Filesystem {
     fn flock(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32);
     fn getlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock);
     fn setlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool);
+    fn getxattr(&self, req: Request, ino: u64, name: &str, size: usize);
+    fn setxattr(&self, req: Request, ino: u64, name: &str, value: &[u8], flags: i32);
+    fn listxattr(&self, req: Request, ino: u64, size: usize);
+    fn removexattr(&self, req: Request, ino: u64, name: &str);
 }
 
 // Lowlevel C callback bridges
@@ -813,6 +839,60 @@ extern "C" fn setlk_bridge(
     fs.setlk(Request { req }, ino, fh, lock_owner, sh_lock, sleep != 0);
 }
 
+extern "C" fn getxattr_bridge(req: shim_req_t, ino: u64, name: *const c_char, size: usize, userdata: *mut c_void) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::EINVAL);
+            return;
+        }
+    };
+    fs.getxattr(Request { req }, ino, name_str, size);
+}
+
+extern "C" fn setxattr_bridge(
+    req: shim_req_t,
+    ino: u64,
+    name: *const c_char,
+    value: *const u8,
+    size: usize,
+    flags: c_int,
+    userdata: *mut c_void,
+) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::EINVAL);
+            return;
+        }
+    };
+    let val_slice = if size > 0 && !value.is_null() {
+        unsafe { std::slice::from_raw_parts(value, size) }
+    } else {
+        &[]
+    };
+    fs.setxattr(Request { req }, ino, name_str, val_slice, flags);
+}
+
+extern "C" fn listxattr_bridge(req: shim_req_t, ino: u64, size: usize, userdata: *mut c_void) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    fs.listxattr(Request { req }, ino, size);
+}
+
+extern "C" fn removexattr_bridge(req: shim_req_t, ino: u64, name: *const c_char, userdata: *mut c_void) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            Request { req }.reply_err(libc::EINVAL);
+            return;
+        }
+    };
+    fs.removexattr(Request { req }, ino, name_str);
+}
+
 extern "C" fn init_bridge(userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.init();
@@ -871,6 +951,10 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
         flock: Some(flock_bridge),
         getlk: Some(getlk_bridge),
         setlk: Some(setlk_bridge),
+        getxattr: Some(getxattr_bridge),
+        setxattr: Some(setxattr_bridge),
+        listxattr: Some(listxattr_bridge),
+        removexattr: Some(removexattr_bridge),
         init: Some(init_bridge),
         destroy: Some(destroy_bridge),
     };

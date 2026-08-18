@@ -75,6 +75,11 @@ typedef void (*rust_getlk_t)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t
                              void *userdata);
 typedef void (*rust_setlk_t)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner,
                              const struct shim_flock *lock, int sleep, void *userdata);
+typedef void (*rust_getxattr_t)(shim_req_t req, uint64_t ino, const char *name, size_t size, void *userdata);
+typedef void (*rust_setxattr_t)(shim_req_t req, uint64_t ino, const char *name, const char *value, size_t size,
+                                int flags, void *userdata);
+typedef void (*rust_listxattr_t)(shim_req_t req, uint64_t ino, size_t size, void *userdata);
+typedef void (*rust_removexattr_t)(shim_req_t req, uint64_t ino, const char *name, void *userdata);
 typedef void (*rust_init_t)(void *userdata);
 typedef void (*rust_destroy_t)(void *userdata);
 
@@ -105,6 +110,10 @@ struct rust_lowlevel_ops {
   rust_flock_t flock;
   rust_getlk_t getlk;
   rust_setlk_t setlk;
+  rust_getxattr_t getxattr;
+  rust_setxattr_t setxattr;
+  rust_listxattr_t listxattr;
+  rust_removexattr_t removexattr;
   rust_init_t init;
   rust_destroy_t destroy;
 };
@@ -128,6 +137,7 @@ int shim_reply_create(shim_req_t req, const shim_file_attr *attr, double attr_ti
 int shim_reply_readlink(shim_req_t req, const char *link);
 int shim_reply_statfs(shim_req_t req, const shim_statfs_attr *attr);
 int shim_reply_lock(shim_req_t req, const struct shim_flock *lock);
+int shim_reply_xattr(shim_req_t req, size_t count);
 
 // Directory entry layout packing helper using individual fields instead of stat struct
 size_t shim_add_direntry(shim_req_t req, char *buf, size_t bufsize, const char *name, uint64_t ino, uint32_t mode,

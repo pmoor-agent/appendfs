@@ -168,7 +168,7 @@ pub fn dump_log_reader_with_path(
     let mut records: Vec<DumpRecordEntry> = Vec::new();
     let mut current_offset = FILE_HEADER_SIZE as u64;
 
-    let mut op_counts: [OpCodeStats; 11] = Default::default();
+    let mut op_counts: [OpCodeStats; 14] = Default::default();
     let mut write_buckets = vec![
         WriteBucket::new("< 64 B", 0, 63),
         WriteBucket::new("64 B .. 511 B", 64, 511),
@@ -376,7 +376,7 @@ pub fn dump_log_reader_with_path(
         .filter(|r| matches!(r, DumpRecordEntry::Valid { .. }))
         .count();
 
-    for code in 1..=10u8 {
+    for code in 1..=13u8 {
         if let Ok(opcode) = OpCode::try_from(code) {
             let stats = &op_counts[code as usize];
             let pct = if total_valid > 0 {
@@ -974,6 +974,13 @@ pub fn dump_summary_reader_with_path(
                         .unwrap();
                     }
                 }
+                if let Some(ref xattrs) = node.meta.xattrs {
+                    let mut xattr_strs = Vec::new();
+                    for (k, v) in xattrs.iter() {
+                        xattr_strs.push(format!("{:?} ({} bytes)", k, v.len()));
+                    }
+                    writeln!(out, "      xattrs: [{}]", xattr_strs.join(", ")).unwrap();
+                }
             }
         }
     }
@@ -1071,9 +1078,9 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
         Ok(crate::log::record::DecodedPayload::Rename(r)) => {
             writeln!(
                 out,
-                "      parent: {}, name: {:?} -> new_parent: {}, new_name: {:?}, op_time: {}",
-                r.parent,
-                r.name,
+                "      old_parent: {}, old_name: {:?} -> new_parent: {}, new_name: {:?}, op_time: {}",
+                r.old_parent,
+                r.old_name,
                 r.new_parent,
                 r.new_name,
                 format_system_time(r.op_time)
@@ -1139,6 +1146,28 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
                 m.uid,
                 m.gid,
                 format_system_time(m.created_at)
+            )
+            .unwrap();
+        }
+        Ok(crate::log::record::DecodedPayload::Setxattr(x)) => {
+            writeln!(
+                out,
+                "      name: {:?}, value_len: {}, op_time: {}",
+                x.name,
+                format_bytes(x.value.len() as u64),
+                format_system_time(x.op_time)
+            )
+            .unwrap();
+            if dump_data_hex && !x.value.is_empty() {
+                out.push_str(&format_hexdump(&x.value, 256));
+            }
+        }
+        Ok(crate::log::record::DecodedPayload::Removexattr(x)) => {
+            writeln!(
+                out,
+                "      name: {:?}, op_time: {}",
+                x.name,
+                format_system_time(x.op_time)
             )
             .unwrap();
         }

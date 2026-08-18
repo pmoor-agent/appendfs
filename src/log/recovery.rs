@@ -457,9 +457,9 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             let now = rename.op_time;
             let mut map = fs_instance.base.write().unwrap();
 
-            let overwritten_ino = if rename.parent == rename.new_parent {
+            let overwritten_ino = if rename.old_parent == rename.new_parent {
                 let mut overwritten = None;
-                if let Some(parent_node_arc) = map.get_mut(&rename.parent) {
+                if let Some(parent_node_arc) = map.get_mut(&rename.old_parent) {
                     let parent_node = Arc::make_mut(parent_node_arc);
                     if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                         if let Some(dest_pos) = entries
@@ -470,7 +470,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         }
                         if let Some(src_pos) = entries
                             .iter()
-                            .position(|(n, ino)| n == &rename.name && *ino == target_ino)
+                            .position(|(n, ino)| n == &rename.old_name && *ino == target_ino)
                         {
                             entries[src_pos].0 = rename.new_name.clone();
                         }
@@ -481,10 +481,10 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 overwritten
             } else {
                 // Remove source entry
-                if let Some(parent_node_arc) = map.get_mut(&rename.parent) {
+                if let Some(parent_node_arc) = map.get_mut(&rename.old_parent) {
                     let parent_node = Arc::make_mut(parent_node_arc);
                     if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
-                        entries.retain(|(name, ino)| !(name == &rename.name && *ino == target_ino));
+                        entries.retain(|(name, ino)| !(name == &rename.old_name && *ino == target_ino));
                         parent_node.meta.mtime = now;
                         parent_node.meta.ctime = now;
                     }
@@ -510,7 +510,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 }
             };
 
-            if rename.parent != rename.new_parent
+            if rename.old_parent != rename.new_parent
                 && let Some(target_node_arc) = map.get_mut(&target_ino)
             {
                 let target_node = Arc::make_mut(target_node_arc);
@@ -624,6 +624,35 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     parent_node.meta.mtime = now;
                     parent_node.meta.ctime = now;
                 }
+            }
+        }
+        DecodedPayload::Setxattr(setxattr) => {
+            let mut map = fs_instance.base.write().unwrap();
+            if let Some(node_arc) = map.get_mut(&target_ino) {
+                let node = Arc::make_mut(node_arc);
+                let now = setxattr.op_time;
+                let mut xattrs = match node.meta.xattrs.take() {
+                    Some(arc) => (*arc).clone(),
+                    None => std::collections::BTreeMap::new(),
+                };
+                xattrs.insert(setxattr.name, setxattr.value);
+                node.meta.xattrs = Some(Arc::new(xattrs));
+                node.meta.ctime = now;
+            }
+        }
+        DecodedPayload::Removexattr(removexattr) => {
+            let mut map = fs_instance.base.write().unwrap();
+            if let Some(node_arc) = map.get_mut(&target_ino) {
+                let node = Arc::make_mut(node_arc);
+                let now = removexattr.op_time;
+                if let Some(arc) = node.meta.xattrs.take() {
+                    let mut xattrs = (*arc).clone();
+                    xattrs.remove(&removexattr.name);
+                    if !xattrs.is_empty() {
+                        node.meta.xattrs = Some(Arc::new(xattrs));
+                    }
+                }
+                node.meta.ctime = now;
             }
         }
         DecodedPayload::FlushCommit(_) => {}

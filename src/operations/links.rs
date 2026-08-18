@@ -107,6 +107,7 @@ pub fn symlink_core(
                 atime: Some(now),
                 mtime: Some(now),
                 ctime: Some(now),
+                xattrs: None,
             },
         });
 

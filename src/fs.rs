@@ -1,8 +1,8 @@
 use crate::clock::{Clock, SystemClock};
 use crate::log::{
     BackgroundFlusher, CreatePayload, ExtentState, GenerationLiveStats, LinkPayload, LogFileCache, LogManifest,
-    LogWriter, MkdirPayload, MknodPayload, OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload, SetattrPayload,
-    SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
+    LogWriter, MkdirPayload, MknodPayload, OpCode, RECORD_HEADER_SIZE, RemovexattrPayload, RenamePayload,
+    RmdirPayload, SetattrPayload, SetxattrPayload, SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
 use crate::node::{
     AttrDelta, DirectoryDelta, EntryDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta, SymlinkDelta,
@@ -10,7 +10,7 @@ use crate::node::{
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
 use crate::storage::Storage;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -839,6 +839,139 @@ impl InMemoryFS {
         None
     }
 
+    /// Resolves an extended attribute value for an inode across live -> flushing -> base layers.
+    pub fn get_xattr(&self, ino: u64, name: &str) -> Option<Vec<u8>> {
+        // 1. Live layer
+        if let Some(entry) = self.live.read().unwrap().get(&ino) {
+            match entry {
+                EntryDelta::Tombstone => return None,
+                EntryDelta::Node(delta) => {
+                    if let Some(ref xattrs) = delta.attr_delta().xattrs
+                        && let Some(val_opt) = xattrs.get(name)
+                    {
+                        return val_opt.clone();
+                    }
+                }
+            }
+        }
+
+        // 2. Flushing layers (newest to oldest)
+        {
+            let flushing_guard = self.flushing.read().unwrap();
+            for batch in flushing_guard.iter().rev() {
+                if let Some(entry) = batch.get(&ino) {
+                    match entry {
+                        EntryDelta::Tombstone => return None,
+                        EntryDelta::Node(delta) => {
+                            if let Some(ref xattrs) = delta.attr_delta().xattrs
+                                && let Some(val_opt) = xattrs.get(name)
+                            {
+                                return val_opt.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Base layer
+        if let Some(arc) = self.base.read().unwrap().get(&ino)
+            && let Some(ref xattrs) = arc.meta.xattrs
+        {
+            return xattrs.get(name).cloned();
+        }
+
+        None
+    }
+
+    /// Lists all extended attribute names for an inode across all layers in alphabetical order.
+    pub fn list_xattrs(&self, ino: u64) -> Option<Vec<String>> {
+        let _attr = self.get_attr(ino)?;
+        let mut map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+
+        // 1. Base layer
+        if let Some(arc) = self.base.read().unwrap().get(&ino)
+            && let Some(ref xattrs) = arc.meta.xattrs
+        {
+            for (k, v) in xattrs.iter() {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+
+        // 2. Flushing layers (oldest to newest)
+        {
+            let flushing_guard = self.flushing.read().unwrap();
+            for batch in flushing_guard.iter() {
+                if let Some(entry) = batch.get(&ino) {
+                    match entry {
+                        EntryDelta::Tombstone => return None,
+                        EntryDelta::Node(delta) => {
+                            if let Some(ref xattrs) = delta.attr_delta().xattrs {
+                                for (k, v) in xattrs {
+                                    match v {
+                                        Some(val) => {
+                                            map.insert(k.clone(), val.clone());
+                                        }
+                                        None => {
+                                            map.remove(k);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Live layer
+        if let Some(entry) = self.live.read().unwrap().get(&ino) {
+            match entry {
+                EntryDelta::Tombstone => return None,
+                EntryDelta::Node(delta) => {
+                    if let Some(ref xattrs) = delta.attr_delta().xattrs {
+                        for (k, v) in xattrs {
+                            match v {
+                                Some(val) => {
+                                    map.insert(k.clone(), val.clone());
+                                }
+                                None => {
+                                    map.remove(k);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(map.into_keys().collect())
+    }
+
+    /// Stages a set/replace mutation for an extended attribute.
+    pub fn set_xattr(&self, ino: u64, name: &str, value: Vec<u8>, now: SystemTime) {
+        let mut xattrs = HashMap::new();
+        xattrs.insert(name.to_string(), Some(value));
+        let delta = AttrDelta {
+            ctime: Some(now),
+            xattrs: Some(xattrs),
+            ..Default::default()
+        };
+        self.update_attr_delta(ino, delta);
+    }
+
+    /// Stages a removal mutation for an extended attribute.
+    pub fn remove_xattr(&self, ino: u64, name: &str, now: SystemTime) {
+        let mut xattrs = HashMap::new();
+        xattrs.insert(name.to_string(), None);
+        let delta = AttrDelta {
+            ctime: Some(now),
+            xattrs: Some(xattrs),
+            ..Default::default()
+        };
+        self.update_attr_delta(ino, delta);
+    }
+
     /// Reads file data at `[offset, offset + size)` resolving extents across layers.
     pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
         let attr = self.get_attr(ino).ok_or(libc::ENOENT)?;
@@ -1527,8 +1660,8 @@ impl InMemoryFS {
 
             for (child_ino, parent, name, new_parent, new_name, op_time) in ordered_renames {
                 let payload = RenamePayload {
-                    parent,
-                    name,
+                    old_parent: parent,
+                    old_name: name,
                     new_parent,
                     new_name,
                     op_time,
@@ -1799,6 +1932,42 @@ impl InMemoryFS {
                         written_count += 1;
                     }
                     _ => {}
+                }
+            }
+
+            // 4b. Emit Setxattr / Removexattr records
+            for (&ino, entry) in frozen.iter() {
+                if let EntryDelta::Node(node_delta) = entry {
+                    let attr_delta = node_delta.attr_delta();
+                    if let Some(ref xattr_changes) = attr_delta.xattrs {
+                        let op_time = attr_delta.ctime.or(attr_delta.mtime).unwrap_or(now);
+                        for (name, val_opt) in xattr_changes {
+                            match val_opt {
+                                Some(val) => {
+                                    let payload = SetxattrPayload {
+                                        name: name.clone(),
+                                        value: val.clone(),
+                                        flags: 0,
+                                        op_time,
+                                    };
+                                    let bytes = bincode::serialize(&payload)
+                                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                                    writer.append_record(OpCode::Setxattr, ino, &bytes)?;
+                                    written_count += 1;
+                                }
+                                None => {
+                                    let payload = RemovexattrPayload {
+                                        name: name.clone(),
+                                        op_time,
+                                    };
+                                    let bytes = bincode::serialize(&payload)
+                                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                                    writer.append_record(OpCode::Removexattr, ino, &bytes)?;
+                                    written_count += 1;
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2283,6 +2452,12 @@ fn merge_attr_delta(target: &mut AttrDelta, incoming: &AttrDelta) {
     if incoming.ctime.is_some() {
         target.ctime = incoming.ctime;
     }
+    if let Some(ref inc_xattrs) = incoming.xattrs {
+        let target_xattrs = target.xattrs.get_or_insert_with(HashMap::new);
+        for (k, v) in inc_xattrs {
+            target_xattrs.insert(k.clone(), v.clone());
+        }
+    }
 }
 
 fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
@@ -2330,7 +2505,7 @@ fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
 }
 
 fn delta_to_node(delta: &NodeDelta) -> Node {
-    match delta {
+    let mut node = match delta {
         NodeDelta::Directory(d) => {
             let mut entries: Vec<(String, u64)> = d.added.iter().map(|(k, v)| (k.clone(), *v)).collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2342,6 +2517,7 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
                 atime: d.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: d.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
                 ctime: d.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+                xattrs: None,
             };
             Node {
                 meta,
@@ -2364,6 +2540,7 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
                 atime: f.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: f.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
                 ctime: f.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+                xattrs: None,
             };
             Node {
                 meta,
@@ -2382,6 +2559,7 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
                 atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
                 ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+                xattrs: None,
             };
             Node {
                 meta,
@@ -2399,6 +2577,7 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
                 atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
                 ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+                xattrs: None,
             };
             Node {
                 meta,
@@ -2414,6 +2593,7 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
                 atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
                 ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+                xattrs: None,
             };
             Node {
                 meta,
@@ -2429,6 +2609,7 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
                 atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
                 ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+                xattrs: None,
             };
             Node {
                 meta,
@@ -2444,13 +2625,16 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
                 atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
                 ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+                xattrs: None,
             };
             Node {
                 meta,
                 kind: NodeKind::Socket,
             }
         }
-    }
+    };
+    node.apply_attr_delta(delta.attr_delta());
+    node
 }
 
 pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {

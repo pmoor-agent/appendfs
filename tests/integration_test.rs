@@ -1339,3 +1339,252 @@ fn test_special_file_types_and_recovery() {
     assert_eq!(st_after.st_nlink, 1);
 }
 
+fn sys_setxattr(path: &std::path::Path, name: &str, value: &[u8], flags: i32) -> std::io::Result<()> {
+    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let c_name = std::ffi::CString::new(name).unwrap();
+    let res = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            flags,
+        )
+    };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn sys_getxattr(path: &std::path::Path, name: &str) -> std::io::Result<Vec<u8>> {
+    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let c_name = std::ffi::CString::new(name).unwrap();
+    let sz = unsafe { libc::getxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
+    if sz < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buf = vec![0u8; sz as usize];
+    let res = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if res < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    buf.truncate(res as usize);
+    Ok(buf)
+}
+
+fn sys_listxattr(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let sz = unsafe { libc::listxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
+    if sz < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if sz == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; sz as usize];
+    let res = unsafe { libc::listxattr(c_path.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if res < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    buf.truncate(res as usize);
+    let mut list = Vec::new();
+    for chunk in buf.split(|&b| b == 0) {
+        if !chunk.is_empty() {
+            list.push(String::from_utf8_lossy(chunk).to_string());
+        }
+    }
+    Ok(list)
+}
+
+fn sys_removexattr(path: &std::path::Path, name: &str) -> std::io::Result<()> {
+    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let c_name = std::ffi::CString::new(name).unwrap();
+    let res = unsafe { libc::removexattr(c_path.as_ptr(), c_name.as_ptr()) };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[test]
+fn test_xattr_fuse_crud_and_crash_recovery() {
+    let clock = Arc::new(appendfs::SystemClock);
+    let log_dir = tempfile::Builder::new()
+        .prefix("appendfs_xattr_log_")
+        .tempdir()
+        .unwrap();
+    let log_path = log_dir.path().to_path_buf();
+
+    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1, &*clock).unwrap());
+    let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+    let mount_dir = tempfile::Builder::new()
+        .prefix("appendfs_xattr_mnt_")
+        .tempdir()
+        .unwrap();
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, fs_instance, false);
+    let mount_path = mount.path().to_path_buf();
+
+    let file_path = mount_path.join("doc.txt");
+    fs::write(&file_path, b"document content").unwrap();
+
+    // 1. Initial get / list on file with no xattrs
+    assert_eq!(
+        sys_getxattr(&file_path, "user.comment")
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ENODATA)
+    );
+    assert_eq!(sys_listxattr(&file_path).unwrap(), Vec::<String>::new());
+
+    // 2. Set multiple xattrs (string, binary)
+    sys_setxattr(&file_path, "user.comment", b"hello appendfs", 0).unwrap();
+    let binary_data = vec![0x00, 0xff, 0x42, 0x13, 0x37, 0xca, 0xfe];
+    sys_setxattr(&file_path, "user.binary", &binary_data, 0).unwrap();
+    sys_setxattr(&file_path, "user.author", b"antigravity", libc::XATTR_CREATE).unwrap();
+
+    // 3. Flags validation: XATTR_CREATE on existing fails with EEXIST
+    assert_eq!(
+        sys_setxattr(&file_path, "user.author", b"duplicate", libc::XATTR_CREATE)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EEXIST)
+    );
+
+    // 4. Verify get and list
+    assert_eq!(
+        sys_getxattr(&file_path, "user.comment").unwrap(),
+        b"hello appendfs"
+    );
+    assert_eq!(
+        sys_getxattr(&file_path, "user.binary").unwrap(),
+        binary_data
+    );
+    assert_eq!(
+        sys_getxattr(&file_path, "user.author").unwrap(),
+        b"antigravity"
+    );
+
+    let mut attrs = sys_listxattr(&file_path).unwrap();
+    attrs.sort();
+    assert_eq!(attrs, vec!["user.author", "user.binary", "user.comment"]);
+
+    // 5. Update and remove
+    sys_setxattr(
+        &file_path,
+        "user.comment",
+        b"updated comment",
+        libc::XATTR_REPLACE,
+    )
+    .unwrap();
+    sys_removexattr(&file_path, "user.author").unwrap();
+
+    assert_eq!(
+        sys_getxattr(&file_path, "user.author")
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ENODATA)
+    );
+    assert_eq!(
+        sys_getxattr(&file_path, "user.comment").unwrap(),
+        b"updated comment"
+    );
+
+    // Unmount and flush to log
+    mount.unmount();
+
+    // 6. Recover filesystem from log files
+    let recovered_fs = appendfs::recover_fs(&log_path).expect("recovery should succeed");
+    let remount_dir = tempfile::Builder::new()
+        .prefix("appendfs_xattr_remount_")
+        .tempdir()
+        .unwrap();
+    let log_dir_keep = tempfile::tempdir().unwrap();
+    let remount = TestMount::mount_custom(log_dir_keep, remount_dir, recovered_fs, false);
+    let remount_path = remount.path().to_path_buf();
+
+    let recovered_file = remount_path.join("doc.txt");
+    assert_eq!(
+        sys_getxattr(&recovered_file, "user.comment").unwrap(),
+        b"updated comment"
+    );
+    assert_eq!(
+        sys_getxattr(&recovered_file, "user.binary").unwrap(),
+        binary_data
+    );
+    assert_eq!(
+        sys_getxattr(&recovered_file, "user.author")
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ENODATA)
+    );
+
+    let mut recovered_attrs = sys_listxattr(&recovered_file).unwrap();
+    recovered_attrs.sort();
+    assert_eq!(recovered_attrs, vec!["user.binary", "user.comment"]);
+}
+
+#[test]
+fn test_xattr_on_directories_and_special_files() {
+    let clock = Arc::new(appendfs::SystemClock);
+    let log_dir = tempfile::Builder::new()
+        .prefix("appendfs_xattr_dir_log_")
+        .tempdir()
+        .unwrap();
+    let log_path = log_dir.path().to_path_buf();
+
+    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1, &*clock).unwrap());
+    let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+    let mount_dir = tempfile::Builder::new()
+        .prefix("appendfs_xattr_dir_mnt_")
+        .tempdir()
+        .unwrap();
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, fs_instance, false);
+    let mount_path = mount.path().to_path_buf();
+
+    // 1. Directory xattrs
+    let dir_path = mount_path.join("test_dir");
+    fs::create_dir(&dir_path).unwrap();
+
+    sys_setxattr(&dir_path, "user.folder_tag", b"photos_2026", 0).unwrap();
+    assert_eq!(
+        sys_getxattr(&dir_path, "user.folder_tag").unwrap(),
+        b"photos_2026"
+    );
+    assert_eq!(sys_listxattr(&dir_path).unwrap(), vec!["user.folder_tag"]);
+
+    // 2. Symlink creation & directory recovery
+    let target_path = dir_path.join("target.txt");
+    fs::write(&target_path, b"target file").unwrap();
+
+    mount.unmount();
+
+    // Recover and verify directory xattr persisted
+    let recovered_fs = appendfs::recover_fs(&log_path).expect("recovery should succeed");
+    let remount_dir = tempfile::Builder::new()
+        .prefix("appendfs_xattr_dir_remount_")
+        .tempdir()
+        .unwrap();
+    let log_dir_keep = tempfile::tempdir().unwrap();
+    let remount = TestMount::mount_custom(log_dir_keep, remount_dir, recovered_fs, false);
+    let remount_path = remount.path().to_path_buf();
+
+    let rec_dir_path = remount_path.join("test_dir");
+    assert_eq!(
+        sys_getxattr(&rec_dir_path, "user.folder_tag").unwrap(),
+        b"photos_2026"
+    );
+}
+
+

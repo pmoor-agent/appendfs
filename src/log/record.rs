@@ -93,6 +93,8 @@ pub enum OpCode {
     /// `FlushCommitPayload`.
     FlushCommit = 10,
     Mknod = 11,
+    Setxattr = 12,
+    Removexattr = 13,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -111,6 +113,8 @@ impl TryFrom<u8> for OpCode {
             9 => Ok(OpCode::Link),
             10 => Ok(OpCode::FlushCommit),
             11 => Ok(OpCode::Mknod),
+            12 => Ok(OpCode::Setxattr),
+            13 => Ok(OpCode::Removexattr),
             _ => Err("Unknown operation code"),
         }
     }
@@ -130,6 +134,8 @@ impl std::fmt::Display for OpCode {
             OpCode::Link => "Link",
             OpCode::FlushCommit => "FlushCommit",
             OpCode::Mknod => "Mknod",
+            OpCode::Setxattr => "Setxattr",
+            OpCode::Removexattr => "Removexattr",
         };
         f.pad(name)
     }
@@ -225,7 +231,9 @@ pub struct CreatePayload {
 }
 
 /// Structured metadata payload for directory creation operations (`OP_MKDIR`).
-/// See `CreatePayload::created_at`.
+///
+/// `created_at` is applied to atime/mtime/ctime of the new directory on replay - see
+/// `WriteMeta::op_time` for why this needs to be carried explicitly.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MkdirPayload {
     pub parent: u64,
@@ -248,7 +256,7 @@ pub struct UnlinkPayload {
     pub op_time: SystemTime,
 }
 
-/// Structured metadata payload for directory rmdir operations (`OP_RMDIR`).
+/// Structured metadata payload for directory removal operations (`OP_RMDIR`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RmdirPayload {
     pub parent: u64,
@@ -258,7 +266,9 @@ pub struct RmdirPayload {
 }
 
 /// Structured metadata payload for symlink creation operations (`OP_SYMLINK`).
-/// See `CreatePayload::created_at`.
+///
+/// `created_at` is applied to atime/mtime/ctime of the new symlink on replay - see
+/// `WriteMeta::op_time` for why this needs to be carried explicitly.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SymlinkPayload {
     pub parent: u64,
@@ -272,21 +282,21 @@ pub struct SymlinkPayload {
     pub created_at: SystemTime,
 }
 
-/// Structured metadata payload for rename operations (`OP_RENAME`).
+/// Structured metadata payload for file and directory rename operations (`OP_RENAME`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RenamePayload {
-    pub parent: u64,
-    pub name: String,
+    pub old_parent: u64,
+    pub old_name: String,
     pub new_parent: u64,
     pub new_name: String,
     #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
     pub op_time: SystemTime,
 }
 
-/// Structured metadata payload for setattr operations (`OP_SETATTR`).
+/// Structured metadata payload for metadata updates (`OP_SETATTR`).
 ///
-/// `atime`/`mtime` carry the *user-requested* value when explicitly set (a `utimes()`
-/// call can set either to an arbitrary value, not necessarily "now"). `op_time` is
+/// `atime` and `mtime` are optional: when `Some`, replay restores the exact timestamp
+/// requested by `utimensat`/`setattr`. When `None`, they are left untouched. `op_time` is
 /// different: it's the wall-clock time this setattr call happened, applied to ctime
 /// whenever any other field is `Some` - mirroring live, which touches ctime inside
 /// each individual to_set-bit branch, never on a call that changes nothing. `op_time`
@@ -335,6 +345,25 @@ pub struct MknodPayload {
     pub created_at: SystemTime,
 }
 
+/// Structured metadata payload for extended attribute set operations (`OP_SETXATTR`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SetxattrPayload {
+    pub name: String,
+    pub value: Vec<u8>,
+    #[serde(default)]
+    pub flags: u32,
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    pub op_time: SystemTime,
+}
+
+/// Structured metadata payload for extended attribute remove operations (`OP_REMOVEXATTR`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RemovexattrPayload {
+    pub name: String,
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
+    pub op_time: SystemTime,
+}
+
 /// Unified typed representation of any decoded log record payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedPayload<'a> {
@@ -349,6 +378,8 @@ pub enum DecodedPayload<'a> {
     Link(LinkPayload),
     FlushCommit(FlushCommitPayload),
     Mknod(MknodPayload),
+    Setxattr(SetxattrPayload),
+    Removexattr(RemovexattrPayload),
 }
 
 impl DecodedPayload<'_> {
@@ -366,6 +397,8 @@ impl DecodedPayload<'_> {
             DecodedPayload::Link(p) => Some(p.op_time),
             DecodedPayload::FlushCommit(p) => Some(p.timestamp),
             DecodedPayload::Mknod(p) => Some(p.created_at),
+            DecodedPayload::Setxattr(p) => Some(p.op_time),
+            DecodedPayload::Removexattr(p) => Some(p.op_time),
         }
     }
 }
