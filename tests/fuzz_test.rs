@@ -2,7 +2,7 @@ mod common;
 use appendfs::LogWriter;
 use appendfs::clock::{AdvancingClock, Clock, MockClock, SystemClock};
 use appendfs::log::{CreatePayload, MkdirPayload, OpCode, recover_fs, recover_fs_with_clock};
-use appendfs::node::Node;
+use appendfs::node::NodeKind;
 use common::{SnapshotNode, TestFS, TestRng};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -805,8 +805,8 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     let map = recovered.snapshot_all();
 
     let root = map.get(&1).unwrap();
-    let entries = match root.as_ref() {
-        Node::Directory { entries, .. } => entries.clone(),
+    let entries = match &root.kind {
+        NodeKind::Directory { entries, .. } => entries.clone(),
         _ => panic!("root is not a directory"),
     };
 

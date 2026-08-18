@@ -2,7 +2,7 @@ use crate::fs::InMemoryFS;
 use crate::log::LogFileCache;
 use crate::log::extent::ExtentState;
 use crate::log::record::{OpCode, RECORD_HEADER_SIZE, checksum_payload};
-use crate::node::Node;
+use crate::node::NodeKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -250,17 +250,16 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
     let base_map = fs.base.read().unwrap();
     report.total_inodes = base_map.len();
 
-    // Inventory node types and extents
     for (&_ino, node_arc) in base_map.iter() {
         let node = node_arc.as_ref();
-        match node {
-            Node::Directory { .. } => report.directories += 1,
-            Node::File { range_map, size, .. } => {
+        match &node.kind {
+            NodeKind::Directory { .. } => report.directories += 1,
+            NodeKind::File { range_map, size, .. } => {
                 report.regular_files += 1;
                 report.total_extents += range_map.len();
                 report.total_data_bytes += *size;
             }
-            Node::Symlink { .. } => report.symlinks += 1,
+            NodeKind::Symlink { .. } => report.symlinks += 1,
         }
     }
 
@@ -280,8 +279,8 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
         }
         Some(root_arc) => {
             let root_node = root_arc.as_ref();
-            match root_node {
-                Node::Directory { parent, .. } => {
+            match &root_node.kind {
+                NodeKind::Directory { parent, .. } => {
                     if *parent != 1 {
                         report.issues.push(IntegrityIssue::error(
                             "ROOT_INVALID_PARENT",
@@ -303,8 +302,8 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                             None => continue,
                         };
                         let curr_node = curr_arc.as_ref();
-                        let entries = match curr_node {
-                            Node::Directory { entries, .. } => entries,
+                        let entries = match &curr_node.kind {
+                            NodeKind::Directory { entries, .. } => entries,
                             _ => continue,
                         };
 
@@ -362,8 +361,8 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                             *ref_counts.entry(*child_ino).or_default() += 1;
 
                             let child_node = child_arc.as_ref();
-                            match child_node {
-                                Node::Directory { parent, .. } => {
+                            match &child_node.kind {
+                                NodeKind::Directory { parent, .. } => {
                                     if *child_ino == 1 {
                                         report.issues.push(IntegrityIssue::error(
                                             "ROOT_IN_SUBDIR",
@@ -417,7 +416,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                     next_ancestors.insert(*child_ino);
                                     queue.push_back((*child_ino, next_ancestors));
                                 }
-                                Node::File { .. } | Node::Symlink { .. } => {
+                                NodeKind::File { .. } | NodeKind::Symlink { .. } => {
                                     reachable.insert(*child_ino);
                                 }
                             }
@@ -440,12 +439,12 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
         if !reachable.contains(&ino) {
             report.orphaned_inodes.push(ino);
             let node = node_arc.as_ref();
-            let type_str = match node {
-                Node::Directory { entries, .. } => {
+            let type_str = match &node.kind {
+                NodeKind::Directory { entries, .. } => {
                     format!("Directory with {} entries", entries.len())
                 }
-                Node::File { size, .. } => format!("RegularFile with {} bytes", size),
-                Node::Symlink { target, .. } => format!("Symlink -> '{}'", target),
+                NodeKind::File { size, .. } => format!("RegularFile with {} bytes", size),
+                NodeKind::Symlink { target, .. } => format!("Symlink -> '{}'", target),
             };
             report.issues.push(IntegrityIssue::error(
                 "ORPHAN_INODE",
@@ -465,41 +464,26 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
             continue;
         }
         let node = node_arc.as_ref();
-        match node {
-            Node::Directory { nlink, .. } => {
-                if *nlink != 2 {
-                    report.issues.push(IntegrityIssue::error(
-                        "NLINK_MISMATCH",
-                        Some(ino),
-                        format!("Directory inode {} has nlink {}, expected 2", ino, nlink),
-                    ));
-                }
+        if node.is_dir() {
+            if node.meta.nlink != 2 {
+                report.issues.push(IntegrityIssue::error(
+                    "NLINK_MISMATCH",
+                    Some(ino),
+                    format!("Directory inode {} has nlink {}, expected 2", ino, node.meta.nlink),
+                ));
             }
-            Node::File { nlink, .. } => {
-                let expected_nlink = ref_counts.get(&ino).copied().unwrap_or(0);
-                if *nlink != expected_nlink {
-                    report.issues.push(IntegrityIssue::error(
-                        "NLINK_MISMATCH",
-                        Some(ino),
-                        format!(
-                            "File inode {} has nlink {}, expected {} (referenced by {} directory entries)",
-                            ino, nlink, expected_nlink, expected_nlink
-                        ),
-                    ));
-                }
-            }
-            Node::Symlink { nlink, .. } => {
-                let expected_nlink = ref_counts.get(&ino).copied().unwrap_or(0);
-                if *nlink != expected_nlink {
-                    report.issues.push(IntegrityIssue::error(
-                        "NLINK_MISMATCH",
-                        Some(ino),
-                        format!(
-                            "Symlink inode {} has nlink {}, expected {} (referenced by {} directory entries)",
-                            ino, nlink, expected_nlink, expected_nlink
-                        ),
-                    ));
-                }
+        } else {
+            let expected_nlink = ref_counts.get(&ino).copied().unwrap_or(0);
+            if node.meta.nlink != expected_nlink {
+                let kind_str = if node.is_file() { "File" } else { "Symlink" };
+                report.issues.push(IntegrityIssue::error(
+                    "NLINK_MISMATCH",
+                    Some(ino),
+                    format!(
+                        "{} inode {} has nlink {}, expected {} (referenced by {} directory entries)",
+                        kind_str, ino, node.meta.nlink, expected_nlink, expected_nlink
+                    ),
+                ));
             }
         }
     }
@@ -513,7 +497,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
 
     for (&ino, node_arc) in base_map.iter() {
         let node = node_arc.as_ref();
-        if let Node::File { range_map, size, .. } = node {
+        if let NodeKind::File { range_map, size, .. } = &node.kind {
             for (offset, entry) in range_map.iter() {
                 let file_offset = *offset;
                 let extent_len = entry.length;
@@ -726,6 +710,7 @@ mod tests {
     use super::*;
     use crate::clock::SystemClock;
     use crate::log::{LogWriter, SharedExtentState};
+    use crate::node::{InodeMeta, Node, NodeKind};
     use crate::range_map::RangeMap;
     use std::sync::Arc;
 
@@ -766,16 +751,12 @@ mod tests {
         let fs = crate::recover_fs(dir.path()).unwrap();
         // Inject an orphan inode 999 not linked into directory tree
         let orphan_ino = 999;
-        let orphan_node = Node::File {
-            range_map: RangeMap::new(),
-            size: 0,
-            perm: 0o644,
-            nlink: 0, // Unlinked
-            uid: 1000,
-            gid: 1000,
-            atime: std::time::SystemTime::UNIX_EPOCH,
-            mtime: std::time::SystemTime::UNIX_EPOCH,
-            ctime: std::time::SystemTime::UNIX_EPOCH,
+        let orphan_node = Node {
+            meta: InodeMeta::new(0o644, 0, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
+            kind: NodeKind::File {
+                range_map: RangeMap::new(),
+                size: 0,
+            },
         };
         fs.base.write().unwrap().insert(orphan_ino, Arc::new(orphan_node));
 
@@ -805,9 +786,7 @@ mod tests {
             let mut base = fs.base.write().unwrap();
             let node_arc = base.get_mut(&f.ino).unwrap();
             let mut node = (**node_arc).clone();
-            if let Node::File { ref mut nlink, .. } = node {
-                *nlink = 5;
-            }
+            node.meta.nlink = 5;
             *node_arc = Arc::new(node);
         }
 
@@ -827,16 +806,12 @@ mod tests {
         // Inject file with extent beyond its size
         let mut rm = RangeMap::new();
         rm.insert(100, 50, SharedExtentState::new_staged(Arc::new(vec![0; 50]), 0, 50));
-        let bad_file = Node::File {
-            range_map: rm,
-            size: 120, // Extent ends at 150 > size 120!
-            perm: 0o644,
-            nlink: 1,
-            uid: 1000,
-            gid: 1000,
-            atime: std::time::SystemTime::UNIX_EPOCH,
-            mtime: std::time::SystemTime::UNIX_EPOCH,
-            ctime: std::time::SystemTime::UNIX_EPOCH,
+        let bad_file = Node {
+            meta: InodeMeta::new(0o644, 1, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
+            kind: NodeKind::File {
+                range_map: rm,
+                size: 120, // Extent ends at 150 > size 120!
+            },
         };
         fs.base.write().unwrap().insert(2, Arc::new(bad_file));
         // Link to root
@@ -844,7 +819,7 @@ mod tests {
             let mut base = fs.base.write().unwrap();
             let root_arc = base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
-            if let Node::Directory { ref mut entries, .. } = root {
+            if let NodeKind::Directory { entries, .. } = &mut root.kind {
                 entries.push(("bad.txt".to_string(), 2));
             }
             *root_arc = Arc::new(root);
@@ -864,27 +839,19 @@ mod tests {
         let fs = crate::recover_fs(dir.path()).unwrap();
 
         // Create cycle: /a (ino 2) -> /a/b (ino 3) -> /a/b/a (ino 2)
-        let dir_a = Node::Directory {
-            parent: 1,
-            entries: vec![("b".to_string(), 3)],
-            perm: 0o755,
-            nlink: 2,
-            uid: 1000,
-            gid: 1000,
-            atime: std::time::SystemTime::UNIX_EPOCH,
-            mtime: std::time::SystemTime::UNIX_EPOCH,
-            ctime: std::time::SystemTime::UNIX_EPOCH,
+        let dir_a = Node {
+            meta: InodeMeta::new(0o755, 2, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
+            kind: NodeKind::Directory {
+                parent: 1,
+                entries: vec![("b".to_string(), 3)],
+            },
         };
-        let dir_b = Node::Directory {
-            parent: 2,
-            entries: vec![("cycle_to_a".to_string(), 2)],
-            perm: 0o755,
-            nlink: 2,
-            uid: 1000,
-            gid: 1000,
-            atime: std::time::SystemTime::UNIX_EPOCH,
-            mtime: std::time::SystemTime::UNIX_EPOCH,
-            ctime: std::time::SystemTime::UNIX_EPOCH,
+        let dir_b = Node {
+            meta: InodeMeta::new(0o755, 2, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
+            kind: NodeKind::Directory {
+                parent: 2,
+                entries: vec![("cycle_to_a".to_string(), 2)],
+            },
         };
 
         {
@@ -893,7 +860,7 @@ mod tests {
             base.insert(3, Arc::new(dir_b));
             let root_arc = base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
-            if let Node::Directory { ref mut entries, .. } = root {
+            if let NodeKind::Directory { entries, .. } = &mut root.kind {
                 entries.push(("a".to_string(), 2));
             }
             *root_arc = Arc::new(root);
@@ -914,16 +881,12 @@ mod tests {
 
         // 1. Root contains dangling entry to ino 404
         // 2. Dir 2 has parent field 999 instead of 1
-        let dir_wrong_parent = Node::Directory {
-            parent: 999, // Mismatched parent!
-            entries: vec![],
-            perm: 0o755,
-            nlink: 2,
-            uid: 1000,
-            gid: 1000,
-            atime: std::time::SystemTime::UNIX_EPOCH,
-            mtime: std::time::SystemTime::UNIX_EPOCH,
-            ctime: std::time::SystemTime::UNIX_EPOCH,
+        let dir_wrong_parent = Node {
+            meta: InodeMeta::new(0o755, 2, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
+            kind: NodeKind::Directory {
+                parent: 999, // Mismatched parent!
+                entries: vec![],
+            },
         };
 
         {
@@ -931,7 +894,7 @@ mod tests {
             base.insert(2, Arc::new(dir_wrong_parent));
             let root_arc = base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
-            if let Node::Directory { ref mut entries, .. } = root {
+            if let NodeKind::Directory { entries, .. } = &mut root.kind {
                 entries.push(("dangling".to_string(), 404));
                 entries.push(("wrong_parent_dir".to_string(), 2));
             }
@@ -965,7 +928,7 @@ mod tests {
             let base = fs.base.read().unwrap();
             let node_arc = base.get(&f.ino).unwrap();
             let node = node_arc.as_ref();
-            if let Node::File { range_map, .. } = node {
+            if let NodeKind::File { range_map, .. } = &node.kind {
                 let entry = range_map.iter().next().unwrap().1;
                 if let ExtentState::Disk { record_log_offset, .. } = entry.value.read_state() {
                     record_log_offset

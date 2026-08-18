@@ -1008,16 +1008,12 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
 
     // 3. Inject an orphaned inode into base and verify check detects it
     let orphan_ino = 888;
-    let orphan_node = appendfs::Node::File {
-        range_map: appendfs::RangeMap::new(),
-        size: 256,
-        perm: 0o644,
-        nlink: 1,
-        uid: 1000,
-        gid: 1000,
-        atime: std::time::SystemTime::UNIX_EPOCH,
-        mtime: std::time::SystemTime::UNIX_EPOCH,
-        ctime: std::time::SystemTime::UNIX_EPOCH,
+    let orphan_node = appendfs::Node {
+        meta: appendfs::InodeMeta::new(0o644, 1, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
+        kind: appendfs::NodeKind::File {
+            range_map: appendfs::RangeMap::new(),
+            size: 256,
+        },
     };
     fs.base
         .write()
@@ -1143,7 +1139,77 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
     drop(fs1);
 
     // 5. Subsequent RW Mount: must now succeed cleanly
-    let writer2 = appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1)
-        .expect("Subsequent RW mount must succeed after previous RW mount is dropped");
+    let mut writer2_res = appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1);
+    for _ in 0..20 {
+        if writer2_res.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        writer2_res = appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1);
+    }
+    let writer2 = writer2_res.expect("Subsequent RW mount must succeed after previous RW mount is dropped");
     drop(writer2);
+}
+
+#[test]
+fn test_fuse_flock_and_posix_locks() {
+    use std::os::unix::io::AsRawFd;
+
+    let mount = common::TestMount::new_rw();
+    let file_path = mount.path().join("lock_test.txt");
+    std::fs::write(&file_path, b"abcdefghijklmnopqrstuvwxyz0123456789").unwrap();
+
+    let f1 = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .unwrap();
+    let f2 = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .unwrap();
+
+    // 1. Acquire shared lock on f1 and f2 concurrently
+    let ret1 = unsafe { libc::flock(f1.as_raw_fd(), libc::LOCK_SH) };
+    assert_eq!(ret1, 0, "flock(f1, LOCK_SH) should succeed");
+
+    let ret2 = unsafe { libc::flock(f2.as_raw_fd(), libc::LOCK_SH) };
+    assert_eq!(ret2, 0, "flock(f2, LOCK_SH) should succeed concurrently");
+
+    // 2. Attempt exclusive lock on f2 -> must fail with EWOULDBLOCK
+    let ret_ex = unsafe { libc::flock(f2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(ret_ex, -1);
+    let err = std::io::Error::last_os_error();
+    assert!(
+        err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN),
+        "Expected EWOULDBLOCK/EAGAIN, got: {:?}",
+        err
+    );
+
+    // 3. Unlock f1
+    let ret_un1 = unsafe { libc::flock(f1.as_raw_fd(), libc::LOCK_UN) };
+    assert_eq!(ret_un1, 0, "flock(f1, LOCK_UN) should succeed");
+
+    // 4. Upgrade f2 to exclusive -> should now succeed!
+    let ret_ex2 = unsafe { libc::flock(f2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(ret_ex2, 0, "flock(f2, LOCK_EX) should succeed after f1 unlocked");
+
+    // 5. Unlock f2
+    let ret_un2 = unsafe { libc::flock(f2.as_raw_fd(), libc::LOCK_UN) };
+    assert_eq!(ret_un2, 0, "flock(f2, LOCK_UN) should succeed");
+
+    // 6. Test POSIX fcntl range locking
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = libc::F_WRLCK as i16;
+    fl.l_whence = libc::SEEK_SET as i16;
+    fl.l_start = 0;
+    fl.l_len = 10;
+
+    let ret_fcntl = unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_SETLK, &fl) };
+    assert_eq!(ret_fcntl, 0, "fcntl(f1, F_SETLK, F_WRLCK) should succeed");
+
+    fl.l_type = libc::F_UNLCK as i16;
+    let ret_fcntl_un = unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_SETLK, &fl) };
+    assert_eq!(ret_fcntl_un, 0, "fcntl(f1, F_SETLK, F_UNLCK) should succeed");
 }

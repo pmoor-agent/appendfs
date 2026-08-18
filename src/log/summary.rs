@@ -1,6 +1,6 @@
 use crate::fs::InMemoryFS;
 use crate::log::SharedExtentState;
-use crate::node::Node;
+use crate::node::{Node, NodeKind};
 use crate::range_map::RangeMap;
 use crate::storage::{OsStorage, Storage, StorageReader, WriteMode};
 use serde::{Deserialize, Serialize};
@@ -143,9 +143,9 @@ pub fn export_summary_with_time_to_storage(
     for (inode, node_arc) in &inodes_snapshot {
         let node = node_arc.as_ref();
         let mut node_to_serialize = node.clone();
-        if let Node::Directory { ref mut entries, .. } = node_to_serialize {
+        if let NodeKind::Directory { ref mut entries, .. } = node_to_serialize.kind {
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-        } else if let Node::File { ref mut range_map, .. } = node_to_serialize {
+        } else if let NodeKind::File { ref mut range_map, .. } = node_to_serialize.kind {
             let entries: Vec<(u64, u64, SharedExtentState)> = range_map
                 .iter()
                 .map(|(start, e)| (*start, e.length, e.value.clone()))
@@ -504,6 +504,7 @@ impl SummaryReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::InodeMeta;
     use crate::storage::{FaultStorage, MemoryStorage};
     use std::time::SystemTime;
 
@@ -515,16 +516,12 @@ mod tests {
         let root_entries = vec![("hello.txt".to_string(), 2)];
         snapshot.insert(
             1,
-            Arc::new(Node::Directory {
-                parent: 1,
-                entries: root_entries,
-                perm: 0o755,
-                nlink: 2,
-                uid: 1000,
-                gid: 1000,
-                atime: SystemTime::UNIX_EPOCH,
-                mtime: SystemTime::UNIX_EPOCH,
-                ctime: SystemTime::UNIX_EPOCH,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o755, 2, 1000, 1000, SystemTime::UNIX_EPOCH),
+                kind: NodeKind::Directory {
+                    parent: 1,
+                    entries: root_entries,
+                },
             }),
         );
 
@@ -532,16 +529,12 @@ mod tests {
         rmap.insert(0, 100, SharedExtentState::new_disk(1, 24, 0, 100));
         snapshot.insert(
             2,
-            Arc::new(Node::File {
-                range_map: rmap,
-                size: 100,
-                perm: 0o644,
-                nlink: 1,
-                uid: 1000,
-                gid: 1000,
-                atime: SystemTime::UNIX_EPOCH,
-                mtime: SystemTime::UNIX_EPOCH,
-                ctime: SystemTime::UNIX_EPOCH,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
+                kind: NodeKind::File {
+                    range_map: rmap,
+                    size: 100,
+                },
             }),
         );
 
@@ -564,8 +557,8 @@ mod tests {
         assert_eq!(reader.footer.entry_count, 2);
 
         let node1 = reader.read_inode(1).unwrap().unwrap();
-        match node1 {
-            Node::Directory { entries, .. } => {
+        match node1.kind {
+            NodeKind::Directory { entries, .. } => {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].0, "hello.txt");
             }
@@ -573,8 +566,8 @@ mod tests {
         }
 
         let node2 = reader.read_inode(2).unwrap().unwrap();
-        match node2 {
-            Node::File { range_map, .. } => {
+        match node2.kind {
+            NodeKind::File { range_map, .. } => {
                 assert_eq!(range_map.len(), 1);
                 let extent = range_map.query(0, 100);
                 assert_eq!(extent.len(), 1);
@@ -594,16 +587,12 @@ mod tests {
         for i in 1..=50 {
             snapshot.insert(
                 i,
-                Arc::new(Node::File {
-                    range_map: RangeMap::new(),
-                    size: i * 10,
-                    perm: 0o644,
-                    nlink: 1,
-                    uid: 1000,
-                    gid: 1000,
-                    atime: SystemTime::UNIX_EPOCH,
-                    mtime: SystemTime::UNIX_EPOCH,
-                    ctime: SystemTime::UNIX_EPOCH,
+                Arc::new(Node {
+                    meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
+                    kind: NodeKind::File {
+                        range_map: RangeMap::new(),
+                        size: i * 10,
+                    },
                 }),
             );
         }
@@ -645,8 +634,8 @@ mod tests {
         assert_eq!(reader.manifest.next_filename, "000001.log");
 
         let root = reader.read_inode(1).unwrap().unwrap();
-        match root {
-            Node::Directory { entries, .. } => {
+        match root.kind {
+            NodeKind::Directory { entries, .. } => {
                 assert!(entries.is_empty());
             }
             _ => panic!("expected directory root"),
@@ -676,16 +665,12 @@ mod tests {
         let mut snapshot: HashMap<u64, Arc<Node>> = HashMap::new();
         snapshot.insert(
             1,
-            Arc::new(Node::Directory {
-                parent: 1,
-                entries: vec![("a.txt".to_string(), 2)],
-                perm: 0o755,
-                nlink: 2,
-                uid: 1000,
-                gid: 1000,
-                atime: SystemTime::UNIX_EPOCH,
-                mtime: SystemTime::UNIX_EPOCH,
-                ctime: SystemTime::UNIX_EPOCH,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o755, 2, 1000, 1000, SystemTime::UNIX_EPOCH),
+                kind: NodeKind::Directory {
+                    parent: 1,
+                    entries: vec![("a.txt".to_string(), 2)],
+                },
             }),
         );
 
@@ -729,8 +714,8 @@ mod tests {
         let reader = SummaryReader::open_with_storage(storage.as_ref(), &filename).unwrap();
         assert_eq!(reader.header.generation, 1);
         assert_eq!(reader.footer.entry_count, 1);
-        match reader.read_inode(1).unwrap().unwrap() {
-            Node::Directory { entries, .. } => assert_eq!(entries[0].0, "a.txt"),
+        match reader.read_inode(1).unwrap().unwrap().kind {
+            NodeKind::Directory { entries, .. } => assert_eq!(entries[0].0, "a.txt"),
             _ => panic!("expected directory root"),
         }
     }

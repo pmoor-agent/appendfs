@@ -1,10 +1,11 @@
 pub mod dir;
 pub mod links;
+pub mod locks;
 pub mod read_write;
 pub mod statfs;
 
 use crate::fs::InMemoryFS;
-use crate::shim::{Filesystem, Request};
+use crate::shim::{Filesystem, Request, ShimFlock};
 use std::time::SystemTime;
 
 impl Filesystem for InMemoryFS {
@@ -105,5 +106,17 @@ impl Filesystem for InMemoryFS {
 
     fn statfs(&self, req: Request, ino: u64) {
         statfs::statfs(self, req, ino);
+    }
+
+    fn flock(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
+        locks::flock(self, req, ino, fh, lock_owner, op);
+    }
+
+    fn getlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) {
+        locks::getlk(self, req, ino, fh, lock_owner, lock);
+    }
+
+    fn setlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
+        locks::setlk(self, req, ino, fh, lock_owner, lock, sleep);
     }
 }

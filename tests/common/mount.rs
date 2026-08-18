@@ -130,10 +130,21 @@ impl TestMount {
         let mut fs = appendfs::log::recover_fs(&self.log_path).unwrap();
         let next_gen = appendfs::find_latest_generation(&self.log_path) + 1;
         let start_tx = fs.last_tx_id.load(Ordering::SeqCst) + 1;
-        let writer = Arc::new(
-            appendfs::LogWriter::create_lazy(&self.log_path, next_gen, appendfs::cli::DEFAULT_MAX_LOG_SIZE, start_tx)
-                .unwrap(),
-        );
+        let mut writer_res =
+            appendfs::LogWriter::create_lazy(&self.log_path, next_gen, appendfs::cli::DEFAULT_MAX_LOG_SIZE, start_tx);
+        for _ in 0..20 {
+            if writer_res.is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+            writer_res = appendfs::LogWriter::create_lazy(
+                &self.log_path,
+                next_gen,
+                appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+                start_tx,
+            );
+        }
+        let writer = Arc::new(writer_res.unwrap());
         fs.log_writer = Some(writer);
         fs.set_log_dir(&self.log_path);
 

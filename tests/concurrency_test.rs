@@ -12,13 +12,14 @@ use appendfs::LogWriter;
 use appendfs::clock::{Clock, SystemClock};
 use appendfs::log::record::DecodedPayload;
 use appendfs::log::{LogReader, SummaryReader, recover_fs};
-use appendfs::node::Node;
+use appendfs::node::{Node, NodeKind};
 use appendfs::operations::dir::{list_dir_core, mkdir_core, opendir_core, releasedir_core, rmdir_core};
 use appendfs::operations::links::{link_core, readlink_core, rename_core, symlink_core, unlink_core};
+use appendfs::operations::locks::{flock_core, getlk_core, setlk_core};
 use appendfs::operations::read_write::{
     FUSE_SET_ATTR_SIZE, create_core, getattr_core, open_core, read_core, release_core, setattr_core, write_core,
 };
-use appendfs::shim::FileType;
+use appendfs::shim::{FileType, ShimFlock};
 use common::TestRng;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -142,12 +143,82 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                     let _ = release_core(&fs, ino, fh);
                 }
             }
+            10 => {
+                // Exercise BSD flock whole-file locking concurrently
+                if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
+                    && let Ok(fh) = open_core(&fs, ino, 0)
+                {
+                    let op = match rng.gen_range(0, 3) {
+                        0 => libc::LOCK_SH,
+                        1 => libc::LOCK_EX,
+                        2 => libc::LOCK_SH | libc::LOCK_NB,
+                        _ => libc::LOCK_UN,
+                    };
+                    let _ = flock_core(&fs, ino, fh, seed, op);
+                    let _ = release_core(&fs, ino, fh);
+                }
+            }
+            11 => {
+                // Exercise POSIX fcntl range locking concurrently
+                if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
+                    && let Ok(fh) = open_core(&fs, ino, 0)
+                {
+                    let lock_type = match rng.gen_range(0, 2) {
+                        0 => libc::F_RDLCK as i16,
+                        1 => libc::F_WRLCK as i16,
+                        _ => libc::F_UNLCK as i16,
+                    };
+                    let start = rng.gen_range(0, 64) as i64;
+                    let len = rng.gen_range(0, 64) as i64;
+                    let lock = ShimFlock {
+                        lock_type,
+                        whence: libc::SEEK_SET as i16,
+                        start,
+                        len,
+                        pid: (seed % 10000) as i32,
+                    };
+                    let _ = setlk_core(&fs, ino, fh, seed, lock, false);
+                    let _ = getlk_core(&fs, ino, fh, seed, lock);
+                    let _ = release_core(&fs, ino, fh);
+                }
+            }
             _ => {
                 if let Some((name, _)) = pick_entry(&fs, dir_a, &mut rng) {
                     let newname = FILE_NAMES[rng.gen_range(0, FILE_NAMES.len() - 1)];
                     let _ = rename_core(&fs, dir_a, &name, dir_b, newname);
                 }
             }
+        }
+    }
+}
+
+/// Dedicated lock worker hammering BSD flock and POSIX range locks across files
+fn lock_worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
+    let mut rng = TestRng::new(seed);
+    for _ in 0..OPS_PER_THREAD {
+        let dir = pick_target_dir(&fs, &shared_dirs, &mut rng);
+        if let Some((_, ino)) = pick_entry(&fs, dir, &mut rng)
+            && let Ok(fh) = open_core(&fs, ino, 0)
+        {
+            // Perform multiple lock operations on the open handle
+            let op = if rng.gen_range(0, 1) == 0 {
+                libc::LOCK_SH
+            } else {
+                libc::LOCK_EX
+            };
+            let _ = flock_core(&fs, ino, fh, seed, op);
+
+            let lock = ShimFlock {
+                lock_type: libc::F_RDLCK as i16,
+                whence: libc::SEEK_SET as i16,
+                start: rng.gen_range(0, 128) as i64,
+                len: rng.gen_range(0, 64) as i64,
+                pid: (seed % 10000) as i32,
+            };
+            let _ = setlk_core(&fs, ino, fh, seed, lock, false);
+            let _ = getlk_core(&fs, ino, fh, seed, lock);
+
+            let _ = release_core(&fs, ino, fh);
         }
     }
 }
@@ -270,7 +341,7 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
             // hardlinked so its subtree was skipped).
             let mut referrers = Vec::new();
             for (parent_ino, node) in &snapshot {
-                if let Node::Directory { entries, .. } = &**node {
+                if let NodeKind::Directory { entries, .. } = &node.kind {
                     for (name, child) in entries {
                         if child == ino {
                             referrers.push((*parent_ino, name.clone()));
@@ -314,14 +385,10 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
 // the same order they committed live). Every other inode is fully log-derived and
 // compared exactly.
 fn normalize_for_compare(ino: u64, mut node: Node) -> Node {
-    if ino == 1
-        && let Node::Directory {
-            atime, mtime, ctime, ..
-        } = &mut node
-    {
-        *atime = UNIX_EPOCH;
-        *mtime = UNIX_EPOCH;
-        *ctime = UNIX_EPOCH;
+    if ino == 1 && node.is_dir() {
+        node.meta.atime = UNIX_EPOCH;
+        node.meta.mtime = UNIX_EPOCH;
+        node.meta.ctime = UNIX_EPOCH;
     }
     node
 }
@@ -533,7 +600,7 @@ fn run_concurrent_stress(seed: u64) {
     }
     let shared_dirs = Arc::new(shared_dirs);
 
-    let handles: Vec<_> = (0..NUM_THREADS)
+    let mut handles: Vec<_> = (0..NUM_THREADS)
         .map(|i| {
             let fs = Arc::clone(&fs);
             let shared_dirs = Arc::clone(&shared_dirs);
@@ -541,6 +608,14 @@ fn run_concurrent_stress(seed: u64) {
             thread::spawn(move || worker(fs, shared_dirs, thread_seed))
         })
         .collect();
+
+    // Spawn 2 dedicated lock workers hammering flock and range locks
+    for i in 0..2 {
+        let fs = Arc::clone(&fs);
+        let shared_dirs = Arc::clone(&shared_dirs);
+        let thread_seed = seed.wrapping_mul(2_000_033).wrapping_add(i as u64 + 100);
+        handles.push(thread::spawn(move || lock_worker(fs, shared_dirs, thread_seed)));
+    }
 
     // Flush continuously while the workers mutate. Without this the whole run stays in
     // `live` and is written out by a single quiescent flush at the end, so the pipeline
@@ -592,6 +667,16 @@ fn run_concurrent_stress(seed: u64) {
     assert!(
         fs.file_handles.read().unwrap().is_empty(),
         "seed {}: leaked file handles",
+        seed
+    );
+    assert!(
+        fs.flock_table.read().unwrap().is_empty(),
+        "seed {}: leaked flock entries",
+        seed
+    );
+    assert!(
+        fs.range_lock_table.read().unwrap().is_empty(),
+        "seed {}: leaked range lock entries",
         seed
     );
     assert!(

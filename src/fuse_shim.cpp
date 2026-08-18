@@ -44,6 +44,14 @@ struct shim_fuse_ctx {
   uint32_t umask;
 };
 
+struct shim_flock {
+  int16_t type;    // F_RDLCK, F_WRLCK, F_UNLCK
+  int16_t whence;  // SEEK_SET, SEEK_CUR, SEEK_END
+  int64_t start;
+  int64_t len;
+  int32_t pid;
+};
+
 extern "C" {
 
 typedef void (*shim_lookup_fn)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
@@ -74,6 +82,11 @@ typedef void (*shim_release_fn)(shim_req_t req, uint64_t ino, uint64_t fh, void 
 typedef void (*shim_releasedir_fn)(shim_req_t req, uint64_t ino, uint64_t fh, void *userdata);
 typedef void (*shim_fsyncdir_fn)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
 typedef void (*shim_statfs_fn)(shim_req_t req, uint64_t ino, void *userdata);
+typedef void (*shim_flock_fn)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner, int op, void *userdata);
+typedef void (*shim_getlk_fn)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner, struct shim_flock *lock,
+                              void *userdata);
+typedef void (*shim_setlk_fn)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner,
+                              const struct shim_flock *lock, int sleep, void *userdata);
 typedef void (*shim_init_fn)(void *userdata);
 typedef void (*shim_destroy_fn)(void *userdata);
 
@@ -100,6 +113,9 @@ struct RustLowlevelOps {
   shim_releasedir_fn releasedir;
   shim_fsyncdir_fn fsyncdir;
   shim_statfs_fn statfs;
+  shim_flock_fn flock;
+  shim_getlk_fn getlk;
+  shim_setlk_fn setlk;
   shim_init_fn init;
   shim_destroy_fn destroy;
 };
@@ -335,6 +351,51 @@ static void ll_statfs(fuse_req_t req, fuse_ino_t ino) {
   }
 }
 
+static void ll_flock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, int op) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.flock) {
+    uint64_t fh = fi ? fi->fh : 0;
+    uint64_t lock_owner = fi ? fi->lock_owner : 0;
+    ctx->ops.flock(static_cast<shim_req_t>(req), ino, fh, lock_owner, op, ctx->userdata);
+  } else {
+    fuse_reply_err(req, 38);
+  }
+}
+
+static void ll_getlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, struct flock *lock) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.getlk && lock) {
+    uint64_t fh = fi ? fi->fh : 0;
+    uint64_t lock_owner = fi ? fi->lock_owner : 0;
+    struct shim_flock sh_lock = {};
+    sh_lock.type = lock->l_type;
+    sh_lock.whence = lock->l_whence;
+    sh_lock.start = lock->l_start;
+    sh_lock.len = lock->l_len;
+    sh_lock.pid = lock->l_pid;
+    ctx->ops.getlk(static_cast<shim_req_t>(req), ino, fh, lock_owner, &sh_lock, ctx->userdata);
+  } else {
+    fuse_reply_err(req, 38);
+  }
+}
+
+static void ll_setlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, struct flock *lock, int sleep) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.setlk && lock) {
+    uint64_t fh = fi ? fi->fh : 0;
+    uint64_t lock_owner = fi ? fi->lock_owner : 0;
+    struct shim_flock sh_lock = {};
+    sh_lock.type = lock->l_type;
+    sh_lock.whence = lock->l_whence;
+    sh_lock.start = lock->l_start;
+    sh_lock.len = lock->l_len;
+    sh_lock.pid = lock->l_pid;
+    ctx->ops.setlk(static_cast<shim_req_t>(req), ino, fh, lock_owner, &sh_lock, sleep, ctx->userdata);
+  } else {
+    fuse_reply_err(req, 38);
+  }
+}
+
 static void ll_init(void *userdata, struct fuse_conn_info *conn) {
   (void)conn;
   auto *ctx = static_cast<ShimContext *>(userdata);
@@ -423,6 +484,9 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   ll_ops.releasedir = ll_releasedir;
   ll_ops.fsyncdir = ll_fsyncdir;
   ll_ops.statfs = ll_statfs;
+  ll_ops.flock = ll_flock;
+  ll_ops.getlk = ll_getlk;
+  ll_ops.setlk = ll_setlk;
 
   se = fuse_session_new(&args, &ll_ops, sizeof(ll_ops), &ctx);
   if (se == nullptr) {
@@ -557,6 +621,19 @@ int shim_reply_statfs(shim_req_t req, const shim_statfs_attr *attr) {
     stbuf.f_namemax = attr->namelen;
   }
   return fuse_reply_statfs(static_cast<fuse_req_t>(req), &stbuf);
+}
+
+int shim_reply_lock(shim_req_t req, const struct shim_flock *lock) {
+  if (!lock) {
+    return fuse_reply_err(static_cast<fuse_req_t>(req), EINVAL);
+  }
+  struct flock fl = {};
+  fl.l_type = lock->type;
+  fl.l_whence = lock->whence;
+  fl.l_start = lock->start;
+  fl.l_len = lock->len;
+  fl.l_pid = lock->pid;
+  return fuse_reply_lock(static_cast<fuse_req_t>(req), &fl);
 }
 
 size_t shim_add_direntry(shim_req_t req, char *buf, size_t bufsize, const char *name, uint64_t ino, uint32_t mode,

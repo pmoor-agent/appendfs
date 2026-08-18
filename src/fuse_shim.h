@@ -32,6 +32,14 @@ struct shim_statfs_attr {
   uint32_t namelen;
 };
 
+struct shim_flock {
+  int16_t type;    // F_RDLCK, F_WRLCK, F_UNLCK
+  int16_t whence;  // SEEK_SET, SEEK_CUR, SEEK_END
+  int64_t start;
+  int64_t len;
+  int32_t pid;
+};
+
 // Callback signatures that Rust will implement for low-level FUSE
 typedef void (*rust_lookup_t)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
 typedef void (*rust_getattr_t)(shim_req_t req, uint64_t ino, void *userdata);
@@ -59,6 +67,11 @@ typedef void (*rust_release_t)(shim_req_t req, uint64_t ino, uint64_t fh, void *
 typedef void (*rust_releasedir_t)(shim_req_t req, uint64_t ino, uint64_t fh, void *userdata);
 typedef void (*rust_fsyncdir_t)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
 typedef void (*rust_statfs_t)(shim_req_t req, uint64_t ino, void *userdata);
+typedef void (*rust_flock_t)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner, int op, void *userdata);
+typedef void (*rust_getlk_t)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner, struct shim_flock *lock,
+                             void *userdata);
+typedef void (*rust_setlk_t)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner,
+                             const struct shim_flock *lock, int sleep, void *userdata);
 typedef void (*rust_init_t)(void *userdata);
 typedef void (*rust_destroy_t)(void *userdata);
 
@@ -85,6 +98,9 @@ struct rust_lowlevel_ops {
   rust_releasedir_t releasedir;
   rust_fsyncdir_t fsyncdir;
   rust_statfs_t statfs;
+  rust_flock_t flock;
+  rust_getlk_t getlk;
+  rust_setlk_t setlk;
   rust_init_t init;
   rust_destroy_t destroy;
 };
@@ -107,6 +123,7 @@ int shim_reply_create(shim_req_t req, const shim_file_attr *attr, double attr_ti
                       uint64_t fh);
 int shim_reply_readlink(shim_req_t req, const char *link);
 int shim_reply_statfs(shim_req_t req, const shim_statfs_attr *attr);
+int shim_reply_lock(shim_req_t req, const struct shim_flock *lock);
 
 // Directory entry layout packing helper using individual fields instead of stat struct
 size_t shim_add_direntry(shim_req_t req, char *buf, size_t bufsize, const char *name, uint64_t ino, uint32_t mode,

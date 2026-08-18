@@ -4,7 +4,7 @@ use crate::log::extent::SharedExtentState;
 use crate::log::reader::{LogReader, LogRecord};
 use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode};
 use crate::log::summary::SummaryReader;
-use crate::node::Node;
+use crate::node::{InodeMeta, Node, NodeKind};
 use crate::range_map::RangeMap;
 use std::io;
 use std::path::Path;
@@ -115,14 +115,11 @@ pub fn recover_fs_to_target_with_storage(
     {
         let created = oldest_reader.file_header().created_at;
         last_op_time = Some(created);
-        if let Some(root_arc) = fs_instance.base.write().unwrap().get_mut(&1)
-            && let Node::Directory {
-                atime, mtime, ctime, ..
-            } = Arc::make_mut(root_arc)
-        {
-            *atime = created;
-            *mtime = created;
-            *ctime = created;
+        if let Some(root_arc) = fs_instance.base.write().unwrap().get_mut(&1) {
+            let root_node = Arc::make_mut(root_arc);
+            root_node.meta.atime = created;
+            root_node.meta.mtime = created;
+            root_node.meta.ctime = created;
         }
     }
 
@@ -302,13 +299,11 @@ pub fn recover_fs_to_target_with_storage(
     if max_inode >= fs_instance.next_inode.load(Ordering::SeqCst) {
         fs_instance.next_inode.store(max_inode + 1, Ordering::SeqCst);
     }
-    fs_instance.base.write().unwrap().retain(|_ino, arc| {
-        let node = arc.as_ref();
-        match node {
-            Node::File { nlink, .. } | Node::Symlink { nlink, .. } => *nlink > 0,
-            Node::Directory { .. } => true,
-        }
-    });
+    fs_instance
+        .base
+        .write()
+        .unwrap()
+        .retain(|_ino, arc| arc.meta.nlink > 0 || arc.is_dir());
     fs_instance.last_tx_id.store(last_tx_id, Ordering::SeqCst);
     fs_instance.set_recovered_time(last_op_time);
 
@@ -331,16 +326,12 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
     match decoded {
         DecodedPayload::Create(create) => {
             let now = create.created_at;
-            let new_node = Arc::new(Node::File {
-                range_map: RangeMap::new(),
-                size: 0,
-                perm: create.mode & 0o777,
-                nlink: 1,
-                uid: create.uid,
-                gid: create.gid,
-                atime: now,
-                mtime: now,
-                ctime: now,
+            let new_node = Arc::new(Node {
+                meta: InodeMeta::new(create.mode & 0o7777, 1, create.uid, create.gid, now),
+                kind: NodeKind::File {
+                    range_map: RangeMap::new(),
+                    size: 0,
+                },
             });
 
             let mut map = fs_instance.base.write().unwrap();
@@ -348,28 +339,21 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
 
             if let Some(parent_node_arc) = map.get_mut(&create.parent) {
                 let parent_node = Arc::make_mut(parent_node_arc);
-                if let Node::Directory {
-                    entries, mtime, ctime, ..
-                } = parent_node
-                {
+                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                     entries.push((create.name, target_ino));
-                    *mtime = now;
-                    *ctime = now;
+                    parent_node.meta.mtime = now;
+                    parent_node.meta.ctime = now;
                 }
             }
         }
         DecodedPayload::Mkdir(mkdir) => {
             let now = mkdir.created_at;
-            let new_node = Arc::new(Node::Directory {
-                parent: mkdir.parent,
-                entries: Vec::new(),
-                perm: mkdir.mode & 0o777,
-                nlink: 2,
-                uid: mkdir.uid,
-                gid: mkdir.gid,
-                atime: now,
-                mtime: now,
-                ctime: now,
+            let new_node = Arc::new(Node {
+                meta: InodeMeta::new(mkdir.mode & 0o7777, 2, mkdir.uid, mkdir.gid, now),
+                kind: NodeKind::Directory {
+                    parent: mkdir.parent,
+                    entries: Vec::new(),
+                },
             });
 
             let mut map = fs_instance.base.write().unwrap();
@@ -377,13 +361,10 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
 
             if let Some(parent_node_arc) = map.get_mut(&mkdir.parent) {
                 let parent_node = Arc::make_mut(parent_node_arc);
-                if let Node::Directory {
-                    entries, mtime, ctime, ..
-                } = parent_node
-                {
+                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                     entries.push((mkdir.name, target_ino));
-                    *mtime = now;
-                    *ctime = now;
+                    parent_node.meta.mtime = now;
+                    parent_node.meta.ctime = now;
                 }
             }
         }
@@ -397,21 +378,14 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             let mut map = fs_instance.base.write().unwrap();
             if let Some(node_arc) = map.get_mut(&target_ino) {
                 let node = Arc::make_mut(node_arc);
-                if let Node::File {
-                    range_map,
-                    size,
-                    mtime,
-                    ctime,
-                    ..
-                } = node
-                {
+                if let NodeKind::File { range_map, size } = &mut node.kind {
                     let end_offset = write_meta.file_offset + write_data_len as u64;
                     if end_offset > *size {
                         *size = end_offset;
                     }
                     let now = write_meta.op_time;
-                    *mtime = now;
-                    *ctime = now;
+                    node.meta.mtime = now;
+                    node.meta.ctime = now;
                     range_map.insert(write_meta.file_offset, write_data_len as u64, shared_state);
                 }
             }
@@ -421,30 +395,24 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             let mut map = fs_instance.base.write().unwrap();
             if let Some(parent_node_arc) = map.get_mut(&unlink.parent) {
                 let parent_node = Arc::make_mut(parent_node_arc);
-                if let Node::Directory {
-                    entries, mtime, ctime, ..
-                } = parent_node
-                {
+                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                     entries.retain(|(name, ino)| !(name == &unlink.name && *ino == target_ino));
-                    *mtime = now;
-                    *ctime = now;
+                    parent_node.meta.mtime = now;
+                    parent_node.meta.ctime = now;
                 }
             }
 
             let mut should_delete = false;
             if let Some(child_node_arc) = map.get_mut(&target_ino) {
                 let child_node = Arc::make_mut(child_node_arc);
-                match child_node {
-                    Node::File { nlink, ctime, .. } | Node::Symlink { nlink, ctime, .. } => {
-                        if *nlink > 0 {
-                            *nlink -= 1;
-                            *ctime = now;
-                        }
-                        if *nlink == 0 {
-                            should_delete = true;
-                        }
+                if child_node.is_dir() {
+                    should_delete = true;
+                } else {
+                    if child_node.meta.nlink > 0 {
+                        child_node.meta.nlink -= 1;
+                        child_node.meta.ctime = now;
                     }
-                    Node::Directory { .. } => {
+                    if child_node.meta.nlink == 0 {
                         should_delete = true;
                     }
                 }
@@ -458,27 +426,19 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             let mut map = fs_instance.base.write().unwrap();
             if let Some(parent_node_arc) = map.get_mut(&rmdir.parent) {
                 let parent_node = Arc::make_mut(parent_node_arc);
-                if let Node::Directory {
-                    entries, mtime, ctime, ..
-                } = parent_node
-                {
+                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                     entries.retain(|(name, ino)| !(name == &rmdir.name && *ino == target_ino));
-                    *mtime = now;
-                    *ctime = now;
+                    parent_node.meta.mtime = now;
+                    parent_node.meta.ctime = now;
                 }
             }
             map.remove(&target_ino);
         }
         DecodedPayload::Symlink(symlink) => {
             let now = symlink.created_at;
-            let new_node = Arc::new(Node::Symlink {
-                target: symlink.target,
-                nlink: 1,
-                uid: symlink.uid,
-                gid: symlink.gid,
-                atime: now,
-                mtime: now,
-                ctime: now,
+            let new_node = Arc::new(Node {
+                meta: InodeMeta::new(0o777, 1, symlink.uid, symlink.gid, now),
+                kind: NodeKind::Symlink { target: symlink.target },
             });
 
             let mut map = fs_instance.base.write().unwrap();
@@ -486,13 +446,10 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
 
             if let Some(parent_node_arc) = map.get_mut(&symlink.parent) {
                 let parent_node = Arc::make_mut(parent_node_arc);
-                if let Node::Directory {
-                    entries, mtime, ctime, ..
-                } = parent_node
-                {
+                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                     entries.push((symlink.name, target_ino));
-                    *mtime = now;
-                    *ctime = now;
+                    parent_node.meta.mtime = now;
+                    parent_node.meta.ctime = now;
                 }
             }
         }
@@ -504,10 +461,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 let mut overwritten = None;
                 if let Some(parent_node_arc) = map.get_mut(&rename.parent) {
                     let parent_node = Arc::make_mut(parent_node_arc);
-                    if let Node::Directory {
-                        entries, mtime, ctime, ..
-                    } = parent_node
-                    {
+                    if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                         if let Some(dest_pos) = entries
                             .iter()
                             .position(|(n, ino)| n == &rename.new_name && *ino != target_ino)
@@ -520,8 +474,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                         {
                             entries[src_pos].0 = rename.new_name.clone();
                         }
-                        *mtime = now;
-                        *ctime = now;
+                        parent_node.meta.mtime = now;
+                        parent_node.meta.ctime = now;
                     }
                 }
                 overwritten
@@ -529,30 +483,24 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 // Remove source entry
                 if let Some(parent_node_arc) = map.get_mut(&rename.parent) {
                     let parent_node = Arc::make_mut(parent_node_arc);
-                    if let Node::Directory {
-                        entries, mtime, ctime, ..
-                    } = parent_node
-                    {
+                    if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                         entries.retain(|(name, ino)| !(name == &rename.name && *ino == target_ino));
-                        *mtime = now;
-                        *ctime = now;
+                        parent_node.meta.mtime = now;
+                        parent_node.meta.ctime = now;
                     }
                 }
 
                 // Add new entry, capturing any destination inode it clobbers
                 if let Some(newparent_node_arc) = map.get_mut(&rename.new_parent) {
                     let newparent_node = Arc::make_mut(newparent_node_arc);
-                    if let Node::Directory {
-                        entries, mtime, ctime, ..
-                    } = newparent_node
-                    {
+                    if let NodeKind::Directory { entries, .. } = &mut newparent_node.kind {
                         let overwritten = entries
                             .iter()
                             .position(|(name, ino)| name == &rename.new_name && *ino != target_ino)
                             .map(|pos| entries.remove(pos).1);
                         entries.push((rename.new_name.clone(), target_ino));
-                        *mtime = now;
-                        *ctime = now;
+                        newparent_node.meta.mtime = now;
+                        newparent_node.meta.ctime = now;
                         overwritten
                     } else {
                         None
@@ -566,7 +514,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 && let Some(target_node_arc) = map.get_mut(&target_ino)
             {
                 let target_node = Arc::make_mut(target_node_arc);
-                if let Node::Directory { parent, .. } = target_node {
+                if let NodeKind::Directory { parent, .. } = &mut target_node.kind {
                     *parent = rename.new_parent;
                 }
             }
@@ -577,17 +525,14 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 let mut should_delete = false;
                 if let Some(dest_node_arc) = map.get_mut(&dest_ino) {
                     let dest_node = Arc::make_mut(dest_node_arc);
-                    match dest_node {
-                        Node::File { nlink, ctime, .. } | Node::Symlink { nlink, ctime, .. } => {
-                            if *nlink > 0 {
-                                *nlink -= 1;
-                                *ctime = now;
-                            }
-                            if *nlink == 0 {
-                                should_delete = true;
-                            }
+                    if dest_node.is_dir() {
+                        should_delete = true;
+                    } else {
+                        if dest_node.meta.nlink > 0 {
+                            dest_node.meta.nlink -= 1;
+                            dest_node.meta.ctime = now;
                         }
-                        Node::Directory { .. } => {
+                        if dest_node.meta.nlink == 0 {
                             should_delete = true;
                         }
                     }
@@ -603,91 +548,31 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 let node = Arc::make_mut(node_arc);
                 let now = setattr.op_time;
 
-                match node {
-                    Node::File {
-                        range_map,
-                        perm,
-                        uid,
-                        gid,
-                        size,
-                        atime,
-                        mtime,
-                        ctime,
-                        ..
-                    } => {
-                        if let Some(m) = setattr.mode {
-                            *perm = m;
-                        }
-                        if let Some(u) = setattr.uid {
-                            *uid = u;
-                        }
-                        if let Some(g) = setattr.gid {
-                            *gid = g;
-                        }
-                        if let Some(s) = setattr.size {
-                            if s < *size {
-                                range_map.truncate(s);
-                            }
-                            *size = s;
-                            *mtime = now;
-                        }
-                        if let Some(t) = setattr.atime {
-                            *atime = t;
-                        }
-                        if let Some(t) = setattr.mtime {
-                            *mtime = t;
-                        }
-                        *ctime = now;
-                    }
-                    Node::Directory {
-                        perm,
-                        uid,
-                        gid,
-                        atime,
-                        mtime,
-                        ctime,
-                        ..
-                    } => {
-                        if let Some(m) = setattr.mode {
-                            *perm = m;
-                        }
-                        if let Some(u) = setattr.uid {
-                            *uid = u;
-                        }
-                        if let Some(g) = setattr.gid {
-                            *gid = g;
-                        }
-                        if let Some(t) = setattr.atime {
-                            *atime = t;
-                        }
-                        if let Some(t) = setattr.mtime {
-                            *mtime = t;
-                        }
-                        *ctime = now;
-                    }
-                    Node::Symlink {
-                        uid,
-                        gid,
-                        atime,
-                        mtime,
-                        ctime,
-                        ..
-                    } => {
-                        if let Some(u) = setattr.uid {
-                            *uid = u;
-                        }
-                        if let Some(g) = setattr.gid {
-                            *gid = g;
-                        }
-                        if let Some(t) = setattr.atime {
-                            *atime = t;
-                        }
-                        if let Some(t) = setattr.mtime {
-                            *mtime = t;
-                        }
-                        *ctime = now;
-                    }
+                if let Some(m) = setattr.mode {
+                    node.meta.perm = m & 0o7777;
                 }
+                if let Some(u) = setattr.uid {
+                    node.meta.uid = u;
+                }
+                if let Some(g) = setattr.gid {
+                    node.meta.gid = g;
+                }
+                if let Some(s) = setattr.size
+                    && let NodeKind::File { range_map, size } = &mut node.kind
+                {
+                    if s < *size {
+                        range_map.truncate(s);
+                    }
+                    *size = s;
+                    node.meta.mtime = now;
+                }
+                if let Some(t) = setattr.atime {
+                    node.meta.atime = t;
+                }
+                if let Some(t) = setattr.mtime {
+                    node.meta.mtime = t;
+                }
+                node.meta.ctime = now;
             }
         }
         DecodedPayload::Link(link) => {
@@ -695,32 +580,17 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             let mut map = fs_instance.base.write().unwrap();
             if let Some(newparent_node_arc) = map.get_mut(&link.new_parent) {
                 let newparent_node = Arc::make_mut(newparent_node_arc);
-                if let Node::Directory {
-                    entries, mtime, ctime, ..
-                } = newparent_node
-                {
+                if let NodeKind::Directory { entries, .. } = &mut newparent_node.kind {
                     entries.push((link.new_name, target_ino));
-                    *mtime = now;
-                    *ctime = now;
+                    newparent_node.meta.mtime = now;
+                    newparent_node.meta.ctime = now;
                 }
             }
 
             if let Some(node_arc) = map.get_mut(&target_ino) {
                 let node = Arc::make_mut(node_arc);
-                match node {
-                    Node::File { nlink, ctime, .. } => {
-                        *nlink += 1;
-                        *ctime = now;
-                    }
-                    Node::Symlink { nlink, ctime, .. } => {
-                        *nlink += 1;
-                        *ctime = now;
-                    }
-                    Node::Directory { nlink, ctime, .. } => {
-                        *nlink += 1;
-                        *ctime = now;
-                    }
-                }
+                node.meta.nlink += 1;
+                node.meta.ctime = now;
             }
         }
         DecodedPayload::FlushCommit(_) => {}

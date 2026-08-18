@@ -1,6 +1,6 @@
 use crate::fs::InMemoryFS;
 use crate::log::manifest::GenerationLiveStats;
-use crate::node::Node;
+use crate::node::NodeKind;
 use std::fmt::Write as FmtWrite;
 
 /// Aggregate statistics and fragmentation status for an appendfs volume.
@@ -26,6 +26,7 @@ impl VolumeStats {
     pub fn collect(fs: &InMemoryFS) -> Self {
         let manifest = fs.manifest.read().unwrap().clone();
         let base = fs.base.read().unwrap();
+        let total_inodes = base.len();
 
         let mut directory_count = 0;
         let mut file_count = 0;
@@ -34,13 +35,13 @@ impl VolumeStats {
 
         for node_arc in base.values() {
             let node = node_arc.as_ref();
-            match node {
-                Node::Directory { .. } => directory_count += 1,
-                Node::File { size, .. } => {
+            match &node.kind {
+                NodeKind::Directory { .. } => directory_count += 1,
+                NodeKind::File { size, .. } => {
                     file_count += 1;
                     total_logical_bytes += *size;
                 }
-                Node::Symlink { .. } => symlink_count += 1,
+                NodeKind::Symlink { .. } => symlink_count += 1,
             }
         }
 
@@ -67,7 +68,7 @@ impl VolumeStats {
             branch: manifest.branch,
             next_generation: manifest.next_generation,
             next_filename: manifest.next_filename,
-            total_inodes: base.len(),
+            total_inodes,
             directory_count,
             file_count,
             symlink_count,

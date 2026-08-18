@@ -3,7 +3,7 @@ use crate::log::record::{
     DecodedPayload, FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader, checksum_payload,
 };
 use crate::log::summary::{SUMMARY_MAGIC, SummaryReader};
-use crate::node::Node;
+use crate::node::NodeKind;
 use crate::storage::{OsStorage, Storage, StorageReader};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
@@ -566,7 +566,7 @@ pub fn dump_summary_reader_with_path(
             .unwrap_or_else(|| format!("<inode {}>", dir_ino));
         if let Some(sync_node) = inodes.get(&dir_ino) {
             let node = sync_node.as_ref();
-            if let Node::Directory { entries, .. } = node {
+            if let NodeKind::Directory { entries, .. } = &node.kind {
                 for (name, child_ino) in entries {
                     let child_path = if dir_ino == 1 {
                         format!("/{}", name)
@@ -576,7 +576,7 @@ pub fn dump_summary_reader_with_path(
                     path_map.insert(*child_ino, child_path);
                     if let Some(child_sync) = inodes.get(child_ino) {
                         let child_node = child_sync.as_ref();
-                        if matches!(child_node, Node::Directory { .. }) {
+                        if child_node.is_dir() {
                             queue.push_back(*child_ino);
                         }
                     }
@@ -585,18 +585,17 @@ pub fn dump_summary_reader_with_path(
         }
     }
 
-    // Inspect all inodes
     for &ino in &sorted_inodes {
         if let Some(sync_node) = inodes.get(&ino) {
             let node = sync_node.as_ref();
-            match node {
-                Node::Directory { .. } => {
+            match &node.kind {
+                NodeKind::Directory { .. } => {
                     dir_count += 1;
                 }
-                Node::Symlink { .. } => {
+                NodeKind::Symlink { .. } => {
                     symlink_count += 1;
                 }
-                Node::File { range_map, size, .. } => {
+                NodeKind::File { range_map, size, .. } => {
                     file_count += 1;
                     total_logical_bytes += *size;
                     let num_extents = range_map.len();
@@ -763,7 +762,7 @@ pub fn dump_summary_reader_with_path(
         let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
         for sync_node in inodes.values() {
             let node = sync_node.as_ref();
-            if let Node::File { range_map, .. } = node {
+            if let NodeKind::File { range_map, .. } = &node.kind {
                 for (_, entry) in range_map.iter() {
                     if let ExtentState::Disk { generation, length, .. } = entry.value.read_state() {
                         let stats = live_map.entry(generation).or_insert((0, 0));
@@ -807,26 +806,19 @@ pub fn dump_summary_reader_with_path(
             if let Some(sync_node) = inodes.get(&ino) {
                 let node = sync_node.as_ref();
                 let path_str = path_map.get(&ino).map(|p| p.as_str()).unwrap_or("");
-                match node {
-                    Node::Directory {
-                        entries,
-                        perm,
-                        uid,
-                        gid,
-                        mtime,
-                        ..
-                    } => {
+                match &node.kind {
+                    NodeKind::Directory { entries, .. } => {
                         writeln!(
                             out,
                             "#{:<5} [Inode {:<5}] Directory  {:?} (mode 0o{:o}, uid {}, gid {}, entries: {}, mtime: {})",
                             i + 1,
                             ino,
                             path_str,
-                            perm,
-                            uid,
-                            gid,
+                            node.meta.perm,
+                            node.meta.uid,
+                            node.meta.gid,
                             entries.len(),
-                            format_system_time(*mtime)
+                            format_system_time(node.meta.mtime)
                         )
                         .unwrap();
                         if !entries.is_empty() {
@@ -839,13 +831,7 @@ pub fn dump_summary_reader_with_path(
                             writeln!(out, "      entries: [{}]", entry_strs.join(", ")).unwrap();
                         }
                     }
-                    Node::Symlink {
-                        target,
-                        uid,
-                        gid,
-                        mtime,
-                        ..
-                    } => {
+                    NodeKind::Symlink { target, .. } => {
                         writeln!(
                             out,
                             "#{:<5} [Inode {:<5}] Symlink    {:?} -> {:?} (uid {}, gid {}, mtime: {})",
@@ -853,21 +839,13 @@ pub fn dump_summary_reader_with_path(
                             ino,
                             path_str,
                             target,
-                            uid,
-                            gid,
-                            format_system_time(*mtime)
+                            node.meta.uid,
+                            node.meta.gid,
+                            format_system_time(node.meta.mtime)
                         )
                         .unwrap();
                     }
-                    Node::File {
-                        range_map,
-                        size,
-                        perm,
-                        uid,
-                        gid,
-                        mtime,
-                        ..
-                    } => {
+                    NodeKind::File { range_map, size, .. } => {
                         writeln!(
                             out,
                             "#{:<5} [Inode {:<5}] RegularFile {:?} (size {}, extents {}, mode 0o{:o}, uid {}, gid {}, mtime: {})",
@@ -876,10 +854,10 @@ pub fn dump_summary_reader_with_path(
                             path_str,
                             format_bytes(*size),
                             range_map.len(),
-                            perm,
-                            uid,
-                            gid,
-                            format_system_time(*mtime)
+                            node.meta.perm,
+                            node.meta.uid,
+                            node.meta.gid,
+                            format_system_time(node.meta.mtime)
                         )
                         .unwrap();
 
@@ -1243,7 +1221,7 @@ mod tests {
         use crate::fs::InMemoryFS;
         use crate::log::summary::{export_summary, init_volume};
         use crate::log::{LogManifest, SharedExtentState};
-        use crate::node::Node;
+        use crate::node::{InodeMeta, Node, NodeKind};
         use crate::range_map::RangeMap;
         use std::sync::Arc;
 
@@ -1266,16 +1244,12 @@ mod tests {
         let now = SystemClock.now();
 
         // Create directory /docs (inode 2)
-        let dir_node = Arc::new(Node::Directory {
-            parent: 1,
-            entries: vec![("fragmented.bin".to_string(), 3)],
-            perm: 0o755,
-            nlink: 2,
-            uid: 1000,
-            gid: 1000,
-            atime: now,
-            mtime: now,
-            ctime: now,
+        let dir_node = Arc::new(Node {
+            meta: InodeMeta::new(0o755, 2, 1000, 1000, now),
+            kind: NodeKind::Directory {
+                parent: 1,
+                entries: vec![("fragmented.bin".to_string(), 3)],
+            },
         });
 
         // Create fragmented file (inode 3) with 2 extents
@@ -1283,29 +1257,21 @@ mod tests {
         rmap.insert(0, 4096, SharedExtentState::new_disk(1, 100, 20, 4096));
         rmap.insert(4096, 4096, SharedExtentState::new_disk(2, 200, 20, 4096));
 
-        let file_node = Arc::new(Node::File {
-            range_map: rmap,
-            size: 8192,
-            perm: 0o644,
-            nlink: 1,
-            uid: 1000,
-            gid: 1000,
-            atime: now,
-            mtime: now,
-            ctime: now,
+        let file_node = Arc::new(Node {
+            meta: InodeMeta::new(0o644, 1, 1000, 1000, now),
+            kind: NodeKind::File {
+                range_map: rmap,
+                size: 8192,
+            },
         });
 
         // Root directory (inode 1)
-        let root_node = Arc::new(Node::Directory {
-            parent: 1,
-            entries: vec![("docs".to_string(), 2)],
-            perm: 0o755,
-            nlink: 2,
-            uid: 0,
-            gid: 0,
-            atime: now,
-            mtime: now,
-            ctime: now,
+        let root_node = Arc::new(Node {
+            meta: InodeMeta::new(0o755, 2, 0, 0, now),
+            kind: NodeKind::Directory {
+                parent: 1,
+                entries: vec![("docs".to_string(), 2)],
+            },
         });
 
         {

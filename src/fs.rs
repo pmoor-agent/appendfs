@@ -4,7 +4,9 @@ use crate::log::{
     LogWriter, MkdirPayload, OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload, SetattrPayload,
     SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
-use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SymlinkDelta};
+use crate::node::{
+    AttrDelta, DirectoryDelta, EntryDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind, SymlinkDelta,
+};
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
 use crate::storage::Storage;
@@ -24,9 +26,24 @@ pub type DirSnapshot = Arc<Vec<(String, u64)>>;
 pub type FileHandleMap = HashMap<u64, FileHandle>;
 pub type DirectoryHandleMap = HashMap<u64, DirSnapshot>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlockState {
+    Shared(HashSet<u64>),
+    Exclusive(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeLock {
+    pub lock_type: i16,
+    pub start: u64,
+    pub end: u64,
+    pub owner: u64,
+    pub pid: i32,
+}
+
 pub struct InMemoryFS {
     /// Resting consolidated state loaded from `.summary` at mount, folded forward over
-    /// time by `fold_flush`. Never holds a `Tombstone`.
+    /// generations.
     pub base: RwLock<HashMap<u64, Arc<Node>>>,
     /// Ordered queue of immutable frozen snapshots waiting to be written/flushed to disk.
     /// New batches are pushed to the back; flusher drains from the front.
@@ -37,6 +54,10 @@ pub struct InMemoryFS {
     pub file_handles: RwLock<FileHandleMap>,
     /// Active open directory handle snapshots keyed by allocated file handle ID (`fh`).
     pub dir_handles: RwLock<DirectoryHandleMap>,
+    /// Active whole-file BSD flock locks keyed by inode number.
+    pub flock_table: RwLock<HashMap<u64, FlockState>>,
+    /// Active POSIX byte-range record locks keyed by inode number.
+    pub range_lock_table: RwLock<HashMap<u64, Vec<RangeLock>>>,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
     pub open_counts: RwLock<HashMap<u64, u32>>,
     /// Atomic counter for allocating unique file and directory handle IDs (`fh`).
@@ -88,20 +109,7 @@ impl InMemoryFS {
         let now = clock.now();
 
         // Start with only the root directory (Inode 1), which is empty, nlink is 2 (parent entry and '.' link)
-        map.insert(
-            1,
-            Arc::new(Node::Directory {
-                parent: 1,
-                entries: Vec::new(),
-                perm: 0o755,
-                nlink: 2,
-                uid,
-                gid,
-                atime: now,
-                mtime: now,
-                ctime: now,
-            }),
-        );
+        map.insert(1, Arc::new(Node::new_dir(1, 0o755, uid, gid, now)));
 
         let log_cache = log_writer
             .as_ref()
@@ -116,6 +124,8 @@ impl InMemoryFS {
             live: RwLock::new(HashMap::new()),
             file_handles: RwLock::new(HashMap::new()),
             dir_handles: RwLock::new(HashMap::new()),
+            flock_table: RwLock::new(HashMap::new()),
+            range_lock_table: RwLock::new(HashMap::new()),
             open_counts: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             manifest,
@@ -192,12 +202,17 @@ impl InMemoryFS {
             return Err(libc::EBADF);
         }
 
+        // Clean up any BSD flock held by this handle
+        self.release_flock(ino, fh);
+
         let mut counts = self.open_counts.write().unwrap();
         if let Some(count) = counts.get_mut(&ino) {
             *count = count.saturating_sub(1);
         }
         if counts.get(&ino) == Some(&0) {
             counts.remove(&ino);
+            // Clean up POSIX range locks if all handles on inode are closed
+            self.range_lock_table.write().unwrap().remove(&ino);
         }
         let remaining = counts.get(&ino).copied().unwrap_or(0);
         if remaining == 0
@@ -207,6 +222,25 @@ impl InMemoryFS {
             self.tombstone(ino);
         }
         Ok(())
+    }
+
+    pub fn release_flock(&self, ino: u64, fh: u64) {
+        let mut table = self.flock_table.write().unwrap();
+        if let Some(state) = table.get_mut(&ino) {
+            match state {
+                FlockState::Shared(set) => {
+                    set.remove(&fh);
+                    if set.is_empty() {
+                        table.remove(&ino);
+                    }
+                }
+                FlockState::Exclusive(holder) => {
+                    if *holder == fh {
+                        table.remove(&ino);
+                    }
+                }
+            }
+        }
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {
@@ -330,7 +364,7 @@ impl InMemoryFS {
         // 3. Check base
         if let Some(arc) = self.base.read().unwrap().get(&ino) {
             let node = arc.as_ref();
-            if let Node::Directory { parent, .. } = node {
+            if let NodeKind::Directory { parent, .. } = &node.kind {
                 return Some(*parent);
             }
         }
@@ -394,11 +428,7 @@ impl InMemoryFS {
             }
         }
         if file_type.is_none() && !found_in_flushing {
-            file_type = self.base.read().unwrap().get(&ino).map(|arc| match arc.as_ref() {
-                Node::Directory { .. } => FileType::Directory,
-                Node::File { .. } => FileType::RegularFile,
-                Node::Symlink { .. } => FileType::Symlink,
-            });
+            file_type = self.base.read().unwrap().get(&ino).map(|arc| arc.file_type());
         }
 
         match file_type {
@@ -636,7 +666,7 @@ impl InMemoryFS {
 
         if let Some(arc) = self.base.read().unwrap().get(&parent) {
             let node = arc.as_ref();
-            if let Node::Directory { entries, .. } = node
+            if let NodeKind::Directory { entries, .. } = &node.kind
                 && let Some((_, ino)) = entries.iter().find(|(entry_name, _)| entry_name == name)
             {
                 return Some(*ino);
@@ -676,7 +706,7 @@ impl InMemoryFS {
 
         if let Some(arc) = self.base.read().unwrap().get(&parent) {
             let node = arc.as_ref();
-            if let Node::Directory { entries, .. } = node {
+            if let NodeKind::Directory { entries, .. } = &node.kind {
                 for (name, child_ino) in entries {
                     map.insert(name.clone(), *child_ino);
                 }
@@ -739,7 +769,7 @@ impl InMemoryFS {
 
         if let Some(arc) = self.base.read().unwrap().get(&ino) {
             let node = arc.as_ref();
-            if let Node::Symlink { target, .. } = node {
+            if let NodeKind::Symlink { target, .. } = &node.kind {
                 return Some(target.clone());
             }
         }
@@ -811,7 +841,7 @@ impl InMemoryFS {
         // 3. Base layer
         if let Some(arc) = self.base.read().unwrap().get(&ino) {
             let node = arc.as_ref();
-            if let Node::File { range_map, .. } = node {
+            if let NodeKind::File { range_map, .. } = &node.kind {
                 let max_base_read = std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
                 if max_base_read > 0 {
                     for (ext_start, ext_len, shared_state) in range_map.query(offset, max_base_read) {
@@ -964,13 +994,7 @@ impl InMemoryFS {
             }
         }
 
-        result.retain(|_ino, arc| {
-            let node = arc.as_ref();
-            match node {
-                Node::File { nlink, .. } | Node::Symlink { nlink, .. } => *nlink > 0,
-                Node::Directory { .. } => true,
-            }
-        });
+        result.retain(|_ino, arc| arc.meta.nlink > 0 || arc.is_dir());
 
         result
     }
@@ -1076,8 +1100,8 @@ impl InMemoryFS {
             let entry_already_in_base = |parent: u64, name: &str, child: u64| -> bool {
                 base_map
                     .get(&parent)
-                    .map(|arc| match &**arc {
-                        Node::Directory { entries, .. } => entries.iter().any(|(n, c)| n == name && *c == child),
+                    .map(|arc| match &arc.kind {
+                        NodeKind::Directory { entries, .. } => entries.iter().any(|(n, c)| n == name && *c == child),
                         _ => false,
                     })
                     .unwrap_or(false)
@@ -1125,7 +1149,7 @@ impl InMemoryFS {
 
                 if let Some(base_arc) = base_map.get(&parent_ino) {
                     let node = base_arc.as_ref();
-                    if let Node::Directory { entries, .. } = node {
+                    if let NodeKind::Directory { entries, .. } = &node.kind {
                         for (name, c_ino) in entries {
                             let was_removed = d_added.is_none()
                                 || d_removed.contains(name)
@@ -1137,7 +1161,7 @@ impl InMemoryFS {
                             if was_removed {
                                 let mut is_dir = false;
                                 if let Some(child_arc) = base_map.get(c_ino) {
-                                    if let Node::Directory { .. } = child_arc.as_ref() {
+                                    if child_arc.is_dir() {
                                         is_dir = true;
                                     }
                                 } else if let Some(EntryDelta::Node(NodeDelta::Directory(_))) = frozen.get(c_ino) {
@@ -1753,7 +1777,7 @@ impl InMemoryFS {
         let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
         for node_arc in base.values() {
             let node = node_arc.as_ref();
-            if let Node::File { range_map, .. } = node {
+            if let NodeKind::File { range_map, .. } = &node.kind {
                 for (_, entry) in range_map.iter() {
                     if let ExtentState::Disk { generation, length, .. } = entry.value.read_state() {
                         let stats = live_map.entry(generation).or_insert((0, 0));
@@ -1861,70 +1885,22 @@ impl Default for InMemoryFS {
 // --- Helper Functions ---
 
 fn node_to_attr(ino: u64, node: &Node) -> FileAttr {
-    match node {
-        Node::Directory {
-            perm,
-            nlink,
-            uid,
-            gid,
-            atime,
-            mtime,
-            ctime,
-            ..
-        } => FileAttr {
-            ino,
-            file_type: FileType::Directory,
-            perm: *perm,
-            nlink: *nlink,
-            uid: *uid,
-            gid: *gid,
-            size: 0,
-            atime: *atime,
-            mtime: *mtime,
-            ctime: *ctime,
-        },
-        Node::File {
-            size,
-            perm,
-            nlink,
-            uid,
-            gid,
-            atime,
-            mtime,
-            ctime,
-            ..
-        } => FileAttr {
-            ino,
-            file_type: FileType::RegularFile,
-            perm: *perm,
-            nlink: *nlink,
-            uid: *uid,
-            gid: *gid,
-            size: *size as i64,
-            atime: *atime,
-            mtime: *mtime,
-            ctime: *ctime,
-        },
-        Node::Symlink {
-            target,
-            nlink,
-            uid,
-            gid,
-            atime,
-            mtime,
-            ctime,
-        } => FileAttr {
-            ino,
-            file_type: FileType::Symlink,
-            perm: 0o777,
-            nlink: *nlink,
-            uid: *uid,
-            gid: *gid,
-            size: target.len() as i64,
-            atime: *atime,
-            mtime: *mtime,
-            ctime: *ctime,
-        },
+    let (file_type, size, perm) = match &node.kind {
+        NodeKind::Directory { .. } => (FileType::Directory, 0, node.meta.perm),
+        NodeKind::File { size, .. } => (FileType::RegularFile, *size as i64, node.meta.perm),
+        NodeKind::Symlink { target } => (FileType::Symlink, target.len() as i64, 0o777),
+    };
+    FileAttr {
+        ino,
+        file_type,
+        perm,
+        nlink: node.meta.nlink,
+        uid: node.meta.uid,
+        gid: node.meta.gid,
+        size,
+        atime: node.meta.atime,
+        mtime: node.meta.mtime,
+        ctime: node.meta.ctime,
     }
 }
 
@@ -2048,21 +2024,8 @@ fn merge_attr_delta(target: &mut AttrDelta, incoming: &AttrDelta) {
 }
 
 fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
-    match (node, delta) {
-        (
-            Node::Directory {
-                parent,
-                entries,
-                perm,
-                nlink,
-                uid,
-                gid,
-                atime,
-                mtime,
-                ctime,
-            },
-            NodeDelta::Directory(d),
-        ) => {
+    match (&mut node.kind, delta) {
+        (NodeKind::Directory { parent, entries }, NodeDelta::Directory(d)) => {
             if let Some(p) = d.parent {
                 *parent = p;
             }
@@ -2074,42 +2037,9 @@ fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
                 entries.push((name.clone(), *child_ino));
             }
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-            if let Some(m) = d.attr_delta.mode {
-                *perm = m & 0o777;
-            }
-            if let Some(n) = d.attr_delta.nlink {
-                *nlink = n;
-            }
-            if let Some(u) = d.attr_delta.uid {
-                *uid = u;
-            }
-            if let Some(g) = d.attr_delta.gid {
-                *gid = g;
-            }
-            if let Some(a) = d.attr_delta.atime {
-                *atime = a;
-            }
-            if let Some(m) = d.attr_delta.mtime {
-                *mtime = m;
-            }
-            if let Some(c) = d.attr_delta.ctime {
-                *ctime = c;
-            }
+            node.apply_attr_delta(&d.attr_delta);
         }
-        (
-            Node::File {
-                range_map,
-                size,
-                perm,
-                nlink,
-                uid,
-                gid,
-                atime,
-                mtime,
-                ctime,
-            },
-            NodeDelta::File(f),
-        ) => {
+        (NodeKind::File { range_map, size }, NodeDelta::File(f)) => {
             if let Some(mask) = f.truncate_mask {
                 range_map.truncate(mask);
             }
@@ -2119,61 +2049,13 @@ fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
             if let Some(s) = f.size {
                 *size = s;
             }
-            if let Some(m) = f.attr_delta.mode {
-                *perm = m & 0o777;
-            }
-            if let Some(n) = f.attr_delta.nlink {
-                *nlink = n;
-            }
-            if let Some(u) = f.attr_delta.uid {
-                *uid = u;
-            }
-            if let Some(g) = f.attr_delta.gid {
-                *gid = g;
-            }
-            if let Some(a) = f.attr_delta.atime {
-                *atime = a;
-            }
-            if let Some(m) = f.attr_delta.mtime {
-                *mtime = m;
-            }
-            if let Some(c) = f.attr_delta.ctime {
-                *ctime = c;
-            }
+            node.apply_attr_delta(&f.attr_delta);
         }
-        (
-            Node::Symlink {
-                target,
-                nlink,
-                uid,
-                gid,
-                atime,
-                mtime,
-                ctime,
-            },
-            NodeDelta::Symlink(s),
-        ) => {
+        (NodeKind::Symlink { target }, NodeDelta::Symlink(s)) => {
             if let Some(ref t) = s.target {
                 *target = t.clone();
             }
-            if let Some(n) = s.attr_delta.nlink {
-                *nlink = n;
-            }
-            if let Some(u) = s.attr_delta.uid {
-                *uid = u;
-            }
-            if let Some(g) = s.attr_delta.gid {
-                *gid = g;
-            }
-            if let Some(a) = s.attr_delta.atime {
-                *atime = a;
-            }
-            if let Some(m) = s.attr_delta.mtime {
-                *mtime = m;
-            }
-            if let Some(c) = s.attr_delta.ctime {
-                *ctime = c;
-            }
+            node.apply_attr_delta(&s.attr_delta);
         }
         _ => {}
     }
@@ -2184,16 +2066,21 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
         NodeDelta::Directory(d) => {
             let mut entries: Vec<(String, u64)> = d.added.iter().map(|(k, v)| (k.clone(), *v)).collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-            Node::Directory {
-                parent: d.parent.unwrap_or(1),
-                entries,
-                perm: d.attr_delta.mode.unwrap_or(0o755),
+            let meta = InodeMeta {
+                perm: d.attr_delta.mode.unwrap_or(0o755) & 0o7777,
                 nlink: d.attr_delta.nlink.unwrap_or(2),
                 uid: d.attr_delta.uid.unwrap_or(0),
                 gid: d.attr_delta.gid.unwrap_or(0),
                 atime: d.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: d.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
                 ctime: d.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            Node {
+                meta,
+                kind: NodeKind::Directory {
+                    parent: d.parent.unwrap_or(1),
+                    entries,
+                },
             }
         }
         NodeDelta::File(f) => {
@@ -2201,27 +2088,40 @@ fn delta_to_node(delta: &NodeDelta) -> Node {
             for (start, entry) in f.extents.iter() {
                 range_map.insert(*start, entry.length, entry.value.clone());
             }
-            Node::File {
-                range_map,
-                size: f.size.unwrap_or(0),
-                perm: f.attr_delta.mode.unwrap_or(0o644),
+            let meta = InodeMeta {
+                perm: f.attr_delta.mode.unwrap_or(0o644) & 0o7777,
                 nlink: f.attr_delta.nlink.unwrap_or(1),
                 uid: f.attr_delta.uid.unwrap_or(0),
                 gid: f.attr_delta.gid.unwrap_or(0),
                 atime: f.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
                 mtime: f.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
                 ctime: f.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            Node {
+                meta,
+                kind: NodeKind::File {
+                    range_map,
+                    size: f.size.unwrap_or(0),
+                },
             }
         }
-        NodeDelta::Symlink(s) => Node::Symlink {
-            target: s.target.clone().unwrap_or_default(),
-            nlink: s.attr_delta.nlink.unwrap_or(1),
-            uid: s.attr_delta.uid.unwrap_or(0),
-            gid: s.attr_delta.gid.unwrap_or(0),
-            atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-            mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-            ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-        },
+        NodeDelta::Symlink(s) => {
+            let meta = InodeMeta {
+                perm: s.attr_delta.mode.unwrap_or(0o777) & 0o7777,
+                nlink: s.attr_delta.nlink.unwrap_or(1),
+                uid: s.attr_delta.uid.unwrap_or(0),
+                gid: s.attr_delta.gid.unwrap_or(0),
+                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
+            };
+            Node {
+                meta,
+                kind: NodeKind::Symlink {
+                    target: s.target.clone().unwrap_or_default(),
+                },
+            }
+        }
     }
 }
 
@@ -2280,7 +2180,7 @@ mod tests {
             let base = fs.base.read().unwrap();
             let node_arc = base.get(&ino).expect("inode missing in base");
             let node = node_arc.as_ref();
-            if let Node::File { range_map, size, .. } = node {
+            if let NodeKind::File { range_map, size, .. } = &node.kind {
                 assert_eq!(*size, 50);
                 assert_eq!(
                     range_map.len(),
@@ -2295,7 +2195,7 @@ mod tests {
                     crate::log::ExtentState::Disk { length: 50, .. }
                 ));
             } else {
-                panic!("Expected Node::File in base");
+                panic!("Expected NodeKind::File in base");
             }
         }
 
@@ -2358,16 +2258,12 @@ mod tests {
         let ino1 = fs.allocate_inode();
         fs.base.write().unwrap().insert(
             ino1,
-            Arc::new(Node::File {
-                range_map: RangeMap::new(),
-                size: 0,
-                perm: 0o644,
-                nlink: 1,
-                uid: 1000,
-                gid: 1000,
-                atime: clock.now(),
-                mtime: clock.now(),
-                ctime: clock.now(),
+            Arc::new(Node {
+                meta: InodeMeta::new(0o644, 1, 1000, 1000, clock.now()),
+                kind: NodeKind::File {
+                    range_map: RangeMap::new(),
+                    size: 0,
+                },
             }),
         );
         fs.add_dir_entry(1, "file1.bin", ino1, clock.now());

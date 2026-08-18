@@ -84,6 +84,16 @@ type ShimSetattrCallback = extern "C" fn(
 );
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShimFlock {
+    pub lock_type: i16,
+    pub whence: i16,
+    pub start: i64,
+    pub len: i64,
+    pub pid: i32,
+}
+
+#[repr(C)]
 struct RustLowlevelOps {
     lookup: Option<extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void)>,
     getattr: Option<extern "C" fn(req: shim_req_t, ino: u64, userdata: *mut c_void)>,
@@ -124,6 +134,21 @@ struct RustLowlevelOps {
     releasedir: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void)>,
     fsyncdir: Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void)>,
     statfs: Option<extern "C" fn(req: shim_req_t, ino: u64, userdata: *mut c_void)>,
+    flock: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, lock_owner: u64, op: c_int, userdata: *mut c_void)>,
+    getlk: Option<
+        extern "C" fn(req: shim_req_t, ino: u64, fh: u64, lock_owner: u64, lock: *mut ShimFlock, userdata: *mut c_void),
+    >,
+    setlk: Option<
+        extern "C" fn(
+            req: shim_req_t,
+            ino: u64,
+            fh: u64,
+            lock_owner: u64,
+            lock: *const ShimFlock,
+            sleep: c_int,
+            userdata: *mut c_void,
+        ),
+    >,
     init: Option<extern "C" fn(userdata: *mut c_void)>,
     destroy: Option<extern "C" fn(userdata: *mut c_void)>,
 }
@@ -151,6 +176,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn shim_reply_readlink(req: shim_req_t, link: *const c_char) -> c_int;
     fn shim_reply_statfs(req: shim_req_t, attr: *const ShimStatfsAttr) -> c_int;
+    fn shim_reply_lock(req: shim_req_t, lock: *const ShimFlock) -> c_int;
 
     fn shim_add_direntry(
         req: shim_req_t,
@@ -275,6 +301,12 @@ impl Request {
         };
         unsafe {
             shim_reply_statfs(self.req, &shim_attr);
+        }
+    }
+
+    pub fn reply_lock(self, lock: &ShimFlock) {
+        unsafe {
+            shim_reply_lock(self.req, lock);
         }
     }
 
@@ -481,6 +513,9 @@ pub trait Filesystem {
     fn releasedir(&self, req: Request, ino: u64, fh: u64);
     fn fsyncdir(&self, req: Request, ino: u64, datasync: bool);
     fn statfs(&self, req: Request, ino: u64);
+    fn flock(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32);
+    fn getlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock);
+    fn setlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool);
 }
 
 // Lowlevel C callback bridges
@@ -708,6 +743,38 @@ extern "C" fn statfs_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
     fs.statfs(Request { req }, ino);
 }
 
+extern "C" fn flock_bridge(req: shim_req_t, ino: u64, fh: u64, lock_owner: u64, op: c_int, userdata: *mut c_void) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    fs.flock(Request { req }, ino, fh, lock_owner, op);
+}
+
+extern "C" fn getlk_bridge(
+    req: shim_req_t,
+    ino: u64,
+    fh: u64,
+    lock_owner: u64,
+    lock: *mut ShimFlock,
+    userdata: *mut c_void,
+) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    let sh_lock = unsafe { *lock };
+    fs.getlk(Request { req }, ino, fh, lock_owner, sh_lock);
+}
+
+extern "C" fn setlk_bridge(
+    req: shim_req_t,
+    ino: u64,
+    fh: u64,
+    lock_owner: u64,
+    lock: *const ShimFlock,
+    sleep: c_int,
+    userdata: *mut c_void,
+) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    let sh_lock = unsafe { *lock };
+    fs.setlk(Request { req }, ino, fh, lock_owner, sh_lock, sleep != 0);
+}
+
 extern "C" fn init_bridge(userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.init();
@@ -762,6 +829,9 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
         releasedir: Some(releasedir_bridge),
         fsyncdir: Some(fsyncdir_bridge),
         statfs: Some(statfs_bridge),
+        flock: Some(flock_bridge),
+        getlk: Some(getlk_bridge),
+        setlk: Some(setlk_bridge),
         init: Some(init_bridge),
         destroy: Some(destroy_bridge),
     };
