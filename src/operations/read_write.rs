@@ -59,13 +59,13 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
         return;
     }
 
-    fs.open_handle(ino);
+    let fh = fs.open_file_handle(ino, flags);
 
     if (flags & libc::O_TRUNC as u32) != 0 {
         let now = fs.clock.now();
         let _ = setattr_core(fs, ino, 0, 0, 0, 0, now, now, FUSE_SET_ATTR_SIZE | FUSE_SET_ATTR_MTIME);
     }
-    req.reply_open(0);
+    req.reply_open(fh);
 }
 
 pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
@@ -321,8 +321,8 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
     let gid = req.gid();
     match create_core(fs, parent, name, mode, flags, uid, gid) {
         Ok(attr) => {
-            fs.open_handle(attr.ino);
-            req.reply_create(&attr, 1.0, 1.0, 0);
+            let fh = fs.open_file_handle(attr.ino, flags);
+            req.reply_create(&attr, 1.0, 1.0, fh);
         }
         Err(e) => req.reply_err(e),
     }
@@ -334,8 +334,8 @@ pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool) {
     req.reply_err(0);
 }
 
-pub fn release(fs: &InMemoryFS, req: Request, ino: u64) {
-    log::trace!("release(ino={})", ino);
-    fs.release_handle(ino);
+pub fn release(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
+    log::trace!("release(ino={}, fh={})", ino, fh);
+    fs.release_file_handle(fh, ino);
     req.reply_err(0);
 }

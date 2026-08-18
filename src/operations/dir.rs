@@ -103,18 +103,46 @@ pub fn iter_dir_entries<'a>(
     dot.into_iter().chain(dotdot).chain(rest)
 }
 
-pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64) {
-    log::trace!("readdir(ino={}, size={}, offset={})", ino, size, offset);
-    let entries = match list_dir_core(fs, ino) {
-        Ok(entries) => entries,
-        Err(e) => {
-            req.reply_err(e);
+pub fn opendir(fs: &InMemoryFS, req: Request, ino: u64, _flags: u32) {
+    log::trace!("opendir(ino={})", ino);
+    let attr = match fs.get_attr(ino) {
+        Some(attr) => attr,
+        None => {
+            req.reply_err(libc::ENOENT);
             return;
         }
     };
+    if attr.file_type != FileType::Directory {
+        req.reply_err(libc::ENOTDIR);
+        return;
+    }
+    match fs.open_dir_handle(ino) {
+        Some(fh) => req.reply_open(fh),
+        None => req.reply_err(libc::ENOENT),
+    }
+}
+
+pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
+    log::trace!("readdir(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
+    let entries_arc = if fh != 0 { fs.get_dir_handle(fh) } else { None };
+
+    let entries_fallback;
+    let entries: &[(String, u64)] = match entries_arc {
+        Some(ref e) => e.as_slice(),
+        None => match list_dir_core(fs, ino) {
+            Ok(e) => {
+                entries_fallback = e;
+                entries_fallback.as_slice()
+            }
+            Err(e) => {
+                req.reply_err(e);
+                return;
+            }
+        },
+    };
 
     let mut db = shim::DirectoryBuffer::new(req, size);
-    for item in iter_dir_entries(fs, ino, &entries, offset) {
+    for item in iter_dir_entries(fs, ino, entries, offset) {
         if let Some(attr) = fs.get_attr(item.ino)
             && !db.add(item.name, item.ino, attr.file_type, item.next_offset)
         {
@@ -124,18 +152,27 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
     db.reply();
 }
 
-pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64) {
-    log::trace!("readdirplus(ino={}, size={}, offset={})", ino, size, offset);
-    let entries = match list_dir_core(fs, ino) {
-        Ok(entries) => entries,
-        Err(e) => {
-            req.reply_err(e);
-            return;
-        }
+pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
+    log::trace!("readdirplus(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
+    let entries_arc = if fh != 0 { fs.get_dir_handle(fh) } else { None };
+
+    let entries_fallback;
+    let entries: &[(String, u64)] = match entries_arc {
+        Some(ref e) => e.as_slice(),
+        None => match list_dir_core(fs, ino) {
+            Ok(e) => {
+                entries_fallback = e;
+                entries_fallback.as_slice()
+            }
+            Err(e) => {
+                req.reply_err(e);
+                return;
+            }
+        },
     };
 
     let mut db = shim::DirectoryBufferPlus::new(req, size);
-    for item in iter_dir_entries(fs, ino, &entries, offset) {
+    for item in iter_dir_entries(fs, ino, entries, offset) {
         if let Some(attr) = fs.get_attr(item.ino)
             && !db.add(item.name, &attr, 1.0, 1.0, item.next_offset)
         {
@@ -270,8 +307,11 @@ pub fn rmdir(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
     }
 }
 
-pub fn releasedir(_fs: &InMemoryFS, req: Request, ino: u64) {
-    log::trace!("releasedir(ino={})", ino);
+pub fn releasedir(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
+    log::trace!("releasedir(ino={}, fh={})", ino, fh);
+    if fh != 0 {
+        fs.release_dir_handle(fh);
+    }
     req.reply_err(0);
 }
 

@@ -14,6 +14,16 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileHandle {
+    pub ino: u64,
+    pub flags: u32,
+}
+
+pub type DirSnapshot = Arc<Vec<(String, u64)>>;
+pub type FileHandleMap = HashMap<u64, FileHandle>;
+pub type DirectoryHandleMap = HashMap<u64, DirSnapshot>;
+
 pub struct InMemoryFS {
     /// Resting consolidated state loaded from `.summary` at mount, folded forward over
     /// time by `fold_flush`. Never holds a `Tombstone`.
@@ -23,8 +33,14 @@ pub struct InMemoryFS {
     pub flushing: RwLock<VecDeque<HashMap<u64, EntryDelta>>>,
     /// Current generation's active mutable delta layer receiving live operations.
     pub live: RwLock<HashMap<u64, EntryDelta>>,
-    /// Active open file descriptor reference counts per inode for POSIX unlinking semantics.
-    pub open_handles: RwLock<HashMap<u64, u32>>,
+    /// Active open file handles keyed by allocated file handle ID (`fh`).
+    pub file_handles: RwLock<FileHandleMap>,
+    /// Active open directory handle snapshots keyed by allocated file handle ID (`fh`).
+    pub dir_handles: RwLock<DirectoryHandleMap>,
+    /// Open descriptor reference count per inode for fast POSIX unlinking checks.
+    pub open_counts: RwLock<HashMap<u64, u32>>,
+    /// Atomic counter for allocating unique file and directory handle IDs (`fh`).
+    pub next_fh: AtomicU64,
     /// Authoritative manifest of all active log generations and lineage.
     pub manifest: Arc<RwLock<LogManifest>>,
     pub next_inode: AtomicU64,
@@ -98,7 +114,10 @@ impl InMemoryFS {
             base: RwLock::new(map),
             flushing: RwLock::new(VecDeque::new()),
             live: RwLock::new(HashMap::new()),
-            open_handles: RwLock::new(HashMap::new()),
+            file_handles: RwLock::new(HashMap::new()),
+            dir_handles: RwLock::new(HashMap::new()),
+            open_counts: RwLock::new(HashMap::new()),
+            next_fh: AtomicU64::new(1),
             manifest,
             next_inode: AtomicU64::new(2),
             last_tx_id: AtomicU64::new(0),
@@ -154,32 +173,80 @@ impl InMemoryFS {
         self.next_inode.fetch_add(1, Ordering::SeqCst)
     }
 
-    // --- POSIX Open File Descriptor Tracking ---
+    // --- POSIX File Handle Tracking ---
 
-    pub fn open_handle(&self, ino: u64) {
-        let mut handles = self.open_handles.write().unwrap();
-        *handles.entry(ino).or_insert(0) += 1;
+    pub fn open_file_handle(&self, ino: u64, flags: u32) -> u64 {
+        let fh = self.allocate_fh();
+        self.file_handles.write().unwrap().insert(fh, FileHandle { ino, flags });
+        *self.open_counts.write().unwrap().entry(ino).or_insert(0) += 1;
+        fh
     }
 
-    pub fn release_handle(&self, ino: u64) {
-        let mut handles = self.open_handles.write().unwrap();
-        if let Some(count) = handles.get_mut(&ino) {
+    pub fn get_file_handle(&self, fh: u64) -> Option<FileHandle> {
+        self.file_handles.read().unwrap().get(&fh).copied()
+    }
+
+    pub fn release_file_handle(&self, fh: u64, ino: u64) {
+        let target_ino = if fh != 0 {
+            self.file_handles
+                .write()
+                .unwrap()
+                .remove(&fh)
+                .map(|h| h.ino)
+                .unwrap_or(ino)
+        } else {
+            ino
+        };
+
+        let mut counts = self.open_counts.write().unwrap();
+        if let Some(count) = counts.get_mut(&target_ino) {
             *count = count.saturating_sub(1);
         }
-        if handles.get(&ino) == Some(&0) {
-            handles.remove(&ino);
+        if counts.get(&target_ino) == Some(&0) {
+            counts.remove(&target_ino);
         }
-        let remaining = handles.get(&ino).copied().unwrap_or(0);
+        let remaining = counts.get(&target_ino).copied().unwrap_or(0);
         if remaining == 0
-            && let Some(attr) = self.get_attr(ino)
+            && let Some(attr) = self.get_attr(target_ino)
             && attr.nlink == 0
         {
-            self.tombstone(ino);
+            self.tombstone(target_ino);
         }
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {
-        self.open_handles.read().unwrap().get(&ino).copied().unwrap_or(0)
+        self.open_counts.read().unwrap().get(&ino).copied().unwrap_or(0)
+    }
+
+    /// Convenience helper for direct programmatic / test usage without an explicit `fh`.
+    pub fn open_handle(&self, ino: u64) {
+        *self.open_counts.write().unwrap().entry(ino).or_insert(0) += 1;
+    }
+
+    /// Convenience helper for direct programmatic / test usage without an explicit `fh`.
+    pub fn release_handle(&self, ino: u64) {
+        self.release_file_handle(0, ino);
+    }
+
+    // --- Directory Handle Snapshot Management ---
+
+    pub fn allocate_fh(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn open_dir_handle(&self, ino: u64) -> Option<u64> {
+        let entries = self.list_directory(ino)?;
+        let fh = self.allocate_fh();
+        self.dir_handles.write().unwrap().insert(fh, Arc::new(entries));
+        Some(fh)
+    }
+
+    pub fn get_dir_handle(&self, fh: u64) -> Option<Arc<Vec<(String, u64)>>> {
+        self.dir_handles.read().unwrap().get(&fh).cloned()
+    }
+
+    pub fn release_dir_handle(&self, fh: u64) {
+        self.dir_handles.write().unwrap().remove(&fh);
     }
 
     // --- In-Memory Delta Layer Mutations ---
@@ -2523,7 +2590,7 @@ mod tests {
         let ino = file_attr.ino;
 
         // Open handle (like a POSIX process keeping file open)
-        *fs.open_handles.write().unwrap().entry(ino).or_insert(0) += 1;
+        let _fh = fs.open_file_handle(ino, 0);
 
         // Write data
         crate::operations::read_write::write_core(&fs, ino, &[0xCC; 128], 0).unwrap();
@@ -2871,5 +2938,99 @@ mod tests {
         assert_eq!(fs.flush_queue_depth(), 0);
         crate::operations::read_write::create_core(&fs, 1, "after.txt", 0o644, 0, 1000, 1000)
             .expect("mutations must be accepted again once the log drains");
+    }
+
+    #[test]
+    fn test_dir_handle_snapshot_isolation_and_lifecycle() {
+        let fs = InMemoryFS::new();
+        let now = fs.clock.now();
+
+        // 1. Create two files under root
+        crate::operations::read_write::create_core(&fs, 1, "alpha.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::create_core(&fs, 1, "bravo.txt", 0o644, 0, 1000, 1000).unwrap();
+
+        // 2. Open a directory handle on root
+        let fh1 = fs
+            .open_dir_handle(1)
+            .expect("open_dir_handle must succeed on directory");
+        assert!(fh1 > 0);
+
+        let snap1 = fs.get_dir_handle(fh1).expect("Handle snapshot must exist");
+        assert_eq!(snap1.len(), 2);
+        assert_eq!(snap1[0].0, "alpha.txt");
+        assert_eq!(snap1[1].0, "bravo.txt");
+
+        // 3. Mutate directory: add charlie.txt, delete alpha.txt
+        crate::operations::read_write::create_core(&fs, 1, "charlie.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.remove_dir_entry(1, "alpha.txt", now);
+
+        // 4. fh1 MUST retain its original snapshot (alpha, bravo)
+        let snap1_recheck = fs.get_dir_handle(fh1).expect("Handle snapshot must still exist");
+        assert_eq!(snap1_recheck.len(), 2);
+        assert_eq!(snap1_recheck[0].0, "alpha.txt");
+        assert_eq!(snap1_recheck[1].0, "bravo.txt");
+
+        // 5. A new directory handle on root gets the new snapshot (bravo, charlie)
+        let fh2 = fs
+            .open_dir_handle(1)
+            .expect("open_dir_handle must succeed on directory");
+        assert_ne!(fh1, fh2);
+        let snap2 = fs.get_dir_handle(fh2).expect("Second handle snapshot must exist");
+        assert_eq!(snap2.len(), 2);
+        assert_eq!(snap2[0].0, "bravo.txt");
+        assert_eq!(snap2[1].0, "charlie.txt");
+
+        // 6. Release fh1
+        fs.release_dir_handle(fh1);
+        assert!(fs.get_dir_handle(fh1).is_none());
+        assert!(fs.get_dir_handle(fh2).is_some());
+
+        // 7. Release fh2
+        fs.release_dir_handle(fh2);
+        assert!(fs.get_dir_handle(fh2).is_none());
+
+        // 8. open_dir_handle on a non-directory returns None
+        let alpha_ino = snap1[0].1;
+        assert!(fs.open_dir_handle(alpha_ino).is_none());
+    }
+
+    #[test]
+    fn test_file_handle_lifecycle_and_unlinking() {
+        let fs = InMemoryFS::new();
+
+        // 1. Create a file
+        let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino = attr.ino;
+
+        // 2. Open two file handles
+        let fh1 = fs.open_file_handle(ino, libc::O_RDONLY as u32);
+        let fh2 = fs.open_file_handle(ino, libc::O_WRONLY as u32);
+        assert_ne!(fh1, fh2);
+        assert_eq!(fs.open_count(ino), 2);
+        assert_eq!(fs.get_file_handle(fh1).unwrap().ino, ino);
+        assert_eq!(fs.get_file_handle(fh2).unwrap().ino, ino);
+
+        // 3. Unlink the file while handles are still open
+        crate::operations::links::unlink_core(&fs, 1, "test.txt").unwrap();
+
+        // Inode must still exist (not tombstoned) because open_count is 2
+        assert!(fs.get_attr(ino).is_some());
+        assert_eq!(fs.get_attr(ino).unwrap().nlink, 0);
+
+        // 4. Release first handle
+        fs.release_file_handle(fh1, ino);
+        assert!(fs.get_file_handle(fh1).is_none());
+        assert!(fs.get_file_handle(fh2).is_some());
+        assert_eq!(fs.open_count(ino), 1);
+        assert!(fs.get_attr(ino).is_some());
+
+        // 5. Release second handle -> count drops to 0, inode gets tombstoned
+        fs.release_file_handle(fh2, ino);
+        assert!(fs.get_file_handle(fh2).is_none());
+        assert_eq!(fs.open_count(ino), 0);
+        assert!(
+            fs.get_attr(ino).is_none(),
+            "Unlinked file with 0 handles must be tombstoned"
+        );
     }
 }

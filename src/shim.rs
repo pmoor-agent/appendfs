@@ -87,8 +87,10 @@ type ShimSetattrCallback = extern "C" fn(
 struct RustLowlevelOps {
     lookup: Option<extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void)>,
     getattr: Option<extern "C" fn(req: shim_req_t, ino: u64, userdata: *mut c_void)>,
-    readdir: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void)>,
-    readdirplus: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void)>,
+    opendir: Option<extern "C" fn(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void)>,
+    readdir: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void)>,
+    readdirplus:
+        Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void)>,
     read: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void)>,
     open: Option<extern "C" fn(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void)>,
     write:
@@ -117,8 +119,8 @@ struct RustLowlevelOps {
     link:
         Option<extern "C" fn(req: shim_req_t, ino: u64, newparent: u64, newname: *const c_char, userdata: *mut c_void)>,
     fsync: Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void)>,
-    release: Option<extern "C" fn(req: shim_req_t, ino: u64, userdata: *mut c_void)>,
-    releasedir: Option<extern "C" fn(req: shim_req_t, ino: u64, userdata: *mut c_void)>,
+    release: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void)>,
+    releasedir: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void)>,
     fsyncdir: Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void)>,
     statfs: Option<extern "C" fn(req: shim_req_t, ino: u64, userdata: *mut c_void)>,
     init: Option<extern "C" fn(userdata: *mut c_void)>,
@@ -446,8 +448,9 @@ impl DirectoryBufferPlus {
 pub trait Filesystem {
     fn lookup(&self, req: Request, parent: u64, name: &str);
     fn getattr(&self, req: Request, ino: u64);
-    fn readdir(&self, req: Request, ino: u64, size: usize, offset: i64);
-    fn readdirplus(&self, req: Request, ino: u64, size: usize, offset: i64);
+    fn opendir(&self, req: Request, ino: u64, flags: u32);
+    fn readdir(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64);
+    fn readdirplus(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64);
     fn read(&self, req: Request, ino: u64, size: usize, offset: i64);
     fn open(&self, req: Request, ino: u64, flags: u32);
     fn write(&self, req: Request, ino: u64, buf: &[u8], offset: i64);
@@ -473,8 +476,8 @@ pub trait Filesystem {
     fn rename(&self, req: Request, parent: u64, name: &str, newparent: u64, newname: &str);
     fn link(&self, req: Request, ino: u64, newparent: u64, newname: &str);
     fn fsync(&self, req: Request, ino: u64, datasync: bool);
-    fn release(&self, req: Request, ino: u64);
-    fn releasedir(&self, req: Request, ino: u64);
+    fn release(&self, req: Request, ino: u64, fh: u64);
+    fn releasedir(&self, req: Request, ino: u64, fh: u64);
     fn fsyncdir(&self, req: Request, ino: u64, datasync: bool);
     fn statfs(&self, req: Request, ino: u64);
 }
@@ -497,14 +500,19 @@ extern "C" fn getattr_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
     fs.getattr(Request { req }, ino);
 }
 
-extern "C" fn readdir_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void) {
+extern "C" fn opendir_bridge(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.readdir(Request { req }, ino, size, off);
+    fs.opendir(Request { req }, ino, flags);
 }
 
-extern "C" fn readdirplus_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void) {
+extern "C" fn readdir_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.readdirplus(Request { req }, ino, size, off);
+    fs.readdir(Request { req }, ino, size, off, fh);
+}
+
+extern "C" fn readdirplus_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    fs.readdirplus(Request { req }, ino, size, off, fh);
 }
 
 extern "C" fn read_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, userdata: *mut c_void) {
@@ -671,14 +679,14 @@ extern "C" fn fsync_bridge(req: shim_req_t, ino: u64, datasync: c_int, userdata:
     fs.fsync(Request { req }, ino, datasync != 0);
 }
 
-extern "C" fn release_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
+extern "C" fn release_bridge(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.release(Request { req }, ino);
+    fs.release(Request { req }, ino, fh);
 }
 
-extern "C" fn releasedir_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
+extern "C" fn releasedir_bridge(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.releasedir(Request { req }, ino);
+    fs.releasedir(Request { req }, ino, fh);
 }
 
 extern "C" fn fsyncdir_bridge(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void) {
@@ -725,6 +733,7 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
     let ops = RustLowlevelOps {
         lookup: Some(lookup_bridge),
         getattr: Some(getattr_bridge),
+        opendir: Some(opendir_bridge),
         readdir: Some(readdir_bridge),
         readdirplus: Some(readdirplus_bridge),
         read: Some(read_bridge),

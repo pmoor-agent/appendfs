@@ -48,8 +48,10 @@ extern "C" {
 
 typedef void (*shim_lookup_fn)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
 typedef void (*shim_getattr_fn)(shim_req_t req, uint64_t ino, void *userdata);
-typedef void (*shim_readdir_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
-typedef void (*shim_readdirplus_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
+typedef void (*shim_opendir_fn)(shim_req_t req, uint64_t ino, uint32_t flags, void *userdata);
+typedef void (*shim_readdir_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, uint64_t fh, void *userdata);
+typedef void (*shim_readdirplus_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, uint64_t fh,
+                                    void *userdata);
 typedef void (*shim_read_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
 typedef void (*shim_open_fn)(shim_req_t req, uint64_t ino, uint32_t flags, void *userdata);
 typedef void (*shim_write_fn)(shim_req_t req, uint64_t ino, const uint8_t *buf, size_t size, int64_t off,
@@ -68,8 +70,8 @@ typedef void (*shim_rename_fn)(shim_req_t req, uint64_t parent, const char *name
                                const char *newname, void *userdata);
 typedef void (*shim_link_fn)(shim_req_t req, uint64_t ino, uint64_t newparent, const char *newname, void *userdata);
 typedef void (*shim_fsync_fn)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
-typedef void (*shim_release_fn)(shim_req_t req, uint64_t ino, void *userdata);
-typedef void (*shim_releasedir_fn)(shim_req_t req, uint64_t ino, void *userdata);
+typedef void (*shim_release_fn)(shim_req_t req, uint64_t ino, uint64_t fh, void *userdata);
+typedef void (*shim_releasedir_fn)(shim_req_t req, uint64_t ino, uint64_t fh, void *userdata);
 typedef void (*shim_fsyncdir_fn)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
 typedef void (*shim_statfs_fn)(shim_req_t req, uint64_t ino, void *userdata);
 typedef void (*shim_init_fn)(void *userdata);
@@ -78,6 +80,7 @@ typedef void (*shim_destroy_fn)(void *userdata);
 struct RustLowlevelOps {
   shim_lookup_fn lookup;
   shim_getattr_fn getattr;
+  shim_opendir_fn opendir;
   shim_readdir_fn readdir;
   shim_readdirplus_fn readdirplus;
   shim_read_fn read;
@@ -129,21 +132,30 @@ static void ll_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
   }
 }
 
+static void ll_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.opendir) {
+    ctx->ops.opendir(static_cast<shim_req_t>(req), ino, fi ? fi->flags : 0, ctx->userdata);
+  } else {
+    fuse_reply_open(req, fi);
+  }
+}
+
 static void ll_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi) {
-  (void)fi;
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.readdir) {
-    ctx->ops.readdir(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), ctx->userdata);
+    uint64_t fh = fi ? fi->fh : 0;
+    ctx->ops.readdir(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), fh, ctx->userdata);
   } else {
     fuse_reply_err(req, 38);
   }
 }
 
 static void ll_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi) {
-  (void)fi;
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.readdirplus) {
-    ctx->ops.readdirplus(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), ctx->userdata);
+    uint64_t fh = fi ? fi->fh : 0;
+    ctx->ops.readdirplus(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), fh, ctx->userdata);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -285,20 +297,20 @@ static void ll_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_f
 }
 
 static void ll_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
-  (void)fi;
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.release) {
-    ctx->ops.release(static_cast<shim_req_t>(req), ino, ctx->userdata);
+    uint64_t fh = fi ? fi->fh : 0;
+    ctx->ops.release(static_cast<shim_req_t>(req), ino, fh, ctx->userdata);
   } else {
     fuse_reply_err(req, 0);
   }
 }
 
 static void ll_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
-  (void)fi;
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.releasedir) {
-    ctx->ops.releasedir(static_cast<shim_req_t>(req), ino, ctx->userdata);
+    uint64_t fh = fi ? fi->fh : 0;
+    ctx->ops.releasedir(static_cast<shim_req_t>(req), ino, fh, ctx->userdata);
   } else {
     fuse_reply_err(req, 0);
   }
@@ -391,6 +403,7 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   ll_ops.destroy = ll_destroy;
   ll_ops.lookup = ll_lookup;
   ll_ops.getattr = ll_getattr;
+  ll_ops.opendir = ll_opendir;
   ll_ops.readdir = ll_readdir;
   ll_ops.readdirplus = ll_readdirplus;
   ll_ops.read = ll_read;

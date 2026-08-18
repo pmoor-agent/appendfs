@@ -16,12 +16,16 @@ impl Filesystem for InMemoryFS {
         read_write::getattr(self, req, ino);
     }
 
-    fn readdir(&self, req: Request, ino: u64, size: usize, offset: i64) {
-        dir::readdir(self, req, ino, size, offset);
+    fn opendir(&self, req: Request, ino: u64, flags: u32) {
+        dir::opendir(self, req, ino, flags);
     }
 
-    fn readdirplus(&self, req: Request, ino: u64, size: usize, offset: i64) {
-        dir::readdirplus(self, req, ino, size, offset);
+    fn readdir(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
+        dir::readdir(self, req, ino, size, offset, fh);
+    }
+
+    fn readdirplus(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
+        dir::readdirplus(self, req, ino, size, offset, fh);
     }
 
     fn read(&self, req: Request, ino: u64, size: usize, offset: i64) {
@@ -87,12 +91,12 @@ impl Filesystem for InMemoryFS {
         read_write::fsync(self, req, ino, datasync);
     }
 
-    fn release(&self, req: Request, ino: u64) {
-        read_write::release(self, req, ino);
+    fn release(&self, req: Request, ino: u64, fh: u64) {
+        read_write::release(self, req, ino, fh);
     }
 
-    fn releasedir(&self, req: Request, ino: u64) {
-        dir::releasedir(self, req, ino);
+    fn releasedir(&self, req: Request, ino: u64, fh: u64) {
+        dir::releasedir(self, req, ino, fh);
     }
 
     fn fsyncdir(&self, req: Request, ino: u64, datasync: bool) {

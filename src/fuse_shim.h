@@ -35,8 +35,9 @@ struct shim_statfs_attr {
 // Callback signatures that Rust will implement for low-level FUSE
 typedef void (*rust_lookup_t)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
 typedef void (*rust_getattr_t)(shim_req_t req, uint64_t ino, void *userdata);
-typedef void (*rust_readdir_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
-typedef void (*rust_readdirplus_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
+typedef void (*rust_opendir_t)(shim_req_t req, uint64_t ino, uint32_t flags, void *userdata);
+typedef void (*rust_readdir_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off, uint64_t fh, void *userdata);
+typedef void (*rust_readdirplus_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off, uint64_t fh, void *userdata);
 typedef void (*rust_read_t)(shim_req_t req, uint64_t ino, size_t size, int64_t off, void *userdata);
 typedef void (*rust_open_t)(shim_req_t req, uint64_t ino, uint32_t flags, void *userdata);
 typedef void (*rust_write_t)(shim_req_t req, uint64_t ino, const char *buf, size_t size, int64_t off, void *userdata);
@@ -54,8 +55,8 @@ typedef void (*rust_rename_t)(shim_req_t req, uint64_t parent, const char *name,
                               const char *newname, void *userdata);
 typedef void (*rust_link_t)(shim_req_t req, uint64_t ino, uint64_t newparent, const char *newname, void *userdata);
 typedef void (*rust_fsync_t)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
-typedef void (*rust_release_t)(shim_req_t req, uint64_t ino, void *userdata);
-typedef void (*rust_releasedir_t)(shim_req_t req, uint64_t ino, void *userdata);
+typedef void (*rust_release_t)(shim_req_t req, uint64_t ino, uint64_t fh, void *userdata);
+typedef void (*rust_releasedir_t)(shim_req_t req, uint64_t ino, uint64_t fh, void *userdata);
 typedef void (*rust_fsyncdir_t)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
 typedef void (*rust_statfs_t)(shim_req_t req, uint64_t ino, void *userdata);
 typedef void (*rust_init_t)(void *userdata);
@@ -64,6 +65,7 @@ typedef void (*rust_destroy_t)(void *userdata);
 struct rust_lowlevel_ops {
   rust_lookup_t lookup;
   rust_getattr_t getattr;
+  rust_opendir_t opendir;
   rust_readdir_t readdir;
   rust_readdirplus_t readdirplus;
   rust_read_t read;
