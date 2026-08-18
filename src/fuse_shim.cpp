@@ -579,52 +579,58 @@ err_out1:
   return ret;
 }
 
+namespace {
+
+// Standard ceiling division for 512-byte POSIX stat blocks (st_blocks)
+inline blkcnt_t size_to_blocks(uint64_t size) {
+  return static_cast<blkcnt_t>((size + 511) / 512);
+}
+
+inline void populate_stat(const shim_file_attr *attr, struct stat *st) {
+  if (!attr || !st) return;
+  st->st_ino = attr->ino;
+  st->st_mode = attr->mode;
+  st->st_nlink = attr->nlink;
+  st->st_uid = attr->uid;
+  st->st_gid = attr->gid;
+  st->st_rdev = attr->rdev;
+  st->st_size = attr->size;
+  st->st_blocks = size_to_blocks(attr->size);
+  st->st_blksize = 4096;
+  st->st_atim.tv_sec = attr->atime_sec;
+  st->st_atim.tv_nsec = attr->atime_nsec;
+  st->st_mtim.tv_sec = attr->mtime_sec;
+  st->st_mtim.tv_nsec = attr->mtime_nsec;
+  st->st_ctim.tv_sec = attr->ctime_sec;
+  st->st_ctim.tv_nsec = attr->ctime_nsec;
+}
+
+inline void populate_fuse_entry(const shim_file_attr *attr, double attr_timeout, double entry_timeout,
+                                struct fuse_entry_param *e) {
+  if (!e) return;
+  if (attr) {
+    e->ino = attr->ino;
+    e->generation = 1;
+    populate_stat(attr, &e->attr);
+  }
+  e->attr_timeout = attr_timeout;
+  e->entry_timeout = entry_timeout;
+}
+
+} // namespace
+
 int shim_reply_err(shim_req_t req, int err) { return fuse_reply_err(static_cast<fuse_req_t>(req), err); }
 
 int shim_reply_entry(shim_req_t req, const shim_file_attr *attr, double attr_timeout, double entry_timeout) {
   struct fuse_entry_param e = {};
-  if (attr) {
-    e.ino = attr->ino;
-    e.generation = 1;
-    e.attr.st_ino = attr->ino;
-    e.attr.st_mode = attr->mode;
-    e.attr.st_nlink = attr->nlink;
-    e.attr.st_uid = attr->uid;
-    e.attr.st_gid = attr->gid;
-    e.attr.st_rdev = attr->rdev;
-    e.attr.st_size = attr->size;
-    e.attr.st_blocks = (attr->size > 0) ? ((attr->size + 511) / 512) : 0;
-    e.attr.st_blksize = 4096;
-    e.attr.st_atim.tv_sec = attr->atime_sec;
-    e.attr.st_atim.tv_nsec = attr->atime_nsec;
-    e.attr.st_mtim.tv_sec = attr->mtime_sec;
-    e.attr.st_mtim.tv_nsec = attr->mtime_nsec;
-    e.attr.st_ctim.tv_sec = attr->ctime_sec;
-    e.attr.st_ctim.tv_nsec = attr->ctime_nsec;
-  }
-  e.attr_timeout = attr_timeout;
-  e.entry_timeout = entry_timeout;
+  populate_fuse_entry(attr, attr_timeout, entry_timeout, &e);
   return fuse_reply_entry(static_cast<fuse_req_t>(req), &e);
 }
 
 int shim_reply_attr(shim_req_t req, const shim_file_attr *attr, double attr_timeout) {
   struct stat stbuf = {};
   if (attr) {
-    stbuf.st_ino = attr->ino;
-    stbuf.st_mode = attr->mode;
-    stbuf.st_nlink = attr->nlink;
-    stbuf.st_uid = attr->uid;
-    stbuf.st_gid = attr->gid;
-    stbuf.st_rdev = attr->rdev;
-    stbuf.st_size = attr->size;
-    stbuf.st_blocks = (attr->size > 0) ? ((attr->size + 511) / 512) : 0;
-    stbuf.st_blksize = 4096;
-    stbuf.st_atim.tv_sec = attr->atime_sec;
-    stbuf.st_atim.tv_nsec = attr->atime_nsec;
-    stbuf.st_mtim.tv_sec = attr->mtime_sec;
-    stbuf.st_mtim.tv_nsec = attr->mtime_nsec;
-    stbuf.st_ctim.tv_sec = attr->ctime_sec;
-    stbuf.st_ctim.tv_nsec = attr->ctime_nsec;
+    populate_stat(attr, &stbuf);
   }
   return fuse_reply_attr(static_cast<fuse_req_t>(req), &stbuf, attr_timeout);
 }
@@ -644,26 +650,7 @@ int shim_reply_write(shim_req_t req, size_t count) { return fuse_reply_write(sta
 int shim_reply_create(shim_req_t req, const shim_file_attr *attr, double attr_timeout, double entry_timeout,
                       uint64_t fh) {
   struct fuse_entry_param e = {};
-  if (attr) {
-    e.ino = attr->ino;
-    e.generation = 1;
-    e.attr.st_ino = attr->ino;
-    e.attr.st_mode = attr->mode;
-    e.attr.st_nlink = attr->nlink;
-    e.attr.st_uid = attr->uid;
-    e.attr.st_gid = attr->gid;
-    e.attr.st_size = attr->size;
-    e.attr.st_blocks = (attr->size > 0) ? ((attr->size + 511) / 512) : 0;
-    e.attr.st_blksize = 4096;
-    e.attr.st_atim.tv_sec = attr->atime_sec;
-    e.attr.st_atim.tv_nsec = attr->atime_nsec;
-    e.attr.st_mtim.tv_sec = attr->mtime_sec;
-    e.attr.st_mtim.tv_nsec = attr->mtime_nsec;
-    e.attr.st_ctim.tv_sec = attr->ctime_sec;
-    e.attr.st_ctim.tv_nsec = attr->ctime_nsec;
-  }
-  e.attr_timeout = attr_timeout;
-  e.entry_timeout = entry_timeout;
+  populate_fuse_entry(attr, attr_timeout, entry_timeout, &e);
   struct fuse_file_info fi = {};
   fi.fh = fh;
   return fuse_reply_create(static_cast<fuse_req_t>(req), &e, &fi);
@@ -717,26 +704,7 @@ size_t shim_add_direntry(shim_req_t req, char *buf, size_t bufsize, const char *
 size_t shim_add_direntry_plus(shim_req_t req, char *buf, size_t bufsize, const char *name, const shim_file_attr *attr,
                               double attr_timeout, double entry_timeout, int64_t off) {
   struct fuse_entry_param e = {};
-  if (attr) {
-    e.ino = attr->ino;
-    e.generation = 1;
-    e.attr.st_ino = attr->ino;
-    e.attr.st_mode = attr->mode;
-    e.attr.st_nlink = attr->nlink;
-    e.attr.st_uid = attr->uid;
-    e.attr.st_gid = attr->gid;
-    e.attr.st_size = attr->size;
-    e.attr.st_blocks = (attr->size > 0) ? ((attr->size + 511) / 512) : 0;
-    e.attr.st_blksize = 4096;
-    e.attr.st_atim.tv_sec = attr->atime_sec;
-    e.attr.st_atim.tv_nsec = attr->atime_nsec;
-    e.attr.st_mtim.tv_sec = attr->mtime_sec;
-    e.attr.st_mtim.tv_nsec = attr->mtime_nsec;
-    e.attr.st_ctim.tv_sec = attr->ctime_sec;
-    e.attr.st_ctim.tv_nsec = attr->ctime_nsec;
-  }
-  e.attr_timeout = attr_timeout;
-  e.entry_timeout = entry_timeout;
+  populate_fuse_entry(attr, attr_timeout, entry_timeout, &e);
   return fuse_add_direntry_plus(static_cast<fuse_req_t>(req), buf, bufsize, name, &e, static_cast<off_t>(off));
 }
 
