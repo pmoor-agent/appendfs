@@ -54,9 +54,7 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
         return;
     }
 
-    if fs.is_read_only()
-        && (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0
-    {
+    if fs.is_read_only() && (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0 {
         req.reply_err(libc::EROFS);
         return;
     }
@@ -65,17 +63,7 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
 
     if (flags & libc::O_TRUNC as u32) != 0 {
         let now = fs.clock.now();
-        let _ = setattr_core(
-            fs,
-            ino,
-            0,
-            0,
-            0,
-            0,
-            now,
-            now,
-            FUSE_SET_ATTR_SIZE | FUSE_SET_ATTR_MTIME,
-        );
+        let _ = setattr_core(fs, ino, 0, 0, 0, 0, now, now, FUSE_SET_ATTR_SIZE | FUSE_SET_ATTR_MTIME);
     }
     req.reply_open(0);
 }
@@ -115,8 +103,7 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
         if let EntryDelta::Node(NodeDelta::File(f)) = entry {
-            f.extents
-                .insert(file_offset, write_len, shared_state.clone());
+            f.extents.insert(file_offset, write_len, shared_state.clone());
             // `f.size` is only `Some` here if an earlier op in this same live batch
             // already touched this file - otherwise this delta was just freshly
             // inserted above, possibly because a flush froze the previous one out from

@@ -28,8 +28,7 @@ impl FaultStorage {
     /// Sets a byte threshold after which `append` will fail with simulated ENOSPC / EFBIG.
     pub fn fail_writes_after_bytes(&self, limit: u64, write_partial: bool) {
         self.max_append_bytes.store(limit, Ordering::SeqCst);
-        self.write_partial_on_fail
-            .store(write_partial, Ordering::SeqCst);
+        self.write_partial_on_fail.store(write_partial, Ordering::SeqCst);
     }
 
     /// Clears any write limit.
@@ -112,9 +111,7 @@ impl StorageWriter for FaultStorageWriter {
                     let partial_len = (data.len() / 2).max(1);
                     let _ = self.inner.append(&data[..partial_len]);
                 }
-                return Err(io::Error::other(
-                    "simulated ENOSPC / EFBIG write failure",
-                ));
+                return Err(io::Error::other("simulated ENOSPC / EFBIG write failure"));
             }
         }
         self.inner.append(data)

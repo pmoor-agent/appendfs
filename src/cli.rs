@@ -104,10 +104,7 @@ pub struct MountArgs {
 impl MountArgs {
     /// Formats CLI arguments into libfuse-compatible C-style argv.
     pub fn to_fuse_args(&self) -> Vec<String> {
-        let mut fuse_args = vec![
-            "appendfs".to_string(),
-            self.mount_point.to_str().unwrap().to_string(),
-        ];
+        let mut fuse_args = vec!["appendfs".to_string(), self.mount_point.to_str().unwrap().to_string()];
         if self.foreground {
             fuse_args.push("-f".to_string());
         }
@@ -151,10 +148,7 @@ pub struct MountRoArgs {
 impl MountRoArgs {
     /// Formats CLI arguments into libfuse-compatible C-style argv.
     pub fn to_fuse_args(&self) -> Vec<String> {
-        let mut fuse_args = vec![
-            "appendfs".to_string(),
-            self.mount_point.to_str().unwrap().to_string(),
-        ];
+        let mut fuse_args = vec!["appendfs".to_string(), self.mount_point.to_str().unwrap().to_string()];
         if self.foreground {
             fuse_args.push("-f".to_string());
         }
@@ -194,9 +188,10 @@ pub fn find_latest_generation_in_storage(storage: &dyn crate::storage::Storage) 
             if file.ends_with(".log") {
                 let stem = file.trim_end_matches(".log");
                 if let Ok(gen_num) = stem.parse::<u64>()
-                    && gen_num > max_gen {
-                        max_gen = gen_num;
-                    }
+                    && gen_num > max_gen
+                {
+                    max_gen = gen_num;
+                }
             }
         }
     }

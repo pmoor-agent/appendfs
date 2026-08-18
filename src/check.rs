@@ -46,11 +46,7 @@ impl IntegrityIssue {
         }
     }
 
-    pub fn warning(
-        code: impl Into<String>,
-        inode: Option<u64>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn warning(code: impl Into<String>, inode: Option<u64>, message: impl Into<String>) -> Self {
         Self {
             level: IssueLevel::Warning,
             code: code.into(),
@@ -91,18 +87,12 @@ impl IntegrityReport {
 
     /// Returns the number of Error-level issues.
     pub fn error_count(&self) -> usize {
-        self.issues
-            .iter()
-            .filter(|i| i.level == IssueLevel::Error)
-            .count()
+        self.issues.iter().filter(|i| i.level == IssueLevel::Error).count()
     }
 
     /// Returns the number of Warning-level issues.
     pub fn warning_count(&self) -> usize {
-        self.issues
-            .iter()
-            .filter(|i| i.level == IssueLevel::Warning)
-            .count()
+        self.issues.iter().filter(|i| i.level == IssueLevel::Warning).count()
     }
 
     /// Formats the report as a clean, human-readable terminal output.
@@ -141,11 +131,7 @@ impl IntegrityReport {
             ));
         }
 
-        let nlink_issues = self
-            .issues
-            .iter()
-            .filter(|i| i.code == "NLINK_MISMATCH")
-            .count();
+        let nlink_issues = self.issues.iter().filter(|i| i.code == "NLINK_MISMATCH").count();
         if nlink_issues == 0 {
             out.push_str("  [PASS] Hardlink Reference Counts (nlink)\n");
         } else {
@@ -254,11 +240,7 @@ impl IntegrityReport {
 }
 
 /// Runs a read-only filesystem integrity check on the provided `InMemoryFS`.
-pub fn check_fs_integrity(
-    fs: &InMemoryFS,
-    log_dir: Option<&Path>,
-    verify_data: bool,
-) -> IntegrityReport {
+pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: bool) -> IntegrityReport {
     let mut report = IntegrityReport::default();
 
     // 0. Extract manifest and base snapshot
@@ -273,9 +255,7 @@ pub fn check_fs_integrity(
         let node = node_arc.as_ref();
         match node {
             Node::Directory { .. } => report.directories += 1,
-            Node::File {
-                range_map, size, ..
-            } => {
+            Node::File { range_map, size, .. } => {
                 report.regular_files += 1;
                 report.total_extents += range_map.len();
                 report.total_data_bytes += *size;
@@ -342,19 +322,13 @@ pub fn check_fs_integrity(
                                 report.issues.push(IntegrityIssue::error(
                                     "NAME_TOO_LONG",
                                     Some(curr_dir_ino),
-                                    format!(
-                                        "Directory contains entry '{}' exceeding 255 bytes",
-                                        name
-                                    ),
+                                    format!("Directory contains entry '{}' exceeding 255 bytes", name),
                                 ));
                             } else if name.contains('/') || name.contains('\0') {
                                 report.issues.push(IntegrityIssue::error(
                                     "INVALID_NAME",
                                     Some(curr_dir_ino),
-                                    format!(
-                                        "Directory entry '{}' contains illegal characters ('/' or '\\0')",
-                                        name
-                                    ),
+                                    format!("Directory entry '{}' contains illegal characters ('/' or '\\0')", name),
                                 ));
                             }
 
@@ -539,10 +513,7 @@ pub fn check_fs_integrity(
 
     for (&ino, node_arc) in base_map.iter() {
         let node = node_arc.as_ref();
-        if let Node::File {
-            range_map, size, ..
-        } = node
-        {
+        if let Node::File { range_map, size, .. } = node {
             for (offset, entry) in range_map.iter() {
                 let file_offset = *offset;
                 let extent_len = entry.length;
@@ -551,10 +522,7 @@ pub fn check_fs_integrity(
                     report.issues.push(IntegrityIssue::error(
                         "ZERO_LEN_EXTENT",
                         Some(ino),
-                        format!(
-                            "File inode {} has 0-length extent at offset {}",
-                            ino, file_offset
-                        ),
+                        format!("File inode {} has 0-length extent at offset {}", ino, file_offset),
                     ));
                 }
 
@@ -593,11 +561,10 @@ pub fn check_fs_integrity(
                         ));
                     }
 
-                    if verify_data
-                        && let Some(ref c) = cache {
-                            let log_filename = format!("{:06}.log", generation);
-                            if !c.storage().exists(&log_filename) {
-                                report.issues.push(IntegrityIssue::error(
+                    if verify_data && let Some(ref c) = cache {
+                        let log_filename = format!("{:06}.log", generation);
+                        if !c.storage().exists(&log_filename) {
+                            report.issues.push(IntegrityIssue::error(
                                     "MISSING_LOG_FILE",
                                     Some(ino),
                                     format!(
@@ -605,10 +572,10 @@ pub fn check_fs_integrity(
                                         ino, generation, log_filename
                                     ),
                                 ));
-                            } else if let Ok(file_len) = c.storage().file_len(&log_filename) {
-                                let required_end = record_log_offset + length as u64;
-                                if file_len < required_end {
-                                    report.issues.push(IntegrityIssue::error(
+                        } else if let Ok(file_len) = c.storage().file_len(&log_filename) {
+                            let required_end = record_log_offset + length as u64;
+                            if file_len < required_end {
+                                report.issues.push(IntegrityIssue::error(
                                         "EXTENT_PAST_LOG_EOF",
                                         Some(ino),
                                         format!(
@@ -616,75 +583,77 @@ pub fn check_fs_integrity(
                                             ino, generation, record_log_offset, length, file_len
                                         ),
                                     ));
-                                } else {
-                                    // Deep verification: Check record header & BLAKE3 checksum
-                                    match c.get_or_open(generation) {
-                                        Ok(reader) => {
-                                            let mut hdr_buf = [0u8; RECORD_HEADER_SIZE];
-                                            if let Err(e) = reader.read_exact_at(record_log_offset, &mut hdr_buf) {
-                                                report.issues.push(IntegrityIssue::error(
-                                                    "CORRUPT_LOG_RECORD",
-                                                    Some(ino),
-                                                    format!("Failed to read record header at offset 0x{:x} in {}: {}", record_log_offset, log_filename, e),
-                                                ));
-                                            } else {
-                                                let opcode = hdr_buf[0];
-                                                let rec_ino = u64::from_le_bytes(
-                                                    hdr_buf[9..17].try_into().unwrap(),
-                                                );
-                                                let payload_len = u32::from_le_bytes(
-                                                    hdr_buf[17..21].try_into().unwrap(),
-                                                ) as usize;
-                                                let stored_checksum = &hdr_buf[21..25];
+                            } else {
+                                // Deep verification: Check record header & BLAKE3 checksum
+                                match c.get_or_open(generation) {
+                                    Ok(reader) => {
+                                        let mut hdr_buf = [0u8; RECORD_HEADER_SIZE];
+                                        if let Err(e) = reader.read_exact_at(record_log_offset, &mut hdr_buf) {
+                                            report.issues.push(IntegrityIssue::error(
+                                                "CORRUPT_LOG_RECORD",
+                                                Some(ino),
+                                                format!(
+                                                    "Failed to read record header at offset 0x{:x} in {}: {}",
+                                                    record_log_offset, log_filename, e
+                                                ),
+                                            ));
+                                        } else {
+                                            let opcode = hdr_buf[0];
+                                            let rec_ino = u64::from_le_bytes(hdr_buf[9..17].try_into().unwrap());
+                                            let payload_len =
+                                                u32::from_le_bytes(hdr_buf[17..21].try_into().unwrap()) as usize;
+                                            let stored_checksum = &hdr_buf[21..25];
 
-                                                if opcode != OpCode::Write as u8 {
-                                                    report.issues.push(IntegrityIssue::error(
+                                            if opcode != OpCode::Write as u8 {
+                                                report.issues.push(IntegrityIssue::error(
                                                         "CORRUPT_LOG_RECORD",
                                                         Some(ino),
                                                         format!("Record at offset 0x{:x} in {} has OpCode {} instead of OpCode::Write", record_log_offset, log_filename, opcode),
                                                     ));
-                                                } else if rec_ino != ino {
-                                                    report.issues.push(IntegrityIssue::error(
+                                            } else if rec_ino != ino {
+                                                report.issues.push(IntegrityIssue::error(
                                                         "CORRUPT_LOG_RECORD",
                                                         Some(ino),
                                                         format!("Record at offset 0x{:x} in {} belongs to inode {}, expected inode {}", record_log_offset, log_filename, rec_ino, ino),
                                                     ));
+                                            } else {
+                                                let mut payload = vec![0u8; payload_len];
+                                                if let Err(e) = reader.read_exact_at(
+                                                    record_log_offset + RECORD_HEADER_SIZE as u64,
+                                                    &mut payload,
+                                                ) {
+                                                    report.issues.push(IntegrityIssue::error(
+                                                        "CORRUPT_LOG_RECORD",
+                                                        Some(ino),
+                                                        format!(
+                                                            "Failed to read payload at offset 0x{:x} in {}: {}",
+                                                            record_log_offset, log_filename, e
+                                                        ),
+                                                    ));
                                                 } else {
-                                                    let mut payload = vec![0u8; payload_len];
-                                                    if let Err(e) = reader.read_exact_at(
-                                                        record_log_offset + RECORD_HEADER_SIZE as u64,
-                                                        &mut payload,
-                                                    ) {
+                                                    let computed = checksum_payload(&payload);
+                                                    if &computed[..] != stored_checksum {
                                                         report.issues.push(IntegrityIssue::error(
-                                                            "CORRUPT_LOG_RECORD",
-                                                            Some(ino),
-                                                            format!("Failed to read payload at offset 0x{:x} in {}: {}", record_log_offset, log_filename, e),
-                                                        ));
-                                                    } else {
-                                                        let computed =
-                                                            checksum_payload(&payload);
-                                                        if &computed[..] != stored_checksum {
-                                                            report.issues.push(IntegrityIssue::error(
                                                                 "CORRUPT_LOG_RECORD",
                                                                 Some(ino),
                                                                 format!("BLAKE3 checksum mismatch for record at offset 0x{:x} in {}", record_log_offset, log_filename),
                                                             ));
-                                                        }
                                                     }
                                                 }
                                             }
                                         }
-                                        Err(e) => {
-                                            report.issues.push(IntegrityIssue::error(
-                                                "LOG_FILE_READ_ERROR",
-                                                Some(ino),
-                                                format!("Failed to open log file {}: {}", log_filename, e),
-                                            ));
-                                        }
+                                    }
+                                    Err(e) => {
+                                        report.issues.push(IntegrityIssue::error(
+                                            "LOG_FILE_READ_ERROR",
+                                            Some(ino),
+                                            format!("Failed to open log file {}: {}", log_filename, e),
+                                        ));
                                     }
                                 }
                             }
                         }
+                    }
                 }
             }
         }
@@ -720,17 +689,18 @@ pub fn check_fs_integrity(
 
         if let Some(ref c) = cache
             && c.storage().exists(&info.filename)
-                && let Ok(file_len) = c.storage().file_len(&info.filename)
-                    && file_len < info.total_bytes {
-                        report.issues.push(IntegrityIssue::warning(
-                            "LOG_SIZE_MISMATCH",
-                            None,
-                            format!(
-                                "Physical log file '{}' in storage ({} bytes) is smaller than recorded in manifest ({} bytes)",
-                                info.filename, file_len, info.total_bytes
-                            ),
-                        ));
-                    }
+            && let Ok(file_len) = c.storage().file_len(&info.filename)
+            && file_len < info.total_bytes
+        {
+            report.issues.push(IntegrityIssue::warning(
+                "LOG_SIZE_MISMATCH",
+                None,
+                format!(
+                    "Physical log file '{}' in storage ({} bytes) is smaller than recorded in manifest ({} bytes)",
+                    info.filename, file_len, info.total_bytes
+                ),
+            ));
+        }
     }
 
     report
@@ -746,10 +716,7 @@ pub fn check_volume_with_storage(
 }
 
 /// Helper function to recover a volume in read-only mode and run integrity checks.
-pub fn check_volume(
-    log_dir: impl AsRef<Path>,
-    verify_data: bool,
-) -> std::io::Result<IntegrityReport> {
+pub fn check_volume(log_dir: impl AsRef<Path>, verify_data: bool) -> std::io::Result<IntegrityReport> {
     let storage = Arc::new(crate::storage::OsStorage::new(log_dir));
     check_volume_with_storage(storage, verify_data)
 }
@@ -775,31 +742,15 @@ mod tests {
 
         // Create dir, file, symlink, hardlink
         let d = crate::operations::dir::mkdir_core(&fs, 1, "mydir", 0o755, 1000, 1000).unwrap();
-        let f = crate::operations::read_write::create_core(
-            &fs, d.ino, "file.txt", 0o644, 0, 1000, 1000,
-        )
-        .unwrap();
-        crate::operations::read_write::write_core(&fs, f.ino, b"hello integrity checker", 0)
-            .unwrap();
-        let _s = crate::operations::links::symlink_core(
-            &fs,
-            1,
-            "link_to_file",
-            "mydir/file.txt",
-            1000,
-            1000,
-        )
-        .unwrap();
+        let f = crate::operations::read_write::create_core(&fs, d.ino, "file.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f.ino, b"hello integrity checker", 0).unwrap();
+        let _s = crate::operations::links::symlink_core(&fs, 1, "link_to_file", "mydir/file.txt", 1000, 1000).unwrap();
         let _h = crate::operations::links::link_core(&fs, f.ino, 1, "hardlink.txt").unwrap();
 
         fs.sync_log().unwrap();
 
         let report = check_volume(dir.path(), true).unwrap();
-        assert!(
-            report.is_clean(),
-            "Report must be clean: {:?}",
-            report.issues
-        );
+        assert!(report.is_clean(), "Report must be clean: {:?}", report.issues);
         assert_eq!(report.error_count(), 0);
         assert_eq!(report.orphaned_inodes.len(), 0);
         assert_eq!(report.directories, 2); // root + mydir
@@ -826,19 +777,12 @@ mod tests {
             mtime: std::time::SystemTime::UNIX_EPOCH,
             ctime: std::time::SystemTime::UNIX_EPOCH,
         };
-        fs.base
-            .write()
-            .unwrap()
-            .insert(orphan_ino, Arc::new(orphan_node));
+        fs.base.write().unwrap().insert(orphan_ino, Arc::new(orphan_node));
 
         let report = check_fs_integrity(&fs, Some(dir.path()), false);
         assert!(!report.is_clean());
         assert_eq!(report.orphaned_inodes, vec![999]);
-        let orphan_issue = report
-            .issues
-            .iter()
-            .find(|i| i.code == "ORPHAN_INODE")
-            .unwrap();
+        let orphan_issue = report.issues.iter().find(|i| i.code == "ORPHAN_INODE").unwrap();
         assert_eq!(orphan_issue.inode, Some(999));
     }
 
@@ -853,9 +797,7 @@ mod tests {
         fs.log_writer = Some(writer);
         fs.set_log_dir(dir.path());
 
-        let f =
-            crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000)
-                .unwrap();
+        let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.sync_log().unwrap();
 
         // Corrupt nlink on test.txt in base (set nlink to 5 instead of 1)
@@ -871,11 +813,7 @@ mod tests {
 
         let report = check_fs_integrity(&fs, Some(dir.path()), false);
         assert!(!report.is_clean());
-        let issue = report
-            .issues
-            .iter()
-            .find(|i| i.code == "NLINK_MISMATCH")
-            .unwrap();
+        let issue = report.issues.iter().find(|i| i.code == "NLINK_MISMATCH").unwrap();
         assert_eq!(issue.inode, Some(f.ino));
     }
 
@@ -888,11 +826,7 @@ mod tests {
 
         // Inject file with extent beyond its size
         let mut rm = RangeMap::new();
-        rm.insert(
-            100,
-            50,
-            SharedExtentState::new_staged(Arc::new(vec![0; 50]), 0, 50),
-        );
+        rm.insert(100, 50, SharedExtentState::new_staged(Arc::new(vec![0; 50]), 0, 50));
         let bad_file = Node::File {
             range_map: rm,
             size: 120, // Extent ends at 150 > size 120!
@@ -910,10 +844,7 @@ mod tests {
             let mut base = fs.base.write().unwrap();
             let root_arc = base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
-            if let Node::Directory {
-                ref mut entries, ..
-            } = root
-            {
+            if let Node::Directory { ref mut entries, .. } = root {
                 entries.push(("bad.txt".to_string(), 2));
             }
             *root_arc = Arc::new(root);
@@ -921,11 +852,7 @@ mod tests {
 
         let report = check_fs_integrity(&fs, Some(dir.path()), false);
         assert!(!report.is_clean());
-        let issue = report
-            .issues
-            .iter()
-            .find(|i| i.code == "EXTENT_PAST_EOF")
-            .unwrap();
+        let issue = report.issues.iter().find(|i| i.code == "EXTENT_PAST_EOF").unwrap();
         assert_eq!(issue.inode, Some(2));
     }
 
@@ -966,10 +893,7 @@ mod tests {
             base.insert(3, Arc::new(dir_b));
             let root_arc = base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
-            if let Node::Directory {
-                ref mut entries, ..
-            } = root
-            {
+            if let Node::Directory { ref mut entries, .. } = root {
                 entries.push(("a".to_string(), 2));
             }
             *root_arc = Arc::new(root);
@@ -978,11 +902,7 @@ mod tests {
         let report = check_fs_integrity(&fs, Some(dir.path()), false);
         assert!(!report.is_clean());
         let cycle_issue = report.issues.iter().find(|i| i.code == "DIR_CYCLE");
-        assert!(
-            cycle_issue.is_some(),
-            "Must report DIR_CYCLE: {:?}",
-            report.issues
-        );
+        assert!(cycle_issue.is_some(), "Must report DIR_CYCLE: {:?}", report.issues);
     }
 
     #[test]
@@ -1011,10 +931,7 @@ mod tests {
             base.insert(2, Arc::new(dir_wrong_parent));
             let root_arc = base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
-            if let Node::Directory {
-                ref mut entries, ..
-            } = root
-            {
+            if let Node::Directory { ref mut entries, .. } = root {
                 entries.push(("dangling".to_string(), 404));
                 entries.push(("wrong_parent_dir".to_string(), 2));
             }
@@ -1035,22 +952,12 @@ mod tests {
         let mut fs = crate::log::recover_fs_with_storage(storage.clone()).unwrap();
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
-            LogWriter::create_with_storage(
-                storage.clone(),
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-            )
-            .unwrap(),
+            LogWriter::create_with_storage(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
         );
         fs.log_writer = Some(writer);
 
-        let f =
-            crate::operations::read_write::create_core(&fs, 1, "data.txt", 0o644, 0, 1000, 1000)
-                .unwrap();
-        crate::operations::read_write::write_core(&fs, f.ino, b"original clean payload bytes", 0)
-            .unwrap();
+        let f = crate::operations::read_write::create_core(&fs, 1, "data.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f.ino, b"original clean payload bytes", 0).unwrap();
         fs.sync_log().unwrap();
 
         // 1. Initial check must be clean
@@ -1060,10 +967,7 @@ mod tests {
             let node = node_arc.as_ref();
             if let Node::File { range_map, .. } = node {
                 let entry = range_map.iter().next().unwrap().1;
-                if let ExtentState::Disk {
-                    record_log_offset, ..
-                } = entry.value.read_state()
-                {
+                if let ExtentState::Disk { record_log_offset, .. } = entry.value.read_state() {
                     record_log_offset
                 } else {
                     panic!("Expected Disk extent");
@@ -1081,11 +985,6 @@ mod tests {
         // 3. Re-check: must catch CORRUPT_LOG_RECORD
         let corrupt_report = check_fs_integrity(&fs, None, true);
         assert!(!corrupt_report.is_clean());
-        assert!(
-            corrupt_report
-                .issues
-                .iter()
-                .any(|i| i.code == "CORRUPT_LOG_RECORD")
-        );
+        assert!(corrupt_report.issues.iter().any(|i| i.code == "CORRUPT_LOG_RECORD"));
     }
 }

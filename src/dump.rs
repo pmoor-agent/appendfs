@@ -1,7 +1,6 @@
 use crate::log::ExtentState;
 use crate::log::record::{
-    DecodedPayload, FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader,
-    checksum_payload,
+    DecodedPayload, FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader, checksum_payload,
 };
 use crate::log::summary::{SUMMARY_MAGIC, SummaryReader};
 use crate::node::Node;
@@ -13,11 +12,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 /// Dispatches dumping from a `Storage` instance based on magic bytes or extension.
-pub fn dump_file_with_storage(
-    storage: &dyn Storage,
-    filename: &str,
-    verbosity: u8,
-) -> io::Result<String> {
+pub fn dump_file_with_storage(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Result<String> {
     let reader = storage.open_reader(filename)?;
     let mut magic = [0u8; 4];
     if reader.len()? < 4 {
@@ -47,11 +42,7 @@ pub fn dump_file_with_storage(
 pub fn dump_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
     let path = path.as_ref();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let filename = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let storage = OsStorage::new(parent);
     dump_file_with_storage(&storage, &filename, verbosity)
 }
@@ -141,11 +132,7 @@ impl WriteBucket {
 pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
     let path = path.as_ref();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let filename = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let storage = OsStorage::new(parent);
     let reader = storage.open_reader(&filename)?;
     dump_log_reader_with_path(reader.as_ref(), Some(&path.to_string_lossy()), verbosity)
@@ -176,8 +163,7 @@ pub fn dump_log_reader_with_path(
 
     let mut header_buf = [0u8; FILE_HEADER_SIZE];
     reader.read_exact_at(0, &mut header_buf)?;
-    let file_header = FileHeader::from_bytes(&header_buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let file_header = FileHeader::from_bytes(&header_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let mut records: Vec<DumpRecordEntry> = Vec::new();
     let mut current_offset = FILE_HEADER_SIZE as u64;
@@ -351,28 +337,17 @@ pub fn dump_log_reader_with_path(
             .count()
     )
     .unwrap();
-    writeln!(
-        out,
-        "Total Data Payload:  {}",
-        format_bytes(total_data_bytes)
-    )
-    .unwrap();
+    writeln!(out, "Total Data Payload:  {}", format_bytes(total_data_bytes)).unwrap();
     writeln!(out).unwrap();
 
     // Flush batch statistics
     writeln!(out, "--- Flush Batch Statistics ---").unwrap();
     writeln!(out, "Committed Flushes:   {}", total_flush_batches).unwrap();
     if total_flush_batches > 0 {
-        let avg_records = (records.len().saturating_sub(uncommitted_records_count)) as f64
-            / total_flush_batches as f64;
+        let avg_records = (records.len().saturating_sub(uncommitted_records_count)) as f64 / total_flush_batches as f64;
         let avg_data = total_data_bytes as f64 / total_flush_batches as f64;
         writeln!(out, "Avg Records / Flush: {:.1}", avg_records).unwrap();
-        writeln!(
-            out,
-            "Avg Data / Flush:    {}",
-            format_bytes(avg_data as u64)
-        )
-        .unwrap();
+        writeln!(out, "Avg Data / Flush:    {}", format_bytes(avg_data as u64)).unwrap();
     }
     if uncommitted_records_count > 0 {
         writeln!(
@@ -506,8 +481,7 @@ pub fn dump_log_reader_with_path(
                     .unwrap();
                     writeln!(out, "      Error: {}", reason).unwrap();
                     if !partial_bytes.is_empty() && verbosity >= 2 {
-                        writeln!(out, "      Partial Bytes ({} bytes):", partial_bytes.len())
-                            .unwrap();
+                        writeln!(out, "      Partial Bytes ({} bytes):", partial_bytes.len()).unwrap();
                         out.push_str(&format_hexdump(partial_bytes, 256));
                     }
                 }
@@ -522,11 +496,7 @@ pub fn dump_log_reader_with_path(
 /// - `verbosity == 0`: Summary metadata, whole-file checksum, inode breakdown, extent fragmentation stats, histogram, top fragmented files, manifest table.
 /// - `verbosity == 1`: Summary + complete inode listing / directory tree.
 /// - `verbosity >= 2`: Summary + complete inode listing + detailed physical extent range mappings for all files.
-pub fn dump_summary_file_with_storage(
-    storage: &dyn Storage,
-    filename: &str,
-    verbosity: u8,
-) -> io::Result<String> {
+pub fn dump_summary_file_with_storage(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Result<String> {
     let reader = SummaryReader::open_with_storage(storage, filename)?;
     dump_summary_reader_with_path(&reader, Some(filename), verbosity)
 }
@@ -626,9 +596,7 @@ pub fn dump_summary_reader_with_path(
                 Node::Symlink { .. } => {
                     symlink_count += 1;
                 }
-                Node::File {
-                    range_map, size, ..
-                } => {
+                Node::File { range_map, size, .. } => {
                     file_count += 1;
                     total_logical_bytes += *size;
                     let num_extents = range_map.len();
@@ -697,12 +665,7 @@ pub fn dump_summary_reader_with_path(
         symlink_count
     )
     .unwrap();
-    writeln!(
-        out,
-        "Logical Data Size:   {}",
-        format_bytes(total_logical_bytes)
-    )
-    .unwrap();
+    writeln!(out, "Logical Data Size:   {}", format_bytes(total_logical_bytes)).unwrap();
     writeln!(out).unwrap();
 
     // File Extents & Fragmentation Stats
@@ -733,21 +696,12 @@ pub fn dump_summary_reader_with_path(
             let bar_len = (pct / 5.0).round() as usize;
             let bar: String = "█".repeat(bar_len);
             let pct_str = format!("{:.1}%", pct);
-            writeln!(
-                out,
-                "{:<24} {:>8} {:>12}   {:<20}",
-                b.label, b.count, pct_str, bar
-            )
-            .unwrap();
+            writeln!(out, "{:<24} {:>8} {:>12}   {:<20}", b.label, b.count, pct_str, bar).unwrap();
         }
         writeln!(out).unwrap();
 
         // Top fragmented files (if any have > 1 extent)
-        let multi_extent_files: Vec<_> = file_frag_list
-            .iter()
-            .filter(|f| f.extents > 1)
-            .take(5)
-            .collect();
+        let multi_extent_files: Vec<_> = file_frag_list.iter().filter(|f| f.extents > 1).take(5).collect();
         if !multi_extent_files.is_empty() {
             writeln!(out, "--- Top Fragmented Files ---").unwrap();
             writeln!(
@@ -756,18 +710,9 @@ pub fn dump_summary_reader_with_path(
                 "INODE", "SIZE", "EXTENTS", "AVG EXTENT SIZE"
             )
             .unwrap();
-            writeln!(
-                out,
-                "{:-<8} {:-<12} {:-<9} {:-<16}   {:-<30}",
-                "", "", "", "", ""
-            )
-            .unwrap();
+            writeln!(out, "{:-<8} {:-<12} {:-<9} {:-<16}   {:-<30}", "", "", "", "", "").unwrap();
             for f in multi_extent_files {
-                let avg_sz = if f.extents > 0 {
-                    f.size / f.extents as u64
-                } else {
-                    0
-                };
+                let avg_sz = if f.extents > 0 { f.size / f.extents as u64 } else { 0 };
                 writeln!(
                     out,
                     "{:<8} {:>12} {:>9} {:>16}   {}",
@@ -804,13 +749,7 @@ pub fn dump_summary_reader_with_path(
         writeln!(
             out,
             "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  STATUS",
-            "LOG FILE",
-            "RECORDS",
-            "LOG SIZE",
-            "DATA SIZE",
-            "LIVE DATA",
-            "EXTENTS",
-            "LIVE RATIO"
+            "LOG FILE", "RECORDS", "LOG SIZE", "DATA SIZE", "LIVE DATA", "EXTENTS", "LIVE RATIO"
         )
         .unwrap();
         writeln!(
@@ -826,10 +765,7 @@ pub fn dump_summary_reader_with_path(
             let node = sync_node.as_ref();
             if let Node::File { range_map, .. } = node {
                 for (_, entry) in range_map.iter() {
-                    if let ExtentState::Disk {
-                        generation, length, ..
-                    } = entry.value.read_state()
-                    {
+                    if let ExtentState::Disk { generation, length, .. } = entry.value.read_state() {
                         let stats = live_map.entry(generation).or_insert((0, 0));
                         stats.0 += length as u64;
                         stats.1 += 1;
@@ -845,12 +781,8 @@ pub fn dump_summary_reader_with_path(
             } else {
                 0.0
             };
-            let (status, ratio_str) = crate::stats::format_generation_status(
-                g.total_data_bytes,
-                live_bytes,
-                live_ratio,
-                g.record_count,
-            );
+            let (status, ratio_str) =
+                crate::stats::format_generation_status(g.total_data_bytes, live_bytes, live_ratio, g.record_count);
             writeln!(
                 out,
                 "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
@@ -902,9 +834,7 @@ pub fn dump_summary_reader_with_path(
                             sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
                             let entry_strs: Vec<String> = sorted_entries
                                 .iter()
-                                .map(|(name, child_ino)| {
-                                    format!("{:?} -> Inode {}", name, child_ino)
-                                })
+                                .map(|(name, child_ino)| format!("{:?} -> Inode {}", name, child_ino))
                                 .collect();
                             writeln!(out, "      entries: [{}]", entry_strs.join(", ")).unwrap();
                         }
@@ -1196,11 +1126,7 @@ pub fn format_hexdump(data: &[u8], max_bytes: usize) -> String {
         out.push_str("|\n");
     }
     if data.len() > max_bytes {
-        let _ = writeln!(
-            out,
-            "      ... [{} more data bytes omitted]",
-            data.len() - max_bytes
-        );
+        let _ = writeln!(out, "      ... [{} more data bytes omitted]", data.len() - max_bytes);
     }
     out
 }
@@ -1248,9 +1174,7 @@ mod tests {
             created_at: clock.now(),
         };
         let create_bytes = bincode::serialize(&create_p).unwrap();
-        writer
-            .append_record(OpCode::Create, 2, &create_bytes)
-            .unwrap();
+        writer.append_record(OpCode::Create, 2, &create_bytes).unwrap();
 
         // Write Write record with 100 bytes
         let write_m = WriteMeta {
@@ -1259,9 +1183,7 @@ mod tests {
         };
         let mut write_bytes = bincode::serialize(&write_m).unwrap();
         write_bytes.extend_from_slice(&[0x42; 100]);
-        writer
-            .append_record(OpCode::Write, 2, &write_bytes)
-            .unwrap();
+        writer.append_record(OpCode::Write, 2, &write_bytes).unwrap();
 
         // Commit batch
         writer.emit_flush_commit(2, &clock).unwrap();
@@ -1307,9 +1229,7 @@ mod tests {
             created_at: clock.now(),
         };
         let create_bytes = bincode::serialize(&create_p).unwrap();
-        writer
-            .append_record(OpCode::Create, 2, &create_bytes)
-            .unwrap();
+        writer.append_record(OpCode::Create, 2, &create_bytes).unwrap();
         drop(writer);
 
         let log_path = dir.path().join("000001.log");
@@ -1337,9 +1257,7 @@ mod tests {
         let dump_v0 = dump_file(&summary_path, 0).unwrap();
         assert!(dump_v0.contains("=== appendfs Summary File Dump ==="));
         assert!(dump_v0.contains("Branch:              feature-branch"));
-        assert!(
-            dump_v0.contains("Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)")
-        );
+        assert!(dump_v0.contains("Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)"));
         assert!(dump_v0.contains("Checksum (BLAKE3):"));
         assert!(dump_v0.contains("VERIFIED"));
 

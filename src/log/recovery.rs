@@ -35,18 +35,12 @@ pub fn recover_fs(log_dir: impl AsRef<Path>) -> io::Result<InMemoryFS> {
 
 /// Same as `recover_fs`, but with an injectable clock instead of always defaulting to
 /// `SystemClock` internally.
-pub fn recover_fs_with_clock(
-    log_dir: impl AsRef<Path>,
-    clock: Arc<dyn Clock>,
-) -> io::Result<InMemoryFS> {
+pub fn recover_fs_with_clock(log_dir: impl AsRef<Path>, clock: Arc<dyn Clock>) -> io::Result<InMemoryFS> {
     recover_fs_to_target_with_clock(log_dir, RecoveryTarget::Latest, clock)
 }
 
 /// Rebuilds filesystem state from summary and log files up to the specified `target` point in time.
-pub fn recover_fs_to_target(
-    log_dir: impl AsRef<Path>,
-    target: RecoveryTarget,
-) -> io::Result<InMemoryFS> {
+pub fn recover_fs_to_target(log_dir: impl AsRef<Path>, target: RecoveryTarget) -> io::Result<InMemoryFS> {
     recover_fs_to_target_with_clock(log_dir, target, Arc::new(SystemClock))
 }
 
@@ -85,15 +79,12 @@ pub fn recover_fs_to_target_with_storage(
                         let eligible = match target {
                             RecoveryTarget::Latest => true,
                             RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
-                            RecoveryTarget::Timestamp(max_time) => {
-                                reader.header.created_at <= max_time
-                            }
+                            RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
                             RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
                         };
-                        if eligible
-                            && latest_summary.as_ref().is_none_or(|(g, _)| gen_num > *g) {
-                                latest_summary = Some((gen_num, reader));
-                            }
+                        if eligible && latest_summary.as_ref().is_none_or(|(g, _)| gen_num > *g) {
+                            latest_summary = Some((gen_num, reader));
+                        }
                     }
                     Err(e) => {
                         log::warn!("Ignoring unreadable summary {}: {}", file, e);
@@ -120,22 +111,20 @@ pub fn recover_fs_to_target_with_storage(
     let mut last_op_time: Option<SystemTime> = None;
     if latest_summary.is_none()
         && let Some((_, oldest_file)) = log_files.first()
-            && let Ok(oldest_reader) = LogReader::open_with_storage(&storage, oldest_file) {
-                let created = oldest_reader.file_header().created_at;
-                last_op_time = Some(created);
-                if let Some(root_arc) = fs_instance.base.write().unwrap().get_mut(&1)
-                    && let Node::Directory {
-                        atime,
-                        mtime,
-                        ctime,
-                        ..
-                    } = Arc::make_mut(root_arc)
-                    {
-                        *atime = created;
-                        *mtime = created;
-                        *ctime = created;
-                    }
-            }
+        && let Ok(oldest_reader) = LogReader::open_with_storage(&storage, oldest_file)
+    {
+        let created = oldest_reader.file_header().created_at;
+        last_op_time = Some(created);
+        if let Some(root_arc) = fs_instance.base.write().unwrap().get_mut(&1)
+            && let Node::Directory {
+                atime, mtime, ctime, ..
+            } = Arc::make_mut(root_arc)
+        {
+            *atime = created;
+            *mtime = created;
+            *ctime = created;
+        }
+    }
 
     let mut min_log_gen = 0u64;
     let mut last_tx_id = 0u64;
@@ -159,10 +148,7 @@ pub fn recover_fs_to_target_with_storage(
         min_log_gen = summary_gen;
     }
 
-    let mut max_inode = fs_instance
-        .next_inode
-        .load(Ordering::SeqCst)
-        .saturating_sub(1);
+    let mut max_inode = fs_instance.next_inode.load(Ordering::SeqCst).saturating_sub(1);
 
     let mut target_cutoff_reached = false;
 
@@ -173,9 +159,10 @@ pub fn recover_fs_to_target_with_storage(
         }
 
         if let RecoveryTarget::Generation(max_gen) = target
-            && gen_num > max_gen {
-                break;
-            }
+            && gen_num > max_gen
+        {
+            break;
+        }
 
         let mut pending: Vec<LogRecord> = Vec::new();
         let mut committed_records_count = 0u32;
@@ -202,16 +189,12 @@ pub fn recover_fs_to_target_with_storage(
                     last_tx_id = header.tx_id;
                 }
 
-                let commit =
-                    bincode::deserialize::<FlushCommitPayload>(&record.payload).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "malformed FlushCommit payload in generation {}: {}",
-                                gen_num, e
-                            ),
-                        )
-                    })?;
+                let commit = bincode::deserialize::<FlushCommitPayload>(&record.payload).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("malformed FlushCommit payload in generation {}: {}", gen_num, e),
+                    )
+                })?;
 
                 if commit.record_count as usize != pending.len() {
                     return Err(io::Error::new(
@@ -238,10 +221,11 @@ pub fn recover_fs_to_target_with_storage(
                         }
                         RecoveryTarget::Timestamp(max_time) => {
                             if let Some(op_time) = buffered.op_time()
-                                && op_time > max_time {
-                                    target_cutoff_reached = true;
-                                    break;
-                                }
+                                && op_time > max_time
+                            {
+                                target_cutoff_reached = true;
+                                break;
+                            }
                         }
                         _ => {}
                     }
@@ -283,11 +267,7 @@ pub fn recover_fs_to_target_with_storage(
         {
             let mut manifest = fs_instance.manifest.write().unwrap();
             if manifest.get_by_generation(gen_num).is_none() {
-                if manifest.logs.len() == 1
-                    && manifest.logs[0].generation == 1
-                    && min_log_gen == 0
-                    && gen_num == 1
-                {
+                if manifest.logs.len() == 1 && manifest.logs[0].generation == 1 && min_log_gen == 0 && gen_num == 1 {
                     let entry = &mut manifest.logs[0];
                     entry.created_at = log_created_at;
                     entry.record_count = committed_records_count;
@@ -320,9 +300,7 @@ pub fn recover_fs_to_target_with_storage(
     }
 
     if max_inode >= fs_instance.next_inode.load(Ordering::SeqCst) {
-        fs_instance
-            .next_inode
-            .store(max_inode + 1, Ordering::SeqCst);
+        fs_instance.next_inode.store(max_inode + 1, Ordering::SeqCst);
     }
     fs_instance.base.write().unwrap().retain(|_ino, arc| {
         let node = arc.as_ref();
@@ -371,10 +349,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             if let Some(parent_node_arc) = map.get_mut(&create.parent) {
                 let parent_node = Arc::make_mut(parent_node_arc);
                 if let Node::Directory {
-                    entries,
-                    mtime,
-                    ctime,
-                    ..
+                    entries, mtime, ctime, ..
                 } = parent_node
                 {
                     entries.push((create.name, target_ino));
@@ -403,10 +378,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             if let Some(parent_node_arc) = map.get_mut(&mkdir.parent) {
                 let parent_node = Arc::make_mut(parent_node_arc);
                 if let Node::Directory {
-                    entries,
-                    mtime,
-                    ctime,
-                    ..
+                    entries, mtime, ctime, ..
                 } = parent_node
                 {
                     entries.push((mkdir.name, target_ino));
@@ -415,19 +387,12 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 }
             }
         }
-        DecodedPayload::Write {
-            meta: write_meta,
-            data,
-        } => {
+        DecodedPayload::Write { meta: write_meta, data } => {
             let meta_size = (record.payload.len() - data.len()) as u32;
             let write_data_len = data.len() as u32;
 
-            let shared_state = SharedExtentState::new_disk(
-                gen_num,
-                record.record_log_offset,
-                meta_size,
-                write_data_len,
-            );
+            let shared_state =
+                SharedExtentState::new_disk(gen_num, record.record_log_offset, meta_size, write_data_len);
 
             let mut map = fs_instance.base.write().unwrap();
             if let Some(node_arc) = map.get_mut(&target_ino) {
@@ -457,10 +422,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             if let Some(parent_node_arc) = map.get_mut(&unlink.parent) {
                 let parent_node = Arc::make_mut(parent_node_arc);
                 if let Node::Directory {
-                    entries,
-                    mtime,
-                    ctime,
-                    ..
+                    entries, mtime, ctime, ..
                 } = parent_node
                 {
                     entries.retain(|(name, ino)| !(name == &unlink.name && *ino == target_ino));
@@ -497,10 +459,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             if let Some(parent_node_arc) = map.get_mut(&rmdir.parent) {
                 let parent_node = Arc::make_mut(parent_node_arc);
                 if let Node::Directory {
-                    entries,
-                    mtime,
-                    ctime,
-                    ..
+                    entries, mtime, ctime, ..
                 } = parent_node
                 {
                     entries.retain(|(name, ino)| !(name == &rmdir.name && *ino == target_ino));
@@ -528,10 +487,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             if let Some(parent_node_arc) = map.get_mut(&symlink.parent) {
                 let parent_node = Arc::make_mut(parent_node_arc);
                 if let Node::Directory {
-                    entries,
-                    mtime,
-                    ctime,
-                    ..
+                    entries, mtime, ctime, ..
                 } = parent_node
                 {
                     entries.push((symlink.name, target_ino));
@@ -549,10 +505,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 if let Some(parent_node_arc) = map.get_mut(&rename.parent) {
                     let parent_node = Arc::make_mut(parent_node_arc);
                     if let Node::Directory {
-                        entries,
-                        mtime,
-                        ctime,
-                        ..
+                        entries, mtime, ctime, ..
                     } = parent_node
                     {
                         if let Some(dest_pos) = entries
@@ -577,10 +530,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 if let Some(parent_node_arc) = map.get_mut(&rename.parent) {
                     let parent_node = Arc::make_mut(parent_node_arc);
                     if let Node::Directory {
-                        entries,
-                        mtime,
-                        ctime,
-                        ..
+                        entries, mtime, ctime, ..
                     } = parent_node
                     {
                         entries.retain(|(name, ino)| !(name == &rename.name && *ino == target_ino));
@@ -593,10 +543,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 if let Some(newparent_node_arc) = map.get_mut(&rename.new_parent) {
                     let newparent_node = Arc::make_mut(newparent_node_arc);
                     if let Node::Directory {
-                        entries,
-                        mtime,
-                        ctime,
-                        ..
+                        entries, mtime, ctime, ..
                     } = newparent_node
                     {
                         let overwritten = entries
@@ -616,38 +563,39 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             };
 
             if rename.parent != rename.new_parent
-                && let Some(target_node_arc) = map.get_mut(&target_ino) {
-                    let target_node = Arc::make_mut(target_node_arc);
-                    if let Node::Directory { parent, .. } = target_node {
-                        *parent = rename.new_parent;
-                    }
+                && let Some(target_node_arc) = map.get_mut(&target_ino)
+            {
+                let target_node = Arc::make_mut(target_node_arc);
+                if let Node::Directory { parent, .. } = target_node {
+                    *parent = rename.new_parent;
                 }
+            }
 
             if let Some(dest_ino) = overwritten_ino
-                && dest_ino != target_ino {
-                    let mut should_delete = false;
-                    if let Some(dest_node_arc) = map.get_mut(&dest_ino) {
-                        let dest_node = Arc::make_mut(dest_node_arc);
-                        match dest_node {
-                            Node::File { nlink, ctime, .. }
-                            | Node::Symlink { nlink, ctime, .. } => {
-                                if *nlink > 0 {
-                                    *nlink -= 1;
-                                    *ctime = now;
-                                }
-                                if *nlink == 0 {
-                                    should_delete = true;
-                                }
+                && dest_ino != target_ino
+            {
+                let mut should_delete = false;
+                if let Some(dest_node_arc) = map.get_mut(&dest_ino) {
+                    let dest_node = Arc::make_mut(dest_node_arc);
+                    match dest_node {
+                        Node::File { nlink, ctime, .. } | Node::Symlink { nlink, ctime, .. } => {
+                            if *nlink > 0 {
+                                *nlink -= 1;
+                                *ctime = now;
                             }
-                            Node::Directory { .. } => {
+                            if *nlink == 0 {
                                 should_delete = true;
                             }
                         }
-                    }
-                    if should_delete {
-                        map.remove(&dest_ino);
+                        Node::Directory { .. } => {
+                            should_delete = true;
+                        }
                     }
                 }
+                if should_delete {
+                    map.remove(&dest_ino);
+                }
+            }
         }
         DecodedPayload::Setattr(setattr) => {
             let mut map = fs_instance.base.write().unwrap();
@@ -748,10 +696,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             if let Some(newparent_node_arc) = map.get_mut(&link.new_parent) {
                 let newparent_node = Arc::make_mut(newparent_node_arc);
                 if let Node::Directory {
-                    entries,
-                    mtime,
-                    ctime,
-                    ..
+                    entries, mtime, ctime, ..
                 } = newparent_node
                 {
                     entries.push((link.new_name, target_ino));
@@ -806,30 +751,12 @@ mod tests {
         fs.sync_log().unwrap();
 
         // Tx 2: Create file "file1.txt" inside "step1"
-        let f1 = crate::operations::read_write::create_core(
-            &fs,
-            d1.ino,
-            "file1.txt",
-            0o644,
-            0,
-            1000,
-            1000,
-        )
-        .unwrap();
+        let f1 = crate::operations::read_write::create_core(&fs, d1.ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f1.ino, b"version 1", 0).unwrap();
         fs.sync_log().unwrap();
 
         // Tx 3: Create file "file2.txt" inside "step1"
-        let f2 = crate::operations::read_write::create_core(
-            &fs,
-            d1.ino,
-            "file2.txt",
-            0o644,
-            0,
-            1000,
-            1000,
-        )
-        .unwrap();
+        let f2 = crate::operations::read_write::create_core(&fs, d1.ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f2.ino, b"version 2", 0).unwrap();
         fs.sync_log().unwrap();
 

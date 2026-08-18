@@ -10,10 +10,7 @@ use std::time::{Duration, SystemTime};
 #[test]
 fn test_differential_fuzzing_and_crash_recovery() {
     for seed in 1..=5 {
-        println!(
-            "=== RUNNING DIFFERENTIAL STRESS TEST WITH SEED {} ===",
-            seed
-        );
+        println!("=== RUNNING DIFFERENTIAL STRESS TEST WITH SEED {} ===", seed);
         let mut prng = TestRng::new(seed);
 
         // Shared, advanceable clock: all 4 instances (and, per clean_remount/
@@ -29,8 +26,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
         // force a mid-flush I/O failure before crashing. Every durability bug found so far
         // (the permanent wedge, mid-batch torn records, the unbounded flush queue) lived in
         // that seam and was invisible to a fuzzer that only ever saw a healthy disk.
-        let mut fs_crash =
-            TestFS::new_temp_with_fault_injection(None, Arc::new(clock.clone()));
+        let mut fs_crash = TestFS::new_temp_with_fault_injection(None, Arc::new(clock.clone()));
         let mut observed_flush_failures = 0usize;
 
         // Keep track of created subdirectories (inode IDs) to perform operations on
@@ -45,9 +41,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
         // that's confusing to reason about. Step 200 is always included so the final
         // state is guaranteed to get validated even if no random draw lands there.
         let num_random_checkpoints = 3;
-        let mut checkpoints: Vec<usize> = (0..num_random_checkpoints)
-            .map(|_| prng.gen_range(1, 199))
-            .collect();
+        let mut checkpoints: Vec<usize> = (0..num_random_checkpoints).map(|_| prng.gen_range(1, 199)).collect();
         checkpoints.push(200);
         checkpoints.sort_unstable();
         checkpoints.dedup();
@@ -101,8 +95,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let ino = active_files[prng.gen_range(0, active_files.len() - 1)];
                         let offset = (prng.gen_range(0, 10) * 16) as u64;
                         let payload_len = prng.gen_range(16, 256);
-                        let payload: Vec<u8> =
-                            (0..payload_len).map(|i| ((step + i) % 256) as u8).collect();
+                        let payload: Vec<u8> = (0..payload_len).map(|i| ((step + i) % 256) as u8).collect();
 
                         let res1 = fs_baseline.write(ino, offset, &payload);
                         let res2 = fs_micro.write(ino, offset, &payload);
@@ -123,10 +116,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let (parent_to_unlink, name_to_unlink) = {
                             if let Some(p) = appendfs::fs::find_parent_inode(&fs_baseline.fs, ino) {
                                 let entries = fs_baseline.fs.list_directory(p).unwrap_or_default();
-                                let name = entries
-                                    .into_iter()
-                                    .find(|(_, child)| *child == ino)
-                                    .map(|(n, _)| n);
+                                let name = entries.into_iter().find(|(_, child)| *child == ino).map(|(n, _)| n);
                                 (p, name)
                             } else {
                                 (1u64, None)
@@ -157,17 +147,14 @@ fn test_differential_fuzzing_and_crash_recovery() {
                     // Biased towards colliding with an existing destination name so the
                     // overwrite-and-reclaim path (which crash recovery is known to replay
                     // incorrectly) gets exercised, not just plain moves.
-                    let mut renameable: Vec<u64> =
-                        active_dirs.iter().cloned().filter(|&i| i != 1).collect();
+                    let mut renameable: Vec<u64> = active_dirs.iter().cloned().filter(|&i| i != 1).collect();
                     renameable.extend(active_files.iter().cloned());
 
                     if !renameable.is_empty() {
                         let src_ino = renameable[prng.gen_range(0, renameable.len() - 1)];
 
                         let src_loc = {
-                            if let Some(p) =
-                                appendfs::fs::find_parent_inode(&fs_baseline.fs, src_ino)
-                            {
+                            if let Some(p) = appendfs::fs::find_parent_inode(&fs_baseline.fs, src_ino) {
                                 let entries = fs_baseline.fs.list_directory(p).unwrap_or_default();
                                 entries
                                     .into_iter()
@@ -185,10 +172,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             // dest_parent == src_parent and this picks the source's own entry,
                             // that exercises the literal self-rename (name == newname) no-op path.
                             let existing_name = {
-                                let entries = fs_baseline
-                                    .fs
-                                    .list_directory(dest_parent)
-                                    .unwrap_or_default();
+                                let entries = fs_baseline.fs.list_directory(dest_parent).unwrap_or_default();
                                 if entries.is_empty() {
                                     None
                                 } else {
@@ -198,20 +182,15 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             };
 
                             let dest_name = if prng.gen_range(0, 1) == 0 {
-                                existing_name
-                                    .unwrap_or_else(|| format!("renamed_s{}_step{}", seed, step))
+                                existing_name.unwrap_or_else(|| format!("renamed_s{}_step{}", seed, step))
                             } else {
                                 format!("renamed_s{}_step{}", seed, step)
                             };
 
-                            let res1 =
-                                fs_baseline.rename(src_parent, &src_name, dest_parent, &dest_name);
-                            let res2 =
-                                fs_micro.rename(src_parent, &src_name, dest_parent, &dest_name);
-                            let res3 =
-                                fs_remount.rename(src_parent, &src_name, dest_parent, &dest_name);
-                            let res4 =
-                                fs_crash.rename(src_parent, &src_name, dest_parent, &dest_name);
+                            let res1 = fs_baseline.rename(src_parent, &src_name, dest_parent, &dest_name);
+                            let res2 = fs_micro.rename(src_parent, &src_name, dest_parent, &dest_name);
+                            let res3 = fs_remount.rename(src_parent, &src_name, dest_parent, &dest_name);
+                            let res4 = fs_crash.rename(src_parent, &src_name, dest_parent, &dest_name);
 
                             assert_eq!(res1, res2, "rename result mismatch (baseline vs micro)");
                             assert_eq!(res1, res3, "rename result mismatch (baseline vs remount)");
@@ -222,8 +201,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 5 => {
                     // Rmdir: pick a random non-root directory; ENOTEMPTY is a valid,
                     // consistently-reproduced outcome, not a skip condition.
-                    let candidates: Vec<u64> =
-                        active_dirs.iter().cloned().filter(|&i| i != 1).collect();
+                    let candidates: Vec<u64> = active_dirs.iter().cloned().filter(|&i| i != 1).collect();
                     if !candidates.is_empty() {
                         let idx = prng.gen_range(0, candidates.len() - 1);
                         let ino = candidates[idx];
@@ -375,11 +353,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 // crash comparison below turns it into a failure instead of silent
                 // corruption nobody notices until a real disk fills up.
                 if let Some(fault) = fs_crash.fault.clone() {
-                    let offset = fs_crash
-                        .fs
-                        .log_writer
-                        .as_ref()
-                        .map_or(0, |w| w.current_offset());
+                    let offset = fs_crash.fs.log_writer.as_ref().map_or(0, |w| w.current_offset());
                     fault.fail_writes_after_bytes(offset + 200, true);
                     if fs_crash.fs.flush_log().is_err() {
                         observed_flush_failures += 1;
@@ -407,22 +381,10 @@ fn test_differential_fuzzing_and_crash_recovery() {
 
                     match (snap, micro_snap, remount_snap, crash_snap) {
                         (
-                            SnapshotNode::Directory {
-                                attr: a1,
-                                entries: e1,
-                            },
-                            SnapshotNode::Directory {
-                                attr: a2,
-                                entries: e2,
-                            },
-                            SnapshotNode::Directory {
-                                attr: a3,
-                                entries: e3,
-                            },
-                            SnapshotNode::Directory {
-                                attr: a4,
-                                entries: e4,
-                            },
+                            SnapshotNode::Directory { attr: a1, entries: e1 },
+                            SnapshotNode::Directory { attr: a2, entries: e2 },
+                            SnapshotNode::Directory { attr: a3, entries: e3 },
+                            SnapshotNode::Directory { attr: a4, entries: e4 },
                         ) => {
                             // Exact Vec order, not just set-equality: live rename does
                             // an in-place update for same-parent renames (preserving
@@ -473,38 +435,14 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             );
                         }
                         (
-                            SnapshotNode::File {
-                                attr: a1,
-                                content: c1,
-                            },
-                            SnapshotNode::File {
-                                attr: a2,
-                                content: c2,
-                            },
-                            SnapshotNode::File {
-                                attr: a3,
-                                content: c3,
-                            },
-                            SnapshotNode::File {
-                                attr: a4,
-                                content: c4,
-                            },
+                            SnapshotNode::File { attr: a1, content: c1 },
+                            SnapshotNode::File { attr: a2, content: c2 },
+                            SnapshotNode::File { attr: a3, content: c3 },
+                            SnapshotNode::File { attr: a4, content: c4 },
                         ) => {
-                            assert_eq!(
-                                c1, c2,
-                                "Content mismatch at inode {} (baseline vs micro)",
-                                ino
-                            );
-                            assert_eq!(
-                                c1, c3,
-                                "Content mismatch at inode {} (baseline vs remount)",
-                                ino
-                            );
-                            assert_eq!(
-                                c1, c4,
-                                "Content mismatch at inode {} (baseline vs crash)",
-                                ino
-                            );
+                            assert_eq!(c1, c2, "Content mismatch at inode {} (baseline vs micro)", ino);
+                            assert_eq!(c1, c3, "Content mismatch at inode {} (baseline vs remount)", ino);
+                            assert_eq!(c1, c4, "Content mismatch at inode {} (baseline vs crash)", ino);
                             assert_eq!(
                                 a1.size, a2.size,
                                 "File size mismatch at inode {} (baseline vs micro)",
@@ -575,38 +513,14 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             );
                         }
                         (
-                            SnapshotNode::Symlink {
-                                attr: a1,
-                                target: t1,
-                            },
-                            SnapshotNode::Symlink {
-                                attr: a2,
-                                target: t2,
-                            },
-                            SnapshotNode::Symlink {
-                                attr: a3,
-                                target: t3,
-                            },
-                            SnapshotNode::Symlink {
-                                attr: a4,
-                                target: t4,
-                            },
+                            SnapshotNode::Symlink { attr: a1, target: t1 },
+                            SnapshotNode::Symlink { attr: a2, target: t2 },
+                            SnapshotNode::Symlink { attr: a3, target: t3 },
+                            SnapshotNode::Symlink { attr: a4, target: t4 },
                         ) => {
-                            assert_eq!(
-                                t1, t2,
-                                "Symlink target mismatch at inode {} (baseline vs micro)",
-                                ino
-                            );
-                            assert_eq!(
-                                t1, t3,
-                                "Symlink target mismatch at inode {} (baseline vs remount)",
-                                ino
-                            );
-                            assert_eq!(
-                                t1, t4,
-                                "Symlink target mismatch at inode {} (baseline vs crash)",
-                                ino
-                            );
+                            assert_eq!(t1, t2, "Symlink target mismatch at inode {} (baseline vs micro)", ino);
+                            assert_eq!(t1, t3, "Symlink target mismatch at inode {} (baseline vs remount)", ino);
+                            assert_eq!(t1, t4, "Symlink target mismatch at inode {} (baseline vs crash)", ino);
                             assert_eq!(
                                 a1.nlink, a2.nlink,
                                 "Symlink nlink mismatch at inode {} (baseline vs micro)",
@@ -731,9 +645,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
         "committed batch's directory should have survived recovery"
     );
     assert!(
-        !entries
-            .iter()
-            .any(|(name, _)| name == "should_not_exist.txt"),
+        !entries.iter().any(|(name, _)| name == "should_not_exist.txt"),
         "uncommitted trailing batch should have been discarded, not partially applied"
     );
     assert!(
@@ -808,11 +720,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     // header (24B) and this record's header (25B) - simulating a bitrotted byte in
     // otherwise-intact, previously-committed data.
     use std::io::{Read, Seek, SeekFrom, Write};
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .unwrap();
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
     let corrupt_offset = 24 + 25 + 2; // a few bytes into the CreatePayload
     file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
     let mut byte = [0u8; 1];
@@ -844,10 +752,8 @@ fn test_truncate_shrink_then_grow_within_one_batch_survives_crash_recovery() {
     fs.fs.flush_log().unwrap();
 
     // Both of these land in one batch, whose final size (6) is above the shrink point (3).
-    fs.setattr(ino, None, None, None, Some(3), None, None)
-        .unwrap();
-    fs.setattr(ino, None, None, None, Some(6), None, None)
-        .unwrap();
+    fs.setattr(ino, None, None, None, Some(3), None, None).unwrap();
+    fs.setattr(ino, None, None, None, Some(6), None, None).unwrap();
 
     let live = fs.read(ino, 0, 6).unwrap();
     assert_eq!(
@@ -880,13 +786,7 @@ fn test_rename_onto_own_hardlink_is_a_noop_and_survives_recovery() {
 
     fs.rename(1, "f0", 1, "f1").unwrap();
 
-    let names = |f: &TestFS| -> Vec<String> {
-        f.fs.list_directory(1)
-            .unwrap()
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect()
-    };
+    let names = |f: &TestFS| -> Vec<String> { f.fs.list_directory(1).unwrap().into_iter().map(|(n, _)| n).collect() };
     assert_eq!(names(&fs), vec!["f0", "f1"], "both hardlinks must survive");
     assert_eq!(
         fs.fs.get_attr(ino).unwrap().nlink,
@@ -971,11 +871,9 @@ fn test_truncate_shrink_then_grow_repro() {
 
     let full: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
     fs.write(ino, 0, &full).unwrap();
-    fs.setattr(ino, None, None, None, Some(50), None, None)
-        .unwrap();
+    fs.setattr(ino, None, None, None, Some(50), None, None).unwrap();
     fs.write(ino, 0, b"XY").unwrap();
-    fs.setattr(ino, None, None, None, Some(80), None, None)
-        .unwrap(); // grow back past the shrink point at 50
+    fs.setattr(ino, None, None, None, Some(80), None, None).unwrap(); // grow back past the shrink point at 50
 
     let content = fs.read(ino, 0, 80).unwrap();
     // Bytes [50..80) were "deleted" by the truncate to 50 and never rewritten -
@@ -1045,28 +943,14 @@ fn test_setattr_times_survive_crash_recovery() {
 
     let fs = TestFS::new_temp_with_clock(None, clock);
     let ino = fs.create(1, "f.txt", 0o644).unwrap();
-    fs.setattr(
-        ino,
-        None,
-        None,
-        None,
-        None,
-        Some(fixed_atime),
-        Some(fixed_mtime),
-    )
-    .unwrap();
+    fs.setattr(ino, None, None, None, None, Some(fixed_atime), Some(fixed_mtime))
+        .unwrap();
 
     let fs = fs.unclean_crash();
 
     let attr = fs.fs.get_attr(ino).unwrap();
-    assert_eq!(
-        attr.atime, fixed_atime,
-        "atime did not survive crash recovery"
-    );
-    assert_eq!(
-        attr.mtime, fixed_mtime,
-        "mtime did not survive crash recovery"
-    );
+    assert_eq!(attr.atime, fixed_atime, "atime did not survive crash recovery");
+    assert_eq!(attr.mtime, fixed_mtime, "mtime did not survive crash recovery");
 }
 
 #[test]
@@ -1084,8 +968,7 @@ fn test_write_mtime_survives_crash_recovery() {
     clock.advance(Duration::from_secs(10));
     fs.write(ino, 100, b"world").unwrap(); // t=1_700_000_020 - disjoint range, no elision
     clock.advance(Duration::from_secs(10));
-    fs.setattr(ino, Some(0o600), None, None, None, None, None)
-        .unwrap(); // t=1_700_000_030 - ctime only
+    fs.setattr(ino, Some(0o600), None, None, None, None, None).unwrap(); // t=1_700_000_030 - ctime only
 
     let expected_mtime = start + Duration::from_secs(20);
     let expected_ctime = start + Duration::from_secs(30);
@@ -1093,14 +976,8 @@ fn test_write_mtime_survives_crash_recovery() {
     let fs = fs.unclean_crash();
 
     let attr = fs.fs.get_attr(ino).unwrap();
-    assert_eq!(
-        attr.mtime, expected_mtime,
-        "mtime did not survive crash recovery"
-    );
-    assert_eq!(
-        attr.ctime, expected_ctime,
-        "ctime did not survive crash recovery"
-    );
+    assert_eq!(attr.mtime, expected_mtime, "mtime did not survive crash recovery");
+    assert_eq!(attr.ctime, expected_ctime, "ctime did not survive crash recovery");
 }
 
 #[test]
@@ -1119,12 +996,10 @@ fn test_setattr_size_change_updates_mtime_and_survives_crash_recovery() {
     fs.write(ino, 0, b"hello world").unwrap(); // t=1_700_000_010
     clock.advance(Duration::from_secs(10));
     // mode-only setattr: touches ctime, must NOT touch mtime.
-    fs.setattr(ino, Some(0o600), None, None, None, None, None)
-        .unwrap(); // t=1_700_000_020
+    fs.setattr(ino, Some(0o600), None, None, None, None, None).unwrap(); // t=1_700_000_020
     clock.advance(Duration::from_secs(10));
     // size-only setattr (truncate): must touch BOTH mtime and ctime.
-    fs.setattr(ino, None, None, None, Some(5), None, None)
-        .unwrap(); // t=1_700_000_030
+    fs.setattr(ino, None, None, None, Some(5), None, None).unwrap(); // t=1_700_000_030
 
     let expected_mtime = start + Duration::from_secs(30);
     let expected_ctime = start + Duration::from_secs(30);
@@ -1137,10 +1012,7 @@ fn test_setattr_size_change_updates_mtime_and_survives_crash_recovery() {
         attr.mtime, expected_mtime,
         "mtime should reflect the truncate, not create/write time"
     );
-    assert_eq!(
-        attr.ctime, expected_ctime,
-        "ctime did not survive crash recovery"
-    );
+    assert_eq!(attr.ctime, expected_ctime, "ctime did not survive crash recovery");
 }
 
 /// One tracked (parent, name, inode) entry, for `test_summary_export_is_deterministic`'s
@@ -1216,10 +1088,8 @@ fn test_summary_export_is_deterministic() {
                 3 => {
                     if !files.is_empty() {
                         let ino = files[prng.gen_range(0, files.len() - 1)];
-                        let mode = (prng.gen_range(0, 1) == 0)
-                            .then(|| 0o600 + prng.gen_range(0, 0o177) as u32);
-                        let size =
-                            (prng.gen_range(0, 1) == 0).then(|| prng.gen_range(0, 200) as u64);
+                        let mode = (prng.gen_range(0, 1) == 0).then(|| 0o600 + prng.gen_range(0, 0o177) as u32);
+                        let size = (prng.gen_range(0, 1) == 0).then(|| prng.gen_range(0, 200) as u64);
                         let _ = fs.setattr(ino, mode, None, None, size, None, None);
                     }
                 }
@@ -1253,8 +1123,7 @@ fn test_summary_export_is_deterministic() {
                     }
                 }
                 6 => {
-                    let candidates: Vec<usize> =
-                        (0..entries.len()).filter(|&i| !entries[i].is_dir).collect();
+                    let candidates: Vec<usize> = (0..entries.len()).filter(|&i| !entries[i].is_dir).collect();
                     if !candidates.is_empty() {
                         let idx = candidates[prng.gen_range(0, candidates.len() - 1)];
                         let e = entries.remove(idx);
@@ -1262,9 +1131,7 @@ fn test_summary_export_is_deterministic() {
                     }
                 }
                 7 => {
-                    let candidates: Vec<usize> = (0..entries.len())
-                        .filter(|&i| entries[i].ino != 1)
-                        .collect();
+                    let candidates: Vec<usize> = (0..entries.len()).filter(|&i| entries[i].ino != 1).collect();
                     if !candidates.is_empty() {
                         let idx = candidates[prng.gen_range(0, candidates.len() - 1)];
                         let newparent = dirs[prng.gen_range(0, dirs.len() - 1)];
@@ -1306,8 +1173,8 @@ fn test_summary_export_is_deterministic() {
                 std::fs::copy(&path, replay_dir.path().join(entry.file_name())).unwrap();
             }
         }
-        let mut replayed = recover_fs_with_clock(replay_dir.path(), Arc::new(clock.clone()))
-            .expect("recover_fs failed on replay");
+        let mut replayed =
+            recover_fs_with_clock(replay_dir.path(), Arc::new(clock.clone())).expect("recover_fs failed on replay");
         replayed.track_atime = false;
         let regenerated_path = replayed
             .export_summary(replay_dir.path())

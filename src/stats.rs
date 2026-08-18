@@ -97,25 +97,10 @@ impl VolumeStats {
             self.total_inodes, self.directory_count, self.file_count, self.symlink_count
         )
         .unwrap();
-        writeln!(
-            out,
-            "Logical Data Size:   {}",
-            format_bytes(self.total_logical_bytes)
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "Physical Log Size:   {}",
-            format_bytes(self.total_disk_bytes)
-        )
-        .unwrap();
+        writeln!(out, "Logical Data Size:   {}", format_bytes(self.total_logical_bytes)).unwrap();
+        writeln!(out, "Physical Log Size:   {}", format_bytes(self.total_disk_bytes)).unwrap();
         if self.total_data_bytes > 0 {
-            writeln!(
-                out,
-                "Overall Live Ratio:  {:.1}%",
-                self.overall_live_ratio * 100.0
-            )
-            .unwrap();
+            writeln!(out, "Overall Live Ratio:  {:.1}%", self.overall_live_ratio * 100.0).unwrap();
         } else {
             writeln!(out, "Overall Live Ratio:  N/A (no data payload)").unwrap();
         }
@@ -131,13 +116,7 @@ impl VolumeStats {
             writeln!(
                 out,
                 "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  STATUS",
-                "LOG FILE",
-                "RECORDS",
-                "LOG SIZE",
-                "DATA SIZE",
-                "LIVE DATA",
-                "EXTENTS",
-                "LIVE RATIO"
+                "LOG FILE", "RECORDS", "LOG SIZE", "DATA SIZE", "LIVE DATA", "EXTENTS", "LIVE RATIO"
             )
             .unwrap();
             writeln!(
@@ -148,12 +127,8 @@ impl VolumeStats {
             .unwrap();
 
             for g in &self.generations {
-                let (status, ratio_str) = format_generation_status(
-                    g.total_data_bytes,
-                    g.live_bytes,
-                    g.live_ratio,
-                    g.record_count,
-                );
+                let (status, ratio_str) =
+                    format_generation_status(g.total_data_bytes, g.live_bytes, g.live_ratio, g.record_count);
 
                 writeln!(
                     out,
@@ -183,11 +158,7 @@ pub fn format_generation_status(
     record_count: u32,
 ) -> (&'static str, String) {
     if total_data_bytes == 0 {
-        let status = if record_count == 0 {
-            "Empty"
-        } else {
-            "Metadata Only"
-        };
+        let status = if record_count == 0 { "Empty" } else { "Metadata Only" };
         (status, "N/A".to_string())
     } else {
         let ratio_str = format!("{:.1}%", live_ratio * 100.0);
@@ -241,10 +212,7 @@ mod tests {
     #[test]
     fn test_format_generation_status() {
         // Zero data bytes
-        assert_eq!(
-            format_generation_status(0, 0, 0.0, 0),
-            ("Empty", "N/A".to_string())
-        );
+        assert_eq!(format_generation_status(0, 0, 0.0, 0), ("Empty", "N/A".to_string()));
         assert_eq!(
             format_generation_status(0, 0, 0.0, 10),
             ("Metadata Only", "N/A".to_string())

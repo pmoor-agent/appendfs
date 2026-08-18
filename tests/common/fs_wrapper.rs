@@ -51,14 +51,8 @@ fn make_writer(
             .unwrap(),
         ),
         None => Arc::new(
-            appendfs::LogWriter::create_with_max_size_and_start_tx(
-                log_dir,
-                generation,
-                clock,
-                max_log_size,
-                start_tx,
-            )
-            .unwrap(),
+            appendfs::LogWriter::create_with_max_size_and_start_tx(log_dir, generation, clock, max_log_size, start_tx)
+                .unwrap(),
         ),
     }
 }
@@ -86,22 +80,14 @@ impl TestFS {
 
     /// Like `new_temp_with_clock`, but routes all log I/O through a `FaultStorage`, so a
     /// test can make flushes fail at chosen moments via `self.fault`.
-    pub fn new_temp_with_fault_injection(
-        max_log_size: Option<u64>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub fn new_temp_with_fault_injection(max_log_size: Option<u64>, clock: Arc<dyn Clock>) -> Self {
         Self::new_temp_inner(max_log_size, clock, true)
     }
 
-    fn new_temp_inner(
-        max_log_size: Option<u64>,
-        clock: Arc<dyn Clock>,
-        inject_faults: bool,
-    ) -> Self {
+    fn new_temp_inner(max_log_size: Option<u64>, clock: Arc<dyn Clock>, inject_faults: bool) -> Self {
         let temp_dir = tempfile::tempdir().unwrap();
         let log_dir = temp_dir.path().to_path_buf();
-        let fault = inject_faults
-            .then(|| Arc::new(FaultStorage::new(Arc::new(OsStorage::new(&log_dir)))));
+        let fault = inject_faults.then(|| Arc::new(FaultStorage::new(Arc::new(OsStorage::new(&log_dir)))));
         let writer = make_writer(
             &log_dir,
             fault.as_ref(),
@@ -124,11 +110,7 @@ impl TestFS {
         }
     }
 
-    pub fn from_instance(
-        fs: InMemoryFS,
-        log_dir: &Path,
-        temp_dir: Option<Arc<tempfile::TempDir>>,
-    ) -> Self {
+    pub fn from_instance(fs: InMemoryFS, log_dir: &Path, temp_dir: Option<Arc<tempfile::TempDir>>) -> Self {
         Self {
             fs,
             log_dir: log_dir.to_path_buf(),
@@ -142,13 +124,11 @@ impl TestFS {
     }
 
     pub fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<u64, i32> {
-        appendfs::operations::dir::mkdir_core(&self.fs, parent, name, mode, 1000, 1000)
-            .map(|attr| attr.ino)
+        appendfs::operations::dir::mkdir_core(&self.fs, parent, name, mode, 1000, 1000).map(|attr| attr.ino)
     }
 
     pub fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64, i32> {
-        appendfs::operations::read_write::create_core(&self.fs, parent, name, mode, 0, 1000, 1000)
-            .map(|attr| attr.ino)
+        appendfs::operations::read_write::create_core(&self.fs, parent, name, mode, 0, 1000, 1000).map(|attr| attr.ino)
     }
 
     pub fn write(&self, ino: u64, offset: u64, buf: &[u8]) -> Result<usize, i32> {
@@ -168,8 +148,7 @@ impl TestFS {
     }
 
     pub fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64, i32> {
-        appendfs::operations::links::symlink_core(&self.fs, parent, name, target, 1000, 1000)
-            .map(|attr| attr.ino)
+        appendfs::operations::links::symlink_core(&self.fs, parent, name, target, 1000, 1000).map(|attr| attr.ino)
     }
 
     pub fn link(&self, ino: u64, newparent: u64, newname: &str) -> Result<(), i32> {
@@ -188,8 +167,8 @@ impl TestFS {
         mtime: Option<SystemTime>,
     ) -> Result<(), i32> {
         use appendfs::operations::read_write::{
-            FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME,
-            FUSE_SET_ATTR_SIZE, FUSE_SET_ATTR_UID, setattr_core,
+            FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_SIZE,
+            FUSE_SET_ATTR_UID, setattr_core,
         };
 
         let mut to_set = 0u32;
@@ -230,13 +209,7 @@ impl TestFS {
         appendfs::operations::links::readlink_core(&self.fs, ino)
     }
 
-    pub fn rename(
-        &self,
-        parent: u64,
-        name: &str,
-        newparent: u64,
-        newname: &str,
-    ) -> Result<(), i32> {
+    pub fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), i32> {
         appendfs::operations::links::rename_core(&self.fs, parent, name, newparent, newname)
     }
 
@@ -255,8 +228,7 @@ impl TestFS {
 
             match attr.file_type {
                 FileType::Directory => {
-                    let entries =
-                        appendfs::operations::dir::list_dir_core(&self.fs, ino).unwrap_or_default();
+                    let entries = appendfs::operations::dir::list_dir_core(&self.fs, ino).unwrap_or_default();
                     for (_, child_ino) in &entries {
                         if visited.insert(*child_ino) {
                             queue.push_back(*child_ino);
@@ -269,8 +241,7 @@ impl TestFS {
                     snapshot.insert(ino, SnapshotNode::File { attr, content });
                 }
                 FileType::Symlink => {
-                    let target = appendfs::operations::links::readlink_core(&self.fs, ino)
-                        .unwrap_or_default();
+                    let target = appendfs::operations::links::readlink_core(&self.fs, ino).unwrap_or_default();
                     snapshot.insert(ino, SnapshotNode::Symlink { attr, target });
                 }
             }

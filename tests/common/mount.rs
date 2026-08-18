@@ -12,21 +12,15 @@ use std::time::Duration;
 
 pub fn unmount_fuse(mount_path: &str) {
     for _ in 0..10 {
-        let status = Command::new("fusermount3")
-            .arg("-u")
-            .arg(mount_path)
-            .status();
+        let status = Command::new("fusermount3").arg("-u").arg(mount_path).status();
         if let Ok(s) = status
-            && s.success() {
-                return;
-            }
+            && s.success()
+        {
+            return;
+        }
         thread::sleep(Duration::from_millis(50));
     }
-    let _ = Command::new("fusermount3")
-        .arg("-u")
-        .arg("-z")
-        .arg(mount_path)
-        .status();
+    let _ = Command::new("fusermount3").arg("-u").arg("-z").arg(mount_path).status();
 }
 
 #[allow(dead_code)]
@@ -43,17 +37,11 @@ pub struct TestMount {
 impl TestMount {
     /// Creates and mounts a new initialized volume with default in-memory filesystem in RW mode.
     pub fn new_rw() -> Self {
-        let log_dir = tempfile::Builder::new()
-            .prefix("appendfs_log_")
-            .tempdir()
-            .unwrap();
+        let log_dir = tempfile::Builder::new().prefix("appendfs_log_").tempdir().unwrap();
         let log_path = log_dir.path().to_path_buf();
         appendfs::init_volume(&log_path, Some("main")).unwrap();
 
-        let mount_dir = tempfile::Builder::new()
-            .prefix("appendfs_mnt_")
-            .tempdir()
-            .unwrap();
+        let mount_dir = tempfile::Builder::new().prefix("appendfs_mnt_").tempdir().unwrap();
         let mount_path = mount_dir.path().to_path_buf();
         fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -106,10 +94,11 @@ impl TestMount {
         let mut mounted = false;
         for _ in 0..200 {
             if let Ok(meta) = fs::metadata(&mount_path)
-                && meta.dev() != initial_dev {
-                    mounted = true;
-                    break;
-                }
+                && meta.dev() != initial_dev
+            {
+                mounted = true;
+                break;
+            }
             if handle.is_finished() {
                 break;
             }
@@ -169,10 +158,11 @@ impl TestMount {
         let mut mounted = false;
         for _ in 0..200 {
             if let Ok(meta) = fs::metadata(&self.mount_path)
-                && meta.dev() != initial_dev {
-                    mounted = true;
-                    break;
-                }
+                && meta.dev() != initial_dev
+            {
+                mounted = true;
+                break;
+            }
             if handle.is_finished() {
                 break;
             }
@@ -210,10 +200,11 @@ impl TestMount {
         let mut mounted = false;
         for _ in 0..200 {
             if let Ok(meta) = fs::metadata(&self.mount_path)
-                && meta.dev() != initial_dev {
-                    mounted = true;
-                    break;
-                }
+                && meta.dev() != initial_dev
+            {
+                mounted = true;
+                break;
+            }
             if handle.is_finished() {
                 break;
             }

@@ -20,12 +20,7 @@ pub struct LogFileInfo {
 }
 
 impl LogFileInfo {
-    pub fn new(
-        generation: u64,
-        filename: impl Into<String>,
-        created_at: SystemTime,
-        initial_header_size: u64,
-    ) -> Self {
+    pub fn new(generation: u64, filename: impl Into<String>, created_at: SystemTime, initial_header_size: u64) -> Self {
         Self {
             generation,
             filename: filename.into(),
@@ -61,11 +56,7 @@ impl LogManifest {
         Self::new_with_time(start_generation, branch, SystemTime::now())
     }
 
-    pub fn new_with_time(
-        start_generation: u64,
-        branch: impl Into<String>,
-        created_at: SystemTime,
-    ) -> Self {
+    pub fn new_with_time(start_generation: u64, branch: impl Into<String>, created_at: SystemTime) -> Self {
         let branch = branch.into();
         let current_filename = format!("{:06}.log", start_generation);
         let next_generation = start_generation + 1;
@@ -73,25 +64,14 @@ impl LogManifest {
 
         Self {
             branch,
-            logs: vec![LogFileInfo::new(
-                start_generation,
-                current_filename,
-                created_at,
-                24,
-            )],
+            logs: vec![LogFileInfo::new(start_generation, current_filename, created_at, 24)],
             next_generation,
             next_filename,
         }
     }
 
     /// Appends a new rolled log generation and advances `next_generation` / `next_filename`.
-    pub fn record_roll(
-        &mut self,
-        next_gen: u64,
-        next_file: String,
-        created_at: SystemTime,
-        initial_header_size: u64,
-    ) {
+    pub fn record_roll(&mut self, next_gen: u64, next_file: String, created_at: SystemTime, initial_header_size: u64) {
         let entry = LogFileInfo::new(next_gen, next_file, created_at, initial_header_size);
         self.logs.push(entry);
         self.next_generation = next_gen + 1;

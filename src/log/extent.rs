@@ -120,12 +120,7 @@ impl SharedExtentState {
         })))
     }
 
-    pub fn new_disk(
-        generation: u64,
-        record_log_offset: u64,
-        payload_offset: u32,
-        length: u32,
-    ) -> Self {
+    pub fn new_disk(generation: u64, record_log_offset: u64, payload_offset: u32, length: u32) -> Self {
         Self(Arc::new(RwLock::new(StoredExtent::Disk {
             generation,
             record_log_offset,
@@ -180,13 +175,7 @@ impl SharedExtentState {
     }
 
     /// Converts this extent directly to Disk state with exact disk payload offset and length.
-    pub fn convert_to_disk(
-        &self,
-        generation: u64,
-        record_log_offset: u64,
-        payload_offset: u32,
-        length: u32,
-    ) {
+    pub fn convert_to_disk(&self, generation: u64, record_log_offset: u64, payload_offset: u32, length: u32) {
         let mut state = match self.0.write() {
             Ok(guard) => guard,
             Err(err) => err.into_inner(),
@@ -224,17 +213,13 @@ impl RangeValue for SharedExtentState {
         let shift_u32 = shift as u32;
         match &mut *state {
             StoredExtent::Staged {
-                payload_offset,
-                length,
-                ..
+                payload_offset, length, ..
             } => {
                 *payload_offset += shift_u32;
                 *length = length.saturating_sub(shift_u32);
             }
             StoredExtent::Disk {
-                payload_offset,
-                length,
-                ..
+                payload_offset, length, ..
             } => {
                 *payload_offset += shift_u32;
                 *length = length.saturating_sub(shift_u32);

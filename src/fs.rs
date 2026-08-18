@@ -1,12 +1,10 @@
 use crate::clock::{Clock, SystemClock};
 use crate::log::{
-    BackgroundFlusher, CreatePayload, ExtentState, GenerationLiveStats, LinkPayload, LogFileCache,
-    LogManifest, LogWriter, MkdirPayload, OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload,
-    SetattrPayload, SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
+    BackgroundFlusher, CreatePayload, ExtentState, GenerationLiveStats, LinkPayload, LogFileCache, LogManifest,
+    LogWriter, MkdirPayload, OpCode, RECORD_HEADER_SIZE, RenamePayload, RmdirPayload, SetattrPayload,
+    SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
-use crate::node::{
-    AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SymlinkDelta,
-};
+use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SymlinkDelta};
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
 use crate::storage::Storage;
@@ -89,14 +87,12 @@ impl InMemoryFS {
             }),
         );
 
-        let log_cache = log_writer.as_ref().map(|w| {
-            Arc::new(LogFileCache::with_storage(w.storage().clone()))
-        });
+        let log_cache = log_writer
+            .as_ref()
+            .map(|w| Arc::new(LogFileCache::with_storage(w.storage().clone())));
 
         let start_gen = log_writer.as_ref().map_or(1, |w| w.generation());
-        let manifest = Arc::new(RwLock::new(LogManifest::new_with_time(
-            start_gen, "main", now,
-        )));
+        let manifest = Arc::new(RwLock::new(LogManifest::new_with_time(start_gen, "main", now)));
 
         Self {
             base: RwLock::new(map),
@@ -131,8 +127,7 @@ impl InMemoryFS {
     }
 
     pub fn set_read_only(&self, ro: bool) {
-        self.read_only
-            .store(ro, std::sync::atomic::Ordering::SeqCst);
+        self.read_only.store(ro, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -177,34 +172,24 @@ impl InMemoryFS {
         let remaining = handles.get(&ino).copied().unwrap_or(0);
         if remaining == 0
             && let Some(attr) = self.get_attr(ino)
-                && attr.nlink == 0 {
-                    self.tombstone(ino);
-                }
+            && attr.nlink == 0
+        {
+            self.tombstone(ino);
+        }
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {
-        self.open_handles
-            .read()
-            .unwrap()
-            .get(&ino)
-            .copied()
-            .unwrap_or(0)
+        self.open_handles.read().unwrap().get(&ino).copied().unwrap_or(0)
     }
 
     // --- In-Memory Delta Layer Mutations ---
 
     pub fn insert_new_node(&self, ino: u64, delta: NodeDelta) {
-        self.live
-            .write()
-            .unwrap()
-            .insert(ino, EntryDelta::Node(delta));
+        self.live.write().unwrap().insert(ino, EntryDelta::Node(delta));
     }
 
     pub fn tombstone(&self, ino: u64) {
-        self.live
-            .write()
-            .unwrap()
-            .insert(ino, EntryDelta::Tombstone);
+        self.live.write().unwrap().insert(ino, EntryDelta::Tombstone);
     }
 
     pub fn add_dir_entry(&self, parent: u64, name: &str, child_ino: u64, now: SystemTime) {
@@ -346,16 +331,11 @@ impl InMemoryFS {
             }
         }
         if file_type.is_none() && !found_in_flushing {
-            file_type = self
-                .base
-                .read()
-                .unwrap()
-                .get(&ino)
-                .map(|arc| match arc.as_ref() {
-                    Node::Directory { .. } => FileType::Directory,
-                    Node::File { .. } => FileType::RegularFile,
-                    Node::Symlink { .. } => FileType::Symlink,
-                });
+            file_type = self.base.read().unwrap().get(&ino).map(|arc| match arc.as_ref() {
+                Node::Directory { .. } => FileType::Directory,
+                Node::File { .. } => FileType::RegularFile,
+                Node::Symlink { .. } => FileType::Symlink,
+            });
         }
 
         match file_type {
@@ -538,9 +518,10 @@ impl InMemoryFS {
         if let Some(arc) = self.base.read().unwrap().get(&parent) {
             let node = arc.as_ref();
             if let Node::Directory { entries, .. } = node
-                && let Some((_, ino)) = entries.iter().find(|(entry_name, _)| entry_name == name) {
-                    return Some(*ino);
-                }
+                && let Some((_, ino)) = entries.iter().find(|(entry_name, _)| entry_name == name)
+            {
+                return Some(*ino);
+            }
         }
 
         None
@@ -687,11 +668,9 @@ impl InMemoryFS {
             let flushing_guard = self.flushing.read().unwrap();
             for flushing_map in flushing_guard.iter().rev() {
                 if let Some(EntryDelta::Node(NodeDelta::File(f))) = flushing_map.get(&ino) {
-                    let max_read =
-                        std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
+                    let max_read = std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
                     if max_read > 0 {
-                        for (ext_start, ext_len, shared_state) in f.extents.query(offset, max_read)
-                        {
+                        for (ext_start, ext_len, shared_state) in f.extents.query(offset, max_read) {
                             self.copy_extent_data(
                                 &mut read_buf,
                                 &mut filled,
@@ -714,11 +693,9 @@ impl InMemoryFS {
         if let Some(arc) = self.base.read().unwrap().get(&ino) {
             let node = arc.as_ref();
             if let Node::File { range_map, .. } = node {
-                let max_base_read =
-                    std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
+                let max_base_read = std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
                 if max_base_read > 0 {
-                    for (ext_start, ext_len, shared_state) in range_map.query(offset, max_base_read)
-                    {
+                    for (ext_start, ext_len, shared_state) in range_map.query(offset, max_base_read) {
                         self.copy_extent_data(
                             &mut read_buf,
                             &mut filled,
@@ -786,8 +763,7 @@ impl InMemoryFS {
                 let src_end = std::cmp::min(src_start + seg_len, data.len());
                 let actual_len = std::cmp::min(seg_len, src_end.saturating_sub(src_start));
                 if actual_len > 0 && src_start < data.len() {
-                    temp_buf[..actual_len]
-                        .copy_from_slice(&data[src_start..src_start + actual_len]);
+                    temp_buf[..actual_len].copy_from_slice(&data[src_start..src_start + actual_len]);
                     bytes_read = actual_len;
                 }
             }
@@ -798,15 +774,16 @@ impl InMemoryFS {
                 length: _,
             } => {
                 if let Some(ref cache) = self.log_cache
-                    && let Ok(reader) = cache.get_or_open(generation) {
-                        let disk_seek_pos = record_log_offset
-                            + crate::log::RECORD_HEADER_SIZE as u64
-                            + payload_offset as u64
-                            + slice_inner_offset as u64;
-                        if reader.read_exact_at(disk_seek_pos, &mut temp_buf).is_ok() {
-                            bytes_read = seg_len;
-                        }
+                    && let Ok(reader) = cache.get_or_open(generation)
+                {
+                    let disk_seek_pos = record_log_offset
+                        + crate::log::RECORD_HEADER_SIZE as u64
+                        + payload_offset as u64
+                        + slice_inner_offset as u64;
+                    if reader.read_exact_at(disk_seek_pos, &mut temp_buf).is_ok() {
+                        bytes_read = seg_len;
                     }
+                }
             }
         }
 
@@ -829,8 +806,7 @@ impl InMemoryFS {
     /// The clones are then applied in the normal oldest-to-newest logical order.
     pub fn snapshot_all(&self) -> HashMap<u64, Arc<Node>> {
         let live_snapshot: HashMap<u64, EntryDelta> = self.live.read().unwrap().clone();
-        let flushing_snapshot: VecDeque<HashMap<u64, EntryDelta>> =
-            self.flushing.read().unwrap().clone();
+        let flushing_snapshot: VecDeque<HashMap<u64, EntryDelta>> = self.flushing.read().unwrap().clone();
         let mut result: HashMap<u64, Arc<Node>> = self.base.read().unwrap().clone();
 
         for flushing_map in flushing_snapshot.iter() {
@@ -932,14 +908,12 @@ impl InMemoryFS {
                             estimated_bytes += RECORD_HEADER_SIZE as u64 + 32 + length as u64;
                         }
                     }
-                    if f.size.is_some() || f.truncate_mask.is_some() || f.attr_delta.mode.is_some()
-                    {
+                    if f.size.is_some() || f.truncate_mask.is_some() || f.attr_delta.mode.is_some() {
                         estimated_bytes += RECORD_HEADER_SIZE as u64 + 64;
                     }
                 }
                 EntryDelta::Node(NodeDelta::Directory(d)) => {
-                    estimated_bytes +=
-                        (d.added.len() + d.removed.len()) as u64 * (RECORD_HEADER_SIZE as u64 + 64);
+                    estimated_bytes += (d.added.len() + d.removed.len()) as u64 * (RECORD_HEADER_SIZE as u64 + 64);
                     if d.attr_delta.mode.is_some() {
                         estimated_bytes += RECORD_HEADER_SIZE as u64 + 64;
                     }
@@ -984,9 +958,7 @@ impl InMemoryFS {
                 base_map
                     .get(&parent)
                     .map(|arc| match &**arc {
-                        Node::Directory { entries, .. } => {
-                            entries.iter().any(|(n, c)| n == name && *c == child)
-                        }
+                        Node::Directory { entries, .. } => entries.iter().any(|(n, c)| n == name && *c == child),
                         _ => false,
                     })
                     .unwrap_or(false)
@@ -1000,19 +972,14 @@ impl InMemoryFS {
                     let mut added_entries: Vec<(&String, &u64)> = d.added.iter().collect();
                     added_entries.sort_by_key(|(name, _)| *name);
                     for (name, &child_ino) in added_entries {
-                        if !base_map.contains_key(&child_ino)
-                            && !primary_creation.contains_key(&child_ino)
-                        {
+                        if !base_map.contains_key(&child_ino) && !primary_creation.contains_key(&child_ino) {
                             primary_creation.insert(child_ino, (parent_ino, name.clone()));
                             continue;
                         }
                         if entry_already_in_base(parent_ino, name, child_ino) {
                             continue;
                         }
-                        all_added
-                            .entry(child_ino)
-                            .or_default()
-                            .push((parent_ino, name.clone()));
+                        all_added.entry(child_ino).or_default().push((parent_ino, name.clone()));
                     }
                 }
             }
@@ -1024,11 +991,9 @@ impl InMemoryFS {
 
             for &parent_ino in &inos {
                 let (d_removed, d_added, op_time) = match frozen.get(&parent_ino) {
-                    Some(EntryDelta::Node(NodeDelta::Directory(d))) => (
-                        &d.removed,
-                        Some(&d.added),
-                        d.attr_delta.mtime.unwrap_or(now),
-                    ),
+                    Some(EntryDelta::Node(NodeDelta::Directory(d))) => {
+                        (&d.removed, Some(&d.added), d.attr_delta.mtime.unwrap_or(now))
+                    }
                     Some(EntryDelta::Tombstone) => {
                         static EMPTY_REMOVED: std::sync::LazyLock<HashSet<String>> =
                             std::sync::LazyLock::new(HashSet::new);
@@ -1056,9 +1021,7 @@ impl InMemoryFS {
                                     if let Node::Directory { .. } = child_arc.as_ref() {
                                         is_dir = true;
                                     }
-                                } else if let Some(EntryDelta::Node(NodeDelta::Directory(_))) =
-                                    frozen.get(c_ino)
-                                {
+                                } else if let Some(EntryDelta::Node(NodeDelta::Directory(_))) = frozen.get(c_ino) {
                                     is_dir = true;
                                 }
                                 removed_entries.push((name.clone(), *c_ino, is_dir));
@@ -1070,12 +1033,9 @@ impl InMemoryFS {
                 removed_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
                 for (name, child_ino, is_dir) in removed_entries {
-                    if let Some((new_parent, new_name)) =
-                        all_added.get_mut(&child_ino).and_then(|v| v.pop())
-                    {
+                    if let Some((new_parent, new_name)) = all_added.get_mut(&child_ino).and_then(|v| v.pop()) {
                         renamed_additions.insert((new_parent, new_name.clone()));
-                        renames_to_emit
-                            .push((child_ino, parent_ino, name, new_parent, new_name, op_time));
+                        renames_to_emit.push((child_ino, parent_ino, name, new_parent, new_name, op_time));
                     } else {
                         unlinks_to_emit.push((child_ino, parent_ino, name, is_dir, op_time));
                     }
@@ -1110,42 +1070,41 @@ impl InMemoryFS {
             for &ino in &inos {
                 if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = frozen.get(&ino)
                     && !base_map.contains_key(&ino)
-                        && let Some((parent, name)) = primary_creation.get(&ino).cloned() {
-                            let op_time = d.attr_delta.ctime.unwrap_or(now);
+                    && let Some((parent, name)) = primary_creation.get(&ino).cloned()
+                {
+                    let op_time = d.attr_delta.ctime.unwrap_or(now);
 
-                            if parent >= ino && !base_map.contains_key(&parent) {
-                                let tmp_name = format!(".agy_tmp_{}", ino);
-                                let payload = MkdirPayload {
-                                    parent: 1,
-                                    name: tmp_name.clone(),
-                                    mode: d.attr_delta.mode.unwrap_or(0o755),
-                                    uid: d.attr_delta.uid.unwrap_or(0),
-                                    gid: d.attr_delta.gid.unwrap_or(0),
-                                    created_at: op_time,
-                                };
-                                let bytes = bincode::serialize(&payload).map_err(|e| {
-                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                                })?;
-                                writer.append_record(OpCode::Mkdir, ino, &bytes)?;
-                                written_count += 1;
+                    if parent >= ino && !base_map.contains_key(&parent) {
+                        let tmp_name = format!(".agy_tmp_{}", ino);
+                        let payload = MkdirPayload {
+                            parent: 1,
+                            name: tmp_name.clone(),
+                            mode: d.attr_delta.mode.unwrap_or(0o755),
+                            uid: d.attr_delta.uid.unwrap_or(0),
+                            gid: d.attr_delta.gid.unwrap_or(0),
+                            created_at: op_time,
+                        };
+                        let bytes = bincode::serialize(&payload)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        writer.append_record(OpCode::Mkdir, ino, &bytes)?;
+                        written_count += 1;
 
-                                renames_to_emit.push((ino, 1, tmp_name, parent, name, op_time));
-                            } else {
-                                let payload = MkdirPayload {
-                                    parent,
-                                    name,
-                                    mode: d.attr_delta.mode.unwrap_or(0o755),
-                                    uid: d.attr_delta.uid.unwrap_or(0),
-                                    gid: d.attr_delta.gid.unwrap_or(0),
-                                    created_at: op_time,
-                                };
-                                let bytes = bincode::serialize(&payload).map_err(|e| {
-                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                                })?;
-                                writer.append_record(OpCode::Mkdir, ino, &bytes)?;
-                                written_count += 1;
-                            }
-                        }
+                        renames_to_emit.push((ino, 1, tmp_name, parent, name, op_time));
+                    } else {
+                        let payload = MkdirPayload {
+                            parent,
+                            name,
+                            mode: d.attr_delta.mode.unwrap_or(0o755),
+                            uid: d.attr_delta.uid.unwrap_or(0),
+                            gid: d.attr_delta.gid.unwrap_or(0),
+                            created_at: op_time,
+                        };
+                        let bytes = bincode::serialize(&payload)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        writer.append_record(OpCode::Mkdir, ino, &bytes)?;
+                        written_count += 1;
+                    }
+                }
             }
 
             // Phase 3: Create and Symlink
@@ -1153,41 +1112,41 @@ impl InMemoryFS {
                 match frozen.get(&ino) {
                     Some(EntryDelta::Node(NodeDelta::File(f))) => {
                         if !base_map.contains_key(&ino)
-                            && let Some((parent, name)) = primary_creation.get(&ino).cloned() {
-                                let op_time = f.attr_delta.ctime.unwrap_or(now);
-                                let payload = CreatePayload {
-                                    parent,
-                                    name,
-                                    mode: f.attr_delta.mode.unwrap_or(0o644),
-                                    uid: f.attr_delta.uid.unwrap_or(0),
-                                    gid: f.attr_delta.gid.unwrap_or(0),
-                                    created_at: op_time,
-                                };
-                                let bytes = bincode::serialize(&payload).map_err(|e| {
-                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                                })?;
-                                writer.append_record(OpCode::Create, ino, &bytes)?;
-                                written_count += 1;
-                            }
+                            && let Some((parent, name)) = primary_creation.get(&ino).cloned()
+                        {
+                            let op_time = f.attr_delta.ctime.unwrap_or(now);
+                            let payload = CreatePayload {
+                                parent,
+                                name,
+                                mode: f.attr_delta.mode.unwrap_or(0o644),
+                                uid: f.attr_delta.uid.unwrap_or(0),
+                                gid: f.attr_delta.gid.unwrap_or(0),
+                                created_at: op_time,
+                            };
+                            let bytes = bincode::serialize(&payload)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                            writer.append_record(OpCode::Create, ino, &bytes)?;
+                            written_count += 1;
+                        }
                     }
                     Some(EntryDelta::Node(NodeDelta::Symlink(s))) => {
                         if !base_map.contains_key(&ino)
-                            && let Some((parent, name)) = primary_creation.get(&ino).cloned() {
-                                let op_time = s.attr_delta.ctime.unwrap_or(now);
-                                let payload = SymlinkPayload {
-                                    parent,
-                                    name,
-                                    target: s.target.clone().unwrap_or_default(),
-                                    uid: s.attr_delta.uid.unwrap_or(0),
-                                    gid: s.attr_delta.gid.unwrap_or(0),
-                                    created_at: op_time,
-                                };
-                                let bytes = bincode::serialize(&payload).map_err(|e| {
-                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                                })?;
-                                writer.append_record(OpCode::Symlink, ino, &bytes)?;
-                                written_count += 1;
-                            }
+                            && let Some((parent, name)) = primary_creation.get(&ino).cloned()
+                        {
+                            let op_time = s.attr_delta.ctime.unwrap_or(now);
+                            let payload = SymlinkPayload {
+                                parent,
+                                name,
+                                target: s.target.clone().unwrap_or_default(),
+                                uid: s.attr_delta.uid.unwrap_or(0),
+                                gid: s.attr_delta.gid.unwrap_or(0),
+                                created_at: op_time,
+                            };
+                            let bytes = bincode::serialize(&payload)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                            writer.append_record(OpCode::Symlink, ino, &bytes)?;
+                            written_count += 1;
+                        }
                     }
                     _ => {}
                 }
@@ -1262,8 +1221,7 @@ impl InMemoryFS {
                     cur = predecessor[cur].expect("unresolved rename must be part of a cycle");
                 }
                 let breaker = cycle[0];
-                let (child_ino, parent, name, new_parent, new_name, op_time) =
-                    renames_to_emit[breaker].clone();
+                let (child_ino, parent, name, new_parent, new_name, op_time) = renames_to_emit[breaker].clone();
                 let tmp_name = format!(".agy_tmp_rename_{}", child_ino);
                 ordered_renames.push((child_ino, parent, name, 1, tmp_name.clone(), op_time));
                 emitted[breaker] = true;
@@ -1415,25 +1373,19 @@ impl InMemoryFS {
                         let mut total_length: u64 = 0;
                         for item in run {
                             total_length += item.length as u64;
-                            let slice = &item.data[item.payload_offset as usize
-                                ..(item.payload_offset + item.length) as usize];
+                            let slice =
+                                &item.data[item.payload_offset as usize..(item.payload_offset + item.length) as usize];
                             payload.extend_from_slice(slice);
                         }
 
-                        let (_, generation, record_log_offset) =
-                            writer.append_record(OpCode::Write, ino, &payload)?;
+                        let (_, generation, record_log_offset) = writer.append_record(OpCode::Write, ino, &payload)?;
                         written_count += 1;
                         flushed_data_bytes += total_length;
 
                         // Collapse the entire contiguous run into a single consolidated RangeEntry in f.extents
-                        let consolidated_extent = SharedExtentState::new_disk(
-                            generation,
-                            record_log_offset,
-                            meta_size,
-                            total_length as u32,
-                        );
-                        f.extents
-                            .insert(start_offset, total_length, consolidated_extent);
+                        let consolidated_extent =
+                            SharedExtentState::new_disk(generation, record_log_offset, meta_size, total_length as u32);
+                        f.extents.insert(start_offset, total_length, consolidated_extent);
 
                         idx = run_end;
                     }
@@ -1472,9 +1424,8 @@ impl InMemoryFS {
                                 mtime: f.attr_delta.mtime,
                                 op_time,
                             };
-                            let bytes = bincode::serialize(&payload).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                            })?;
+                            let bytes = bincode::serialize(&payload)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                             writer.append_record(OpCode::Setattr, ino, &bytes)?;
                             written_count += 1;
                         }
@@ -1496,9 +1447,8 @@ impl InMemoryFS {
                                 mtime: d.attr_delta.mtime,
                                 op_time,
                             };
-                            let bytes = bincode::serialize(&payload).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                            })?;
+                            let bytes = bincode::serialize(&payload)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                             writer.append_record(OpCode::Setattr, ino, &bytes)?;
                             written_count += 1;
                         }
@@ -1508,24 +1458,23 @@ impl InMemoryFS {
                             || s.attr_delta.uid.is_some()
                             || s.attr_delta.gid.is_some()
                             || s.attr_delta.mtime.is_some()
-                            || s.attr_delta.ctime.is_some())
-                        => {
-                            let op_time = s.attr_delta.ctime.or(s.attr_delta.mtime).unwrap_or(now);
-                            let payload = SetattrPayload {
-                                mode: s.attr_delta.mode,
-                                uid: s.attr_delta.uid,
-                                gid: s.attr_delta.gid,
-                                size: None,
-                                atime: s.attr_delta.atime,
-                                mtime: s.attr_delta.mtime,
-                                op_time,
-                            };
-                            let bytes = bincode::serialize(&payload).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                            })?;
-                            writer.append_record(OpCode::Setattr, ino, &bytes)?;
-                            written_count += 1;
-                        }
+                            || s.attr_delta.ctime.is_some()) =>
+                    {
+                        let op_time = s.attr_delta.ctime.or(s.attr_delta.mtime).unwrap_or(now);
+                        let payload = SetattrPayload {
+                            mode: s.attr_delta.mode,
+                            uid: s.attr_delta.uid,
+                            gid: s.attr_delta.gid,
+                            size: None,
+                            atime: s.attr_delta.atime,
+                            mtime: s.attr_delta.mtime,
+                            op_time,
+                        };
+                        let bytes = bincode::serialize(&payload)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        writer.append_record(OpCode::Setattr, ino, &bytes)?;
+                        written_count += 1;
+                    }
                     _ => {}
                 }
             }
@@ -1627,9 +1576,7 @@ impl InMemoryFS {
     /// Increments mutation counters (ops & bytes) and triggers an automatic flush if thresholds are reached.
     pub fn notify_mutation(&self, additional_bytes: usize) {
         let staged_b = if additional_bytes > 0 {
-            self.staged_bytes
-                .fetch_add(additional_bytes, Ordering::Relaxed)
-                + additional_bytes
+            self.staged_bytes.fetch_add(additional_bytes, Ordering::Relaxed) + additional_bytes
         } else {
             self.staged_bytes.load(Ordering::Relaxed)
         };
@@ -1689,10 +1636,7 @@ impl InMemoryFS {
             let node = node_arc.as_ref();
             if let Node::File { range_map, .. } = node {
                 for (_, entry) in range_map.iter() {
-                    if let ExtentState::Disk {
-                        generation, length, ..
-                    } = entry.value.read_state()
-                    {
+                    if let ExtentState::Disk { generation, length, .. } = entry.value.read_state() {
                         let stats = live_map.entry(generation).or_insert((0, 0));
                         stats.0 += length as u64;
                         stats.1 += 1;
@@ -1703,8 +1647,7 @@ impl InMemoryFS {
 
         let mut result = Vec::new();
         for log in &manifest.logs {
-            let (live_bytes, live_extents) =
-                live_map.get(&log.generation).copied().unwrap_or((0, 0));
+            let (live_bytes, live_extents) = live_map.get(&log.generation).copied().unwrap_or((0, 0));
             let live_ratio = if log.total_data_bytes > 0 {
                 live_bytes as f64 / log.total_data_bytes as f64
             } else {
@@ -1725,11 +1668,7 @@ impl InMemoryFS {
     }
 
     /// Performs a comprehensive, read-only integrity check of the filesystem state.
-    pub fn check_integrity(
-        &self,
-        log_dir: Option<&Path>,
-        verify_data: bool,
-    ) -> crate::check::IntegrityReport {
+    pub fn check_integrity(&self, log_dir: Option<&Path>, verify_data: bool) -> crate::check::IntegrityReport {
         crate::check::check_fs_integrity(self, log_dir, verify_data)
     }
 
@@ -1738,10 +1677,10 @@ impl InMemoryFS {
         self.sync_log()?;
         let snapshot = self.snapshot_all();
         let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
-        let last_tx_id = self.log_writer.as_ref().map_or_else(
-            || self.last_tx_id.load(Ordering::SeqCst),
-            |w| w.last_tx_id(),
-        );
+        let last_tx_id = self
+            .log_writer
+            .as_ref()
+            .map_or_else(|| self.last_tx_id.load(Ordering::SeqCst), |w| w.last_tx_id());
         let next_inode = self.next_inode.load(Ordering::SeqCst);
         let manifest = self.manifest.read().unwrap().clone();
         let now = self.clock.now();
@@ -1755,10 +1694,10 @@ impl InMemoryFS {
         self.sync_log()?;
         let snapshot = self.snapshot_all();
         let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
-        let last_tx_id = self.log_writer.as_ref().map_or_else(
-            || self.last_tx_id.load(Ordering::SeqCst),
-            |w| w.last_tx_id(),
-        );
+        let last_tx_id = self
+            .log_writer
+            .as_ref()
+            .map_or_else(|| self.last_tx_id.load(Ordering::SeqCst), |w| w.last_tx_id());
         let next_inode = self.next_inode.load(Ordering::SeqCst);
         let manifest = self.manifest.read().unwrap().clone();
         let now = self.clock.now();
@@ -2124,8 +2063,7 @@ fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
 fn delta_to_node(delta: &NodeDelta) -> Node {
     match delta {
         NodeDelta::Directory(d) => {
-            let mut entries: Vec<(String, u64)> =
-                d.added.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            let mut entries: Vec<(String, u64)> = d.added.iter().map(|(k, v)| (k.clone(), *v)).collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             Node::Directory {
                 parent: d.parent.unwrap_or(1),
@@ -2223,10 +2161,7 @@ mod tests {
             let base = fs.base.read().unwrap();
             let node_arc = base.get(&ino).expect("inode missing in base");
             let node = node_arc.as_ref();
-            if let Node::File {
-                range_map, size, ..
-            } = node
-            {
+            if let Node::File { range_map, size, .. } = node {
                 assert_eq!(*size, 50);
                 assert_eq!(
                     range_map.len(),
@@ -2367,51 +2302,23 @@ mod tests {
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // 1. Create /Gletscher, /Gletscher/sub, and files
-        let gletscher_attr =
-            crate::operations::dir::mkdir_core(&fs, 1, "Gletscher", 0o755, 1000, 1000).unwrap();
+        let gletscher_attr = crate::operations::dir::mkdir_core(&fs, 1, "Gletscher", 0o755, 1000, 1000).unwrap();
         let gletscher_ino = gletscher_attr.ino;
 
-        let file1_attr = crate::operations::read_write::create_core(
-            &fs,
-            gletscher_ino,
-            "file1.txt",
-            0o644,
-            0,
-            1000,
-            1000,
-        )
-        .unwrap();
+        let file1_attr =
+            crate::operations::read_write::create_core(&fs, gletscher_ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, file1_attr.ino, &[1, 2, 3, 4], 0).unwrap();
 
-        let file2_attr = crate::operations::read_write::create_core(
-            &fs,
-            gletscher_ino,
-            "file2.txt",
-            0o644,
-            0,
-            1000,
-            1000,
-        )
-        .unwrap();
+        let file2_attr =
+            crate::operations::read_write::create_core(&fs, gletscher_ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, file2_attr.ino, &[5, 6, 7, 8], 0).unwrap();
 
-        let sub_attr =
-            crate::operations::dir::mkdir_core(&fs, gletscher_ino, "sub", 0o755, 1000, 1000)
-                .unwrap();
+        let sub_attr = crate::operations::dir::mkdir_core(&fs, gletscher_ino, "sub", 0o755, 1000, 1000).unwrap();
         let sub_ino = sub_attr.ino;
 
-        let file3_attr = crate::operations::read_write::create_core(
-            &fs,
-            sub_ino,
-            "file3.txt",
-            0o644,
-            0,
-            1000,
-            1000,
-        )
-        .unwrap();
-        crate::operations::read_write::write_core(&fs, file3_attr.ino, &[9, 10, 11, 12], 0)
-            .unwrap();
+        let file3_attr =
+            crate::operations::read_write::create_core(&fs, sub_ino, "file3.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file3_attr.ino, &[9, 10, 11, 12], 0).unwrap();
 
         // Flush creation to disk
         fs.sync_log().unwrap();
@@ -2466,38 +2373,17 @@ mod tests {
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // 1. Create /keep and /Gletscher directories
-        let keep_attr =
-            crate::operations::dir::mkdir_core(&fs, 1, "keep", 0o755, 1000, 1000).unwrap();
-        let gletscher_attr =
-            crate::operations::dir::mkdir_core(&fs, 1, "Gletscher", 0o755, 1000, 1000).unwrap();
+        let keep_attr = crate::operations::dir::mkdir_core(&fs, 1, "keep", 0o755, 1000, 1000).unwrap();
+        let gletscher_attr = crate::operations::dir::mkdir_core(&fs, 1, "Gletscher", 0o755, 1000, 1000).unwrap();
 
         // 2. Create /keep/shared.txt (inode N, nlink 1) and write data
-        let file_attr = crate::operations::read_write::create_core(
-            &fs,
-            keep_attr.ino,
-            "shared.txt",
-            0o644,
-            0,
-            1000,
-            1000,
-        )
-        .unwrap();
-        crate::operations::read_write::write_core(
-            &fs,
-            file_attr.ino,
-            b"persistent shared content",
-            0,
-        )
-        .unwrap();
+        let file_attr =
+            crate::operations::read_write::create_core(&fs, keep_attr.ino, "shared.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file_attr.ino, b"persistent shared content", 0).unwrap();
 
         // 3. Create hard link /Gletscher/shared_link.txt -> inode N (nlink becomes 2)
-        let link_attr = crate::operations::links::link_core(
-            &fs,
-            file_attr.ino,
-            gletscher_attr.ino,
-            "shared_link.txt",
-        )
-        .unwrap();
+        let link_attr =
+            crate::operations::links::link_core(&fs, file_attr.ino, gletscher_attr.ino, "shared_link.txt").unwrap();
         assert_eq!(link_attr.nlink, 2);
 
         // Commit everything to disk
@@ -2530,8 +2416,7 @@ mod tests {
             .expect("shared.txt must survive recovery");
         assert_eq!(rec_file_attr.nlink, 1);
 
-        let data =
-            crate::operations::read_write::read_core(&recovered, file_attr.ino, 25, 0).unwrap();
+        let data = crate::operations::read_write::read_core(&recovered, file_attr.ino, 25, 0).unwrap();
         assert_eq!(&data, b"persistent shared content");
 
         let rec_stats = recovered.calculate_generation_live_stats();
@@ -2546,9 +2431,7 @@ mod tests {
         let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
-        let attr =
-            crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000)
-                .unwrap();
+        let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.sync_log().unwrap();
         assert!(fs.exists_below_live(attr.ino));
 
@@ -2576,9 +2459,7 @@ mod tests {
         let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
-        let attr =
-            crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000)
-                .unwrap();
+        let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         // Fold it into `base`, so the lower layers still describe the inode after deletion.
         fs.sync_log().unwrap();
         crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
@@ -2616,15 +2497,13 @@ mod tests {
         // Perform 4 create operations - not flushed yet
         for i in 0..4 {
             let name = format!("file_{}.txt", i);
-            crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000)
-                .unwrap();
+            crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
         }
         assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 4);
         assert_eq!(fs.manifest.read().unwrap().logs[0].record_count, 0);
 
         // 5th operation reaches threshold and triggers automatic flush!
-        crate::operations::read_write::create_core(&fs, 1, "file_4.txt", 0o644, 0, 1000, 1000)
-            .unwrap();
+        crate::operations::read_write::create_core(&fs, 1, "file_4.txt", 0o644, 0, 1000, 1000).unwrap();
 
         // Staged ops reset to 0 after automatic flush
         assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 0);
@@ -2639,16 +2518,8 @@ mod tests {
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // Create a temp file
-        let file_attr = crate::operations::read_write::create_core(
-            &fs,
-            1,
-            "temp_scratch.bin",
-            0o644,
-            0,
-            1000,
-            1000,
-        )
-        .unwrap();
+        let file_attr =
+            crate::operations::read_write::create_core(&fs, 1, "temp_scratch.bin", 0o644, 0, 1000, 1000).unwrap();
         let ino = file_attr.ino;
 
         // Open handle (like a POSIX process keeping file open)
@@ -2673,10 +2544,7 @@ mod tests {
         assert!(!base.contains_key(&ino));
 
         let entries = recovered.list_directory(1).unwrap();
-        assert!(
-            entries.is_empty(),
-            "Root directory must be completely empty"
-        );
+        assert!(entries.is_empty(), "Root directory must be completely empty");
     }
 
     #[test]
@@ -2687,9 +2555,7 @@ mod tests {
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // Create file and write 100 bytes (0xAA)
-        let file_attr =
-            crate::operations::read_write::create_core(&fs, 1, "data.bin", 0o644, 0, 1000, 1000)
-                .unwrap();
+        let file_attr = crate::operations::read_write::create_core(&fs, 1, "data.bin", 0o644, 0, 1000, 1000).unwrap();
         let ino = file_attr.ino;
         crate::operations::read_write::write_core(&fs, ino, &[0xAA; 100], 0).unwrap();
 
@@ -2737,8 +2603,7 @@ mod tests {
 
         // Flush and verify reading again from base
         fs.sync_log().unwrap();
-        let read_data_after_flush =
-            crate::operations::read_write::read_core(&fs, ino, 100, 0).unwrap();
+        let read_data_after_flush = crate::operations::read_write::read_core(&fs, ino, 100, 0).unwrap();
         assert_eq!(&read_data_after_flush[0..20], &[0xAA; 20]);
         assert_eq!(&read_data_after_flush[20..100], &[0x00; 80]);
     }
@@ -2749,9 +2614,7 @@ mod tests {
         let fs = InMemoryFS::with_clock(clock.clone());
 
         // 1. Create file in batch 1
-        let f =
-            crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000)
-                .unwrap();
+        let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = f.ino;
         crate::operations::read_write::write_core(&fs, ino, &[0x11; 50], 0).unwrap();
 
@@ -2809,23 +2672,17 @@ mod tests {
 
         let clock = Arc::new(SystemClock);
         // Set tiny max_log_size (50 bytes) so the next flush rolls to 000002.log
-        let writer = Arc::new(
-            LogWriter::create_with_storage(storage.clone(), 1, &*clock, 50, 1).unwrap(),
-        );
+        let writer = Arc::new(LogWriter::create_with_storage(storage.clone(), 1, &*clock, 50, 1).unwrap());
         let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage.clone());
         fs.log_writer = Some(writer);
 
         // 1. First batch: write data to file1 and flush (populates gen 1 past header size)
-        let f1 =
-            crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000)
-                .unwrap();
+        let f1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f1.ino, b"initial payload", 0).unwrap();
         fs.flush_log().unwrap();
 
         // 2. Second batch: write data to file2
-        let f2 =
-            crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000)
-                .unwrap();
+        let f2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f2.ino, b"second payload", 0).unwrap();
 
         // 3. Inject permission error on opening 000002.log to simulate I/O failure when rolling
@@ -2833,10 +2690,7 @@ mod tests {
 
         // 4. Attempt flush - should fail with I/O error on roll creation
         let flush_res = fs.flush_log();
-        assert!(
-            flush_res.is_err(),
-            "Expected flush_log to fail on simulated I/O error"
-        );
+        assert!(flush_res.is_err(), "Expected flush_log to fail on simulated I/O error");
 
         // Verify filesystem is NOT wedged: flushing queue still retains the batch, live mutations still work!
         assert_eq!(
@@ -2846,9 +2700,7 @@ mod tests {
         );
 
         // Live operations continue working smoothly
-        let f3 =
-            crate::operations::read_write::create_core(&fs, 1, "file3.txt", 0o644, 0, 1000, 1000)
-                .unwrap();
+        let f3 = crate::operations::read_write::create_core(&fs, 1, "file3.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f3.ino, b"third payload", 0).unwrap();
 
         // 5. Restore normal write access by clearing injected fault
@@ -2895,14 +2747,7 @@ mod tests {
         let storage = Arc::new(fault_storage.clone());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
-            LogWriter::create_with_storage(
-                storage.clone(),
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-            )
-            .unwrap(),
+            LogWriter::create_with_storage(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
         );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
@@ -2910,8 +2755,7 @@ mod tests {
         let mut initial_inos = Vec::new();
         for i in 1..=2 {
             let name = format!("init_{}.txt", i);
-            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000)
-                .unwrap();
+            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
             crate::operations::read_write::write_core(&fs, f.ino, b"initial payload", 0).unwrap();
             initial_inos.push(f.ino);
         }
@@ -2923,8 +2767,7 @@ mod tests {
         let mut batch2_inos = Vec::new();
         for i in 1..=8 {
             let name = format!("batch2_file_{}.bin", i);
-            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000)
-                .unwrap();
+            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
             let payload = vec![(i as u8) * 0x11; 128];
             crate::operations::read_write::write_core(&fs, f.ino, &payload, 0).unwrap();
             batch2_inos.push((f.ino, payload));
@@ -2952,16 +2795,11 @@ mod tests {
 
         // 7. Retry flush - MUST succeed cleanly
         let retry_res = fs.flush_log();
-        assert!(
-            retry_res.is_ok(),
-            "Retried flush must succeed: {:?}",
-            retry_res
-        );
+        assert!(retry_res.is_ok(), "Retried flush must succeed: {:?}", retry_res);
         assert_eq!(fs.flushing.read().unwrap().len(), 0);
 
         // 8. Recover filesystem and verify 100% data integrity without checksum mismatches!
-        let recovered = crate::log::recover_fs_with_storage(storage.clone())
-            .expect("Recovery must succeed cleanly");
+        let recovered = crate::log::recover_fs_with_storage(storage.clone()).expect("Recovery must succeed cleanly");
         for ino in initial_inos {
             assert!(recovered.get_attr(ino).is_some());
             let d = crate::operations::read_write::read_core(&recovered, ino, 15, 0).unwrap();
@@ -2969,17 +2807,12 @@ mod tests {
         }
         for (ino, payload) in batch2_inos {
             assert!(recovered.get_attr(ino).is_some());
-            let d = crate::operations::read_write::read_core(&recovered, ino, payload.len(), 0)
-                .unwrap();
+            let d = crate::operations::read_write::read_core(&recovered, ino, payload.len(), 0).unwrap();
             assert_eq!(d, payload);
         }
 
         let report = crate::check::check_volume_with_storage(storage, true).unwrap();
-        assert!(
-            report.is_clean(),
-            "Integrity check must be clean: {:?}",
-            report.issues
-        );
+        assert!(report.is_clean(), "Integrity check must be clean: {:?}", report.issues);
     }
 
     #[test]
@@ -2989,14 +2822,7 @@ mod tests {
         let storage = Arc::new(fault_storage.clone());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
-            LogWriter::create_with_storage(
-                storage.clone(),
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-            )
-            .unwrap(),
+            LogWriter::create_with_storage(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
         );
         let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
         fs.max_staged_ops = 1; // freeze a batch on every mutation
@@ -3021,10 +2847,7 @@ mod tests {
         }
 
         // 3. Userspace must be told, rather than every write silently "succeeding".
-        assert!(
-            refused > 0,
-            "mutations must start failing once the log stops draining"
-        );
+        assert!(refused > 0, "mutations must start failing once the log stops draining");
         assert_eq!(last_errno, libc::EIO, "failure must surface as an errno");
         assert!(
             accepted <= fs.max_flush_queue_depth,

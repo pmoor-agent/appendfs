@@ -21,11 +21,7 @@ impl MemoryStorage {
 
     /// Helper to dump file contents for assertions / debugging.
     pub fn get_file_bytes(&self, name: &str) -> Option<Vec<u8>> {
-        self.files
-            .read()
-            .unwrap()
-            .get(name)
-            .map(|b| b.read().unwrap().clone())
+        self.files.read().unwrap().get(name).map(|b| b.read().unwrap().clone())
     }
 
     /// Helper to directly insert or overwrite file bytes.

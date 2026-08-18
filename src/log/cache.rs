@@ -37,8 +37,7 @@ impl LogFileCache {
         let mut header_buf = [0u8; FILE_HEADER_SIZE];
         reader.read_exact_at(0, &mut header_buf)?;
 
-        FileHeader::from_bytes(&header_buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        FileHeader::from_bytes(&header_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         guard.insert(generation, Arc::clone(&reader));
         Ok(reader)
@@ -61,8 +60,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
         let writer =
-            LogWriter::create_with_storage(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1)
-                .unwrap();
+            LogWriter::create_with_storage(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
         writer.sync().unwrap();
 
         let cache = LogFileCache::with_storage(storage);

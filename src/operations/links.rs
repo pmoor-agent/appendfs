@@ -153,13 +153,7 @@ pub fn readlink(fs: &InMemoryFS, req: Request, ino: u64) {
     }
 }
 
-pub fn rename_core(
-    fs: &InMemoryFS,
-    parent: u64,
-    name: &str,
-    newparent: u64,
-    newname: &str,
-) -> Result<(), i32> {
+pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), i32> {
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
@@ -226,11 +220,7 @@ pub fn rename_core(
             let dest_is_dir = dest_attr.file_type == FileType::Directory;
 
             if src_is_dir != dest_is_dir {
-                return Err(if src_is_dir {
-                    libc::ENOTDIR
-                } else {
-                    libc::EISDIR
-                });
+                return Err(if src_is_dir { libc::ENOTDIR } else { libc::EISDIR });
             }
 
             if dest_is_dir {
@@ -269,26 +259,14 @@ pub fn rename_core(
     Ok(())
 }
 
-pub fn rename(
-    fs: &InMemoryFS,
-    req: Request,
-    parent: u64,
-    name: &str,
-    newparent: u64,
-    newname: &str,
-) {
+pub fn rename(fs: &InMemoryFS, req: Request, parent: u64, name: &str, newparent: u64, newname: &str) {
     match rename_core(fs, parent, name, newparent, newname) {
         Ok(()) => req.reply_err(0),
         Err(e) => req.reply_err(e),
     }
 }
 
-pub fn link_core(
-    fs: &InMemoryFS,
-    ino: u64,
-    newparent: u64,
-    newname: &str,
-) -> Result<FileAttr, i32> {
+pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Result<FileAttr, i32> {
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
@@ -297,12 +275,7 @@ pub fn link_core(
     {
         let _dir_guard = fs.dir_lock.lock().unwrap();
         let now = fs.clock.now();
-        log::trace!(
-            "link(ino={}, newparent={}, newname={})",
-            ino,
-            newparent,
-            newname
-        );
+        log::trace!("link(ino={}, newparent={}, newname={})", ino, newparent, newname);
 
         if newname.len() > 255 {
             return Err(libc::ENAMETOOLONG);

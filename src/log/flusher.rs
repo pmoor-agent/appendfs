@@ -23,10 +23,9 @@ impl BackgroundFlusher {
             while !*stop {
                 let result = cvar.wait_timeout(stop, interval).unwrap();
                 stop = result.0;
-                if !*stop
-                    && let Err(e) = flush_fn() {
-                        log::error!("Background flush failed: {}", e);
-                    }
+                if !*stop && let Err(e) = flush_fn() {
+                    log::error!("Background flush failed: {}", e);
+                }
             }
         });
 

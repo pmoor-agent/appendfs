@@ -32,20 +32,10 @@ pub struct SummaryHeader {
 
 impl SummaryHeader {
     pub fn new(generation: u64, last_tx_id: u64, next_inode: u64) -> Self {
-        Self::new_with_time(
-            generation,
-            last_tx_id,
-            next_inode,
-            std::time::SystemTime::now(),
-        )
+        Self::new_with_time(generation, last_tx_id, next_inode, std::time::SystemTime::now())
     }
 
-    pub fn new_with_time(
-        generation: u64,
-        last_tx_id: u64,
-        next_inode: u64,
-        created_at: std::time::SystemTime,
-    ) -> Self {
+    pub fn new_with_time(generation: u64, last_tx_id: u64, next_inode: u64, created_at: std::time::SystemTime) -> Self {
         Self {
             magic: *SUMMARY_MAGIC,
             version: CURRENT_SUMMARY_VERSION,
@@ -79,12 +69,7 @@ pub struct SummaryFooter {
 }
 
 impl SummaryFooter {
-    pub fn new(
-        manifest_offset: u64,
-        index_offset: u64,
-        entry_count: u64,
-        checksum: [u8; 32],
-    ) -> Self {
+    pub fn new(manifest_offset: u64, index_offset: u64, entry_count: u64, checksum: [u8; 32]) -> Self {
         Self {
             manifest_offset,
             index_offset,
@@ -130,10 +115,8 @@ pub fn export_summary_with_time_to_storage(
     next_inode: u64,
     created_at: std::time::SystemTime,
 ) -> io::Result<String> {
-    let mut inodes_snapshot: Vec<(u64, Arc<Node>)> = snapshot
-        .iter()
-        .map(|(ino, arc)| (*ino, Arc::clone(arc)))
-        .collect();
+    let mut inodes_snapshot: Vec<(u64, Arc<Node>)> =
+        snapshot.iter().map(|(ino, arc)| (*ino, Arc::clone(arc))).collect();
     // Sort by inode so physical serialization order is deterministic
     inodes_snapshot.sort_by_key(|(ino, _)| *ino);
 
@@ -160,15 +143,9 @@ pub fn export_summary_with_time_to_storage(
     for (inode, node_arc) in &inodes_snapshot {
         let node = node_arc.as_ref();
         let mut node_to_serialize = node.clone();
-        if let Node::Directory {
-            ref mut entries, ..
-        } = node_to_serialize
-        {
+        if let Node::Directory { ref mut entries, .. } = node_to_serialize {
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-        } else if let Node::File {
-            ref mut range_map, ..
-        } = node_to_serialize
-        {
+        } else if let Node::File { ref mut range_map, .. } = node_to_serialize {
             let entries: Vec<(u64, u64, SharedExtentState)> = range_map
                 .iter()
                 .map(|(start, e)| (*start, e.length, e.value.clone()))
@@ -193,19 +170,14 @@ pub fn export_summary_with_time_to_storage(
                                 length: _,
                             },
                         ) = (cur_state.read_state(), state.read_state())
-                            && g1 == g2
-                                && r1 == r2
-                                && p1 as u64 + cur_len == p2 as u64
-                            {
-                                let new_state = SharedExtentState::new_disk(
-                                    g1,
-                                    r1,
-                                    p1,
-                                    (cur_len + len) as u32,
-                                );
-                                current = Some((cur_start, cur_len + len, new_state));
-                                merged = true;
-                            }
+                        && g1 == g2
+                        && r1 == r2
+                        && p1 as u64 + cur_len == p2 as u64
+                    {
+                        let new_state = SharedExtentState::new_disk(g1, r1, p1, (cur_len + len) as u32);
+                        current = Some((cur_start, cur_len + len, new_state));
+                        merged = true;
+                    }
                     if !merged {
                         coalesced.insert(cur_start, cur_len, cur_state);
                         current = Some((start, len, state));
@@ -219,8 +191,8 @@ pub fn export_summary_with_time_to_storage(
             }
             *range_map = coalesced;
         }
-        let payload = bincode::serialize(&node_to_serialize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let payload =
+            bincode::serialize(&node_to_serialize).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         index_entries.push(SummaryIndexEntry {
             inode: *inode,
@@ -241,8 +213,7 @@ pub fn export_summary_with_time_to_storage(
 
     // 3. Serialize and write LogManifest
     let manifest_offset = current_offset;
-    let manifest_bytes =
-        bincode::serialize(manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let manifest_bytes = bincode::serialize(manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let manifest_len_bytes = (manifest_bytes.len() as u32).to_le_bytes();
     writer.append(&manifest_len_bytes)?;
     writer.append(&manifest_bytes)?;
@@ -263,12 +234,7 @@ pub fn export_summary_with_time_to_storage(
 
     // 6. Append SummaryFooter at EOF
     let checksum: [u8; 32] = *hasher.finalize().as_bytes();
-    let footer = SummaryFooter::new(
-        manifest_offset,
-        index_offset,
-        index_entries.len() as u64,
-        checksum,
-    );
+    let footer = SummaryFooter::new(manifest_offset, index_offset, index_entries.len() as u64, checksum);
     writer.append(&footer.to_bytes())?;
 
     writer.sync()?;
@@ -335,9 +301,7 @@ pub fn export_fs_summary(
     let snapshot = fs.snapshot_all();
     let next_inode = fs.next_inode.load(Ordering::SeqCst);
     let manifest = fs.manifest.read().unwrap().clone();
-    export_summary(
-        &snapshot, &manifest, log_dir, generation, last_tx_id, next_inode,
-    )
+    export_summary(&snapshot, &manifest, log_dir, generation, last_tx_id, next_inode)
 }
 
 /// Initializes a fresh, empty appendfs volume on a `Storage` instance.
@@ -362,15 +326,7 @@ pub fn init_volume_with_storage(storage: Arc<dyn Storage>, branch: Option<&str>)
         next_filename: "000001.log".to_string(),
     };
 
-    export_summary_with_time_to_storage(
-        &snapshot,
-        &manifest,
-        &storage,
-        0,
-        0,
-        2,
-        std::time::SystemTime::now(),
-    )?;
+    export_summary_with_time_to_storage(&snapshot, &manifest, &storage, 0, 0, 2, std::time::SystemTime::now())?;
 
     Ok(())
 }
@@ -442,8 +398,8 @@ impl SummaryReader {
         let manifest_len = u32::from_le_bytes(manifest_len_buf) as usize;
         let mut manifest_buf = vec![0u8; manifest_len];
         reader.read_exact_at(footer.manifest_offset + 4, &mut manifest_buf)?;
-        let manifest: crate::log::LogManifest = bincode::deserialize(&manifest_buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let manifest: crate::log::LogManifest =
+            bincode::deserialize(&manifest_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // 5. Read index array from index_offset
         let mut index_entries = Vec::with_capacity(footer.entry_count as usize);
@@ -468,11 +424,7 @@ impl SummaryReader {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
         let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(parent));
         Self::open_with_storage(&storage, &filename)
     }
@@ -507,10 +459,7 @@ impl SummaryReader {
         if read_inode != inode {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "summary index mismatch: expected inode {}, found {}",
-                    inode, read_inode
-                ),
+                format!("summary index mismatch: expected inode {}, found {}", inode, read_inode),
             ));
         }
 
@@ -518,8 +467,7 @@ impl SummaryReader {
         let mut payload = vec![0u8; payload_len];
         self.reader.read_exact_at(offset + 12, &mut payload)?;
 
-        let node = bincode::deserialize::<Node>(&payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let node = bincode::deserialize::<Node>(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Ok(Some(node))
     }
@@ -604,16 +552,9 @@ mod tests {
             next_filename: "000002.log".to_string(),
         };
 
-        let filename = export_summary_with_time_to_storage(
-            &snapshot,
-            &manifest,
-            storage.as_ref(),
-            1,
-            42,
-            3,
-            SystemTime::now(),
-        )
-        .unwrap();
+        let filename =
+            export_summary_with_time_to_storage(&snapshot, &manifest, storage.as_ref(), 1, 42, 3, SystemTime::now())
+                .unwrap();
 
         let reader = SummaryReader::open_with_storage(storage.as_ref(), &filename).unwrap();
         assert_eq!(reader.header.generation, 1);
@@ -674,24 +615,14 @@ mod tests {
             next_filename: "000005.log".to_string(),
         };
 
-        let filename = export_summary_with_time_to_storage(
-            &snapshot,
-            &manifest,
-            storage.as_ref(),
-            4,
-            999,
-            51,
-            SystemTime::now(),
-        )
-        .unwrap();
+        let filename =
+            export_summary_with_time_to_storage(&snapshot, &manifest, storage.as_ref(), 4, 999, 51, SystemTime::now())
+                .unwrap();
 
         let reader = SummaryReader::open_with_storage(storage.as_ref(), &filename).unwrap();
         assert_eq!(reader.footer.entry_count, 50);
 
-        let all_inodes: Vec<u64> = reader
-            .iter_inodes()
-            .map(|res| res.unwrap().0)
-            .collect();
+        let all_inodes: Vec<u64> = reader.iter_inodes().map(|res| res.unwrap().0).collect();
         assert_eq!(all_inodes.len(), 50);
         for i in 1..=50 {
             assert_eq!(all_inodes[(i - 1) as usize], i);

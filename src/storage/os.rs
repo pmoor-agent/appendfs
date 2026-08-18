@@ -76,9 +76,10 @@ impl Storage for OsStorage {
             let entry = entry?;
             let path = entry.path();
             if path.is_file()
-                && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    files.push(name.to_string());
-                }
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                files.push(name.to_string());
+            }
         }
         files.sort();
         Ok(files)

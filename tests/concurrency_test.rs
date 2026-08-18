@@ -14,9 +14,7 @@ use appendfs::log::record::DecodedPayload;
 use appendfs::log::{LogReader, SummaryReader, recover_fs};
 use appendfs::node::Node;
 use appendfs::operations::dir::{list_dir_core, mkdir_core, rmdir_core};
-use appendfs::operations::links::{
-    link_core, readlink_core, rename_core, symlink_core, unlink_core,
-};
+use appendfs::operations::links::{link_core, readlink_core, rename_core, symlink_core, unlink_core};
 use appendfs::operations::read_write::{
     FUSE_SET_ATTR_SIZE, create_core, getattr_core, read_core, setattr_core, write_core,
 };
@@ -159,8 +157,7 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
     let mut link_counts: HashMap<u64, u32> = HashMap::new();
 
     while let Some(ino) = queue.pop_front() {
-        let attr =
-            getattr_core(fs, ino).unwrap_or_else(|e| panic!("getattr({}) failed: {}", ino, e));
+        let attr = getattr_core(fs, ino).unwrap_or_else(|e| panic!("getattr({}) failed: {}", ino, e));
         match attr.file_type {
             FileType::Directory => {
                 assert_eq!(
@@ -168,8 +165,7 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
                     "directory inode {} has unexpected nlink {} (expected 2)",
                     ino, attr.nlink
                 );
-                let entries = list_dir_core(fs, ino)
-                    .unwrap_or_else(|e| panic!("list_dir({}) failed: {}", ino, e));
+                let entries = list_dir_core(fs, ino).unwrap_or_else(|e| panic!("list_dir({}) failed: {}", ino, e));
                 for (name, child_ino) in entries {
                     let child_attr = match getattr_core(fs, child_ino) {
                         Ok(a) => a,
@@ -180,17 +176,13 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
                             );
                             dump_log_records_for_inode(log_dir, child_ino);
                             dump_log_records_for_inode(log_dir, ino);
-                            let preserved = std::path::PathBuf::from(format!(
-                                "/tmp/appendfs_repro_seed_{}",
-                                seed
-                            ));
+                            let preserved = std::path::PathBuf::from(format!("/tmp/appendfs_repro_seed_{}", seed));
                             let _ = std::fs::remove_dir_all(&preserved);
                             std::fs::create_dir_all(&preserved).unwrap();
                             for entry in std::fs::read_dir(log_dir).unwrap() {
                                 let entry = entry.unwrap();
                                 if entry.path().is_file() {
-                                    std::fs::copy(entry.path(), preserved.join(entry.file_name()))
-                                        .unwrap();
+                                    std::fs::copy(entry.path(), preserved.join(entry.file_name())).unwrap();
                                 }
                             }
                             eprintln!("  preserved log dir at {:?}", preserved);
@@ -215,8 +207,7 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
                 }
             }
             FileType::Symlink => {
-                readlink_core(fs, ino)
-                    .unwrap_or_else(|e| panic!("readlink({}) failed: {}", ino, e));
+                readlink_core(fs, ino).unwrap_or_else(|e| panic!("readlink({}) failed: {}", ino, e));
             }
             FileType::RegularFile => {}
         }
@@ -251,11 +242,7 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
     let snapshot = fs.snapshot_all();
     let total_inodes = snapshot.len();
     if visited.len() != total_inodes {
-        let mut orphans: Vec<u64> = snapshot
-            .keys()
-            .copied()
-            .filter(|k| !visited.contains(k))
-            .collect();
+        let mut orphans: Vec<u64> = snapshot.keys().copied().filter(|k| !visited.contains(k)).collect();
         orphans.sort_unstable();
         eprintln!("orphaned/unreachable inodes: {:?}", orphans);
         for ino in &orphans {
@@ -313,16 +300,13 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
 fn normalize_for_compare(ino: u64, mut node: Node) -> Node {
     if ino == 1
         && let Node::Directory {
-            atime,
-            mtime,
-            ctime,
-            ..
+            atime, mtime, ctime, ..
         } = &mut node
-        {
-            *atime = UNIX_EPOCH;
-            *mtime = UNIX_EPOCH;
-            *ctime = UNIX_EPOCH;
-        }
+    {
+        *atime = UNIX_EPOCH;
+        *mtime = UNIX_EPOCH;
+        *ctime = UNIX_EPOCH;
+    }
     node
 }
 
@@ -336,12 +320,9 @@ fn normalize_for_compare(ino: u64, mut node: Node) -> Node {
 // test's genuinely concurrent log instead of a single-threaded one.
 fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64) {
     let _generation = fs.log_writer.as_ref().unwrap().generation();
-    let written_path = fs.export_summary(log_dir).unwrap_or_else(|e| {
-        panic!(
-            "export_summary failed on the live instance (seed {}): {}",
-            seed, e
-        )
-    });
+    let written_path = fs
+        .export_summary(log_dir)
+        .unwrap_or_else(|e| panic!("export_summary failed on the live instance (seed {}): {}", seed, e));
 
     // Reprocess: copy only the raw .log files into a fresh directory (excluding the
     // .summary file just written), so recover_fs has no fast-path available and is
@@ -354,17 +335,12 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
             std::fs::copy(&path, replay_dir.path().join(entry.file_name())).unwrap();
         }
     }
-    let mut replayed = recover_fs(replay_dir.path())
-        .unwrap_or_else(|e| panic!("recover_fs failed on replay (seed {}): {}", seed, e));
+    let mut replayed =
+        recover_fs(replay_dir.path()).unwrap_or_else(|e| panic!("recover_fs failed on replay (seed {}): {}", seed, e));
     replayed.track_atime = false;
     let regenerated_path = replayed
         .export_summary(replay_dir.path())
-        .unwrap_or_else(|e| {
-            panic!(
-                "export_summary failed on the replayed instance (seed {}): {}",
-                seed, e
-            )
-        });
+        .unwrap_or_else(|e| panic!("export_summary failed on the replayed instance (seed {}): {}", seed, e));
 
     // Compare tree *content* (the inode map), not raw summary bytes - `next_inode` can
     // legitimately differ between the two: a failed create/mkdir/symlink (EEXIST,
@@ -387,14 +363,8 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
     if written_keys != regenerated_keys {
         let written_set: HashSet<u64> = written_keys.iter().copied().collect();
         let regenerated_set: HashSet<u64> = regenerated_keys.iter().copied().collect();
-        let missing_from_replay: Vec<u64> = written_set
-            .difference(&regenerated_set)
-            .copied()
-            .collect();
-        let extra_in_replay: Vec<u64> = regenerated_set
-            .difference(&written_set)
-            .copied()
-            .collect();
+        let missing_from_replay: Vec<u64> = written_set.difference(&regenerated_set).copied().collect();
+        let extra_in_replay: Vec<u64> = regenerated_set.difference(&written_set).copied().collect();
         eprintln!(
             "inode-set divergence (seed {}): missing_from_replay={:?} extra_in_replay={:?}",
             seed, missing_from_replay, extra_in_replay
@@ -430,10 +400,8 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
     for ino in written_keys {
         let live_node = (*written_inodes[&ino]).clone();
         let replayed_node = (*regenerated_inodes[&ino]).clone();
-        let live_bytes =
-            bincode::serialize(&normalize_for_compare(ino, live_node.clone())).unwrap();
-        let replayed_bytes =
-            bincode::serialize(&normalize_for_compare(ino, replayed_node.clone())).unwrap();
+        let live_bytes = bincode::serialize(&normalize_for_compare(ino, live_node.clone())).unwrap();
+        let replayed_bytes = bincode::serialize(&normalize_for_compare(ino, replayed_node.clone())).unwrap();
         if live_bytes != replayed_bytes {
             eprintln!("content divergence (seed {}) at inode {}:", seed, ino);
             eprintln!("  live:     {:?}", live_node);
@@ -507,8 +475,7 @@ fn dump_log_records_for_inode(log_dir: &std::path::Path, ino: u64) {
 #[test]
 #[ignore]
 fn dump_preserved_repro() {
-    let dir = std::env::var("APPENDFS_REPRO_DIR")
-        .unwrap_or_else(|_| "/tmp/appendfs_repro_seed_28".to_string());
+    let dir = std::env::var("APPENDFS_REPRO_DIR").unwrap_or_else(|_| "/tmp/appendfs_repro_seed_28".to_string());
     let mut log_files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -545,8 +512,7 @@ fn run_concurrent_stress(seed: u64) {
 
     let mut shared_dirs = Vec::new();
     for i in 0..4 {
-        let attr = mkdir_core(&fs, 1, &format!("shared{}", i), 0o755, UID, GID)
-            .expect("setup mkdir failed");
+        let attr = mkdir_core(&fs, 1, &format!("shared{}", i), 0o755, UID, GID).expect("setup mkdir failed");
         shared_dirs.push(attr.ino);
     }
     let shared_dirs = Arc::new(shared_dirs);

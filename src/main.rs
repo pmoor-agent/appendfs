@@ -18,10 +18,7 @@ fn main() {
                 Ok(summary_path) => {
                     println!("Initialized empty appendfs volume successfully!");
                     println!("  Log Directory:   {:?}", args.log_dir);
-                    println!(
-                        "  Summary File:    {:?}",
-                        summary_path.file_name().unwrap_or_default()
-                    );
+                    println!("  Summary File:    {:?}", summary_path.file_name().unwrap_or_default());
                     println!("  Branch:          {}", args.branch);
                     println!("  Root Inode:      1 (/)");
                     println!("  Next Generation: 1 (000001.log)");
@@ -36,17 +33,11 @@ fn main() {
             let log_dir = &args.log_dir;
             if !log_dir.exists() {
                 eprintln!("Error: Log directory '{:?}' does not exist.", log_dir);
-                eprintln!(
-                    "Run 'appendfs init {:?}' to create a new volume first.",
-                    log_dir
-                );
+                eprintln!("Run 'appendfs init {:?}' to create a new volume first.", log_dir);
                 std::process::exit(1);
             }
 
-            println!(
-                "Recovering appendfs state from log directory '{:?}'...",
-                log_dir
-            );
+            println!("Recovering appendfs state from log directory '{:?}'...", log_dir);
             let mut fs_instance = match recover_fs(log_dir) {
                 Ok(fs) => fs,
                 Err(e) => {
@@ -60,17 +51,9 @@ fn main() {
                 manifest.next_generation
             };
 
-            let start_tx = fs_instance
-                .last_tx_id
-                .load(std::sync::atomic::Ordering::SeqCst)
-                + 1;
+            let start_tx = fs_instance.last_tx_id.load(std::sync::atomic::Ordering::SeqCst) + 1;
 
-            let writer = Arc::new(LogWriter::create_lazy(
-                log_dir,
-                next_gen,
-                args.max_log_size,
-                start_tx,
-            ));
+            let writer = Arc::new(LogWriter::create_lazy(log_dir, next_gen, args.max_log_size, start_tx));
 
             fs_instance.log_writer = Some(Arc::clone(&writer));
             fs_instance.max_buffer_size = args.flush_threshold;
@@ -137,9 +120,7 @@ fn main() {
             fs_instance.set_log_dir(log_dir);
             fs_instance.set_read_only(true);
 
-            let effective_tx_id = fs_instance
-                .last_tx_id
-                .load(std::sync::atomic::Ordering::SeqCst);
+            let effective_tx_id = fs_instance.last_tx_id.load(std::sync::atomic::Ordering::SeqCst);
             let effective_gen = {
                 let manifest = fs_instance.manifest.read().unwrap();
                 manifest.logs.last().map(|l| l.generation).unwrap_or(1)
@@ -160,10 +141,7 @@ fn main() {
             let fs_instance = Arc::new(fs_instance);
             let fuse_args = args.to_fuse_args();
             if let Err(err) = appendfs::mount_ro_arc(fuse_args, fs_instance) {
-                eprintln!(
-                    "Failed to mount read-only appendfs FUSE filesystem: {}",
-                    err
-                );
+                eprintln!("Failed to mount read-only appendfs FUSE filesystem: {}", err);
                 std::process::exit(1);
             }
         }

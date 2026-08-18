@@ -299,8 +299,6 @@ mod tests {
         assert_write_mode_contract(&OsStorage::new(dir.path()));
 
         let fault_dir = tempfile::tempdir().unwrap();
-        assert_write_mode_contract(&FaultStorage::new(Arc::new(OsStorage::new(
-            fault_dir.path(),
-        ))));
+        assert_write_mode_contract(&FaultStorage::new(Arc::new(OsStorage::new(fault_dir.path()))));
     }
 }

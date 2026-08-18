@@ -48,9 +48,7 @@ impl<V> Default for RangeMap<V> {
 impl<V> RangeMap<V> {
     /// Creates a new empty `RangeMap`.
     pub fn new() -> Self {
-        Self {
-            map: BTreeMap::new(),
-        }
+        Self { map: BTreeMap::new() }
     }
 
     /// Returns `true` if the range map contains no entries.
@@ -332,8 +330,7 @@ mod tests {
             },
         );
 
-        let entries: Vec<(u64, RangeEntry<TestSlice>)> =
-            range_map.iter().map(|(&k, v)| (k, v.clone())).collect();
+        let entries: Vec<(u64, RangeEntry<TestSlice>)> = range_map.iter().map(|(&k, v)| (k, v.clone())).collect();
 
         assert_eq!(entries.len(), 3);
 
@@ -410,8 +407,7 @@ mod tests {
             },
         );
 
-        let entries: Vec<(u64, RangeEntry<TestSlice>)> =
-            range_map.iter().map(|(&k, v)| (k, v.clone())).collect();
+        let entries: Vec<(u64, RangeEntry<TestSlice>)> = range_map.iter().map(|(&k, v)| (k, v.clone())).collect();
 
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].0, 0);

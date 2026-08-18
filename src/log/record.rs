@@ -241,10 +241,7 @@ pub struct MkdirPayload {
 pub struct UnlinkPayload {
     pub parent: u64,
     pub name: String,
-    #[serde(
-        default = "crate::clock::default_epoch",
-        with = "crate::clock::serde_system_time"
-    )]
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
     pub op_time: SystemTime,
 }
 
@@ -253,10 +250,7 @@ pub struct UnlinkPayload {
 pub struct RmdirPayload {
     pub parent: u64,
     pub name: String,
-    #[serde(
-        default = "crate::clock::default_epoch",
-        with = "crate::clock::serde_system_time"
-    )]
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
     pub op_time: SystemTime,
 }
 
@@ -282,10 +276,7 @@ pub struct RenamePayload {
     pub name: String,
     pub new_parent: u64,
     pub new_name: String,
-    #[serde(
-        default = "crate::clock::default_epoch",
-        with = "crate::clock::serde_system_time"
-    )]
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
     pub op_time: SystemTime,
 }
 
@@ -312,10 +303,7 @@ pub struct SetattrPayload {
     pub atime: Option<SystemTime>,
     #[serde(default, with = "crate::clock::serde_system_time_opt")]
     pub mtime: Option<SystemTime>,
-    #[serde(
-        default = "crate::clock::default_epoch",
-        with = "crate::clock::serde_system_time"
-    )]
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
     pub op_time: SystemTime,
 }
 
@@ -325,10 +313,7 @@ pub struct LinkPayload {
     pub ino: u64,
     pub new_parent: u64,
     pub new_name: String,
-    #[serde(
-        default = "crate::clock::default_epoch",
-        with = "crate::clock::serde_system_time"
-    )]
+    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
     pub op_time: SystemTime,
 }
 

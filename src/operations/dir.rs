@@ -116,9 +116,10 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
     let mut db = shim::DirectoryBuffer::new(req, size);
     for item in iter_dir_entries(fs, ino, &entries, offset) {
         if let Some(attr) = fs.get_attr(item.ino)
-            && !db.add(item.name, item.ino, attr.file_type, item.next_offset) {
-                break;
-            }
+            && !db.add(item.name, item.ino, attr.file_type, item.next_offset)
+        {
+            break;
+        }
     }
     db.reply();
 }
@@ -136,21 +137,15 @@ pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset:
     let mut db = shim::DirectoryBufferPlus::new(req, size);
     for item in iter_dir_entries(fs, ino, &entries, offset) {
         if let Some(attr) = fs.get_attr(item.ino)
-            && !db.add(item.name, &attr, 1.0, 1.0, item.next_offset) {
-                break;
-            }
+            && !db.add(item.name, &attr, 1.0, 1.0, item.next_offset)
+        {
+            break;
+        }
     }
     db.reply();
 }
 
-pub fn mkdir_core(
-    fs: &InMemoryFS,
-    parent: u64,
-    name: &str,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-) -> Result<FileAttr, i32> {
+pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> Result<FileAttr, i32> {
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
