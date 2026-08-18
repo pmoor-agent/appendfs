@@ -206,7 +206,7 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
             added: HashMap::new(),
             removed: std::collections::HashSet::new(),
             attr_delta: AttrDelta {
-                mode: Some(mode & 0o777),
+                mode: Some(mode & 0o7777),
                 nlink: Some(2),
                 uid: Some(uid),
                 gid: Some(gid),
@@ -219,11 +219,19 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
 
         fs.insert_new_node(new_ino, new_delta);
         fs.add_dir_entry(parent, name, new_ino, now);
+        fs.update_attr_delta(
+            parent,
+            AttrDelta {
+                nlink: Some(parent_attr.nlink + 1),
+                ctime: Some(now),
+                ..Default::default()
+            },
+        );
 
         FileAttr {
             ino: new_ino,
             file_type: FileType::Directory,
-            perm: mode & 0o777,
+            perm: mode & 0o7777,
             nlink: 2,
             uid,
             gid,
@@ -281,6 +289,14 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
         }
 
         fs.remove_dir_entry(parent, name, now);
+        fs.update_attr_delta(
+            parent,
+            AttrDelta {
+                nlink: Some(parent_attr.nlink.saturating_sub(1)),
+                ctime: Some(now),
+                ..Default::default()
+            },
+        );
         fs.tombstone(child_ino);
     }
 
@@ -312,4 +328,49 @@ pub fn fsyncdir(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool) {
     log::trace!("fsyncdir(ino={}, datasync={})", ino, datasync);
     let _ = fs.sync_log();
     req.reply_err(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_directory_nlink_tracking_across_mkdir_rmdir_and_rename() {
+        let fs = InMemoryFS::new();
+        // Initial root (inode 1) starts with nlink 2
+        assert_eq!(fs.get_attr(1).unwrap().nlink, 2);
+
+        // 1. mkdir "d1" in root -> root nlink becomes 3, d1 has nlink 2
+        let d1 = mkdir_core(&fs, 1, "d1", 0o755, 1000, 1000).unwrap();
+        assert_eq!(d1.nlink, 2);
+        assert_eq!(fs.get_attr(1).unwrap().nlink, 3);
+
+        // 2. mkdir "d2" in root -> root nlink becomes 4, d2 has nlink 2
+        let d2 = mkdir_core(&fs, 1, "d2", 0o755, 1000, 1000).unwrap();
+        assert_eq!(d2.nlink, 2);
+        assert_eq!(fs.get_attr(1).unwrap().nlink, 4);
+
+        // 3. mkdir "sub" inside "d1" -> d1 nlink becomes 3, sub has nlink 2
+        let sub = mkdir_core(&fs, d1.ino, "sub", 0o755, 1000, 1000).unwrap();
+        assert_eq!(sub.nlink, 2);
+        assert_eq!(fs.get_attr(d1.ino).unwrap().nlink, 3);
+
+        // 4. Move "sub" from "d1" to "d2" -> d1 drops to 2, d2 increases to 3
+        crate::operations::links::rename_core(&fs, d1.ino, "sub", d2.ino, "sub").unwrap();
+        assert_eq!(fs.get_attr(d1.ino).unwrap().nlink, 2);
+        assert_eq!(fs.get_attr(d2.ino).unwrap().nlink, 3);
+        assert_eq!(fs.get_attr(sub.ino).unwrap().nlink, 2);
+
+        // 5. rmdir "sub" from "d2" -> d2 drops back to 2
+        rmdir_core(&fs, d2.ino, "sub").unwrap();
+        assert_eq!(fs.get_attr(d2.ino).unwrap().nlink, 2);
+
+        // 6. rmdir "d1" from root -> root drops to 3
+        rmdir_core(&fs, 1, "d1").unwrap();
+        assert_eq!(fs.get_attr(1).unwrap().nlink, 3);
+
+        // 7. rmdir "d2" from root -> root drops to 2
+        rmdir_core(&fs, 1, "d2").unwrap();
+        assert_eq!(fs.get_attr(1).unwrap().nlink, 2);
+    }
 }

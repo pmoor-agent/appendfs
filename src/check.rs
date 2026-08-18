@@ -478,11 +478,18 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
         }
         let node = node_arc.as_ref();
         if node.is_dir() {
-            if node.meta.nlink != 2 {
+            let expected_nlink = 2 + subdirs_count.get(&ino).copied().unwrap_or(0);
+            if node.meta.nlink != expected_nlink {
                 report.issues.push(IntegrityIssue::error(
                     "NLINK_MISMATCH",
                     Some(ino),
-                    format!("Directory inode {} has nlink {}, expected 2", ino, node.meta.nlink),
+                    format!(
+                        "Directory inode {} has nlink {}, expected {} (2 + {} subdirectories)",
+                        ino,
+                        node.meta.nlink,
+                        expected_nlink,
+                        subdirs_count.get(&ino).copied().unwrap_or(0)
+                    ),
                 ));
             }
         } else {

@@ -208,6 +208,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
 
         let src_is_dir = source_attr.file_type == FileType::Directory;
 
+        let mut dest_was_dir = false;
         if let Some(dest_ino) = fs.lookup_child(newparent, newname) {
             // POSIX: when old and new resolve to different directory entries for the same
             // file - two hardlinks to one inode - rename succeeds and does nothing. Without
@@ -230,6 +231,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
                 if !dest_entries.is_empty() {
                     return Err(libc::ENOTEMPTY);
                 }
+                dest_was_dir = true;
                 fs.remove_dir_entry(newparent, newname, now);
                 fs.tombstone(dest_ino);
             } else {
@@ -253,6 +255,24 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
         fs.add_dir_entry(newparent, newname, source_ino, now);
         if src_is_dir && parent != newparent {
             fs.update_dir_parent(source_ino, newparent);
+            fs.update_attr_delta(
+                parent,
+                AttrDelta {
+                    nlink: Some(parent_attr.nlink.saturating_sub(1)),
+                    ctime: Some(now),
+                    ..Default::default()
+                },
+            );
+            if !dest_was_dir {
+                fs.update_attr_delta(
+                    newparent,
+                    AttrDelta {
+                        nlink: Some(newparent_attr.nlink + 1),
+                        ctime: Some(now),
+                        ..Default::default()
+                    },
+                );
+            }
         }
     }
 

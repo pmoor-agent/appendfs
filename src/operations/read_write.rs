@@ -189,7 +189,7 @@ pub fn setattr_core(
     let mut attr_delta = AttrDelta::default();
 
     if (to_set & FUSE_SET_ATTR_MODE) != 0 {
-        attr_delta.mode = Some(mode & 0o777);
+        attr_delta.mode = Some(mode & 0o7777);
         attr_delta.ctime = Some(now);
     }
     if (to_set & FUSE_SET_ATTR_UID) != 0 {
@@ -307,7 +307,7 @@ pub fn create_core(
             size: Some(0),
             truncate_mask: None,
             attr_delta: AttrDelta {
-                mode: Some(mode & 0o777),
+                mode: Some(mode & 0o7777),
                 nlink: Some(1),
                 uid: Some(uid),
                 gid: Some(gid),
@@ -324,7 +324,7 @@ pub fn create_core(
         FileAttr {
             ino: new_ino,
             file_type: FileType::RegularFile,
-            perm: mode & 0o777,
+            perm: mode & 0o7777,
             nlink: 1,
             uid,
             gid,

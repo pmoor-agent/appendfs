@@ -247,12 +247,8 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
         let attr = getattr_core(fs, ino).unwrap_or_else(|e| panic!("getattr({}) failed: {}", ino, e));
         match attr.file_type {
             FileType::Directory => {
-                assert_eq!(
-                    attr.nlink, 2,
-                    "directory inode {} has unexpected nlink {} (expected 2)",
-                    ino, attr.nlink
-                );
                 let entries = list_dir_core(fs, ino).unwrap_or_else(|e| panic!("list_dir({}) failed: {}", ino, e));
+                let mut child_subdirs = 0;
                 for (name, child_ino) in entries {
                     let child_attr = match getattr_core(fs, child_ino) {
                         Ok(a) => a,
@@ -280,6 +276,7 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
                         }
                     };
                     if child_attr.file_type == FileType::Directory {
+                        child_subdirs += 1;
                         assert!(
                             visited.insert(child_ino),
                             "directory inode {} reachable from more than one parent \
@@ -292,6 +289,14 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
                         visited.insert(child_ino);
                     }
                 }
+                assert_eq!(
+                    attr.nlink,
+                    2 + child_subdirs,
+                    "directory inode {} has unexpected nlink {} (expected {})",
+                    ino,
+                    attr.nlink,
+                    2 + child_subdirs
+                );
             }
             FileType::Symlink => {
                 readlink_core(fs, ino).unwrap_or_else(|e| panic!("readlink({}) failed: {}", ino, e));

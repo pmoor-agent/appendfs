@@ -1587,4 +1587,69 @@ fn test_xattr_on_directories_and_special_files() {
     );
 }
 
+#[test]
+fn test_directory_nlink_tracking_and_recovery() {
+    let clock = Arc::new(appendfs::SystemClock);
+    let log_dir = tempfile::Builder::new()
+        .prefix("appendfs_dir_nlink_log_")
+        .tempdir()
+        .unwrap();
+    let log_path = log_dir.path().to_path_buf();
+
+    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1, &*clock).unwrap());
+    let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+    let mount_dir = tempfile::Builder::new()
+        .prefix("appendfs_dir_nlink_mnt_")
+        .tempdir()
+        .unwrap();
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, fs_instance, false);
+    let mount_path = mount.path().to_path_buf();
+
+    // 1. Initial root directory (st_nlink == 2)
+    let root_meta = fs::metadata(&mount_path).unwrap();
+    assert_eq!(root_meta.nlink(), 2);
+
+    // 2. Create subdirectories in root
+    let d1 = mount_path.join("d1");
+    let d2 = mount_path.join("d2");
+    fs::create_dir(&d1).unwrap();
+    fs::create_dir(&d2).unwrap();
+
+    // Root should now have nlink 4 (2 + 2 subdirs), d1 and d2 have nlink 2
+    assert_eq!(fs::metadata(&mount_path).unwrap().nlink(), 4);
+    assert_eq!(fs::metadata(&d1).unwrap().nlink(), 2);
+    assert_eq!(fs::metadata(&d2).unwrap().nlink(), 2);
+
+    // 3. Create nested subdirectory in d1
+    let sub = d1.join("sub");
+    fs::create_dir(&sub).unwrap();
+    assert_eq!(fs::metadata(&d1).unwrap().nlink(), 3);
+
+    // 4. Move sub to d2
+    let sub_in_d2 = d2.join("sub");
+    fs::rename(&sub, &sub_in_d2).unwrap();
+    assert_eq!(fs::metadata(&d1).unwrap().nlink(), 2);
+    assert_eq!(fs::metadata(&d2).unwrap().nlink(), 3);
+
+    // 5. Unmount and recover
+    mount.unmount();
+
+    let recovered_fs = appendfs::recover_fs(&log_path).expect("recovery should succeed");
+    let remount_dir = tempfile::Builder::new()
+        .prefix("appendfs_dir_nlink_remount_")
+        .tempdir()
+        .unwrap();
+    let log_dir_keep = tempfile::tempdir().unwrap();
+    let remount = TestMount::mount_custom(log_dir_keep, remount_dir, recovered_fs, false);
+    let remount_path = remount.path().to_path_buf();
+
+    // Verify link counts on remount
+    assert_eq!(fs::metadata(&remount_path).unwrap().nlink(), 4);
+    assert_eq!(fs::metadata(remount_path.join("d1")).unwrap().nlink(), 2);
+    assert_eq!(fs::metadata(remount_path.join("d2")).unwrap().nlink(), 3);
+    assert_eq!(fs::metadata(remount_path.join("d2/sub")).unwrap().nlink(), 2);
+}
+
+
 

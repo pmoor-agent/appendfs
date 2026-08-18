@@ -363,6 +363,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 let parent_node = Arc::make_mut(parent_node_arc);
                 if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                     entries.push((mkdir.name, target_ino));
+                    parent_node.meta.nlink += 1;
                     parent_node.meta.mtime = now;
                     parent_node.meta.ctime = now;
                 }
@@ -428,6 +429,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                 let parent_node = Arc::make_mut(parent_node_arc);
                 if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                     entries.retain(|(name, ino)| !(name == &rmdir.name && *ino == target_ino));
+                    parent_node.meta.nlink = parent_node.meta.nlink.saturating_sub(1);
                     parent_node.meta.mtime = now;
                     parent_node.meta.ctime = now;
                 }
@@ -457,6 +459,8 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
             let now = rename.op_time;
             let mut map = fs_instance.base.write().unwrap();
 
+            let target_is_dir = map.get(&target_ino).is_some_and(|node| node.is_dir());
+
             let overwritten_ino = if rename.old_parent == rename.new_parent {
                 let mut overwritten = None;
                 if let Some(parent_node_arc) = map.get_mut(&rename.old_parent) {
@@ -485,19 +489,22 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     let parent_node = Arc::make_mut(parent_node_arc);
                     if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
                         entries.retain(|(name, ino)| !(name == &rename.old_name && *ino == target_ino));
+                        if target_is_dir {
+                            parent_node.meta.nlink = parent_node.meta.nlink.saturating_sub(1);
+                        }
                         parent_node.meta.mtime = now;
                         parent_node.meta.ctime = now;
                     }
                 }
 
                 // Add new entry, capturing any destination inode it clobbers
-                if let Some(newparent_node_arc) = map.get_mut(&rename.new_parent) {
+                let overwritten = if let Some(newparent_node_arc) = map.get_mut(&rename.new_parent) {
                     let newparent_node = Arc::make_mut(newparent_node_arc);
                     if let NodeKind::Directory { entries, .. } = &mut newparent_node.kind {
-                        let overwritten = entries
+                        let dest_pos = entries
                             .iter()
-                            .position(|(name, ino)| name == &rename.new_name && *ino != target_ino)
-                            .map(|pos| entries.remove(pos).1);
+                            .position(|(name, ino)| name == &rename.new_name && *ino != target_ino);
+                        let overwritten = dest_pos.map(|pos| entries.remove(pos).1);
                         entries.push((rename.new_name.clone(), target_ino));
                         newparent_node.meta.mtime = now;
                         newparent_node.meta.ctime = now;
@@ -507,7 +514,21 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     }
                 } else {
                     None
+                };
+
+                if target_is_dir {
+                    let dest_was_dir = overwritten
+                        .and_then(|dest_ino| map.get(&dest_ino))
+                        .is_some_and(|node| node.is_dir());
+                    if !dest_was_dir
+                        && let Some(newparent_node_arc) = map.get_mut(&rename.new_parent)
+                    {
+                        let newparent_node = Arc::make_mut(newparent_node_arc);
+                        newparent_node.meta.nlink += 1;
+                    }
                 }
+
+                overwritten
             };
 
             if rename.old_parent != rename.new_parent
