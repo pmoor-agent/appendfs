@@ -358,9 +358,10 @@ impl TestFS {
         self.fs.log_writer = None;
         drop(self);
         let rec = Self::recover_into(&log_dir, temp_dir, clock, fault);
-        rec.fs
-            .next_inode
-            .store(rec.fs.next_inode.load(Ordering::SeqCst).max(next_inode), Ordering::SeqCst);
+        rec.fs.next_inode.store(
+            rec.fs.next_inode.load(Ordering::SeqCst).max(next_inode),
+            Ordering::SeqCst,
+        );
         rec
     }
 

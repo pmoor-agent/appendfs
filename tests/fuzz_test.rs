@@ -305,7 +305,15 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let mut gid = None;
                         let mut size = None;
                         if prng.gen_range(0, 1) == 0 {
-                            mode = Some(0o600 + prng.gen_range(0, 0o177) as u32);
+                            let special = match prng.gen_range(0, 7) {
+                                1 => 0o4000,
+                                2 => 0o2000,
+                                3 => 0o1000,
+                                4 => 0o6000,
+                                5 => 0o7000,
+                                _ => 0,
+                            };
+                            mode = Some(special | (0o600 + prng.gen_range(0, 0o177) as u32));
                         }
                         if prng.gen_range(0, 1) == 0 {
                             uid = Some(prng.gen_range(1000, 2000) as u32);
@@ -1385,7 +1393,17 @@ fn test_summary_export_is_deterministic() {
                 3 => {
                     if !files.is_empty() {
                         let ino = files[prng.gen_range(0, files.len() - 1)];
-                        let mode = (prng.gen_range(0, 1) == 0).then(|| 0o600 + prng.gen_range(0, 0o177) as u32);
+                        let mode = (prng.gen_range(0, 1) == 0).then(|| {
+                            let special = match prng.gen_range(0, 7) {
+                                1 => 0o4000,
+                                2 => 0o2000,
+                                3 => 0o1000,
+                                4 => 0o6000,
+                                5 => 0o7000,
+                                _ => 0,
+                            };
+                            special | (0o600 + prng.gen_range(0, 0o177) as u32)
+                        });
                         let size = (prng.gen_range(0, 1) == 0).then(|| prng.gen_range(0, 200) as u64);
                         let _ = fs.setattr(ino, mode, None, None, size, None, None);
                     }

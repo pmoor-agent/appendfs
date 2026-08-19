@@ -42,10 +42,7 @@ impl VolumeStats {
                     total_logical_bytes += *size;
                 }
                 NodeKind::Symlink { .. } => symlink_count += 1,
-                NodeKind::Fifo
-                | NodeKind::CharDevice { .. }
-                | NodeKind::BlockDevice { .. }
-                | NodeKind::Socket => {}
+                NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
             }
         }
 

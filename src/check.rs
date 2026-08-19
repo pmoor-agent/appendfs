@@ -260,10 +260,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                 report.total_data_bytes += *size;
             }
             NodeKind::Symlink { .. } => report.symlinks += 1,
-            NodeKind::Fifo
-            | NodeKind::CharDevice { .. }
-            | NodeKind::BlockDevice { .. }
-            | NodeKind::Socket => {}
+            NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
         }
     }
 

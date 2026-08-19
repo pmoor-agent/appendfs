@@ -354,8 +354,8 @@ pub fn setlk_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -515,7 +515,10 @@ mod tests {
 
         // Verify Thread 2 is blocked while Owner 1 holds lock
         thread::sleep(Duration::from_millis(50));
-        assert!(!acquired.load(Ordering::SeqCst), "Thread 2 should be blocked on F_SETLKW");
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "Thread 2 should be blocked on F_SETLKW"
+        );
 
         // Owner 1 unlocks [0..100)
         let unlock1 = ShimFlock {
@@ -529,6 +532,9 @@ mod tests {
 
         // Thread 2 should now unblock and acquire the lock
         handle.join().unwrap();
-        assert!(acquired.load(Ordering::SeqCst), "Thread 2 should have acquired the lock after unblocking");
+        assert!(
+            acquired.load(Ordering::SeqCst),
+            "Thread 2 should have acquired the lock after unblocking"
+        );
     }
 }

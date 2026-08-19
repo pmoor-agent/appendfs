@@ -1,4 +1,5 @@
 mod common;
+use appendfs::Clock;
 use common::TestMount;
 use std::fs;
 use std::io::Write;
@@ -1227,7 +1228,11 @@ with open("{}", "r+") as f:
 
     // Verify child process is blocked while f1 holds write lock
     thread::sleep(Duration::from_millis(100));
-    assert_eq!(child.try_wait().unwrap(), None, "Child process should be blocked on F_SETLKW");
+    assert_eq!(
+        child.try_wait().unwrap(),
+        None,
+        "Child process should be blocked on F_SETLKW"
+    );
 
     // Unlock f1 -> child process should unblock and exit
     fl.l_type = libc::F_UNLCK as i16;
@@ -1235,7 +1240,10 @@ with open("{}", "r+") as f:
     assert_eq!(ret_fcntl_un, 0, "fcntl(f1, F_SETLK, F_UNLCK) should succeed");
 
     let status = child.wait().unwrap();
-    assert!(status.success(), "Child process should exit successfully after acquiring lock");
+    assert!(
+        status.success(),
+        "Child process should exit successfully after acquiring lock"
+    );
 }
 
 #[test]
@@ -1300,7 +1308,10 @@ fn test_special_file_types_and_recovery() {
 
     // 2. Recover filesystem and verify special nodes survived
     let recovered_fs = appendfs::log::recover_fs(&log_path).expect("recover_fs should succeed");
-    let remount_dir = tempfile::Builder::new().prefix("appendfs_spec_remount_").tempdir().unwrap();
+    let remount_dir = tempfile::Builder::new()
+        .prefix("appendfs_spec_remount_")
+        .tempdir()
+        .unwrap();
     let log_dir_keep = tempfile::tempdir().unwrap();
 
     let remount = TestMount::mount_custom(log_dir_keep, remount_dir, recovered_fs, false);
@@ -1440,9 +1451,7 @@ fn test_xattr_fuse_crud_and_crash_recovery() {
 
     // 1. Initial get / list on file with no xattrs
     assert_eq!(
-        sys_getxattr(&file_path, "user.comment")
-            .unwrap_err()
-            .raw_os_error(),
+        sys_getxattr(&file_path, "user.comment").unwrap_err().raw_os_error(),
         Some(libc::ENODATA)
     );
     assert_eq!(sys_listxattr(&file_path).unwrap(), Vec::<String>::new());
@@ -1462,43 +1471,23 @@ fn test_xattr_fuse_crud_and_crash_recovery() {
     );
 
     // 4. Verify get and list
-    assert_eq!(
-        sys_getxattr(&file_path, "user.comment").unwrap(),
-        b"hello appendfs"
-    );
-    assert_eq!(
-        sys_getxattr(&file_path, "user.binary").unwrap(),
-        binary_data
-    );
-    assert_eq!(
-        sys_getxattr(&file_path, "user.author").unwrap(),
-        b"antigravity"
-    );
+    assert_eq!(sys_getxattr(&file_path, "user.comment").unwrap(), b"hello appendfs");
+    assert_eq!(sys_getxattr(&file_path, "user.binary").unwrap(), binary_data);
+    assert_eq!(sys_getxattr(&file_path, "user.author").unwrap(), b"antigravity");
 
     let mut attrs = sys_listxattr(&file_path).unwrap();
     attrs.sort();
     assert_eq!(attrs, vec!["user.author", "user.binary", "user.comment"]);
 
     // 5. Update and remove
-    sys_setxattr(
-        &file_path,
-        "user.comment",
-        b"updated comment",
-        libc::XATTR_REPLACE,
-    )
-    .unwrap();
+    sys_setxattr(&file_path, "user.comment", b"updated comment", libc::XATTR_REPLACE).unwrap();
     sys_removexattr(&file_path, "user.author").unwrap();
 
     assert_eq!(
-        sys_getxattr(&file_path, "user.author")
-            .unwrap_err()
-            .raw_os_error(),
+        sys_getxattr(&file_path, "user.author").unwrap_err().raw_os_error(),
         Some(libc::ENODATA)
     );
-    assert_eq!(
-        sys_getxattr(&file_path, "user.comment").unwrap(),
-        b"updated comment"
-    );
+    assert_eq!(sys_getxattr(&file_path, "user.comment").unwrap(), b"updated comment");
 
     // Unmount and flush to log
     mount.unmount();
@@ -1518,14 +1507,9 @@ fn test_xattr_fuse_crud_and_crash_recovery() {
         sys_getxattr(&recovered_file, "user.comment").unwrap(),
         b"updated comment"
     );
+    assert_eq!(sys_getxattr(&recovered_file, "user.binary").unwrap(), binary_data);
     assert_eq!(
-        sys_getxattr(&recovered_file, "user.binary").unwrap(),
-        binary_data
-    );
-    assert_eq!(
-        sys_getxattr(&recovered_file, "user.author")
-            .unwrap_err()
-            .raw_os_error(),
+        sys_getxattr(&recovered_file, "user.author").unwrap_err().raw_os_error(),
         Some(libc::ENODATA)
     );
 
@@ -1558,10 +1542,7 @@ fn test_xattr_on_directories_and_special_files() {
     fs::create_dir(&dir_path).unwrap();
 
     sys_setxattr(&dir_path, "user.folder_tag", b"photos_2026", 0).unwrap();
-    assert_eq!(
-        sys_getxattr(&dir_path, "user.folder_tag").unwrap(),
-        b"photos_2026"
-    );
+    assert_eq!(sys_getxattr(&dir_path, "user.folder_tag").unwrap(), b"photos_2026");
     assert_eq!(sys_listxattr(&dir_path).unwrap(), vec!["user.folder_tag"]);
 
     // 2. Symlink creation & directory recovery
@@ -1581,10 +1562,7 @@ fn test_xattr_on_directories_and_special_files() {
     let remount_path = remount.path().to_path_buf();
 
     let rec_dir_path = remount_path.join("test_dir");
-    assert_eq!(
-        sys_getxattr(&rec_dir_path, "user.folder_tag").unwrap(),
-        b"photos_2026"
-    );
+    assert_eq!(sys_getxattr(&rec_dir_path, "user.folder_tag").unwrap(), b"photos_2026");
 }
 
 #[test]
@@ -1651,5 +1629,108 @@ fn test_directory_nlink_tracking_and_recovery() {
     assert_eq!(fs::metadata(remount_path.join("d2/sub")).unwrap().nlink(), 2);
 }
 
+#[test]
+fn test_special_permission_bits_live_folded_and_recovery() {
+    let clock = Arc::new(appendfs::SystemClock);
+    let log_dir = tempfile::Builder::new()
+        .prefix("appendfs_perm_bits_")
+        .tempdir()
+        .unwrap();
+    let log_path = log_dir.path().to_path_buf();
+    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1024 * 1024, &*clock).unwrap());
+    let fs = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
+    // 1. Create file and directory
+    let dir_ino = appendfs::operations::dir::mkdir_core(&fs, 1, "test_dir", 0o755, 1000, 1000)
+        .unwrap()
+        .ino;
+    let file_ino = appendfs::operations::read_write::create_core(&fs, 1, "test_file.bin", 0o644, 0, 1000, 1000)
+        .unwrap()
+        .ino;
 
+    // 2. chmod with setuid + setgid (0o6755) on file
+    let attr1 = appendfs::operations::read_write::setattr_core(
+        &fs,
+        file_ino,
+        0o6755,
+        0,
+        0,
+        0,
+        clock.now(),
+        clock.now(),
+        appendfs::operations::read_write::FUSE_SET_ATTR_MODE,
+    )
+    .unwrap();
+    assert_eq!(
+        attr1.perm, 0o6755,
+        "Immediate setattr return must retain special permission bits"
+    );
+
+    // Check live get_attr (while delta is unfolded in live)
+    let live_attr = fs.get_attr(file_ino).unwrap();
+    assert_eq!(
+        live_attr.perm, 0o6755,
+        "Live get_attr before flush must retain special permission bits"
+    );
+
+    // Set sticky bit (0o1755) on directory
+    let dir_attr1 = appendfs::operations::read_write::setattr_core(
+        &fs,
+        dir_ino,
+        0o1755,
+        0,
+        0,
+        0,
+        clock.now(),
+        clock.now(),
+        appendfs::operations::read_write::FUSE_SET_ATTR_MODE,
+    )
+    .unwrap();
+    assert_eq!(
+        dir_attr1.perm, 0o1755,
+        "Immediate directory setattr return must retain sticky bit"
+    );
+    assert_eq!(
+        fs.get_attr(dir_ino).unwrap().perm,
+        0o1755,
+        "Live directory get_attr must retain sticky bit"
+    );
+
+    // 3. Flush log (folds delta into base)
+    fs.sync_log().unwrap();
+
+    let folded_file = fs.get_attr(file_ino).unwrap();
+    let folded_dir = fs.get_attr(dir_ino).unwrap();
+    assert_eq!(
+        folded_file.perm, 0o6755,
+        "Folded base file must retain special permission bits"
+    );
+    assert_eq!(folded_dir.perm, 0o1755, "Folded base directory must retain sticky bit");
+
+    // 4. Recover from log and verify
+    let recovered = appendfs::recover_fs(&log_path).unwrap();
+    let rec_file = recovered.get_attr(file_ino).unwrap();
+    let rec_dir = recovered.get_attr(dir_ino).unwrap();
+    assert_eq!(
+        rec_file.perm, 0o6755,
+        "Recovered file must retain special permission bits"
+    );
+    assert_eq!(rec_dir.perm, 0o1755, "Recovered directory must retain sticky bit");
+
+    // 5. Export summary snapshot and recover from summary
+    let summary_dir = tempfile::tempdir().unwrap();
+    let summary_path = recovered.export_summary(summary_dir.path()).unwrap();
+    assert!(summary_path.exists());
+
+    let summary_recovered = appendfs::recover_fs(summary_dir.path()).unwrap();
+    let sum_file = summary_recovered.get_attr(file_ino).unwrap();
+    let sum_dir = summary_recovered.get_attr(dir_ino).unwrap();
+    assert_eq!(
+        sum_file.perm, 0o6755,
+        "Summary-recovered file must retain special permission bits"
+    );
+    assert_eq!(
+        sum_dir.perm, 0o1755,
+        "Summary-recovered directory must retain sticky bit"
+    );
+}

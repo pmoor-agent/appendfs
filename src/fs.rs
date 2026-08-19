@@ -1,8 +1,8 @@
 use crate::clock::{Clock, SystemClock};
 use crate::log::{
     BackgroundFlusher, CreatePayload, ExtentState, GenerationLiveStats, LinkPayload, LogFileCache, LogManifest,
-    LogWriter, MkdirPayload, MknodPayload, OpCode, RECORD_HEADER_SIZE, RemovexattrPayload, RenamePayload,
-    RmdirPayload, SetattrPayload, SetxattrPayload, SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
+    LogWriter, MkdirPayload, MknodPayload, OpCode, RECORD_HEADER_SIZE, RemovexattrPayload, RenamePayload, RmdirPayload,
+    SetattrPayload, SetxattrPayload, SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
 use crate::node::{
     AttrDelta, DirectoryDelta, EntryDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta, SymlinkDelta,
@@ -1260,10 +1260,7 @@ impl InMemoryFS {
                     estimated_bytes += RECORD_HEADER_SIZE as u64 + 128;
                 }
                 EntryDelta::Node(
-                    NodeDelta::Fifo(_)
-                    | NodeDelta::CharDevice(_)
-                    | NodeDelta::BlockDevice(_)
-                    | NodeDelta::Socket(_),
+                    NodeDelta::Fifo(_) | NodeDelta::CharDevice(_) | NodeDelta::BlockDevice(_) | NodeDelta::Socket(_),
                 ) => {
                     estimated_bytes += RECORD_HEADER_SIZE as u64 + 128;
                 }
@@ -2412,10 +2409,7 @@ fn apply_node_delta(attr: &mut FileAttr, delta: &NodeDelta) {
             }
             apply_attr_delta(attr, &s.attr_delta);
         }
-        NodeDelta::Fifo(s)
-        | NodeDelta::CharDevice(s)
-        | NodeDelta::BlockDevice(s)
-        | NodeDelta::Socket(s) => {
+        NodeDelta::Fifo(s) | NodeDelta::CharDevice(s) | NodeDelta::BlockDevice(s) | NodeDelta::Socket(s) => {
             apply_attr_delta(attr, &s.attr_delta);
         }
     }
@@ -2423,7 +2417,7 @@ fn apply_node_delta(attr: &mut FileAttr, delta: &NodeDelta) {
 
 fn apply_attr_delta(attr: &mut FileAttr, delta: &AttrDelta) {
     if let Some(m) = delta.mode {
-        attr.perm = m & 0o777;
+        attr.perm = m & 0o7777;
     }
     if let Some(u) = delta.uid {
         attr.uid = u;

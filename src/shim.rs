@@ -158,8 +158,7 @@ struct RustLowlevelOps {
             userdata: *mut c_void,
         ),
     >,
-    getxattr:
-        Option<extern "C" fn(req: shim_req_t, ino: u64, name: *const c_char, size: usize, userdata: *mut c_void)>,
+    getxattr: Option<extern "C" fn(req: shim_req_t, ino: u64, name: *const c_char, size: usize, userdata: *mut c_void)>,
     setxattr: Option<
         extern "C" fn(
             req: shim_req_t,

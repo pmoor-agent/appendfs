@@ -622,10 +622,7 @@ pub fn dump_summary_reader_with_path(
                         path: p,
                     });
                 }
-                NodeKind::Fifo
-                | NodeKind::CharDevice { .. }
-                | NodeKind::BlockDevice { .. }
-                | NodeKind::Socket => {}
+                NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
             }
         }
     }

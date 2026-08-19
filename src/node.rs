@@ -289,10 +289,9 @@ impl NodeDelta {
             NodeDelta::Directory(d) => &d.attr_delta,
             NodeDelta::File(f) => &f.attr_delta,
             NodeDelta::Symlink(s) => &s.attr_delta,
-            NodeDelta::Fifo(s)
-            | NodeDelta::CharDevice(s)
-            | NodeDelta::BlockDevice(s)
-            | NodeDelta::Socket(s) => &s.attr_delta,
+            NodeDelta::Fifo(s) | NodeDelta::CharDevice(s) | NodeDelta::BlockDevice(s) | NodeDelta::Socket(s) => {
+                &s.attr_delta
+            }
         }
     }
 
@@ -301,10 +300,9 @@ impl NodeDelta {
             NodeDelta::Directory(d) => &mut d.attr_delta,
             NodeDelta::File(f) => &mut f.attr_delta,
             NodeDelta::Symlink(s) => &mut s.attr_delta,
-            NodeDelta::Fifo(s)
-            | NodeDelta::CharDevice(s)
-            | NodeDelta::BlockDevice(s)
-            | NodeDelta::Socket(s) => &mut s.attr_delta,
+            NodeDelta::Fifo(s) | NodeDelta::CharDevice(s) | NodeDelta::BlockDevice(s) | NodeDelta::Socket(s) => {
+                &mut s.attr_delta
+            }
         }
     }
 }

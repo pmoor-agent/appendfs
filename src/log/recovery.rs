@@ -520,9 +520,7 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
                     let dest_was_dir = overwritten
                         .and_then(|dest_ino| map.get(&dest_ino))
                         .is_some_and(|node| node.is_dir());
-                    if !dest_was_dir
-                        && let Some(newparent_node_arc) = map.get_mut(&rename.new_parent)
-                    {
+                    if !dest_was_dir && let Some(newparent_node_arc) = map.get_mut(&rename.new_parent) {
                         let newparent_node = Arc::make_mut(newparent_node_arc);
                         newparent_node.meta.nlink += 1;
                     }

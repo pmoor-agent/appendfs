@@ -115,22 +115,13 @@ mod tests {
         assert_eq!(getxattr_core(&fs, ino, "user.comment", 0), Err(libc::ENODATA));
 
         // 2. Set attribute
-        assert_eq!(
-            setxattr_core(&fs, ino, "user.comment", b"hello world", 0),
-            Ok(())
-        );
+        assert_eq!(setxattr_core(&fs, ino, "user.comment", b"hello world", 0), Ok(()));
 
         // 3. Query size (size == 0)
-        assert_eq!(
-            getxattr_core(&fs, ino, "user.comment", 0),
-            Ok(GetxattrResult::Size(11))
-        );
+        assert_eq!(getxattr_core(&fs, ino, "user.comment", 0), Ok(GetxattrResult::Size(11)));
 
         // 4. Query with insufficient buffer -> ERANGE
-        assert_eq!(
-            getxattr_core(&fs, ino, "user.comment", 5),
-            Err(libc::ERANGE)
-        );
+        assert_eq!(getxattr_core(&fs, ino, "user.comment", 5), Err(libc::ERANGE));
 
         // 5. Query with sufficient buffer -> Data
         assert_eq!(
@@ -168,10 +159,7 @@ mod tests {
         );
 
         // CREATE succeeds on nonexistent attribute
-        assert_eq!(
-            setxattr_core(&fs, ino, "user.tag", b"v1", libc::XATTR_CREATE),
-            Ok(())
-        );
+        assert_eq!(setxattr_core(&fs, ino, "user.tag", b"v1", libc::XATTR_CREATE), Ok(()));
 
         // CREATE fails on existing attribute
         assert_eq!(
@@ -180,10 +168,7 @@ mod tests {
         );
 
         // REPLACE succeeds on existing attribute
-        assert_eq!(
-            setxattr_core(&fs, ino, "user.tag", b"v2", libc::XATTR_REPLACE),
-            Ok(())
-        );
+        assert_eq!(setxattr_core(&fs, ino, "user.tag", b"v2", libc::XATTR_REPLACE), Ok(()));
 
         assert_eq!(
             getxattr_core(&fs, ino, "user.tag", 10),
