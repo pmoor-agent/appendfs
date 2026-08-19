@@ -10,7 +10,7 @@ use crate::node::{
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
 use crate::storage::Storage;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -251,31 +251,28 @@ impl<'a> InodeLayerStack<'a> {
     /// Lists all extended attribute names across layers in alphabetical order.
     pub fn list_xattrs(&self) -> Option<Vec<String>> {
         let _attr = self.attr()?;
-        let mut map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut names: BTreeSet<String> = BTreeSet::new();
 
         if let Some(arc) = self.base
             && let Some(ref xattrs) = arc.meta.xattrs
         {
-            for (k, v) in xattrs.iter() {
-                map.insert(k.clone(), v.clone());
+            for k in xattrs.keys() {
+                names.insert(k.clone());
             }
         }
 
         for delta in &self.deltas {
             match delta {
                 EntryDelta::Tombstone => {
-                    map.clear();
+                    names.clear();
                 }
                 EntryDelta::Node(d) => {
                     if let Some(ref xattrs) = d.attr_delta().xattrs {
                         for (k, v) in xattrs {
-                            match v {
-                                Some(val) => {
-                                    map.insert(k.clone(), val.clone());
-                                }
-                                None => {
-                                    map.remove(k);
-                                }
+                            if v.is_some() {
+                                names.insert(k.clone());
+                            } else {
+                                names.remove(k);
                             }
                         }
                     }
@@ -283,7 +280,7 @@ impl<'a> InodeLayerStack<'a> {
             }
         }
 
-        Some(map.into_keys().collect())
+        Some(names.into_iter().collect())
     }
 
     /// Reads file data resolving extents across layers.
