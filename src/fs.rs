@@ -41,6 +41,322 @@ pub struct RangeLock {
     pub pid: i32,
 }
 
+// --- Layer Stack Snapshot & Fold Abstraction ---
+
+/// Borrowed snapshot view of an inode's layer hierarchy (`base` plus chronological `deltas`).
+/// Constructed while holding all necessary layer read locks, enabling race-free,
+/// zero-copy folding directly under the locks.
+pub struct InodeLayerStack<'a> {
+    pub ino: u64,
+    pub base: Option<&'a Arc<Node>>,
+    /// Chronological list of entry deltas ordered from oldest to newest (`flushing[0]` ... `flushing[n]`, `[live]`).
+    pub deltas: Vec<&'a EntryDelta>,
+}
+
+impl<'a> InodeLayerStack<'a> {
+    /// Resolves full `FileAttr` across `base` and `deltas` (folded oldest to newest).
+    pub fn attr(&self) -> Option<FileAttr> {
+        let mut attr = self.base.map(|arc| node_to_attr(self.ino, arc.as_ref()));
+        for delta in &self.deltas {
+            match delta {
+                EntryDelta::Tombstone => {
+                    attr = None;
+                }
+                EntryDelta::Node(d) => {
+                    if let Some(ref mut a) = attr {
+                        apply_node_delta(a, d);
+                    } else {
+                        let mut a = delta_to_initial_attr(self.ino, d);
+                        apply_node_delta(&mut a, d);
+                        attr = Some(a);
+                    }
+                }
+            }
+        }
+        attr
+    }
+
+    /// Checks if the inode exists (is not tombstoned and present in deltas or base).
+    pub fn exists(&self) -> bool {
+        if let Some(delta) = self.deltas.last() {
+            return matches!(delta, EntryDelta::Node(_));
+        }
+        self.base.is_some()
+    }
+
+    /// Resolves the file type of the inode (checking newest deltas first).
+    pub fn file_type(&self) -> Option<FileType> {
+        if let Some(delta) = self.deltas.last() {
+            return match delta {
+                EntryDelta::Tombstone => None,
+                EntryDelta::Node(d) => Some(match d {
+                    NodeDelta::Directory(_) => FileType::Directory,
+                    NodeDelta::File(_) => FileType::RegularFile,
+                    NodeDelta::Symlink(_) => FileType::Symlink,
+                    NodeDelta::Fifo(_) => FileType::NamedPipe,
+                    NodeDelta::CharDevice(_) => FileType::CharDevice,
+                    NodeDelta::BlockDevice(_) => FileType::BlockDevice,
+                    NodeDelta::Socket(_) => FileType::Socket,
+                }),
+            };
+        }
+        self.base.map(|arc| arc.file_type())
+    }
+
+    /// Looks up a child entry by `name` inside directory `self.ino`.
+    pub fn lookup_child(&self, name: &str) -> Option<u64> {
+        for delta in self.deltas.iter().rev() {
+            match delta {
+                EntryDelta::Tombstone => return None,
+                EntryDelta::Node(NodeDelta::Directory(d)) => {
+                    if d.removed.contains(name) {
+                        return None;
+                    }
+                    if let Some(&ino) = d.added.get(name) {
+                        return Some(ino);
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        if let Some(arc) = self.base {
+            let node = arc.as_ref();
+            if let NodeKind::Directory { entries, .. } = &node.kind
+                && let Some((_, ino)) = entries.iter().find(|(entry_name, _)| entry_name == name)
+            {
+                return Some(*ino);
+            }
+        }
+
+        None
+    }
+
+    /// Lists all consolidated directory entries across layers in alphabetical order.
+    pub fn list_directory(&self) -> Option<Vec<(String, u64)>> {
+        let attr = self.attr()?;
+        if attr.file_type != FileType::Directory {
+            return None;
+        }
+
+        let mut map: HashMap<String, u64> = HashMap::new();
+
+        if let Some(arc) = self.base {
+            let node = arc.as_ref();
+            if let NodeKind::Directory { entries, .. } = &node.kind {
+                for (name, child_ino) in entries {
+                    map.insert(name.clone(), *child_ino);
+                }
+            }
+        }
+
+        for delta in &self.deltas {
+            match delta {
+                EntryDelta::Tombstone => {
+                    map.clear();
+                }
+                EntryDelta::Node(NodeDelta::Directory(d)) => {
+                    for name in &d.removed {
+                        map.remove(name);
+                    }
+                    for (name, child_ino) in &d.added {
+                        map.insert(name.clone(), *child_ino);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut list: Vec<(String, u64)> = map.into_iter().collect();
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(list)
+    }
+
+    /// Reads target of a symlink across layers.
+    pub fn read_link(&self) -> Option<String> {
+        for delta in self.deltas.iter().rev() {
+            match delta {
+                EntryDelta::Tombstone => return None,
+                EntryDelta::Node(NodeDelta::Symlink(s)) => {
+                    if let Some(ref t) = s.target {
+                        return Some(t.clone());
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        if let Some(arc) = self.base {
+            let node = arc.as_ref();
+            if let NodeKind::Symlink { target, .. } = &node.kind {
+                return Some(target.clone());
+            }
+        }
+
+        None
+    }
+
+    /// Returns the parent directory inode.
+    pub fn parent_dir_inode(&self) -> Option<u64> {
+        if self.ino == 1 {
+            return Some(1);
+        }
+
+        for delta in self.deltas.iter().rev() {
+            match delta {
+                EntryDelta::Tombstone => return None,
+                EntryDelta::Node(NodeDelta::Directory(d)) => {
+                    if let Some(p) = d.parent {
+                        return Some(p);
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        if let Some(arc) = self.base {
+            let node = arc.as_ref();
+            if let NodeKind::Directory { parent, .. } = &node.kind {
+                return Some(*parent);
+            }
+        }
+
+        None
+    }
+
+    /// Resolves an extended attribute value by `name`.
+    pub fn get_xattr(&self, name: &str) -> Option<Vec<u8>> {
+        for delta in self.deltas.iter().rev() {
+            match delta {
+                EntryDelta::Tombstone => return None,
+                EntryDelta::Node(d) => {
+                    if let Some(ref xattrs) = d.attr_delta().xattrs
+                        && let Some(val_opt) = xattrs.get(name)
+                    {
+                        return val_opt.clone();
+                    }
+                }
+            }
+        }
+
+        if let Some(arc) = self.base
+            && let Some(ref xattrs) = arc.meta.xattrs
+        {
+            return xattrs.get(name).cloned();
+        }
+
+        None
+    }
+
+    /// Lists all extended attribute names across layers in alphabetical order.
+    pub fn list_xattrs(&self) -> Option<Vec<String>> {
+        let _attr = self.attr()?;
+        let mut map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+
+        if let Some(arc) = self.base
+            && let Some(ref xattrs) = arc.meta.xattrs
+        {
+            for (k, v) in xattrs.iter() {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+
+        for delta in &self.deltas {
+            match delta {
+                EntryDelta::Tombstone => {
+                    map.clear();
+                }
+                EntryDelta::Node(d) => {
+                    if let Some(ref xattrs) = d.attr_delta().xattrs {
+                        for (k, v) in xattrs {
+                            match v {
+                                Some(val) => {
+                                    map.insert(k.clone(), val.clone());
+                                }
+                                None => {
+                                    map.remove(k);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(map.into_keys().collect())
+    }
+
+    /// Reads file data resolving extents across layers.
+    pub fn read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<Vec<u8>, i32> {
+        let attr = self.attr().ok_or(libc::ENOENT)?;
+        if attr.file_type != FileType::RegularFile {
+            return Err(libc::EISDIR);
+        }
+
+        let file_size = attr.size as u64;
+        if offset >= file_size {
+            return Ok(Vec::new());
+        }
+
+        let read_len = std::cmp::min(size as u64, file_size - offset);
+        let mut read_buf = vec![0u8; read_len as usize];
+        let mut filled = vec![false; read_len as usize];
+
+        let mut current_truncate_mask = u64::MAX;
+        let mut hit_tombstone = false;
+        for delta in self.deltas.iter().rev() {
+            match delta {
+                EntryDelta::Tombstone => {
+                    hit_tombstone = true;
+                    break;
+                }
+                EntryDelta::Node(NodeDelta::File(f)) => {
+                    let max_read = std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
+                    if max_read > 0 {
+                        for (ext_start, ext_len, shared_state) in f.extents.query(offset, max_read) {
+                            fs.copy_extent_data(
+                                &mut read_buf,
+                                &mut filled,
+                                offset,
+                                read_len,
+                                ext_start,
+                                ext_len,
+                                &shared_state,
+                            );
+                        }
+                    }
+                    if let Some(mask) = f.truncate_mask {
+                        current_truncate_mask = std::cmp::min(current_truncate_mask, mask);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !hit_tombstone && let Some(arc) = self.base {
+            let node = arc.as_ref();
+            if let NodeKind::File { range_map, .. } = &node.kind {
+                let max_base_read = std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
+                if max_base_read > 0 {
+                    for (ext_start, ext_len, shared_state) in range_map.query(offset, max_base_read) {
+                        fs.copy_extent_data(
+                            &mut read_buf,
+                            &mut filled,
+                            offset,
+                            read_len,
+                            ext_start,
+                            ext_len,
+                            &shared_state,
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(read_buf)
+    }
+}
+
 pub struct InMemoryFS {
     /// Resting consolidated state loaded from `.summary` at mount, folded forward over
     /// generations.
@@ -322,50 +638,7 @@ impl InMemoryFS {
     }
 
     pub fn get_parent_dir_inode(&self, ino: u64) -> Option<u64> {
-        if ino == 1 {
-            return Some(1);
-        }
-
-        // 1. Check live delta
-        if let Some(entry) = self.live.read().unwrap().get(&ino) {
-            match entry {
-                EntryDelta::Tombstone => return None,
-                EntryDelta::Node(NodeDelta::Directory(d)) => {
-                    if let Some(p) = d.parent {
-                        return Some(p);
-                    }
-                }
-                _ => return None,
-            }
-        }
-
-        // 2. Check flushing deltas (newest to oldest)
-        {
-            let flushing_read = self.flushing.read().unwrap();
-            for flushing_map in flushing_read.iter().rev() {
-                if let Some(entry) = flushing_map.get(&ino) {
-                    match entry {
-                        EntryDelta::Tombstone => return None,
-                        EntryDelta::Node(NodeDelta::Directory(d)) => {
-                            if let Some(p) = d.parent {
-                                return Some(p);
-                            }
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-        }
-
-        // 3. Check base
-        if let Some(arc) = self.base.read().unwrap().get(&ino) {
-            let node = arc.as_ref();
-            if let NodeKind::Directory { parent, .. } = &node.kind {
-                return Some(*parent);
-            }
-        }
-
-        None
+        self.with_inode_layers(ino, |layers| layers.parent_dir_inode())
     }
 
     pub fn update_attr_delta(&self, ino: u64, delta: AttrDelta) {
@@ -392,60 +665,7 @@ impl InMemoryFS {
         }
 
         // Inode not in live yet - query existing type from lower layers without re-acquiring live lock.
-        // A tombstone found in `flushing` is authoritative and must NOT fall through to
-        // `base`: `base` still holds the pre-delete node until that tombstone's batch is
-        // folded, and since inode numbers are never reused, a tombstone anywhere below
-        // `live` means this inode is gone for good. Collapsing "explicitly tombstoned"
-        // and "not found at all" into the same `None` (as a bare `Option<FileType>`
-        // would) made this fall through to `base` and resurrect the inode - exactly the
-        // live-side counterpart of the `live`-tombstone case handled above.
-        let mut file_type = None;
-        let mut found_in_flushing = false;
-        {
-            let flushing_read = self.flushing.read().unwrap();
-            for flushing_map in flushing_read.iter().rev() {
-                if let Some(entry) = flushing_map.get(&ino) {
-                    found_in_flushing = true;
-                    match entry {
-                        EntryDelta::Tombstone => {
-                            file_type = None;
-                            break;
-                        }
-                        EntryDelta::Node(NodeDelta::Directory(_)) => {
-                            file_type = Some(FileType::Directory);
-                            break;
-                        }
-                        EntryDelta::Node(NodeDelta::File(_)) => {
-                            file_type = Some(FileType::RegularFile);
-                            break;
-                        }
-                        EntryDelta::Node(NodeDelta::Symlink(_)) => {
-                            file_type = Some(FileType::Symlink);
-                            break;
-                        }
-                        EntryDelta::Node(NodeDelta::Fifo(_)) => {
-                            file_type = Some(FileType::NamedPipe);
-                            break;
-                        }
-                        EntryDelta::Node(NodeDelta::CharDevice(_)) => {
-                            file_type = Some(FileType::CharDevice);
-                            break;
-                        }
-                        EntryDelta::Node(NodeDelta::BlockDevice(_)) => {
-                            file_type = Some(FileType::BlockDevice);
-                            break;
-                        }
-                        EntryDelta::Node(NodeDelta::Socket(_)) => {
-                            file_type = Some(FileType::Socket);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if file_type.is_none() && !found_in_flushing {
-            file_type = self.base.read().unwrap().get(&ino).map(|arc| arc.file_type());
-        }
+        let file_type = self.with_inode_layers_below_live(ino, |layers| layers.file_type());
 
         match file_type {
             Some(FileType::Directory) => {
@@ -519,423 +739,138 @@ impl InMemoryFS {
         }
     }
 
-    /// Whether `ino` still resolves in the layers *below* `live`.
-    ///
-    /// Callers that would insert a fresh delta for an inode absent from `live` must check
-    /// this while holding the `live` write lock. Validating with `get_attr` first is not
-    /// enough: the inode can be unlinked in the window before the lock is taken, and once
-    /// its tombstone has been frozen out of `live` it is invisible to `live.entry(..)`, so
-    /// the new delta folds into `base` *after* the tombstone and resurrects the inode -
-    /// with `delta_to_node`'s defaults (uid/gid 0, atime at the epoch) and no directory
-    /// referencing it.
-    pub fn exists_below_live(&self, ino: u64) -> bool {
-        {
-            let flushing = self.flushing.read().unwrap();
-            for batch in flushing.iter().rev() {
-                match batch.get(&ino) {
-                    Some(EntryDelta::Tombstone) => return false,
-                    Some(EntryDelta::Node(_)) => return true,
-                    None => {}
-                }
-            }
-        }
-        self.base.read().unwrap().contains_key(&ino)
-    }
-
     // --- Overlay Query & Resolution Methods ---
 
-    /// Resolves full `FileAttr` for an inode across `flushing` -> `base`, deliberately
-    /// skipping `live`. Used by mutators that already hold `live`'s write lock and need
-    /// the authoritative pre-live state *as of right now* - unlike a `get_attr` call
-    /// made before taking that lock, which can go stale if a flush freezes `live` out
-    /// from under the caller in the window between the read and the lock acquisition.
-    ///
-    /// Reads `flushing` *before* `base`, even though `base` is logically the older
-    /// layer: `fold_flushed_batch` writes a batch's delta into `base` and only pops it
-    /// out of `flushing` afterward, so a batch is briefly visible in both places at
-    /// once, never in neither. Reading `base` first (as this used to) can straddle that
-    /// transition - a `base` read that lands *before* the fold's write, followed by a
-    /// `flushing` read that lands *after* the pop, sees neither the old value (base
-    /// hadn't been touched... it had, we just read too early) nor the new one, silently
-    /// dropping the update. Reading `flushing` first closes the gap: if a batch is
-    /// already gone from `flushing` by the time we check, the fold that removed it
-    /// happened-before that observation, and the fold's `base` write happened-before
-    /// its own pop - so by transitivity our later `base` read is guaranteed fresh.
-    pub fn attr_below_live(&self, ino: u64) -> Option<FileAttr> {
-        let flushing_entries: Vec<EntryDelta> = self
-            .flushing
-            .read()
-            .unwrap()
-            .iter()
-            .filter_map(|batch| batch.get(&ino).cloned())
-            .collect();
-        let base_node = self.base.read().unwrap().get(&ino).cloned();
+    /// Acquires read locks across all three layers (`live`, `flushing`, `base`) atomically in
+    /// consistent safe order and invokes `f` with the combined `InodeLayerStack` for `ino`.
+    /// Zero-copy folding executes directly under the read locks.
+    pub fn with_inode_layers<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
+        let live = self.live.read().unwrap();
+        let flushing = self.flushing.read().unwrap();
+        let base = self.base.read().unwrap();
 
-        let mut attr: Option<FileAttr> = base_node.map(|arc| node_to_attr(ino, arc.as_ref()));
-        for entry in &flushing_entries {
-            match entry {
-                EntryDelta::Tombstone => {
-                    attr = None;
-                }
-                EntryDelta::Node(delta) => {
-                    if let Some(ref mut a) = attr {
-                        apply_node_delta(a, delta);
-                    } else {
-                        let mut a = delta_to_initial_attr(ino, delta);
-                        apply_node_delta(&mut a, delta);
-                        attr = Some(a);
-                    }
-                }
+        let base_entry = base.get(&ino);
+        let mut deltas = Vec::with_capacity(flushing.len() + 1);
+        for batch in flushing.iter() {
+            if let Some(entry) = batch.get(&ino) {
+                deltas.push(entry);
+            }
+        }
+        if let Some(entry) = live.get(&ino) {
+            deltas.push(entry);
+        }
+
+        let stack = InodeLayerStack {
+            ino,
+            base: base_entry,
+            deltas,
+        };
+
+        f(stack)
+    }
+
+    /// Acquires read locks across `flushing` and `base` layers (skipping `live`) for callers
+    /// that already hold `live.write()`.
+    pub fn with_inode_layers_below_live<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
+        let flushing = self.flushing.read().unwrap();
+        let base = self.base.read().unwrap();
+
+        let base_entry = base.get(&ino);
+        let mut deltas = Vec::with_capacity(flushing.len());
+        for batch in flushing.iter() {
+            if let Some(entry) = batch.get(&ino) {
+                deltas.push(entry);
             }
         }
 
-        attr
+        let stack = InodeLayerStack {
+            ino,
+            base: base_entry,
+            deltas,
+        };
+
+        f(stack)
+    }
+
+    /// Executes `f` while holding read locks on all three layers (`live`, `flushing`, `base`).
+    pub fn with_layers<R>(
+        &self,
+        f: impl FnOnce(&HashMap<u64, EntryDelta>, &VecDeque<HashMap<u64, EntryDelta>>, &HashMap<u64, Arc<Node>>) -> R,
+    ) -> R {
+        let live = self.live.read().unwrap();
+        let flushing = self.flushing.read().unwrap();
+        let base = self.base.read().unwrap();
+        f(&live, &flushing, &base)
+    }
+
+    /// Validates whether an inode exists in the layers below `live` (flushing -> base).
+    pub fn exists_below_live(&self, ino: u64) -> bool {
+        self.with_inode_layers_below_live(ino, |layers| layers.exists())
+    }
+
+    /// Resolves full `FileAttr` for an inode across `flushing` -> `base`, skipping `live`.
+    /// Used by mutators holding `live.write()`.
+    pub fn attr_below_live(&self, ino: u64) -> Option<FileAttr> {
+        self.with_inode_layers_below_live(ino, |layers| layers.attr())
     }
 
     /// Resolves full `FileAttr` for an inode across `live` -> `flushing` -> `base`.
-    ///
-    /// Reads `live` before delegating to `attr_below_live` for the same reason that
-    /// function reads `flushing` before `base`: `begin_flush` empties `live` into
-    /// `flushing` in two separate lock acquisitions, so a `live` read landing in that
-    /// gap must be followed by a `flushing`/`base` read that is guaranteed to already
-    /// see it - which is exactly what reading `live` first, then delegating, gives us.
     pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
-        let live_entry = self.live.read().unwrap().get(&ino).cloned();
-        let mut attr = self.attr_below_live(ino);
-
-        if let Some(entry) = live_entry {
-            match entry {
-                EntryDelta::Tombstone => {
-                    attr = None;
-                }
-                EntryDelta::Node(delta) => {
-                    if let Some(ref mut a) = attr {
-                        apply_node_delta(a, &delta);
-                    } else {
-                        let mut a = delta_to_initial_attr(ino, &delta);
-                        apply_node_delta(&mut a, &delta);
-                        attr = Some(a);
-                    }
-                }
-            }
-        }
-
-        attr
+        self.with_inode_layers(ino, |layers| layers.attr())
     }
 
     /// Resolves full `FileAttr`s for a slice of inode IDs across `live` -> `flushing` -> `base`
     /// in a single atomic snapshot pass while holding all three layer read locks concurrently.
     pub fn get_attrs_batch(&self, inos: &[u64]) -> HashMap<u64, FileAttr> {
-        let live = self.live.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
-        let base = self.base.read().unwrap();
-
-        let mut result = HashMap::with_capacity(inos.len());
-
-        for &ino in inos {
-            // 1. Check base
-            let base_node = base.get(&ino);
-            let mut attr = base_node.map(|arc| node_to_attr(ino, arc.as_ref()));
-
-            // 2. Apply flushing deltas (oldest to newest)
-            for batch in flushing.iter() {
-                if let Some(entry) = batch.get(&ino) {
-                    match entry {
-                        EntryDelta::Tombstone => attr = None,
-                        EntryDelta::Node(delta) => {
-                            if let Some(ref mut a) = attr {
-                                apply_node_delta(a, delta);
-                            } else {
-                                let mut a = delta_to_initial_attr(ino, delta);
-                                apply_node_delta(&mut a, delta);
-                                attr = Some(a);
-                            }
-                        }
+        self.with_layers(|live, flushing, base| {
+            let mut result = HashMap::with_capacity(inos.len());
+            for &ino in inos {
+                let base_entry = base.get(&ino);
+                let mut deltas = Vec::with_capacity(flushing.len() + 1);
+                for batch in flushing.iter() {
+                    if let Some(entry) = batch.get(&ino) {
+                        deltas.push(entry);
                     }
                 }
-            }
-
-            // 3. Apply live delta
-            if let Some(entry) = live.get(&ino) {
-                match entry {
-                    EntryDelta::Tombstone => attr = None,
-                    EntryDelta::Node(delta) => {
-                        if let Some(ref mut a) = attr {
-                            apply_node_delta(a, delta);
-                        } else {
-                            let mut a = delta_to_initial_attr(ino, delta);
-                            apply_node_delta(&mut a, delta);
-                            attr = Some(a);
-                        }
-                    }
+                if let Some(entry) = live.get(&ino) {
+                    deltas.push(entry);
+                }
+                let stack = InodeLayerStack {
+                    ino,
+                    base: base_entry,
+                    deltas,
+                };
+                if let Some(attr) = stack.attr() {
+                    result.insert(ino, attr);
                 }
             }
-
-            if let Some(a) = attr {
-                result.insert(ino, a);
-            }
-        }
-
-        result
+            result
+        })
     }
 
     /// Looks up a child entry by `name` inside `parent` directory across layers.
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
-        if let Some(entry) = self.live.read().unwrap().get(&parent) {
-            match entry {
-                EntryDelta::Tombstone => return None,
-                EntryDelta::Node(NodeDelta::Directory(d)) => {
-                    if d.removed.contains(name) {
-                        return None;
-                    }
-                    if let Some(&ino) = d.added.get(name) {
-                        return Some(ino);
-                    }
-                }
-                _ => return None,
-            }
-        }
-
-        {
-            let flushing_read = self.flushing.read().unwrap();
-            for flushing_map in flushing_read.iter().rev() {
-                if let Some(entry) = flushing_map.get(&parent) {
-                    match entry {
-                        EntryDelta::Tombstone => return None,
-                        EntryDelta::Node(NodeDelta::Directory(d)) => {
-                            if d.removed.contains(name) {
-                                return None;
-                            }
-                            if let Some(&ino) = d.added.get(name) {
-                                return Some(ino);
-                            }
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-        }
-
-        if let Some(arc) = self.base.read().unwrap().get(&parent) {
-            let node = arc.as_ref();
-            if let NodeKind::Directory { entries, .. } = &node.kind
-                && let Some((_, ino)) = entries.iter().find(|(entry_name, _)| entry_name == name)
-            {
-                return Some(*ino);
-            }
-        }
-
-        None
+        self.with_inode_layers(parent, |layers| layers.lookup_child(name))
     }
 
-    /// Lists all consolidated entries of directory `parent` across layers.
+    /// Lists all consolidated entries of directory `parent` across layers in alphabetical order.
     pub fn list_directory(&self, parent: u64) -> Option<Vec<(String, u64)>> {
-        let attr = self.get_attr(parent)?;
-        if attr.file_type != FileType::Directory {
-            return None;
-        }
-
-        // Clone newest-layer-first (live, then flushing, then base) before applying any
-        // of them, so a concurrent `begin_flush`/`fold_flushed_batch` transition can't
-        // be caught mid-move and silently drop a directory-entry change - see
-        // `attr_below_live`'s comment for the full argument.
-        let live_dir: Option<DirectoryDelta> = match self.live.read().unwrap().get(&parent) {
-            Some(EntryDelta::Node(NodeDelta::Directory(d))) => Some(d.clone()),
-            _ => None,
-        };
-        let flushing_dirs: Vec<DirectoryDelta> = self
-            .flushing
-            .read()
-            .unwrap()
-            .iter()
-            .filter_map(|batch| match batch.get(&parent) {
-                Some(EntryDelta::Node(NodeDelta::Directory(d))) => Some(d.clone()),
-                _ => None,
-            })
-            .collect();
-
-        let mut map: HashMap<String, u64> = HashMap::new();
-
-        if let Some(arc) = self.base.read().unwrap().get(&parent) {
-            let node = arc.as_ref();
-            if let NodeKind::Directory { entries, .. } = &node.kind {
-                for (name, child_ino) in entries {
-                    map.insert(name.clone(), *child_ino);
-                }
-            }
-        }
-
-        for d in &flushing_dirs {
-            for name in &d.removed {
-                map.remove(name);
-            }
-            for (name, child_ino) in &d.added {
-                map.insert(name.clone(), *child_ino);
-            }
-        }
-
-        if let Some(d) = &live_dir {
-            for name in &d.removed {
-                map.remove(name);
-            }
-            for (name, child_ino) in &d.added {
-                map.insert(name.clone(), *child_ino);
-            }
-        }
-
-        let mut list: Vec<(String, u64)> = map.into_iter().collect();
-        list.sort_by(|a, b| a.0.cmp(&b.0));
-        Some(list)
+        self.with_inode_layers(parent, |layers| layers.list_directory())
     }
 
     /// Reads target of a symlink across layers.
     pub fn read_link(&self, ino: u64) -> Option<String> {
-        if let Some(entry) = self.live.read().unwrap().get(&ino) {
-            match entry {
-                EntryDelta::Tombstone => return None,
-                EntryDelta::Node(NodeDelta::Symlink(s)) => {
-                    if let Some(ref t) = s.target {
-                        return Some(t.clone());
-                    }
-                }
-                _ => return None,
-            }
-        }
-
-        {
-            let flushing_read = self.flushing.read().unwrap();
-            for flushing_map in flushing_read.iter().rev() {
-                if let Some(entry) = flushing_map.get(&ino) {
-                    match entry {
-                        EntryDelta::Tombstone => return None,
-                        EntryDelta::Node(NodeDelta::Symlink(s)) => {
-                            if let Some(ref t) = s.target {
-                                return Some(t.clone());
-                            }
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-        }
-
-        if let Some(arc) = self.base.read().unwrap().get(&ino) {
-            let node = arc.as_ref();
-            if let NodeKind::Symlink { target, .. } = &node.kind {
-                return Some(target.clone());
-            }
-        }
-
-        None
+        self.with_inode_layers(ino, |layers| layers.read_link())
     }
 
     /// Resolves an extended attribute value for an inode across live -> flushing -> base layers.
     pub fn get_xattr(&self, ino: u64, name: &str) -> Option<Vec<u8>> {
-        // 1. Live layer
-        if let Some(entry) = self.live.read().unwrap().get(&ino) {
-            match entry {
-                EntryDelta::Tombstone => return None,
-                EntryDelta::Node(delta) => {
-                    if let Some(ref xattrs) = delta.attr_delta().xattrs
-                        && let Some(val_opt) = xattrs.get(name)
-                    {
-                        return val_opt.clone();
-                    }
-                }
-            }
-        }
-
-        // 2. Flushing layers (newest to oldest)
-        {
-            let flushing_guard = self.flushing.read().unwrap();
-            for batch in flushing_guard.iter().rev() {
-                if let Some(entry) = batch.get(&ino) {
-                    match entry {
-                        EntryDelta::Tombstone => return None,
-                        EntryDelta::Node(delta) => {
-                            if let Some(ref xattrs) = delta.attr_delta().xattrs
-                                && let Some(val_opt) = xattrs.get(name)
-                            {
-                                return val_opt.clone();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Base layer
-        if let Some(arc) = self.base.read().unwrap().get(&ino)
-            && let Some(ref xattrs) = arc.meta.xattrs
-        {
-            return xattrs.get(name).cloned();
-        }
-
-        None
+        self.with_inode_layers(ino, |layers| layers.get_xattr(name))
     }
 
     /// Lists all extended attribute names for an inode across all layers in alphabetical order.
     pub fn list_xattrs(&self, ino: u64) -> Option<Vec<String>> {
-        let _attr = self.get_attr(ino)?;
-        let mut map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-
-        // 1. Base layer
-        if let Some(arc) = self.base.read().unwrap().get(&ino)
-            && let Some(ref xattrs) = arc.meta.xattrs
-        {
-            for (k, v) in xattrs.iter() {
-                map.insert(k.clone(), v.clone());
-            }
-        }
-
-        // 2. Flushing layers (oldest to newest)
-        {
-            let flushing_guard = self.flushing.read().unwrap();
-            for batch in flushing_guard.iter() {
-                if let Some(entry) = batch.get(&ino) {
-                    match entry {
-                        EntryDelta::Tombstone => return None,
-                        EntryDelta::Node(delta) => {
-                            if let Some(ref xattrs) = delta.attr_delta().xattrs {
-                                for (k, v) in xattrs {
-                                    match v {
-                                        Some(val) => {
-                                            map.insert(k.clone(), val.clone());
-                                        }
-                                        None => {
-                                            map.remove(k);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Live layer
-        if let Some(entry) = self.live.read().unwrap().get(&ino) {
-            match entry {
-                EntryDelta::Tombstone => return None,
-                EntryDelta::Node(delta) => {
-                    if let Some(ref xattrs) = delta.attr_delta().xattrs {
-                        for (k, v) in xattrs {
-                            match v {
-                                Some(val) => {
-                                    map.insert(k.clone(), val.clone());
-                                }
-                                None => {
-                                    map.remove(k);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Some(map.into_keys().collect())
+        self.with_inode_layers(ino, |layers| layers.list_xattrs())
     }
 
     /// Stages a set/replace mutation for an extended attribute.
@@ -964,85 +899,7 @@ impl InMemoryFS {
 
     /// Reads file data at `[offset, offset + size)` resolving extents across layers.
     pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
-        let attr = self.get_attr(ino).ok_or(libc::ENOENT)?;
-        if attr.file_type != FileType::RegularFile {
-            return Err(libc::EISDIR);
-        }
-
-        let file_size = attr.size as u64;
-        if offset >= file_size {
-            return Ok(Vec::new());
-        }
-
-        let read_len = std::cmp::min(size as u64, file_size - offset);
-        let mut read_buf = vec![0u8; read_len as usize];
-        let mut filled = vec![false; read_len as usize];
-
-        // 1. Live layer
-        let mut current_truncate_mask = u64::MAX;
-        if let Some(EntryDelta::Node(NodeDelta::File(f))) = self.live.read().unwrap().get(&ino) {
-            for (ext_start, ext_len, shared_state) in f.extents.query(offset, read_len) {
-                self.copy_extent_data(
-                    &mut read_buf,
-                    &mut filled,
-                    offset,
-                    read_len,
-                    ext_start,
-                    ext_len,
-                    &shared_state,
-                );
-            }
-            if let Some(mask) = f.truncate_mask {
-                current_truncate_mask = std::cmp::min(current_truncate_mask, mask);
-            }
-        }
-
-        // 2. Flushing layers (from newest to oldest: iter().rev())
-        {
-            let flushing_guard = self.flushing.read().unwrap();
-            for flushing_map in flushing_guard.iter().rev() {
-                if let Some(EntryDelta::Node(NodeDelta::File(f))) = flushing_map.get(&ino) {
-                    let max_read = std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
-                    if max_read > 0 {
-                        for (ext_start, ext_len, shared_state) in f.extents.query(offset, max_read) {
-                            self.copy_extent_data(
-                                &mut read_buf,
-                                &mut filled,
-                                offset,
-                                read_len,
-                                ext_start,
-                                ext_len,
-                                &shared_state,
-                            );
-                        }
-                    }
-                    if let Some(mask) = f.truncate_mask {
-                        current_truncate_mask = std::cmp::min(current_truncate_mask, mask);
-                    }
-                }
-            }
-        }
-
-        // 3. Base layer
-        if let Some(arc) = self.base.read().unwrap().get(&ino) {
-            let node = arc.as_ref();
-            if let NodeKind::File { range_map, .. } = &node.kind {
-                let max_base_read = std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
-                if max_base_read > 0 {
-                    for (ext_start, ext_len, shared_state) in range_map.query(offset, max_base_read) {
-                        self.copy_extent_data(
-                            &mut read_buf,
-                            &mut filled,
-                            offset,
-                            read_len,
-                            ext_start,
-                            ext_len,
-                            &shared_state,
-                        );
-                    }
-                }
-            }
-        }
+        let read_buf = self.with_inode_layers(ino, |layers| layers.read_file_data(offset, size, self))?;
 
         if self.track_atime {
             let now = self.clock.now();
@@ -1129,22 +986,31 @@ impl InMemoryFS {
         }
     }
 
-    /// Merges all layers into a consolidated snapshot map.
-    ///
-    /// Clones `live`, then `flushing`, then `base` - newest layer first - before
-    /// applying any of them, for the same reason `get_attr`/`attr_below_live` do:
-    /// `begin_flush` and `fold_flushed_batch` each move data one layer down (never up)
-    /// in two separate lock acquisitions, so cloning oldest-first can straddle a
-    /// transition and silently miss the batch that moved. Cloning newest-first closes
-    /// that gap - see `attr_below_live`'s comment for the full happens-before argument.
-    /// The clones are then applied in the normal oldest-to-newest logical order.
+    /// Merges all layers into a consolidated snapshot map atomically while holding all 3 layer guards.
     pub fn snapshot_all(&self) -> HashMap<u64, Arc<Node>> {
-        let live_snapshot: HashMap<u64, EntryDelta> = self.live.read().unwrap().clone();
-        let flushing_snapshot: VecDeque<HashMap<u64, EntryDelta>> = self.flushing.read().unwrap().clone();
-        let mut result: HashMap<u64, Arc<Node>> = self.base.read().unwrap().clone();
+        self.with_layers(|live, flushing, base| {
+            let mut result: HashMap<u64, Arc<Node>> = base.clone();
 
-        for flushing_map in flushing_snapshot.iter() {
-            for (ino, entry) in flushing_map {
+            for flushing_map in flushing.iter() {
+                for (ino, entry) in flushing_map {
+                    match entry {
+                        EntryDelta::Tombstone => {
+                            result.remove(ino);
+                        }
+                        EntryDelta::Node(delta) => {
+                            if let Some(existing_arc) = result.get(ino).cloned() {
+                                let mut node_clone = (*existing_arc).clone();
+                                apply_delta_to_node(&mut node_clone, delta);
+                                result.insert(*ino, Arc::new(node_clone));
+                            } else {
+                                result.insert(*ino, Arc::new(delta_to_node(delta)));
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (ino, entry) in live.iter() {
                 match entry {
                     EntryDelta::Tombstone => {
                         result.remove(ino);
@@ -1160,28 +1026,11 @@ impl InMemoryFS {
                     }
                 }
             }
-        }
 
-        for (ino, entry) in live_snapshot.iter() {
-            match entry {
-                EntryDelta::Tombstone => {
-                    result.remove(ino);
-                }
-                EntryDelta::Node(delta) => {
-                    if let Some(existing_arc) = result.get(ino).cloned() {
-                        let mut node_clone = (*existing_arc).clone();
-                        apply_delta_to_node(&mut node_clone, delta);
-                        result.insert(*ino, Arc::new(node_clone));
-                    } else {
-                        result.insert(*ino, Arc::new(delta_to_node(delta)));
-                    }
-                }
-            }
-        }
+            result.retain(|_ino, arc| arc.meta.nlink > 0 || arc.is_dir());
 
-        result.retain(|_ino, arc| arc.meta.nlink > 0 || arc.is_dir());
-
-        result
+            result
+        })
     }
 
     // --- Flush & Fold Pipelines ---

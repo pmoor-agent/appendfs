@@ -1491,6 +1491,10 @@ fn test_summary_export_is_deterministic() {
         let mut replayed =
             recover_fs_with_clock(replay_dir.path(), Arc::new(clock.clone())).expect("recover_fs failed on replay");
         replayed.track_atime = false;
+        replayed.next_inode.store(
+            fs.fs.next_inode.load(std::sync::atomic::Ordering::SeqCst),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         let regenerated_path = replayed
             .export_summary(replay_dir.path())
             .expect("export_summary failed on the replayed instance");
