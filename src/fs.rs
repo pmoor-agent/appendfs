@@ -5,7 +5,7 @@ use crate::log::{
     SetattrPayload, SetxattrPayload, SharedExtentState, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
 use crate::node::{
-    AttrDelta, DirectoryDelta, EntryDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta, SymlinkDelta,
+    AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, NodeKind, SpecialDelta, SymlinkDelta,
 };
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
@@ -56,20 +56,15 @@ pub struct InodeLayerStack<'a> {
 impl<'a> InodeLayerStack<'a> {
     /// Resolves full `FileAttr` across `base` and `deltas` (folded oldest to newest).
     pub fn attr(&self) -> Option<FileAttr> {
-        let mut attr = self.base.map(|arc| node_to_attr(self.ino, arc.as_ref()));
+        let mut attr = self.base.map(|arc| arc.to_attr(self.ino));
         for delta in &self.deltas {
             match delta {
                 EntryDelta::Tombstone => {
                     attr = None;
                 }
                 EntryDelta::Node(d) => {
-                    if let Some(ref mut a) = attr {
-                        apply_node_delta(a, d);
-                    } else {
-                        let mut a = delta_to_initial_attr(self.ino, d);
-                        apply_node_delta(&mut a, d);
-                        attr = Some(a);
-                    }
+                    let a = attr.get_or_insert_with(|| d.initial_attr(self.ino));
+                    d.apply_to_attr(a);
                 }
             }
         }
@@ -647,15 +642,7 @@ impl InMemoryFS {
             // link count, but with nothing referencing it.
             Some(EntryDelta::Tombstone) => return,
             Some(EntryDelta::Node(node_delta)) => {
-                match node_delta {
-                    NodeDelta::Directory(d) => merge_attr_delta(&mut d.attr_delta, &delta),
-                    NodeDelta::File(f) => merge_attr_delta(&mut f.attr_delta, &delta),
-                    NodeDelta::Symlink(s) => merge_attr_delta(&mut s.attr_delta, &delta),
-                    NodeDelta::Fifo(s)
-                    | NodeDelta::CharDevice(s)
-                    | NodeDelta::BlockDevice(s)
-                    | NodeDelta::Socket(s) => merge_attr_delta(&mut s.attr_delta, &delta),
-                }
+                node_delta.attr_delta_mut().merge_from(&delta);
                 return;
             }
             None => {}
@@ -997,10 +984,10 @@ impl InMemoryFS {
                         EntryDelta::Node(delta) => {
                             if let Some(existing_arc) = result.get(ino).cloned() {
                                 let mut node_clone = (*existing_arc).clone();
-                                apply_delta_to_node(&mut node_clone, delta);
+                                delta.apply_to_node(&mut node_clone);
                                 result.insert(*ino, Arc::new(node_clone));
                             } else {
-                                result.insert(*ino, Arc::new(delta_to_node(delta)));
+                                result.insert(*ino, Arc::new(delta.to_node()));
                             }
                         }
                     }
@@ -1015,10 +1002,10 @@ impl InMemoryFS {
                     EntryDelta::Node(delta) => {
                         if let Some(existing_arc) = result.get(ino).cloned() {
                             let mut node_clone = (*existing_arc).clone();
-                            apply_delta_to_node(&mut node_clone, delta);
+                            delta.apply_to_node(&mut node_clone);
                             result.insert(*ino, Arc::new(node_clone));
                         } else {
-                            result.insert(*ino, Arc::new(delta_to_node(delta)));
+                            result.insert(*ino, Arc::new(delta.to_node()));
                         }
                     }
                 }
@@ -1057,10 +1044,10 @@ impl InMemoryFS {
                 EntryDelta::Node(delta) => {
                     if let Some(existing_arc) = base.get(&ino).cloned() {
                         let mut node_clone = (*existing_arc).clone();
-                        apply_delta_to_node(&mut node_clone, &delta);
+                        delta.apply_to_node(&mut node_clone);
                         base.insert(ino, Arc::new(node_clone));
                     } else {
-                        base.insert(ino, Arc::new(delta_to_node(&delta)));
+                        base.insert(ino, Arc::new(delta.to_node()));
                     }
                 }
             }
@@ -2079,409 +2066,6 @@ impl Default for InMemoryFS {
     }
 }
 
-// --- Helper Functions ---
-
-fn node_to_attr(ino: u64, node: &Node) -> FileAttr {
-    let (file_type, size, perm, rdev) = match &node.kind {
-        NodeKind::Directory { .. } => (FileType::Directory, 0, node.meta.perm, 0),
-        NodeKind::File { size, .. } => (FileType::RegularFile, *size as i64, node.meta.perm, 0),
-        NodeKind::Symlink { target } => (FileType::Symlink, target.len() as i64, 0o777, 0),
-        NodeKind::Fifo => (FileType::NamedPipe, 0, node.meta.perm, 0),
-        NodeKind::CharDevice { rdev } => (FileType::CharDevice, 0, node.meta.perm, *rdev),
-        NodeKind::BlockDevice { rdev } => (FileType::BlockDevice, 0, node.meta.perm, *rdev),
-        NodeKind::Socket => (FileType::Socket, 0, node.meta.perm, 0),
-    };
-    FileAttr {
-        ino,
-        file_type,
-        perm,
-        nlink: node.meta.nlink,
-        uid: node.meta.uid,
-        gid: node.meta.gid,
-        rdev,
-        size,
-        atime: node.meta.atime,
-        mtime: node.meta.mtime,
-        ctime: node.meta.ctime,
-    }
-}
-
-fn delta_to_initial_attr(ino: u64, delta: &NodeDelta) -> FileAttr {
-    match delta {
-        NodeDelta::Directory(d) => {
-            let mut attr = FileAttr {
-                ino,
-                file_type: FileType::Directory,
-                perm: d.attr_delta.mode.unwrap_or(0o755),
-                nlink: d.attr_delta.nlink.unwrap_or(2),
-                uid: d.attr_delta.uid.unwrap_or(0),
-                gid: d.attr_delta.gid.unwrap_or(0),
-                rdev: 0,
-                size: 0,
-                atime: d.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: d.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: d.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-            };
-            apply_attr_delta(&mut attr, &d.attr_delta);
-            attr
-        }
-        NodeDelta::File(f) => {
-            let mut attr = FileAttr {
-                ino,
-                file_type: FileType::RegularFile,
-                perm: f.attr_delta.mode.unwrap_or(0o644),
-                nlink: f.attr_delta.nlink.unwrap_or(1),
-                uid: f.attr_delta.uid.unwrap_or(0),
-                gid: f.attr_delta.gid.unwrap_or(0),
-                rdev: 0,
-                size: f.size.unwrap_or(0) as i64,
-                atime: f.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: f.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: f.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-            };
-            apply_attr_delta(&mut attr, &f.attr_delta);
-            attr
-        }
-        NodeDelta::Symlink(s) => {
-            let mut attr = FileAttr {
-                ino,
-                file_type: FileType::Symlink,
-                perm: 0o777,
-                nlink: s.attr_delta.nlink.unwrap_or(1),
-                uid: s.attr_delta.uid.unwrap_or(0),
-                gid: s.attr_delta.gid.unwrap_or(0),
-                rdev: 0,
-                size: s.target.as_ref().map_or(0, |t| t.len() as i64),
-                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-            };
-            apply_attr_delta(&mut attr, &s.attr_delta);
-            attr
-        }
-        NodeDelta::Fifo(s) => {
-            let mut attr = FileAttr {
-                ino,
-                file_type: FileType::NamedPipe,
-                perm: s.attr_delta.mode.unwrap_or(0o644),
-                nlink: s.attr_delta.nlink.unwrap_or(1),
-                uid: s.attr_delta.uid.unwrap_or(0),
-                gid: s.attr_delta.gid.unwrap_or(0),
-                rdev: 0,
-                size: 0,
-                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-            };
-            apply_attr_delta(&mut attr, &s.attr_delta);
-            attr
-        }
-        NodeDelta::CharDevice(s) => {
-            let mut attr = FileAttr {
-                ino,
-                file_type: FileType::CharDevice,
-                perm: s.attr_delta.mode.unwrap_or(0o660),
-                nlink: s.attr_delta.nlink.unwrap_or(1),
-                uid: s.attr_delta.uid.unwrap_or(0),
-                gid: s.attr_delta.gid.unwrap_or(0),
-                rdev: s.rdev,
-                size: 0,
-                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-            };
-            apply_attr_delta(&mut attr, &s.attr_delta);
-            attr
-        }
-        NodeDelta::BlockDevice(s) => {
-            let mut attr = FileAttr {
-                ino,
-                file_type: FileType::BlockDevice,
-                perm: s.attr_delta.mode.unwrap_or(0o660),
-                nlink: s.attr_delta.nlink.unwrap_or(1),
-                uid: s.attr_delta.uid.unwrap_or(0),
-                gid: s.attr_delta.gid.unwrap_or(0),
-                rdev: s.rdev,
-                size: 0,
-                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-            };
-            apply_attr_delta(&mut attr, &s.attr_delta);
-            attr
-        }
-        NodeDelta::Socket(s) => {
-            let mut attr = FileAttr {
-                ino,
-                file_type: FileType::Socket,
-                perm: s.attr_delta.mode.unwrap_or(0o777),
-                nlink: s.attr_delta.nlink.unwrap_or(1),
-                uid: s.attr_delta.uid.unwrap_or(0),
-                gid: s.attr_delta.gid.unwrap_or(0),
-                rdev: 0,
-                size: 0,
-                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-            };
-            apply_attr_delta(&mut attr, &s.attr_delta);
-            attr
-        }
-    }
-}
-
-fn apply_node_delta(attr: &mut FileAttr, delta: &NodeDelta) {
-    match delta {
-        NodeDelta::Directory(d) => apply_attr_delta(attr, &d.attr_delta),
-        NodeDelta::File(f) => {
-            if let Some(s) = f.size {
-                attr.size = s as i64;
-            }
-            apply_attr_delta(attr, &f.attr_delta);
-        }
-        NodeDelta::Symlink(s) => {
-            if let Some(ref t) = s.target {
-                attr.size = t.len() as i64;
-            }
-            apply_attr_delta(attr, &s.attr_delta);
-        }
-        NodeDelta::Fifo(s) | NodeDelta::CharDevice(s) | NodeDelta::BlockDevice(s) | NodeDelta::Socket(s) => {
-            apply_attr_delta(attr, &s.attr_delta);
-        }
-    }
-}
-
-fn apply_attr_delta(attr: &mut FileAttr, delta: &AttrDelta) {
-    if let Some(m) = delta.mode {
-        attr.perm = m & 0o7777;
-    }
-    if let Some(u) = delta.uid {
-        attr.uid = u;
-    }
-    if let Some(g) = delta.gid {
-        attr.gid = g;
-    }
-    if let Some(n) = delta.nlink {
-        attr.nlink = n;
-    }
-    if let Some(a) = delta.atime {
-        attr.atime = a;
-    }
-    if let Some(m) = delta.mtime {
-        attr.mtime = m;
-    }
-    if let Some(c) = delta.ctime {
-        attr.ctime = c;
-    }
-}
-
-fn merge_attr_delta(target: &mut AttrDelta, incoming: &AttrDelta) {
-    if incoming.mode.is_some() {
-        target.mode = incoming.mode;
-    }
-    if incoming.uid.is_some() {
-        target.uid = incoming.uid;
-    }
-    if incoming.gid.is_some() {
-        target.gid = incoming.gid;
-    }
-    if incoming.nlink.is_some() {
-        target.nlink = incoming.nlink;
-    }
-    if incoming.atime.is_some() {
-        target.atime = incoming.atime;
-    }
-    if incoming.mtime.is_some() {
-        target.mtime = incoming.mtime;
-    }
-    if incoming.ctime.is_some() {
-        target.ctime = incoming.ctime;
-    }
-    if let Some(ref inc_xattrs) = incoming.xattrs {
-        let target_xattrs = target.xattrs.get_or_insert_with(HashMap::new);
-        for (k, v) in inc_xattrs {
-            target_xattrs.insert(k.clone(), v.clone());
-        }
-    }
-}
-
-fn apply_delta_to_node(node: &mut Node, delta: &NodeDelta) {
-    match (&mut node.kind, delta) {
-        (NodeKind::Directory { parent, entries }, NodeDelta::Directory(d)) => {
-            if let Some(p) = d.parent {
-                *parent = p;
-            }
-            for rem in &d.removed {
-                entries.retain(|(name, _)| name != rem);
-            }
-            for (name, child_ino) in &d.added {
-                entries.retain(|(existing_name, _)| existing_name != name);
-                entries.push((name.clone(), *child_ino));
-            }
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            node.apply_attr_delta(&d.attr_delta);
-        }
-        (NodeKind::File { range_map, size }, NodeDelta::File(f)) => {
-            if let Some(mask) = f.truncate_mask {
-                range_map.truncate(mask);
-            }
-            for (start, entry) in f.extents.iter() {
-                range_map.insert(*start, entry.length, entry.value.clone());
-            }
-            if let Some(s) = f.size {
-                *size = s;
-            }
-            node.apply_attr_delta(&f.attr_delta);
-        }
-        (NodeKind::Symlink { target }, NodeDelta::Symlink(s)) => {
-            if let Some(ref t) = s.target {
-                *target = t.clone();
-            }
-            node.apply_attr_delta(&s.attr_delta);
-        }
-        (NodeKind::Fifo, NodeDelta::Fifo(s))
-        | (NodeKind::CharDevice { .. }, NodeDelta::CharDevice(s))
-        | (NodeKind::BlockDevice { .. }, NodeDelta::BlockDevice(s))
-        | (NodeKind::Socket, NodeDelta::Socket(s)) => {
-            node.apply_attr_delta(&s.attr_delta);
-        }
-        _ => {}
-    }
-}
-
-fn delta_to_node(delta: &NodeDelta) -> Node {
-    let mut node = match delta {
-        NodeDelta::Directory(d) => {
-            let mut entries: Vec<(String, u64)> = d.added.iter().map(|(k, v)| (k.clone(), *v)).collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            let meta = InodeMeta {
-                perm: d.attr_delta.mode.unwrap_or(0o755) & 0o7777,
-                nlink: d.attr_delta.nlink.unwrap_or(2),
-                uid: d.attr_delta.uid.unwrap_or(0),
-                gid: d.attr_delta.gid.unwrap_or(0),
-                atime: d.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: d.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: d.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-                xattrs: None,
-            };
-            Node {
-                meta,
-                kind: NodeKind::Directory {
-                    parent: d.parent.unwrap_or(1),
-                    entries,
-                },
-            }
-        }
-        NodeDelta::File(f) => {
-            let mut range_map = RangeMap::new();
-            for (start, entry) in f.extents.iter() {
-                range_map.insert(*start, entry.length, entry.value.clone());
-            }
-            let meta = InodeMeta {
-                perm: f.attr_delta.mode.unwrap_or(0o644) & 0o7777,
-                nlink: f.attr_delta.nlink.unwrap_or(1),
-                uid: f.attr_delta.uid.unwrap_or(0),
-                gid: f.attr_delta.gid.unwrap_or(0),
-                atime: f.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: f.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: f.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-                xattrs: None,
-            };
-            Node {
-                meta,
-                kind: NodeKind::File {
-                    range_map,
-                    size: f.size.unwrap_or(0),
-                },
-            }
-        }
-        NodeDelta::Symlink(s) => {
-            let meta = InodeMeta {
-                perm: s.attr_delta.mode.unwrap_or(0o777) & 0o7777,
-                nlink: s.attr_delta.nlink.unwrap_or(1),
-                uid: s.attr_delta.uid.unwrap_or(0),
-                gid: s.attr_delta.gid.unwrap_or(0),
-                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-                xattrs: None,
-            };
-            Node {
-                meta,
-                kind: NodeKind::Symlink {
-                    target: s.target.clone().unwrap_or_default(),
-                },
-            }
-        }
-        NodeDelta::Fifo(s) => {
-            let meta = InodeMeta {
-                perm: s.attr_delta.mode.unwrap_or(0o644) & 0o7777,
-                nlink: s.attr_delta.nlink.unwrap_or(1),
-                uid: s.attr_delta.uid.unwrap_or(0),
-                gid: s.attr_delta.gid.unwrap_or(0),
-                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-                xattrs: None,
-            };
-            Node {
-                meta,
-                kind: NodeKind::Fifo,
-            }
-        }
-        NodeDelta::CharDevice(s) => {
-            let meta = InodeMeta {
-                perm: s.attr_delta.mode.unwrap_or(0o660) & 0o7777,
-                nlink: s.attr_delta.nlink.unwrap_or(1),
-                uid: s.attr_delta.uid.unwrap_or(0),
-                gid: s.attr_delta.gid.unwrap_or(0),
-                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-                xattrs: None,
-            };
-            Node {
-                meta,
-                kind: NodeKind::CharDevice { rdev: s.rdev },
-            }
-        }
-        NodeDelta::BlockDevice(s) => {
-            let meta = InodeMeta {
-                perm: s.attr_delta.mode.unwrap_or(0o660) & 0o7777,
-                nlink: s.attr_delta.nlink.unwrap_or(1),
-                uid: s.attr_delta.uid.unwrap_or(0),
-                gid: s.attr_delta.gid.unwrap_or(0),
-                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-                xattrs: None,
-            };
-            Node {
-                meta,
-                kind: NodeKind::BlockDevice { rdev: s.rdev },
-            }
-        }
-        NodeDelta::Socket(s) => {
-            let meta = InodeMeta {
-                perm: s.attr_delta.mode.unwrap_or(0o777) & 0o7777,
-                nlink: s.attr_delta.nlink.unwrap_or(1),
-                uid: s.attr_delta.uid.unwrap_or(0),
-                gid: s.attr_delta.gid.unwrap_or(0),
-                atime: s.attr_delta.atime.unwrap_or(SystemTime::UNIX_EPOCH),
-                mtime: s.attr_delta.mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                ctime: s.attr_delta.ctime.unwrap_or(SystemTime::UNIX_EPOCH),
-                xattrs: None,
-            };
-            Node {
-                meta,
-                kind: NodeKind::Socket,
-            }
-        }
-    };
-    node.apply_attr_delta(delta.attr_delta());
-    node
-}
-
 pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
     fs.get_parent_dir_inode(child_ino)
 }
@@ -2490,6 +2074,7 @@ pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::log::LogWriter;
+    use crate::node::InodeMeta;
     use crate::operations::read_write::write_core;
 
     #[test]

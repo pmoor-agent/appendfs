@@ -332,6 +332,9 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
         if target_attr.file_type == FileType::Directory {
             return Err(libc::EPERM);
         }
+        if target_attr.nlink == 0 {
+            return Err(libc::ENOENT);
+        }
 
         let newparent_attr = fs.get_attr(newparent).ok_or(libc::ENOENT)?;
         if newparent_attr.file_type != FileType::Directory {
