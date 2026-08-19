@@ -1,8 +1,9 @@
 mod common;
 use appendfs::LogWriter;
 use appendfs::clock::{AdvancingClock, Clock, MockClock, SystemClock};
-use appendfs::log::{CreatePayload, MkdirPayload, OpCode, recover_fs, recover_fs_with_clock};
+use appendfs::log::{CreatePayload, MkdirPayload, OpCode, recover_fs};
 use appendfs::node::NodeKind;
+use appendfs::storage::{OsStorage, Storage};
 use common::{SnapshotNode, TestFS, TestRng};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -899,8 +900,9 @@ fn test_differential_fuzzing_and_crash_recovery() {
 #[test]
 fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(dir.path()));
     let clock = SystemClock;
-    let writer = LogWriter::create(dir.path(), 1, &clock).unwrap();
+    let writer = LogWriter::create(storage.clone(), 1, &clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
     // Batch 1: mkdir "committed_dir" under root (ino 1), properly committed with a
     // trailing FlushCommit - simulates a flush() call that completed successfully.
@@ -934,7 +936,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     writer.sync().unwrap();
     drop(writer);
 
-    let recovered = recover_fs(dir.path()).unwrap();
+    let recovered = recover_fs(storage, appendfs::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
     let map = recovered.snapshot_all();
 
     let root = map.get(&1).unwrap();
@@ -965,8 +967,9 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     // buffered can only mean a bug in the writer - not an expected crash-recovery
     // scenario - so this must hard-fail recovery entirely, not be silently discarded.
     let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(dir.path()));
     let clock = SystemClock;
-    let writer = LogWriter::create(dir.path(), 1, &clock).unwrap();
+    let writer = LogWriter::create(storage.clone(), 1, &clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
     let create_payload = CreatePayload {
         parent: 1,
@@ -983,7 +986,7 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     writer.sync().unwrap();
     drop(writer);
 
-    let result = recover_fs(dir.path());
+    let result = recover_fs(storage, appendfs::RecoveryTarget::Latest, Arc::new(SystemClock));
     assert!(
         result.is_err(),
         "a FlushCommit with a mismatched record_count must fail recovery hard"
@@ -996,8 +999,9 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     // corrupted on disk afterwards (simulating real bitrot, not a torn write) must
     // cause recover_fs to refuse to mount, not silently reconstruct wrong state.
     let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(dir.path()));
     let clock = SystemClock;
-    let writer = LogWriter::create(dir.path(), 1, &clock).unwrap();
+    let writer = LogWriter::create(storage.clone(), 1, &clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
     let create_payload = CreatePayload {
         parent: 1,
@@ -1015,7 +1019,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     drop(writer);
 
     // Sanity check: recovery succeeds and sees the file before any corruption.
-    let recovered = recover_fs(dir.path()).unwrap();
+    let recovered = recover_fs(storage.clone(), appendfs::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
     assert!(recovered.get_attr(2).is_some());
     drop(recovered);
 
@@ -1033,7 +1037,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     file.write_all(&byte).unwrap();
     drop(file);
 
-    let result = recover_fs(dir.path());
+    let result = recover_fs(storage, appendfs::RecoveryTarget::Latest, Arc::new(SystemClock));
     assert!(
         result.is_err(),
         "bitrot in a previously-committed record must be detected and hard-fail recovery, not be silently applied"
@@ -1471,9 +1475,10 @@ fn test_summary_export_is_deterministic() {
         // first, so every extent is guaranteed Disk-backed (SharedExtentState refuses to
         // serialize a still-Staged one) before either summary below gets written.
         let _generation = fs.fs.log_writer.as_ref().unwrap().generation();
-        let written_path = fs
+        let live_storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&fs.log_dir));
+        let written_file = fs
             .fs
-            .export_summary(&fs.log_dir)
+            .export_summary(live_storage.as_ref())
             .expect("export_summary failed on the live instance");
 
         // Reprocess: copy only the raw .log files into a fresh directory (deliberately
@@ -1488,19 +1493,24 @@ fn test_summary_export_is_deterministic() {
                 std::fs::copy(&path, replay_dir.path().join(entry.file_name())).unwrap();
             }
         }
-        let mut replayed =
-            recover_fs_with_clock(replay_dir.path(), Arc::new(clock.clone())).expect("recover_fs failed on replay");
+        let replay_storage: Arc<dyn Storage> = Arc::new(OsStorage::new(replay_dir.path()));
+        let mut replayed = recover_fs(
+            replay_storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            Arc::new(clock.clone()),
+        )
+        .expect("recover_fs failed on replay");
         replayed.track_atime = false;
         replayed.next_inode.store(
             fs.fs.next_inode.load(std::sync::atomic::Ordering::SeqCst),
             std::sync::atomic::Ordering::SeqCst,
         );
-        let regenerated_path = replayed
-            .export_summary(replay_dir.path())
+        let regenerated_file = replayed
+            .export_summary(replay_storage.as_ref())
             .expect("export_summary failed on the replayed instance");
 
-        let written_bytes = std::fs::read(&written_path).unwrap();
-        let regenerated_bytes = std::fs::read(&regenerated_path).unwrap();
+        let written_bytes = std::fs::read(fs.log_dir.join(written_file)).unwrap();
+        let regenerated_bytes = std::fs::read(replay_dir.path().join(regenerated_file)).unwrap();
         assert_eq!(
             written_bytes,
             regenerated_bytes,

@@ -1,4 +1,4 @@
-use crate::clock::{Clock, SystemClock};
+use crate::clock::Clock;
 use crate::fs::InMemoryFS;
 use crate::log::extent::SharedExtentState;
 use crate::log::reader::{LogReader, LogRecord};
@@ -7,7 +7,6 @@ use crate::log::summary::SummaryReader;
 use crate::node::{InodeMeta, Node, NodeKind};
 use crate::range_map::RangeMap;
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
@@ -25,43 +24,9 @@ pub enum RecoveryTarget {
     Generation(u64),
 }
 
-/// Rebuilds complete in-memory filesystem state from summary files and `.log` files
-/// inside `log_dir`, using the real system clock for any timestamp not otherwise
-/// carried by the log itself. See `recover_fs_with_clock` for injecting a different
-/// clock (e.g. for deterministic tests).
-pub fn recover_fs(log_dir: impl AsRef<Path>) -> io::Result<InMemoryFS> {
-    recover_fs_to_target_with_clock(log_dir, RecoveryTarget::Latest, Arc::new(SystemClock))
-}
-
-/// Same as `recover_fs`, but with an injectable clock instead of always defaulting to
-/// `SystemClock` internally.
-pub fn recover_fs_with_clock(log_dir: impl AsRef<Path>, clock: Arc<dyn Clock>) -> io::Result<InMemoryFS> {
-    recover_fs_to_target_with_clock(log_dir, RecoveryTarget::Latest, clock)
-}
-
-/// Rebuilds filesystem state from summary and log files up to the specified `target` point in time.
-pub fn recover_fs_to_target(log_dir: impl AsRef<Path>, target: RecoveryTarget) -> io::Result<InMemoryFS> {
-    recover_fs_to_target_with_clock(log_dir, target, Arc::new(SystemClock))
-}
-
-/// Rebuilds filesystem state from summary and log files up to the specified `target` point in time,
-/// with an injectable `clock` for deterministic test time recovery.
-pub fn recover_fs_to_target_with_clock(
-    log_dir: impl AsRef<Path>,
-    target: RecoveryTarget,
-    clock: Arc<dyn Clock>,
-) -> io::Result<InMemoryFS> {
-    let storage = Arc::new(crate::storage::OsStorage::new(log_dir));
-    recover_fs_to_target_with_storage(storage, target, clock)
-}
-
-/// Rebuilds filesystem state from a custom `Storage` instance.
-pub fn recover_fs_with_storage(storage: Arc<dyn crate::storage::Storage>) -> io::Result<InMemoryFS> {
-    recover_fs_to_target_with_storage(storage, RecoveryTarget::Latest, Arc::new(SystemClock))
-}
-
-/// Rebuilds filesystem state from summary and log files in `storage` up to the specified `target` point in time.
-pub fn recover_fs_to_target_with_storage(
+/// Rebuilds complete in-memory filesystem state from summary files and `.log` files in `storage`
+/// up to the specified `target` boundary, using `clock` for timestamp context.
+pub fn recover_fs(
     storage: Arc<dyn crate::storage::Storage>,
     target: RecoveryTarget,
     clock: Arc<dyn Clock>,
@@ -74,7 +39,7 @@ pub fn recover_fs_to_target_with_storage(
         if file.ends_with(".summary") {
             let stem = file.trim_end_matches(".summary");
             if let Ok(gen_num) = stem.parse::<u64>() {
-                match SummaryReader::open_with_storage(&storage, file) {
+                match SummaryReader::open(storage.as_ref(), file) {
                     Ok(reader) => {
                         let eligible = match target {
                             RecoveryTarget::Latest => true,
@@ -111,7 +76,7 @@ pub fn recover_fs_to_target_with_storage(
     let mut last_op_time: Option<SystemTime> = None;
     if latest_summary.is_none()
         && let Some((_, oldest_file)) = log_files.first()
-        && let Ok(oldest_reader) = LogReader::open_with_storage(&storage, oldest_file)
+        && let Ok(oldest_reader) = LogReader::open(storage.as_ref(), oldest_file)
     {
         let created = oldest_reader.file_header().created_at;
         last_op_time = Some(created);
@@ -165,7 +130,7 @@ pub fn recover_fs_to_target_with_storage(
         let mut committed_records_count = 0u32;
         let mut log_data_bytes = 0u64;
 
-        let reader = LogReader::open_with_storage(&storage, &filename)?;
+        let reader = LogReader::open(storage.as_ref(), &filename)?;
         let log_created_at = reader.file_header().created_at;
         for record_res in reader {
             let record = match record_res {
@@ -681,21 +646,24 @@ fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::AdvancingClock;
+    use crate::clock::{AdvancingClock, SystemClock};
     use crate::log::LogWriter;
+    use crate::storage::OsStorage;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn test_recovery_to_specific_tx_id() {
         let dir = tempfile::tempdir().unwrap();
-        crate::init_volume(dir.path(), Some("main")).unwrap();
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(OsStorage::new(dir.path()));
+        crate::init_volume(storage.clone(), Some("main")).unwrap();
 
-        let mut fs = recover_fs(dir.path()).unwrap();
+        let mut fs = recover_fs(storage.clone(), RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
         fs.clock = Arc::clone(&clock) as Arc<dyn Clock>;
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         fs.log_writer = Some(writer);
-        fs.set_log_dir(dir.path());
+        fs.set_storage(storage.clone());
 
         // Tx 1: Create dir "step1"
         let d1 = crate::operations::dir::mkdir_core(&fs, 1, "step1", 0o755, 1000, 1000).unwrap();
@@ -712,21 +680,21 @@ mod tests {
         fs.sync_log().unwrap();
 
         // 1. Recover to Latest -> step1, file1.txt, file2.txt all exist
-        let fs_latest = recover_fs(dir.path()).unwrap();
+        let fs_latest = recover_fs(storage.clone(), RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
         assert!(fs_latest.lookup_child(1, "step1").is_some());
         let d1_ino = fs_latest.lookup_child(1, "step1").unwrap();
         assert!(fs_latest.lookup_child(d1_ino, "file1.txt").is_some());
         assert!(fs_latest.lookup_child(d1_ino, "file2.txt").is_some());
 
         // 2. Recover to TxId(1) or TxId(4) -> only step1 exists, no file1.txt or file2.txt
-        let fs_tx1 = recover_fs_to_target(dir.path(), RecoveryTarget::TxId(1)).unwrap();
+        let fs_tx1 = recover_fs(storage.clone(), RecoveryTarget::TxId(1), Arc::new(SystemClock)).unwrap();
         assert!(fs_tx1.lookup_child(1, "step1").is_some());
         let d1_tx1 = fs_tx1.lookup_child(1, "step1").unwrap();
         assert!(fs_tx1.lookup_child(d1_tx1, "file1.txt").is_none());
         assert!(fs_tx1.lookup_child(d1_tx1, "file2.txt").is_none());
 
         // 3. Recover to TxId(6) -> step1 and file1.txt exist, but not file2.txt
-        let fs_tx6 = recover_fs_to_target(dir.path(), RecoveryTarget::TxId(6)).unwrap();
+        let fs_tx6 = recover_fs(storage.clone(), RecoveryTarget::TxId(6), Arc::new(SystemClock)).unwrap();
         let d1_tx6 = fs_tx6.lookup_child(1, "step1").unwrap();
         assert!(fs_tx6.lookup_child(d1_tx6, "file1.txt").is_some());
         assert!(fs_tx6.lookup_child(d1_tx6, "file2.txt").is_none());
@@ -735,14 +703,16 @@ mod tests {
     #[test]
     fn test_recovery_to_specific_timestamp() {
         let dir = tempfile::tempdir().unwrap();
-        crate::init_volume(dir.path(), Some("main")).unwrap();
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(OsStorage::new(dir.path()));
+        crate::init_volume(storage.clone(), Some("main")).unwrap();
 
-        let mut fs = recover_fs(dir.path()).unwrap();
+        let mut fs = recover_fs(storage.clone(), RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
         fs.clock = Arc::clone(&clock) as Arc<dyn Clock>;
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         fs.log_writer = Some(writer);
-        fs.set_log_dir(dir.path());
+        fs.set_storage(storage.clone());
 
         // T = 1000: Create "early_dir"
         crate::operations::dir::mkdir_core(&fs, 1, "early_dir", 0o755, 1000, 1000).unwrap();
@@ -754,18 +724,20 @@ mod tests {
         fs.sync_log().unwrap();
 
         // Recover at T = 1500 -> early_dir exists, late_dir does not
-        let fs_t1500 = recover_fs_to_target(
-            dir.path(),
+        let fs_t1500 = recover_fs(
+            storage.clone(),
             RecoveryTarget::Timestamp(UNIX_EPOCH + Duration::from_secs(1500)),
+            Arc::new(SystemClock),
         )
         .unwrap();
         assert!(fs_t1500.lookup_child(1, "early_dir").is_some());
         assert!(fs_t1500.lookup_child(1, "late_dir").is_none());
 
         // Recover at T = 2500 -> both exist
-        let fs_t2500 = recover_fs_to_target(
-            dir.path(),
+        let fs_t2500 = recover_fs(
+            storage.clone(),
             RecoveryTarget::Timestamp(UNIX_EPOCH + Duration::from_secs(2500)),
+            Arc::new(SystemClock),
         )
         .unwrap();
         assert!(fs_t2500.lookup_child(1, "early_dir").is_some());

@@ -1,9 +1,8 @@
-use crate::cli::DEFAULT_MAX_LOG_SIZE;
 use crate::clock::Clock;
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCode, RecordHeader};
-use crate::storage::{OsStorage, Storage, StorageWriter, WriteMode};
+use crate::storage::{Storage, StorageWriter, WriteMode};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,35 +56,8 @@ impl std::fmt::Debug for LogWriter {
 }
 
 impl LogWriter {
-    /// Creates a new generation log file inside `log_dir` with default 1 GiB max log size limit.
-    pub fn create(log_dir: impl AsRef<Path>, generation: u64, clock: &dyn Clock) -> io::Result<Self> {
-        Self::create_with_max_size(log_dir, generation, clock, DEFAULT_MAX_LOG_SIZE)
-    }
-
-    /// Creates a new generation log file inside `log_dir` with a custom maximum log file size.
-    pub fn create_with_max_size(
-        log_dir: impl AsRef<Path>,
-        generation: u64,
-        clock: &dyn Clock,
-        max_log_size: u64,
-    ) -> io::Result<Self> {
-        Self::create_with_max_size_and_start_tx(log_dir, generation, clock, max_log_size, 1)
-    }
-
-    /// Creates a new generation log file with custom max log size and initial `tx_id`.
-    pub fn create_with_max_size_and_start_tx(
-        log_dir: impl AsRef<Path>,
-        generation: u64,
-        clock: &dyn Clock,
-        max_log_size: u64,
-        start_tx_id: u64,
-    ) -> io::Result<Self> {
-        let storage = Arc::new(OsStorage::new(log_dir));
-        Self::create_with_storage(storage, generation, clock, max_log_size, start_tx_id)
-    }
-
     /// Creates a new generation log file backed by a custom `Storage` instance.
-    pub fn create_with_storage(
+    pub fn create(
         storage: Arc<dyn Storage>,
         generation: u64,
         clock: &dyn Clock,
@@ -103,19 +75,8 @@ impl LogWriter {
         })
     }
 
-    /// Creates a lazy log writer that does NOT create a `.log` file on disk until the first write.
-    pub fn create_lazy(
-        log_dir: impl AsRef<Path>,
-        generation: u64,
-        max_log_size: u64,
-        start_tx_id: u64,
-    ) -> io::Result<Self> {
-        let storage = Arc::new(OsStorage::new(log_dir));
-        Self::create_lazy_with_storage(storage, generation, max_log_size, start_tx_id)
-    }
-
     /// Creates a lazy log writer backed by a custom `Storage` instance.
-    pub fn create_lazy_with_storage(
+    pub fn create_lazy(
         storage: Arc<dyn Storage>,
         generation: u64,
         max_log_size: u64,
@@ -332,6 +293,7 @@ impl LogWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::DEFAULT_MAX_LOG_SIZE;
     use crate::clock::SystemClock;
     use crate::log::reader::LogReader;
     use crate::storage::MemoryStorage;
@@ -340,7 +302,7 @@ mod tests {
     fn test_log_writer_create_and_append() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create_with_storage(storage.clone(), 1, &clock, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
         assert_eq!(writer.generation(), 1);
         let (tx, gen_num, offset) = writer.append_record(OpCode::Create, 100, b"test_data").unwrap();
@@ -353,7 +315,7 @@ mod tests {
     fn test_append_record_never_rolls_mid_batch() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create_with_storage(storage.clone(), 1, &clock, 30, 1).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 30, 1).unwrap();
 
         for _ in 0..5 {
             let (_, gen_num, _) = writer.append_record(OpCode::Create, 1, b"0123456789").unwrap();
@@ -366,7 +328,7 @@ mod tests {
     fn test_roll_if_needed_rolls_between_batches() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create_with_storage(storage.clone(), 1, &clock, 60, 1).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 60, 1).unwrap();
 
         writer.append_record(OpCode::Create, 1, b"0123456789").unwrap();
         assert_eq!(writer.generation(), 1);
@@ -382,13 +344,13 @@ mod tests {
     fn test_emit_flush_commit_round_trip() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create_with_storage(storage.clone(), 1, &clock, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
         writer.append_record(OpCode::Create, 1, b"payload").unwrap();
         writer.append_record(OpCode::Write, 1, b"more").unwrap();
         writer.emit_flush_commit(2, &clock).unwrap();
 
-        let records: Vec<_> = LogReader::open_with_storage(storage.as_ref(), &writer.filename())
+        let records: Vec<_> = LogReader::open(storage.as_ref(), &writer.filename())
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
@@ -402,7 +364,7 @@ mod tests {
     fn test_lazy_log_writer_creates_no_file_until_first_write() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create_lazy_with_storage(storage.clone(), 1, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer = LogWriter::create_lazy(storage.clone(), 1, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
         assert!(!writer.is_open());
         assert_eq!(writer.generation(), 1);

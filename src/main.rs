@@ -1,5 +1,7 @@
 use appendfs::cli::{Cli, Commands};
+use appendfs::clock::SystemClock;
 use appendfs::log::LogWriter;
+use appendfs::storage::{OsStorage, Storage};
 use appendfs::{VolumeStats, init_volume, recover_fs};
 use clap::Parser;
 use std::sync::Arc;
@@ -15,14 +17,12 @@ fn main() {
                 args.log_dir.display(),
                 args.branch
             );
-            match init_volume(&args.log_dir, Some(&args.branch)) {
-                Ok(summary_path) => {
+            let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
+            match init_volume(storage, Some(&args.branch)) {
+                Ok(summary_filename) => {
                     println!("Initialized empty appendfs volume successfully!");
                     println!("  Log Directory:   {}", args.log_dir.display());
-                    println!(
-                        "  Summary File:    {}",
-                        summary_path.file_name().unwrap_or_default().to_string_lossy()
-                    );
+                    println!("  Summary File:    {}", summary_filename);
                     println!("  Branch:          {}", args.branch);
                     println!("  Root Inode:      1 (/)");
                     println!("  Next Generation: 1 (000001.log)");
@@ -48,13 +48,15 @@ fn main() {
                 "Recovering appendfs state from log directory '{}'...",
                 log_dir.display()
             );
-            let mut fs_instance = match recover_fs(log_dir) {
-                Ok(fs) => fs,
-                Err(e) => {
-                    eprintln!("Failed to recover volume from '{}': {}", log_dir.display(), e);
-                    std::process::exit(1);
-                }
-            };
+            let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
+            let mut fs_instance =
+                match recover_fs(storage.clone(), appendfs::RecoveryTarget::Latest, Arc::new(SystemClock)) {
+                    Ok(fs) => fs,
+                    Err(e) => {
+                        eprintln!("Failed to recover volume from '{}': {}", log_dir.display(), e);
+                        std::process::exit(1);
+                    }
+                };
 
             let next_gen = {
                 let manifest = fs_instance.manifest.read().unwrap();
@@ -63,7 +65,7 @@ fn main() {
 
             let start_tx = fs_instance.last_tx_id.load(std::sync::atomic::Ordering::SeqCst) + 1;
 
-            let writer = match LogWriter::create_lazy(log_dir, next_gen, args.max_log_size, start_tx) {
+            let writer = match LogWriter::create_lazy(storage, next_gen, args.max_log_size, start_tx) {
                 Ok(w) => Arc::new(w),
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -127,7 +129,8 @@ fn main() {
                 target,
                 log_dir.display()
             );
-            let mut fs_instance = match appendfs::recover_fs_to_target(log_dir, target) {
+            let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
+            let mut fs_instance = match appendfs::recover_fs(storage, target, Arc::new(SystemClock)) {
                 Ok(fs) => fs,
                 Err(e) => {
                     eprintln!("Failed to recover volume from '{}': {}", log_dir.display(), e);
@@ -171,7 +174,8 @@ fn main() {
                 std::process::exit(1);
             }
 
-            let fs = match recover_fs(log_dir) {
+            let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
+            let fs = match recover_fs(storage, appendfs::RecoveryTarget::Latest, Arc::new(SystemClock)) {
                 Ok(fs) => fs,
                 Err(e) => {
                     eprintln!("Failed to inspect volume from '{}': {}", log_dir.display(), e);
@@ -189,7 +193,11 @@ fn main() {
                 std::process::exit(1);
             }
 
-            match appendfs::dump_file(file_path, args.verbose) {
+            let parent = file_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let filename = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let storage = OsStorage::new(parent);
+
+            match appendfs::dump_file(&storage, &filename, args.verbose) {
                 Ok(output) => print!("{}", output),
                 Err(e) => {
                     eprintln!("Error dumping file '{}': {}", file_path.display(), e);
@@ -204,7 +212,8 @@ fn main() {
                 std::process::exit(1);
             }
 
-            match appendfs::check_volume(log_dir, args.verify_data) {
+            let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
+            match appendfs::check_volume(storage, args.verify_data) {
                 Ok(report) => {
                     print!("{}", report.format_report(Some(log_dir), args.verbose > 0));
                     if !report.is_clean() {

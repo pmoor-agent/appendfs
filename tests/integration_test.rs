@@ -1,5 +1,6 @@
 mod common;
 use appendfs::Clock;
+use appendfs::storage::{OsStorage, Storage};
 use common::TestMount;
 use std::fs;
 use std::io::Write;
@@ -252,8 +253,10 @@ fn test_fuse_filesystem() {
 fn test_fuse_with_log_writer() {
     let clock = appendfs::SystemClock;
     let log_dir = tempfile::Builder::new().prefix("appendfs_log_dir_").tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir.path()));
 
-    let writer = Arc::new(appendfs::LogWriter::create(log_dir.path(), 1, &clock).unwrap());
+    let writer =
+        Arc::new(appendfs::LogWriter::create(storage, 1, &clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
     let fs = appendfs::InMemoryFS::with_log(Arc::clone(&writer));
 
     let mount_dir = tempfile::Builder::new()
@@ -430,9 +433,10 @@ fn test_log_rolling() {
         .tempdir()
         .unwrap();
     let log_path = log_dir.path().to_path_buf();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     // Create a LogWriter with a tiny max_log_size of 512 bytes to force rolling
-    let writer = Arc::new(appendfs::LogWriter::create_with_max_size(&log_path, 1, &*clock, 512).unwrap());
+    let writer = Arc::new(appendfs::LogWriter::create(storage, 1, &*clock, 512, 1).unwrap());
 
     let mut fs_instance = appendfs::InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
     fs_instance.set_log_dir(&log_path);
@@ -483,7 +487,13 @@ fn test_log_rolling() {
     );
 
     // Verify recovery across all rolled generation log files
-    let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
+    let recovered_fs = appendfs::recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
     let mount_dir_rec = tempfile::Builder::new()
         .prefix("appendfs_rolling_rec_mount_")
         .tempdir()
@@ -514,8 +524,11 @@ fn test_summary_single_file_export_and_recovery() {
         .tempdir()
         .unwrap();
     let log_path = log_dir.path().to_path_buf();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1, &*clock).unwrap());
+    let writer = Arc::new(
+        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+    );
 
     let mut fs_instance = appendfs::InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
     fs_instance.set_log_dir(&log_path);
@@ -541,15 +554,20 @@ fn test_summary_single_file_export_and_recovery() {
     mount.unmount();
 
     // Recover filesystem state from log and export single-file summary snapshot (000001.summary)
-    let summary_file_path = log_path.join("000001.summary");
-    let fs_tmp = appendfs::recover_fs(&log_path).unwrap();
-    let summary_path = fs_tmp.export_summary(&log_path).unwrap();
+    let fs_tmp = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
+    let summary_file = fs_tmp.export_summary(storage.as_ref()).unwrap();
+    let summary_path = log_path.join(&summary_file);
 
     assert!(summary_path.exists());
-    assert_eq!(summary_path, summary_file_path);
+    assert_eq!(summary_file, "000001.summary");
 
     // Inspect summary snapshot using SummaryReader
-    let reader = appendfs::SummaryReader::open(&summary_path).unwrap();
+    let reader = appendfs::SummaryReader::open(storage.as_ref(), &summary_file).unwrap();
     assert_eq!(reader.header.generation, 1);
     assert_eq!(reader.footer.entry_count, 4); // root (1), docs dir (2), file1 (3), file2 (4)
 
@@ -561,7 +579,12 @@ fn test_summary_single_file_export_and_recovery() {
     }
 
     // Verify recovery: recover_fs should fast-load state from 000001.summary
-    let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
+    let recovered_fs = appendfs::recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
 
     let mount_dir_rec = tempfile::Builder::new()
         .prefix("appendfs_summary_rec_mount_")
@@ -639,9 +662,10 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
         .tempdir()
         .unwrap();
     let log_path = log_dir.path().to_path_buf();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     // 2KB max log size to trigger rolling across writes
-    let writer = Arc::new(appendfs::LogWriter::create_with_max_size(&log_path, 1, &*clock, 2048).unwrap());
+    let writer = Arc::new(appendfs::LogWriter::create(storage, 1, &*clock, 2048, 1).unwrap());
     let fs = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
     let temp_dir = tempfile::Builder::new()
@@ -682,7 +706,13 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
     mount.unmount();
 
     // Recover filesystem
-    let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
+    let recovered_fs = appendfs::recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
     let stats = recovered_fs.calculate_generation_live_stats();
 
     assert!(stats.len() >= 3, "Expected at least 3 generations");
@@ -703,19 +733,25 @@ fn test_volume_init_mount_and_stats_flow() {
     let clock = Arc::new(appendfs::SystemClock);
     let log_dir = tempfile::Builder::new().prefix("appendfs_init_vol_").tempdir().unwrap();
     let log_path = log_dir.path().to_path_buf();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     // 1. Explicitly initialize empty volume
-    let summary_path = appendfs::init_volume(&log_path, Some("work")).unwrap();
+    let summary_filename = appendfs::init_volume(storage.clone(), Some("work")).unwrap();
+    let summary_path = log_path.join(&summary_filename);
     assert!(summary_path.exists());
-    assert_eq!(summary_path.file_name().unwrap(), "000000.summary");
+    assert_eq!(summary_filename, "000000.summary");
 
     // 2. Mount initialized volume
-    let mut fs_instance = appendfs::recover_fs(&log_path).unwrap();
+    let mut fs_instance = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
     let next_gen = fs_instance.manifest.read().unwrap().next_generation;
     assert_eq!(next_gen, 1);
 
-    let writer =
-        Arc::new(appendfs::LogWriter::create_with_max_size(&log_path, next_gen, &*clock, 1024 * 1024).unwrap());
+    let writer = Arc::new(appendfs::LogWriter::create(storage.clone(), next_gen, &*clock, 1024 * 1024, 1).unwrap());
     fs_instance.log_writer = Some(Arc::clone(&writer));
     fs_instance.set_log_dir(&log_path);
 
@@ -747,7 +783,13 @@ fn test_volume_init_mount_and_stats_flow() {
 
     // 3. Inspect volume with stats WHILE THE FUSE MOUNT IS ACTIVELY RUNNING
     {
-        let live_recovered_fs = appendfs::recover_fs(&log_path).unwrap();
+        let live_storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
+        let live_recovered_fs = appendfs::recover_fs(
+            live_storage,
+            appendfs::RecoveryTarget::Latest,
+            Arc::new(appendfs::SystemClock),
+        )
+        .unwrap();
         let live_stats = appendfs::VolumeStats::collect(&live_recovered_fs);
         assert_eq!(live_stats.branch, "work");
         assert_eq!(live_stats.total_inodes, 3);
@@ -760,7 +802,13 @@ fn test_volume_init_mount_and_stats_flow() {
     mount.unmount();
 
     // 4. Inspect volume with stats after clean unmount
-    let recovered_fs = appendfs::recover_fs(&log_path).unwrap();
+    let rec_storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
+    let recovered_fs = appendfs::recover_fs(
+        rec_storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
     let stats = appendfs::VolumeStats::collect(&recovered_fs);
 
     assert_eq!(stats.branch, "work");
@@ -780,7 +828,7 @@ fn test_volume_init_mount_and_stats_flow() {
     assert!(log_file.exists());
 
     // Summary level (verbosity 0)
-    let dump_v0 = appendfs::dump_log_file(&log_file, 0).unwrap();
+    let dump_v0 = appendfs::dump_log_file(rec_storage.as_ref(), "000001.log", 0).unwrap();
     assert!(dump_v0.contains("File Size:"));
     assert!(dump_v0.contains("Committed Flushes:"));
     assert!(dump_v0.contains("Trailing Batch:      None"));
@@ -788,28 +836,28 @@ fn test_volume_init_mount_and_stats_flow() {
     assert!(dump_v0.contains("Write"));
 
     // Record stream level (verbosity 1)
-    let dump_v1 = appendfs::dump_log_file(&log_file, 1).unwrap();
+    let dump_v1 = appendfs::dump_log_file(rec_storage.as_ref(), "000001.log", 1).unwrap();
     assert!(dump_v1.contains("Create"));
     assert!(dump_v1.contains("Write"));
     assert!(dump_v1.contains("note.txt"));
     assert!(dump_v1.contains("[COMMITTED]"));
 
     // Full hex payload level (verbosity 2)
-    let dump_v2 = appendfs::dump_file(&log_file, 2).unwrap();
+    let dump_v2 = appendfs::dump_file(rec_storage.as_ref(), "000001.log", 2).unwrap();
     assert!(dump_v2.contains("hello appendfs v"));
     assert!(dump_v2.contains("olume"));
 
     // 6. Test dump command on the initial summary file 000000.summary
     let summary_file = log_path.join("000000.summary");
     assert!(summary_file.exists());
-    let dump_sum_v0 = appendfs::dump_file(&summary_file, 0).unwrap();
+    let dump_sum_v0 = appendfs::dump_file(rec_storage.as_ref(), "000000.summary", 0).unwrap();
     assert!(dump_sum_v0.contains("=== appendfs Summary File Dump ==="));
     assert!(dump_sum_v0.contains("Branch:              work"));
     assert!(dump_sum_v0.contains("Total Inodes:        1"));
     assert!(dump_sum_v0.contains("Checksum (BLAKE3):"));
     assert!(dump_sum_v0.contains("VERIFIED"));
 
-    let dump_sum_v1 = appendfs::dump_file(&summary_file, 1).unwrap();
+    let dump_sum_v1 = appendfs::dump_file(rec_storage.as_ref(), "000000.summary", 1).unwrap();
     assert!(dump_sum_v1.contains("Summary Inode Records"));
     assert!(dump_sum_v1.contains("Directory  \"/\""));
 }
@@ -818,9 +866,10 @@ fn test_volume_init_mount_and_stats_flow() {
 fn test_lazy_log_creation_and_clean_read_only_unmount() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
     // 1. Initialize volume
-    appendfs::init_volume(log_path, Some("main")).unwrap();
+    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
 
     // Verify only 000000.summary exists
     let files: Vec<_> = std::fs::read_dir(log_path)
@@ -831,9 +880,14 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
 
     // 2. Simulate Mount 1: Read-only mount session
     {
-        let mut fs = appendfs::recover_fs(log_path).unwrap();
+        let mut fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            Arc::new(appendfs::SystemClock),
+        )
+        .unwrap();
         let writer = std::sync::Arc::new(
-            appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+            appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
         );
         fs.log_writer = Some(writer);
         fs.set_log_dir(log_path);
@@ -856,9 +910,14 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
 
     // 3. Simulate Mount 2: Mutation session
     {
-        let mut fs = appendfs::recover_fs(log_path).unwrap();
+        let mut fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            Arc::new(appendfs::SystemClock),
+        )
+        .unwrap();
         let writer = std::sync::Arc::new(
-            appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+            appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
         );
         fs.log_writer = Some(writer);
         fs.set_log_dir(log_path);
@@ -886,7 +945,12 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
     );
 
     // 4. Verify recovery restores the written state
-    let recovered = appendfs::recover_fs(log_path).unwrap();
+    let recovered = appendfs::recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
     let root_entries = recovered.list_directory(1).unwrap();
     assert_eq!(root_entries.len(), 1);
     assert_eq!(root_entries[0].0, "testdir");
@@ -896,12 +960,18 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
 fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    appendfs::init_volume(log_path, Some("main")).unwrap();
+    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
 
-    let mut fs = appendfs::recover_fs(log_path).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
     let writer = std::sync::Arc::new(
-        appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create_lazy(storage, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
     );
     fs.log_writer = Some(writer);
     fs.set_log_dir(log_path);
@@ -937,12 +1007,18 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
 fn test_background_flusher_in_mount_session() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    appendfs::init_volume(log_path, Some("main")).unwrap();
+    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
 
-    let mut fs = appendfs::recover_fs(log_path).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
     let writer = std::sync::Arc::new(
-        appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create_lazy(storage, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
     );
     fs.log_writer = Some(writer);
     fs.set_log_dir(log_path);
@@ -977,12 +1053,18 @@ fn test_background_flusher_in_mount_session() {
 fn test_check_volume_identifies_clean_and_orphaned_volume() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    appendfs::init_volume(log_path, Some("main")).unwrap();
+    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
 
-    let mut fs = appendfs::recover_fs(log_path).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
     let writer = std::sync::Arc::new(
-        appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
     );
     fs.log_writer = Some(writer);
     fs.set_log_dir(log_path);
@@ -996,7 +1078,7 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
     fs.sync_log().unwrap();
 
     // 2. Check clean volume
-    let report = appendfs::check_volume(log_path, true).unwrap();
+    let report = appendfs::check_volume(storage, true).unwrap();
     assert!(report.is_clean(), "Clean volume must pass check: {:?}", report.issues);
     assert_eq!(report.error_count(), 0);
     assert_eq!(report.orphaned_inodes.len(), 0);
@@ -1108,18 +1190,24 @@ fn test_mount_ro_rejects_mutations_and_enables_point_in_time_time_travel() {
 fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    appendfs::init_volume(log_path, Some("main")).unwrap();
+    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
 
     // 1. First RW Mount: acquires exclusive lock
-    let mut fs1 = appendfs::recover_fs(log_path).unwrap();
-    let writer1 = appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1)
+    let mut fs1 = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
+    let writer1 = appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1)
         .expect("First RW mount must successfully acquire exclusive volume lock");
     fs1.log_writer = Some(std::sync::Arc::new(writer1));
     fs1.set_log_dir(log_path);
 
     // 2. Second concurrent RW Mount attempt: must fail with WouldBlock
-    let err = appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap_err();
+    let err = appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap_err();
     assert_eq!(
         err.kind(),
         std::io::ErrorKind::WouldBlock,
@@ -1132,21 +1220,25 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
     );
 
     // 3. Concurrent RO Mount/Recovery: must succeed even while RW is actively mounted!
-    let ro_fs = appendfs::recover_fs_to_target(log_path, appendfs::RecoveryTarget::Latest)
-        .expect("RO recovery must succeed concurrently while RW mount is active");
+    let ro_fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .expect("RO recovery must succeed concurrently while RW mount is active");
     assert!(ro_fs.list_directory(1).is_some());
 
     // 4. Drop first RW mount (unmount / release lock)
     drop(fs1);
 
     // 5. Subsequent RW Mount: must now succeed cleanly
-    let mut writer2_res = appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1);
+    let mut writer2_res = appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1);
     for _ in 0..20 {
         if writer2_res.is_ok() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
-        writer2_res = appendfs::LogWriter::create_lazy(log_path, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1);
+        writer2_res = appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1);
     }
     let writer2 = writer2_res.expect("Subsequent RW mount must succeed after previous RW mount is dropped");
     drop(writer2);
@@ -1253,8 +1345,11 @@ fn test_special_file_types_and_recovery() {
     let clock: Arc<dyn appendfs::Clock> = Arc::new(appendfs::SystemClock);
     let log_dir = tempfile::Builder::new().prefix("appendfs_spec_log_").tempdir().unwrap();
     let log_path = log_dir.path().to_path_buf();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1, &*clock).unwrap());
+    let writer = Arc::new(
+        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+    );
     let mut fs_instance = appendfs::InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
     fs_instance.set_log_dir(&log_path);
 
@@ -1307,7 +1402,12 @@ fn test_special_file_types_and_recovery() {
     mount.unmount();
 
     // 2. Recover filesystem and verify special nodes survived
-    let recovered_fs = appendfs::log::recover_fs(&log_path).expect("recover_fs should succeed");
+    let recovered_fs = appendfs::log::recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .expect("recover_fs should succeed");
     let remount_dir = tempfile::Builder::new()
         .prefix("appendfs_spec_remount_")
         .tempdir()
@@ -1435,8 +1535,11 @@ fn test_xattr_fuse_crud_and_crash_recovery() {
         .tempdir()
         .unwrap();
     let log_path = log_dir.path().to_path_buf();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1, &*clock).unwrap());
+    let writer = Arc::new(
+        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+    );
     let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
     let mount_dir = tempfile::Builder::new()
@@ -1493,7 +1596,12 @@ fn test_xattr_fuse_crud_and_crash_recovery() {
     mount.unmount();
 
     // 6. Recover filesystem from log files
-    let recovered_fs = appendfs::recover_fs(&log_path).expect("recovery should succeed");
+    let recovered_fs = appendfs::recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .expect("recovery should succeed");
     let remount_dir = tempfile::Builder::new()
         .prefix("appendfs_xattr_remount_")
         .tempdir()
@@ -1526,8 +1634,11 @@ fn test_xattr_on_directories_and_special_files() {
         .tempdir()
         .unwrap();
     let log_path = log_dir.path().to_path_buf();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1, &*clock).unwrap());
+    let writer = Arc::new(
+        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+    );
     let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
     let mount_dir = tempfile::Builder::new()
@@ -1552,7 +1663,12 @@ fn test_xattr_on_directories_and_special_files() {
     mount.unmount();
 
     // Recover and verify directory xattr persisted
-    let recovered_fs = appendfs::recover_fs(&log_path).expect("recovery should succeed");
+    let recovered_fs = appendfs::recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .expect("recovery should succeed");
     let remount_dir = tempfile::Builder::new()
         .prefix("appendfs_xattr_dir_remount_")
         .tempdir()
@@ -1573,8 +1689,11 @@ fn test_directory_nlink_tracking_and_recovery() {
         .tempdir()
         .unwrap();
     let log_path = log_dir.path().to_path_buf();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1, &*clock).unwrap());
+    let writer = Arc::new(
+        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+    );
     let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
     let mount_dir = tempfile::Builder::new()
@@ -1613,7 +1732,12 @@ fn test_directory_nlink_tracking_and_recovery() {
     // 5. Unmount and recover
     mount.unmount();
 
-    let recovered_fs = appendfs::recover_fs(&log_path).expect("recovery should succeed");
+    let recovered_fs = appendfs::recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .expect("recovery should succeed");
     let remount_dir = tempfile::Builder::new()
         .prefix("appendfs_dir_nlink_remount_")
         .tempdir()
@@ -1637,7 +1761,8 @@ fn test_special_permission_bits_live_folded_and_recovery() {
         .tempdir()
         .unwrap();
     let log_path = log_dir.path().to_path_buf();
-    let writer = Arc::new(appendfs::LogWriter::create(&log_path, 1024 * 1024, &*clock).unwrap());
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
+    let writer = Arc::new(appendfs::LogWriter::create(storage.clone(), 1, &*clock, 1024 * 1024, 1).unwrap());
     let fs = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
     // 1. Create file and directory
@@ -1708,7 +1833,12 @@ fn test_special_permission_bits_live_folded_and_recovery() {
     assert_eq!(folded_dir.perm, 0o1755, "Folded base directory must retain sticky bit");
 
     // 4. Recover from log and verify
-    let recovered = appendfs::recover_fs(&log_path).unwrap();
+    let recovered = appendfs::recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
     let rec_file = recovered.get_attr(file_ino).unwrap();
     let rec_dir = recovered.get_attr(dir_ino).unwrap();
     assert_eq!(
@@ -1719,10 +1849,17 @@ fn test_special_permission_bits_live_folded_and_recovery() {
 
     // 5. Export summary snapshot and recover from summary
     let summary_dir = tempfile::tempdir().unwrap();
-    let summary_path = recovered.export_summary(summary_dir.path()).unwrap();
+    let sum_storage: Arc<dyn Storage> = Arc::new(OsStorage::new(summary_dir.path()));
+    let summary_file = recovered.export_summary(sum_storage.as_ref()).unwrap();
+    let summary_path = summary_dir.path().join(&summary_file);
     assert!(summary_path.exists());
 
-    let summary_recovered = appendfs::recover_fs(summary_dir.path()).unwrap();
+    let summary_recovered = appendfs::recover_fs(
+        sum_storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
     let sum_file = summary_recovered.get_attr(file_ino).unwrap();
     let sum_dir = summary_recovered.get_attr(dir_ino).unwrap();
     assert_eq!(

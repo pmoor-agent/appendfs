@@ -11,7 +11,7 @@ use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
 use crate::storage::Storage;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
@@ -1999,8 +1999,8 @@ impl InMemoryFS {
         crate::check::check_fs_integrity(self, log_dir, verify_data)
     }
 
-    /// Exports a single-file summary snapshot of the current in-memory filesystem state.
-    pub fn export_summary(&self, log_dir: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    /// Exports a single-file summary snapshot of the current in-memory filesystem state to `storage`.
+    pub fn export_summary(&self, storage: &dyn Storage) -> std::io::Result<String> {
         self.sync_log()?;
         let snapshot = self.snapshot_all();
         let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
@@ -2011,29 +2011,10 @@ impl InMemoryFS {
         let next_inode = self.next_inode.load(Ordering::SeqCst);
         let manifest = self.manifest.read().unwrap().clone();
         let now = self.clock.now();
-        crate::log::summary::export_summary_with_time(
-            &snapshot, &manifest, log_dir, generation, last_tx_id, next_inode, now,
-        )
+        crate::log::summary::export_summary(&snapshot, &manifest, storage, generation, last_tx_id, next_inode, now)
     }
 
-    /// Exports a single-file summary snapshot to a custom `Storage` instance.
-    pub fn export_summary_to_storage(&self, storage: &dyn Storage) -> std::io::Result<String> {
-        self.sync_log()?;
-        let snapshot = self.snapshot_all();
-        let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
-        let last_tx_id = self
-            .log_writer
-            .as_ref()
-            .map_or_else(|| self.last_tx_id.load(Ordering::SeqCst), |w| w.last_tx_id());
-        let next_inode = self.next_inode.load(Ordering::SeqCst);
-        let manifest = self.manifest.read().unwrap().clone();
-        let now = self.clock.now();
-        crate::log::summary::export_summary_with_time_to_storage(
-            &snapshot, &manifest, storage, generation, last_tx_id, next_inode, now,
-        )
-    }
-
-    pub fn sync_and_export_summary(&self) -> std::io::Result<Option<PathBuf>> {
+    pub fn sync_and_export_summary(&self) -> std::io::Result<Option<String>> {
         self.sync_log()?;
         if let Some(ref writer) = self.log_writer {
             if !writer.is_open() {
@@ -2041,8 +2022,8 @@ impl InMemoryFS {
                 return Ok(None);
             }
             let storage = writer.storage();
-            match self.export_summary_to_storage(storage.as_ref()) {
-                Ok(filename) => return Ok(Some(PathBuf::from(filename))),
+            match self.export_summary(storage.as_ref()) {
+                Ok(filename) => return Ok(Some(filename)),
                 Err(e) => {
                     log::warn!("sync_and_export_summary error: {}", e);
                     return Err(e);
@@ -2080,8 +2061,9 @@ mod tests {
     #[test]
     fn test_flush_coalesces_micro_writes_into_single_base_range_entry() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
         let clock = SystemClock;
-        let writer = Arc::new(LogWriter::create(temp_dir.path(), 1024 * 1024, &clock).unwrap());
+        let writer = Arc::new(LogWriter::create(storage, 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let fs = InMemoryFS::with_log(writer);
 
         let ino = fs.allocate_inode();
@@ -2193,8 +2175,10 @@ mod tests {
     #[test]
     fn test_generation_live_stats_and_manifest_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         let ino1 = fs.allocate_inode();
@@ -2238,11 +2222,11 @@ mod tests {
         assert!((stats[0].live_ratio - (100.0 / 140.0)).abs() < 1e-6);
 
         // Export summary snapshot
-        let summary_path = fs.export_summary(dir.path()).unwrap();
-        assert!(summary_path.exists());
+        let summary_file = fs.export_summary(storage.as_ref()).unwrap();
+        assert!(storage.exists(&summary_file));
 
         // Recover filesystem and verify manifest is restored identically
-        let recovered = crate::log::recover_fs(dir.path()).unwrap();
+        let recovered = crate::log::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, clock.clone()).unwrap();
         let recovered_stats = recovered.calculate_generation_live_stats();
         assert_eq!(recovered_stats.len(), 1);
         assert_eq!(recovered_stats[0].generation, 1);
@@ -2254,8 +2238,10 @@ mod tests {
     #[test]
     fn test_rm_rf_directory_tree_emits_unlinks_for_all_children_and_recovers_cleanly() {
         let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // 1. Create /Gletscher, /Gletscher/sub, and files
@@ -2301,8 +2287,7 @@ mod tests {
         assert_eq!(stats_after[0].live_extents, 0);
 
         // 3. Inspect the log dump to verify Unlink and Rmdir records were written
-        let log_file = dir.path().join("000001.log");
-        let dump_text = crate::dump::dump_log_file(&log_file, 1).unwrap();
+        let dump_text = crate::dump::dump_log_file(storage.as_ref(), "000001.log", 1).unwrap();
         assert!(dump_text.contains("Unlink"));
         assert!(dump_text.contains("Rmdir"));
         assert!(dump_text.contains("file1.txt"));
@@ -2312,7 +2297,7 @@ mod tests {
         assert!(dump_text.contains("sub"));
 
         // 4. Recover filesystem and verify no orphaned nodes remain
-        let recovered = crate::log::recover_fs(dir.path()).unwrap();
+        let recovered = crate::log::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, clock.clone()).unwrap();
         let base = recovered.base.read().unwrap();
         assert_eq!(base.len(), 1); // ONLY root directory (inode 1) remains!
         assert!(base.contains_key(&1));
@@ -2325,8 +2310,10 @@ mod tests {
     #[test]
     fn test_hardlink_survives_rm_rf_of_other_parent_directory() {
         let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // 1. Create /keep and /Gletscher directories
@@ -2367,7 +2354,7 @@ mod tests {
         assert_eq!(stats2[0].live_extents, 1);
 
         // 5. Crash-recovery: Recover filesystem and verify /keep/shared.txt survived with full data!
-        let recovered = crate::log::recover_fs(dir.path()).unwrap();
+        let recovered = crate::log::recover_fs(storage, crate::RecoveryTarget::Latest, clock).unwrap();
         let rec_file_attr = recovered
             .get_attr(file_attr.ino)
             .expect("shared.txt must survive recovery");
@@ -2384,8 +2371,9 @@ mod tests {
     #[test]
     fn test_exists_below_live_sees_a_tombstone_frozen_out_of_live() {
         let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer = Arc::new(LogWriter::create(storage, 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -2412,8 +2400,9 @@ mod tests {
     #[test]
     fn test_attr_update_does_not_resurrect_a_tombstoned_inode() {
         let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer = Arc::new(LogWriter::create(storage, 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -2445,8 +2434,9 @@ mod tests {
     #[test]
     fn test_mutation_threshold_triggers_automatic_flush() {
         let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer = Arc::new(LogWriter::create(storage, 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
         // Set small operation threshold of 5 ops
         fs.max_staged_ops = 5;
@@ -2470,8 +2460,10 @@ mod tests {
     #[test]
     fn test_unlinked_open_file_does_not_resurrect_on_recovery() {
         let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // Create a temp file
@@ -2492,7 +2484,7 @@ mod tests {
         fs.sync_log().unwrap();
 
         // Recover filesystem from log
-        let recovered = crate::log::recover_fs(dir.path()).unwrap();
+        let recovered = crate::log::recover_fs(storage, crate::RecoveryTarget::Latest, clock).unwrap();
         let base = recovered.base.read().unwrap();
 
         // Only root inode (1) should exist; NO resurrected /file_{ino} or phantom entries!
@@ -2507,8 +2499,9 @@ mod tests {
     #[test]
     fn test_truncate_down_then_extend_across_flush_boundary() {
         let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(dir.path(), 1, &*clock).unwrap());
+        let writer = Arc::new(LogWriter::create(storage, 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // Create file and write 100 bytes (0xAA)
@@ -2625,11 +2618,11 @@ mod tests {
         let fault_storage = crate::storage::FaultStorage::new(mem);
         let storage = Arc::new(fault_storage.clone());
 
-        crate::log::init_volume_with_storage(storage.clone(), Some("main")).unwrap();
+        crate::log::init_volume(storage.clone(), Some("main")).unwrap();
 
         let clock = Arc::new(SystemClock);
         // Set tiny max_log_size (50 bytes) so the next flush rolls to 000002.log
-        let writer = Arc::new(LogWriter::create_with_storage(storage.clone(), 1, &*clock, 50, 1).unwrap());
+        let writer = Arc::new(LogWriter::create(storage.clone(), 1, &*clock, 50, 1).unwrap());
         let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage.clone());
         fs.log_writer = Some(writer);
 
@@ -2685,7 +2678,7 @@ mod tests {
         assert_eq!(&d3, b"third payload");
 
         // 7. Crash-recovery: Recover filesystem and verify all files recovered cleanly
-        let recovered = crate::log::recover_fs_with_storage(storage.clone()).unwrap();
+        let recovered = crate::log::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, clock.clone()).unwrap();
         assert!(recovered.get_attr(f1.ino).is_some());
         assert!(recovered.get_attr(f2.ino).is_some());
         assert!(recovered.get_attr(f3.ino).is_some());
@@ -2703,9 +2696,8 @@ mod tests {
         let fault_storage = crate::storage::FaultStorage::new(mem);
         let storage = Arc::new(fault_storage.clone());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create_with_storage(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
-        );
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // 1. Initial batch with 2 files flushed cleanly
@@ -2756,7 +2748,8 @@ mod tests {
         assert_eq!(fs.flushing.read().unwrap().len(), 0);
 
         // 8. Recover filesystem and verify 100% data integrity without checksum mismatches!
-        let recovered = crate::log::recover_fs_with_storage(storage.clone()).expect("Recovery must succeed cleanly");
+        let recovered = crate::log::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, clock.clone())
+            .expect("Recovery must succeed cleanly");
         for ino in initial_inos {
             assert!(recovered.get_attr(ino).is_some());
             let d = crate::operations::read_write::read_core(&recovered, ino, 15, 0).unwrap();
@@ -2768,7 +2761,7 @@ mod tests {
             assert_eq!(d, payload);
         }
 
-        let report = crate::check::check_volume_with_storage(storage, true).unwrap();
+        let report = crate::check::check_volume(storage.clone(), true).unwrap();
         assert!(report.is_clean(), "Integrity check must be clean: {:?}", report.issues);
     }
 
@@ -2778,9 +2771,8 @@ mod tests {
         let fault_storage = crate::storage::FaultStorage::new(mem);
         let storage = Arc::new(fault_storage.clone());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create_with_storage(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
-        );
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
         let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
         fs.max_staged_ops = 1; // freeze a batch on every mutation
         fs.max_flush_queue_depth = 4;

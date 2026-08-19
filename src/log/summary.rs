@@ -2,13 +2,11 @@ use crate::fs::InMemoryFS;
 use crate::log::SharedExtentState;
 use crate::node::{Node, NodeKind};
 use crate::range_map::RangeMap;
-use crate::storage::{OsStorage, Storage, StorageReader, WriteMode};
+use crate::storage::{Storage, StorageReader, WriteMode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 pub const SUMMARY_HEADER_SIZE: usize = 44;
 // 28 bytes (manifest_offset + index_offset + entry_count + magic) + 32-byte BLAKE3 checksum.
@@ -105,8 +103,8 @@ impl SummaryIndexEntry {
     }
 }
 
-/// Exports a single-file summary snapshot to a custom `Storage` instance.
-pub fn export_summary_with_time_to_storage(
+/// Exports a single-file summary snapshot to a `Storage` instance.
+pub fn export_summary(
     snapshot: &HashMap<u64, Arc<Node>>,
     manifest: &crate::log::LogManifest,
     storage: &dyn Storage,
@@ -123,11 +121,7 @@ pub fn export_summary_with_time_to_storage(
     let filename = format!("{:06}.summary", generation);
     let tmp_filename = format!("{:06}.summary.tmp", generation);
 
-    // Overwrite: a `.tmp` left behind by a previously failed export is discarded rather
-    // than prefixed to this one and silently renamed over the real summary.
     let mut writer = storage.open_writer(&tmp_filename, WriteMode::Overwrite)?;
-
-    // Hashes everything written before the footer
     let mut hasher = blake3::Hasher::new();
 
     // 1. Write SummaryHeader at offset 0
@@ -148,49 +142,15 @@ pub fn export_summary_with_time_to_storage(
         } else if let NodeKind::File { ref mut range_map, .. } = node_to_serialize.kind {
             let entries: Vec<(u64, u64, SharedExtentState)> = range_map
                 .iter()
-                .map(|(start, e)| (*start, e.length, e.value.clone()))
+                .map(|(start, entry)| (*start, entry.length, entry.value.clone()))
                 .collect();
-            let mut coalesced = RangeMap::new();
-            let mut current: Option<(u64, u64, SharedExtentState)> = None;
-            for (start, len, state) in entries {
-                if let Some((cur_start, cur_len, cur_state)) = current.take() {
-                    let mut merged = false;
-                    if cur_start + cur_len == start
-                        && let (
-                            crate::log::ExtentState::Disk {
-                                generation: g1,
-                                record_log_offset: r1,
-                                payload_offset: p1,
-                                length: _,
-                            },
-                            crate::log::ExtentState::Disk {
-                                generation: g2,
-                                record_log_offset: r2,
-                                payload_offset: p2,
-                                length: _,
-                            },
-                        ) = (cur_state.read_state(), state.read_state())
-                        && g1 == g2
-                        && r1 == r2
-                        && p1 as u64 + cur_len == p2 as u64
-                    {
-                        let new_state = SharedExtentState::new_disk(g1, r1, p1, (cur_len + len) as u32);
-                        current = Some((cur_start, cur_len + len, new_state));
-                        merged = true;
-                    }
-                    if !merged {
-                        coalesced.insert(cur_start, cur_len, cur_state);
-                        current = Some((start, len, state));
-                    }
-                } else {
-                    current = Some((start, len, state));
-                }
+            let mut new_map = RangeMap::new();
+            for (start, length, val) in entries {
+                new_map.insert(start, length, val);
             }
-            if let Some((cur_start, cur_len, cur_state)) = current {
-                coalesced.insert(cur_start, cur_len, cur_state);
-            }
-            *range_map = coalesced;
+            *range_map = new_map;
         }
+
         let payload =
             bincode::serialize(&node_to_serialize).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -254,58 +214,9 @@ pub fn export_summary_with_time_to_storage(
     Ok(filename)
 }
 
-/// Exports a single-file summary snapshot of an inodes snapshot map into `log_dir`.
-pub fn export_summary(
-    snapshot: &HashMap<u64, Arc<Node>>,
-    manifest: &crate::log::LogManifest,
-    log_dir: impl AsRef<Path>,
-    generation: u64,
-    last_tx_id: u64,
-    next_inode: u64,
-) -> io::Result<PathBuf> {
-    export_summary_with_time(
-        snapshot,
-        manifest,
-        log_dir,
-        generation,
-        last_tx_id,
-        next_inode,
-        std::time::SystemTime::now(),
-    )
-}
-
-/// Exports a single-file summary snapshot of an inodes snapshot map into `log_dir` with custom created_at timestamp.
-pub fn export_summary_with_time(
-    snapshot: &HashMap<u64, Arc<Node>>,
-    manifest: &crate::log::LogManifest,
-    log_dir: impl AsRef<Path>,
-    generation: u64,
-    last_tx_id: u64,
-    next_inode: u64,
-    created_at: std::time::SystemTime,
-) -> io::Result<PathBuf> {
-    let log_dir = log_dir.as_ref();
-    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
-    let filename = export_summary_with_time_to_storage(
-        snapshot, manifest, &storage, generation, last_tx_id, next_inode, created_at,
-    )?;
-    Ok(log_dir.join(filename))
-}
-
-pub fn export_fs_summary(
-    fs: &InMemoryFS,
-    log_dir: impl AsRef<Path>,
-    generation: u64,
-    last_tx_id: u64,
-) -> io::Result<PathBuf> {
-    let snapshot = fs.snapshot_all();
-    let next_inode = fs.next_inode.load(Ordering::SeqCst);
-    let manifest = fs.manifest.read().unwrap().clone();
-    export_summary(&snapshot, &manifest, log_dir, generation, last_tx_id, next_inode)
-}
-
 /// Initializes a fresh, empty appendfs volume on a `Storage` instance.
-pub fn init_volume_with_storage(storage: Arc<dyn Storage>, branch: Option<&str>) -> io::Result<()> {
+/// Creates `000000.summary` containing the root directory (inode 1) and an initial LogManifest.
+pub fn init_volume(storage: Arc<dyn Storage>, branch: Option<&str>) -> io::Result<String> {
     let files = storage.list_files()?;
     for file in files {
         if file.ends_with(".summary") || file.ends_with(".log") {
@@ -326,18 +237,15 @@ pub fn init_volume_with_storage(storage: Arc<dyn Storage>, branch: Option<&str>)
         next_filename: "000001.log".to_string(),
     };
 
-    export_summary_with_time_to_storage(&snapshot, &manifest, &storage, 0, 0, 2, std::time::SystemTime::now())?;
-
-    Ok(())
-}
-
-/// Explicitly initializes a fresh, empty appendfs volume at `log_dir`.
-/// Creates `000000.summary` containing the root directory (inode 1) and an initial LogManifest.
-pub fn init_volume(log_dir: impl AsRef<Path>, branch: Option<&str>) -> io::Result<PathBuf> {
-    let log_dir = log_dir.as_ref();
-    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
-    init_volume_with_storage(storage, branch)?;
-    Ok(log_dir.join("000000.summary"))
+    export_summary(
+        &snapshot,
+        &manifest,
+        storage.as_ref(),
+        0,
+        0,
+        2,
+        std::time::SystemTime::now(),
+    )
 }
 
 /// Reader for single-file `{:06}.summary` snapshot files.
@@ -351,7 +259,7 @@ pub struct SummaryReader {
 
 impl SummaryReader {
     /// Opens a `.summary` file from a `Storage` instance.
-    pub fn open_with_storage(storage: &dyn Storage, filename: &str) -> io::Result<Self> {
+    pub fn open(storage: &dyn Storage, filename: &str) -> io::Result<Self> {
         let reader = storage.open_reader(filename)?;
         let file_len = reader.len()?;
 
@@ -418,15 +326,6 @@ impl SummaryReader {
             manifest,
             index_entries,
         })
-    }
-
-    /// Opens a `.summary` file from a local filesystem path.
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref();
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(parent));
-        Self::open_with_storage(&storage, &filename)
     }
 
     /// Returns the slice of all index entries in this summary file.
@@ -545,11 +444,9 @@ mod tests {
             next_filename: "000002.log".to_string(),
         };
 
-        let filename =
-            export_summary_with_time_to_storage(&snapshot, &manifest, storage.as_ref(), 1, 42, 3, SystemTime::now())
-                .unwrap();
+        let filename = export_summary(&snapshot, &manifest, storage.as_ref(), 1, 42, 3, SystemTime::now()).unwrap();
 
-        let reader = SummaryReader::open_with_storage(storage.as_ref(), &filename).unwrap();
+        let reader = SummaryReader::open(storage.as_ref(), &filename).unwrap();
         assert_eq!(reader.header.generation, 1);
         assert_eq!(reader.header.last_tx_id, 42);
         assert_eq!(reader.header.next_inode, 3);
@@ -604,11 +501,9 @@ mod tests {
             next_filename: "000005.log".to_string(),
         };
 
-        let filename =
-            export_summary_with_time_to_storage(&snapshot, &manifest, storage.as_ref(), 4, 999, 51, SystemTime::now())
-                .unwrap();
+        let filename = export_summary(&snapshot, &manifest, storage.as_ref(), 4, 999, 51, SystemTime::now()).unwrap();
 
-        let reader = SummaryReader::open_with_storage(storage.as_ref(), &filename).unwrap();
+        let reader = SummaryReader::open(storage.as_ref(), &filename).unwrap();
         assert_eq!(reader.footer.entry_count, 50);
 
         let all_inodes: Vec<u64> = reader.iter_inodes().map(|res| res.unwrap().0).collect();
@@ -621,11 +516,11 @@ mod tests {
     #[test]
     fn test_init_volume_creates_valid_summary_and_manifest() {
         let storage = Arc::new(MemoryStorage::new());
-        init_volume_with_storage(storage.clone(), Some("dev")).unwrap();
+        init_volume(storage.clone(), Some("dev")).unwrap();
 
         assert!(storage.exists("000000.summary"));
 
-        let reader = SummaryReader::open_with_storage(storage.as_ref(), "000000.summary").unwrap();
+        let reader = SummaryReader::open(storage.as_ref(), "000000.summary").unwrap();
         assert_eq!(reader.header.generation, 0);
         assert_eq!(reader.header.last_tx_id, 0);
         assert_eq!(reader.header.next_inode, 2);
@@ -646,7 +541,7 @@ mod tests {
     #[should_panic(expected = "summary checksum mismatch")]
     fn test_bitrot_in_summary_body_is_detected() {
         let storage = Arc::new(MemoryStorage::new());
-        init_volume_with_storage(storage.clone(), None).unwrap();
+        init_volume(storage.clone(), None).unwrap();
 
         // Mutate a byte in the middle of 000000.summary
         let mut bytes = storage.get_file_bytes("000000.summary").unwrap();
@@ -654,7 +549,7 @@ mod tests {
         storage.insert_file("000000.summary", bytes);
 
         // Opening corrupted summary file must panic with bitrot detected
-        let _ = SummaryReader::open_with_storage(storage.as_ref(), "000000.summary");
+        let _ = SummaryReader::open(storage.as_ref(), "000000.summary");
     }
 
     #[test]
@@ -683,15 +578,7 @@ mod tests {
 
         // A first export dies partway, leaving a partial 000001.summary.tmp behind.
         storage.fail_writes_after_bytes(16, true);
-        let failed = export_summary_with_time_to_storage(
-            &snapshot,
-            &manifest,
-            storage.as_ref(),
-            1,
-            42,
-            3,
-            SystemTime::UNIX_EPOCH,
-        );
+        let failed = export_summary(&snapshot, &manifest, storage.as_ref(), 1, 42, 3, SystemTime::UNIX_EPOCH);
         assert!(failed.is_err(), "injected write fault should fail the export");
         let stale = mem
             .get_file_bytes("000001.summary.tmp")
@@ -700,18 +587,10 @@ mod tests {
 
         // Retrying on a healthy backend must not prefix the stale bytes to the new summary.
         storage.clear_write_limit();
-        let filename = export_summary_with_time_to_storage(
-            &snapshot,
-            &manifest,
-            storage.as_ref(),
-            1,
-            42,
-            3,
-            SystemTime::UNIX_EPOCH,
-        )
-        .unwrap();
+        let filename =
+            export_summary(&snapshot, &manifest, storage.as_ref(), 1, 42, 3, SystemTime::UNIX_EPOCH).unwrap();
 
-        let reader = SummaryReader::open_with_storage(storage.as_ref(), &filename).unwrap();
+        let reader = SummaryReader::open(storage.as_ref(), &filename).unwrap();
         assert_eq!(reader.header.generation, 1);
         assert_eq!(reader.footer.entry_count, 1);
         match reader.read_inode(1).unwrap().unwrap().kind {

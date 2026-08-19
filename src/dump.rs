@@ -4,15 +4,14 @@ use crate::log::record::{
 };
 use crate::log::summary::{SUMMARY_MAGIC, SummaryReader};
 use crate::node::NodeKind;
-use crate::storage::{OsStorage, Storage, StorageReader};
+use crate::storage::{Storage, StorageReader};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::io;
-use std::path::Path;
 use std::time::SystemTime;
 
 /// Dispatches dumping from a `Storage` instance based on magic bytes or extension.
-pub fn dump_file_with_storage(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Result<String> {
+pub fn dump_file(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Result<String> {
     let reader = storage.open_reader(filename)?;
     let mut magic = [0u8; 4];
     if reader.len()? < 4 {
@@ -26,7 +25,7 @@ pub fn dump_file_with_storage(storage: &dyn Storage, filename: &str, verbosity: 
     if magic == crate::log::record::FILE_MAGIC || filename.ends_with(".log") {
         dump_log_reader_with_path(reader.as_ref(), Some(filename), verbosity)
     } else if &magic == SUMMARY_MAGIC || filename.ends_with(".summary") {
-        dump_summary_file_with_storage(storage, filename, verbosity)
+        dump_summary_file(storage, filename, verbosity)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -36,15 +35,6 @@ pub fn dump_file_with_storage(storage: &dyn Storage, filename: &str, verbosity: 
             ),
         ))
     }
-}
-
-/// Dispatches dumping to either `dump_log_file` or `dump_summary_file` based on magic bytes or extension.
-pub fn dump_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
-    let path = path.as_ref();
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-    let storage = OsStorage::new(parent);
-    dump_file_with_storage(&storage, &filename, verbosity)
 }
 
 /// Generic bucket for histogram distributions (e.g. write payload sizes, extents per file).
@@ -104,17 +94,13 @@ pub struct OpCodeStats {
     pub payload_bytes: u64,
 }
 
-/// Reads and analyzes a single `.log` file, formatting the output based on `verbosity`:
-/// - `verbosity == 0`: High-level summary, flush counts, OpCode breakdown, and write histogram.
-/// - `verbosity == 1`: Summary + all individual records (write payloads summarized by length).
+/// Reads and analyzes a single `.log` generation file, formatting the output based on `verbosity`:
+/// - `verbosity == 0`: File header, summary statistics, whole-file checksum, operations histogram, payload sizes histogram.
+/// - `verbosity == 1`: Summary + complete record list (op, tx_id, inode, offsets, payloads).
 /// - `verbosity >= 2`: Summary + all records + full hex/ASCII data dumps for writes.
-pub fn dump_log_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
-    let path = path.as_ref();
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-    let storage = OsStorage::new(parent);
-    let reader = storage.open_reader(&filename)?;
-    dump_log_reader_with_path(reader.as_ref(), Some(&path.to_string_lossy()), verbosity)
+pub fn dump_log_file(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Result<String> {
+    let reader = storage.open_reader(filename)?;
+    dump_log_reader_with_path(reader.as_ref(), Some(filename), verbosity)
 }
 
 /// Reads and analyzes a `.log` file from a `StorageReader`.
@@ -475,16 +461,9 @@ pub fn dump_log_reader_with_path(
 /// - `verbosity == 0`: Summary metadata, whole-file checksum, inode breakdown, extent fragmentation stats, histogram, top fragmented files, manifest table.
 /// - `verbosity == 1`: Summary + complete inode listing / directory tree.
 /// - `verbosity >= 2`: Summary + complete inode listing + detailed physical extent range mappings for all files.
-pub fn dump_summary_file_with_storage(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Result<String> {
-    let reader = SummaryReader::open_with_storage(storage, filename)?;
+pub fn dump_summary_file(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Result<String> {
+    let reader = SummaryReader::open(storage, filename)?;
     dump_summary_reader_with_path(&reader, Some(filename), verbosity)
-}
-
-/// Reads and analyzes a single `.summary` snapshot file, formatting the output based on `verbosity`.
-pub fn dump_summary_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
-    let path = path.as_ref();
-    let reader = SummaryReader::open(path)?;
-    dump_summary_reader_with_path(&reader, Some(&path.to_string_lossy()), verbosity)
 }
 
 /// Reads and analyzes a `.summary` snapshot from an existing `SummaryReader`.
@@ -1215,13 +1194,16 @@ mod tests {
     use crate::clock::{Clock, SystemClock};
     use crate::log::LogWriter;
     use crate::log::record::{CreatePayload, WriteMeta};
+    use crate::storage::OsStorage;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
     fn test_dump_log_file_summary_and_verbosity() {
         let dir = tempdir().unwrap();
+        let storage = Arc::new(OsStorage::new(dir.path()));
         let clock = SystemClock;
-        let writer = LogWriter::create(dir.path(), 1, &clock).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
         // Write Create record
         let create_p = CreatePayload {
@@ -1248,11 +1230,10 @@ mod tests {
         writer.emit_flush_commit(2, &clock).unwrap();
         drop(writer);
 
-        let log_path = dir.path().join("000001.log");
-        assert!(log_path.exists());
+        assert!(storage.exists("000001.log"));
 
         // Level 0: Summary
-        let summary_dump = dump_log_file(&log_path, 0).unwrap();
+        let summary_dump = dump_log_file(storage.as_ref(), "000001.log", 0).unwrap();
         assert!(summary_dump.contains("Total Valid Records: 3"));
         assert!(summary_dump.contains("Committed Flushes:   1"));
         assert!(summary_dump.contains("Trailing Batch:      None"));
@@ -1260,7 +1241,7 @@ mod tests {
         assert!(summary_dump.contains("64 B .. 511 B"));
 
         // Level 1: Records
-        let v1_dump = dump_log_file(&log_path, 1).unwrap();
+        let v1_dump = dump_log_file(storage.as_ref(), "000001.log", 1).unwrap();
         assert!(v1_dump.contains("Sequential Record Stream"));
         assert!(v1_dump.contains("Create"));
         assert!(v1_dump.contains("Write"));
@@ -1268,15 +1249,16 @@ mod tests {
         assert!(v1_dump.contains("[COMMITTED]"));
 
         // Level 2: Full Hex
-        let v2_dump = dump_log_file(&log_path, 2).unwrap();
+        let v2_dump = dump_log_file(storage.as_ref(), "000001.log", 2).unwrap();
         assert!(v2_dump.contains("42 42 42 42"));
     }
 
     #[test]
     fn test_dump_log_file_detects_interrupted_flush_trailing_records() {
         let dir = tempdir().unwrap();
+        let storage = Arc::new(OsStorage::new(dir.path()));
         let clock = SystemClock;
-        let writer = LogWriter::create(dir.path(), 1, &clock).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
         // Write Create and Write records WITHOUT FlushCommit trailer
         let create_p = CreatePayload {
@@ -1291,8 +1273,7 @@ mod tests {
         writer.append_record(OpCode::Create, 2, &create_bytes).unwrap();
         drop(writer);
 
-        let log_path = dir.path().join("000001.log");
-        let dump = dump_log_file(&log_path, 1).unwrap();
+        let dump = dump_log_file(storage.as_ref(), "000001.log", 1).unwrap();
         assert!(dump.contains("Trailing Batch:      1 UNCOMMITTED records"));
         assert!(dump.contains("[UNCOMMITTED TRAILING BATCH]"));
     }
@@ -1307,13 +1288,13 @@ mod tests {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
-        init_volume(dir.path(), Some("feature-branch")).unwrap();
+        let storage = Arc::new(OsStorage::new(dir.path()));
+        init_volume(storage.clone(), Some("feature-branch")).unwrap();
 
-        let summary_path = dir.path().join("000000.summary");
-        assert!(summary_path.exists());
+        assert!(storage.exists("000000.summary"));
 
         // Level 0: Summary
-        let dump_v0 = dump_file(&summary_path, 0).unwrap();
+        let dump_v0 = dump_file(storage.as_ref(), "000000.summary", 0).unwrap();
         assert!(dump_v0.contains("=== appendfs Summary File Dump ==="));
         assert!(dump_v0.contains("Branch:              feature-branch"));
         assert!(dump_v0.contains("Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)"));
@@ -1387,11 +1368,20 @@ mod tests {
             next_filename: "000003.log".to_string(),
         };
 
-        export_summary(&snapshot, &manifest, dir.path(), 1, 100, 4).unwrap();
-        let snapshot_path = dir.path().join("000001.summary");
+        export_summary(
+            &snapshot,
+            &manifest,
+            storage.as_ref(),
+            1,
+            100,
+            4,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert!(storage.exists("000001.summary"));
 
         // Level 0: Fragmentation Stats & Top Fragmented Files
-        let dump_snap_v0 = dump_file(&snapshot_path, 0).unwrap();
+        let dump_snap_v0 = dump_file(storage.as_ref(), "000001.summary", 0).unwrap();
         assert!(dump_snap_v0.contains("Total Regular Files: 1"));
         assert!(dump_snap_v0.contains("Total File Extents:  2"));
         assert!(dump_snap_v0.contains("Avg Extents / File:  2.00"));
@@ -1403,14 +1393,14 @@ mod tests {
         assert!(dump_snap_v0.contains("000002.log"));
 
         // Level 1: Inode Tree Listing
-        let dump_snap_v1 = dump_file(&snapshot_path, 1).unwrap();
+        let dump_snap_v1 = dump_file(storage.as_ref(), "000001.summary", 1).unwrap();
         assert!(dump_snap_v1.contains("Summary Inode Records"));
         assert!(dump_snap_v1.contains("Directory  \"/\""));
         assert!(dump_snap_v1.contains("Directory  \"/docs\""));
         assert!(dump_snap_v1.contains("RegularFile \"/docs/fragmented.bin\""));
 
         // Level 2: Full Physical Extent Mappings
-        let dump_snap_v2 = dump_file(&snapshot_path, 2).unwrap();
+        let dump_snap_v2 = dump_file(storage.as_ref(), "000001.summary", 2).unwrap();
         assert!(dump_snap_v2.contains("extents (2):"));
         assert!(dump_snap_v2.contains("000001.log [record offset 0x00000064 / 100"));
         assert!(dump_snap_v2.contains("000002.log [record offset 0x000000c8 / 200"));

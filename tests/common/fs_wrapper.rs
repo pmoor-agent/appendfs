@@ -1,6 +1,6 @@
 use appendfs::InMemoryFS;
 use appendfs::clock::{Clock, SystemClock};
-use appendfs::log::recover_fs_with_clock;
+use appendfs::log::recover_fs;
 use appendfs::shim::{FileAttr, FileType};
 use appendfs::storage::{FaultStorage, OsStorage, Storage};
 use std::collections::HashMap;
@@ -46,22 +46,11 @@ fn make_writer(
     max_log_size: u64,
     start_tx: u64,
 ) -> Arc<appendfs::LogWriter> {
-    match fault {
-        Some(f) => Arc::new(
-            appendfs::LogWriter::create_with_storage(
-                Arc::clone(f) as Arc<dyn Storage>,
-                generation,
-                clock,
-                max_log_size,
-                start_tx,
-            )
-            .unwrap(),
-        ),
-        None => Arc::new(
-            appendfs::LogWriter::create_with_max_size_and_start_tx(log_dir, generation, clock, max_log_size, start_tx)
-                .unwrap(),
-        ),
-    }
+    let storage: Arc<dyn Storage> = match fault {
+        Some(f) => Arc::clone(f) as Arc<dyn Storage>,
+        None => Arc::new(OsStorage::new(log_dir)),
+    };
+    Arc::new(appendfs::LogWriter::create(storage, generation, clock, max_log_size, start_tx).unwrap())
 }
 
 #[allow(dead_code)]
@@ -375,8 +364,12 @@ impl TestFS {
         clock: Arc<dyn Clock>,
         fault: Option<Arc<FaultStorage>>,
     ) -> Self {
-        let mut recovered = recover_fs_with_clock(log_dir, clock.clone()).unwrap();
-        let next_gen = appendfs::find_latest_generation(log_dir) + 1;
+        let storage: Arc<dyn Storage> = match fault.as_ref() {
+            Some(f) => Arc::clone(f) as Arc<dyn Storage>,
+            None => Arc::new(OsStorage::new(log_dir)),
+        };
+        let mut recovered = recover_fs(storage.clone(), appendfs::RecoveryTarget::Latest, clock.clone()).unwrap();
+        let next_gen = appendfs::find_latest_generation_in_storage(storage.as_ref()) + 1;
         let start_tx = recovered.last_tx_id.load(Ordering::SeqCst) + 1;
         recovered.log_writer = Some(make_writer(
             log_dir,

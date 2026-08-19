@@ -3,9 +3,8 @@ use crate::log::record::{
     MknodPayload, OpCode, RECORD_HEADER_SIZE, RecordHeader, RemovexattrPayload, RenamePayload, RmdirPayload,
     SetattrPayload, SetxattrPayload, SymlinkPayload, UnlinkPayload, WriteMeta,
 };
-use crate::storage::{OsStorage, Storage, StorageReader};
+use crate::storage::{Storage, StorageReader};
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -64,7 +63,7 @@ pub struct LogReader {
 
 impl LogReader {
     /// Opens a `.log` file from a `Storage` instance, verifies its `FileHeader`, and initializes the iterator.
-    pub fn open_with_storage(storage: &dyn Storage, filename: &str) -> io::Result<Self> {
+    pub fn open(storage: &dyn Storage, filename: &str) -> io::Result<Self> {
         let reader = storage.open_reader(filename)?;
 
         let mut header_buf = [0u8; FILE_HEADER_SIZE];
@@ -77,15 +76,6 @@ impl LogReader {
             header,
             current_offset: FILE_HEADER_SIZE as u64,
         })
-    }
-
-    /// Opens a `.log` file from a local filesystem path.
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref();
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(parent));
-        Self::open_with_storage(&storage, &filename)
     }
 
     /// Returns the parsed `FileHeader` of this log file.
@@ -165,14 +155,13 @@ mod tests {
     fn test_log_reader_iteration() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer =
-            LogWriter::create_with_storage(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
         writer.append_record(OpCode::Mkdir, 2, b"payload1").unwrap();
         writer.append_record(OpCode::Write, 3, b"payload22").unwrap();
         writer.sync().unwrap();
 
-        let reader = LogReader::open_with_storage(&storage, &writer.filename()).unwrap();
+        let reader = LogReader::open(&storage, &writer.filename()).unwrap();
         assert_eq!(reader.file_header().generation, 1);
 
         let records: Vec<LogRecord> = reader.map(|r| r.unwrap()).collect();

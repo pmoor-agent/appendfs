@@ -59,8 +59,7 @@ mod tests {
     fn test_log_file_cache_open_and_verify() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer =
-            LogWriter::create_with_storage(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
         writer.sync().unwrap();
 
         let cache = LogFileCache::with_storage(storage);
