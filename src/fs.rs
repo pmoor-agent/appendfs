@@ -253,16 +253,6 @@ impl InMemoryFS {
         self.open_counts.read().unwrap().get(&ino).copied().unwrap_or(0)
     }
 
-    /// Convenience helper for direct programmatic / test usage without an explicit `fh`.
-    pub fn open_handle(&self, ino: u64) -> u64 {
-        self.open_file_handle(ino, 0)
-    }
-
-    /// Convenience helper for direct programmatic / test usage without an explicit `fh`.
-    pub fn release_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
-        self.release_file_handle(fh, ino)
-    }
-
     // --- Directory Handle Snapshot Management ---
 
     pub fn allocate_fh(&self) -> u64 {

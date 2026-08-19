@@ -374,15 +374,15 @@ unsafe extern "C" {
     fn fuse_req_ctx_shim(req: shim_req_t) -> FuseCtx;
 }
 
-pub struct DirectoryBuffer {
+struct DirBufCore {
     req: Request,
     buf: Vec<u8>,
     max_size: usize,
     full: bool,
 }
 
-impl DirectoryBuffer {
-    pub fn new(req: Request, max_size: usize) -> Self {
+impl DirBufCore {
+    fn new(req: Request, max_size: usize) -> Self {
         Self {
             req,
             buf: Vec::with_capacity(max_size),
@@ -391,11 +391,14 @@ impl DirectoryBuffer {
         }
     }
 
-    pub fn is_full(&self) -> bool {
+    fn is_full(&self) -> bool {
         self.full
     }
 
-    pub fn add(&mut self, name: &str, ino: u64, file_type: FileType, next_off: i64) -> bool {
+    fn fill<F>(&mut self, name: &str, ffi_fill: F) -> bool
+    where
+        F: FnOnce(shim_req_t, *mut c_char, usize, *const c_char) -> usize,
+    {
         if self.full {
             return false;
         }
@@ -403,6 +406,50 @@ impl DirectoryBuffer {
             Ok(c) => c,
             Err(_) => return false,
         };
+
+        let current_len = self.buf.len();
+        let remaining = self.max_size.saturating_sub(current_len);
+        if remaining == 0 {
+            self.full = true;
+            return false;
+        }
+
+        self.buf.resize(self.max_size, 0);
+
+        let needed = ffi_fill(
+            self.req.req,
+            self.buf[current_len..].as_mut_ptr() as *mut c_char,
+            remaining,
+            c_name.as_ptr(),
+        );
+
+        if needed <= remaining {
+            self.buf.truncate(current_len + needed);
+            true
+        } else {
+            self.buf.truncate(current_len);
+            self.full = true;
+            false
+        }
+    }
+
+    fn reply(self) {
+        self.req.reply_buf(&self.buf);
+    }
+}
+
+pub struct DirectoryBuffer(DirBufCore);
+
+impl DirectoryBuffer {
+    pub fn new(req: Request, max_size: usize) -> Self {
+        Self(DirBufCore::new(req, max_size))
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.0.is_full()
+    }
+
+    pub fn add(&mut self, name: &str, ino: u64, file_type: FileType, next_off: i64) -> bool {
         let mode = match file_type {
             FileType::Directory => libc::S_IFDIR,
             FileType::RegularFile => libc::S_IFREG,
@@ -413,107 +460,45 @@ impl DirectoryBuffer {
             FileType::Socket => libc::S_IFSOCK,
         };
 
-        let current_len = self.buf.len();
-        let remaining = self.max_size.saturating_sub(current_len);
-        if remaining == 0 {
-            self.full = true;
-            return false;
-        }
-
-        self.buf.resize(self.max_size, 0);
-
-        let needed = unsafe {
-            shim_add_direntry(
-                self.req.req,
-                self.buf[current_len..].as_mut_ptr() as *mut c_char,
-                remaining,
-                c_name.as_ptr(),
-                ino,
-                mode,
-                next_off,
-            )
-        };
-
-        if needed <= remaining {
-            self.buf.truncate(current_len + needed);
-            true
-        } else {
-            self.buf.truncate(current_len);
-            self.full = true;
-            false
-        }
+        self.0.fill(name, |req, buf_ptr, remaining, c_name_ptr| unsafe {
+            shim_add_direntry(req, buf_ptr, remaining, c_name_ptr, ino, mode, next_off)
+        })
     }
 
     pub fn reply(self) {
-        self.req.reply_buf(&self.buf);
+        self.0.reply();
     }
 }
 
-pub struct DirectoryBufferPlus {
-    req: Request,
-    buf: Vec<u8>,
-    max_size: usize,
-    full: bool,
-}
+pub struct DirectoryBufferPlus(DirBufCore);
 
 impl DirectoryBufferPlus {
     pub fn new(req: Request, max_size: usize) -> Self {
-        Self {
-            req,
-            buf: Vec::with_capacity(max_size),
-            max_size,
-            full: false,
-        }
+        Self(DirBufCore::new(req, max_size))
     }
 
     pub fn is_full(&self) -> bool {
-        self.full
+        self.0.is_full()
     }
 
     pub fn add(&mut self, name: &str, attr: &FileAttr, attr_timeout: f64, entry_timeout: f64, next_off: i64) -> bool {
-        if self.full {
-            return false;
-        }
-        let c_name = match CString::new(name) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
         let shim_attr = convert_file_attr(attr);
-
-        let current_len = self.buf.len();
-        let remaining = self.max_size.saturating_sub(current_len);
-        if remaining == 0 {
-            self.full = true;
-            return false;
-        }
-
-        self.buf.resize(self.max_size, 0);
-
-        let needed = unsafe {
+        self.0.fill(name, |req, buf_ptr, remaining, c_name_ptr| unsafe {
             shim_add_direntry_plus(
-                self.req.req,
-                self.buf[current_len..].as_mut_ptr() as *mut c_char,
+                req,
+                buf_ptr,
                 remaining,
-                c_name.as_ptr(),
+                c_name_ptr,
                 &shim_attr,
                 attr_timeout,
                 entry_timeout,
                 next_off,
             )
-        };
-
-        if needed <= remaining {
-            self.buf.truncate(current_len + needed);
-            true
-        } else {
-            self.buf.truncate(current_len);
-            self.full = true;
-            false
-        }
+        })
     }
 
     pub fn reply(self) {
-        self.req.reply_buf(&self.buf);
+        self.0.reply();
     }
 }
 

@@ -47,29 +47,39 @@ pub fn dump_file(path: impl AsRef<Path>, verbosity: u8) -> io::Result<String> {
     dump_file_with_storage(&storage, &filename, verbosity)
 }
 
-/// Bucket for the extents per file fragmentation histogram.
+/// Generic bucket for histogram distributions (e.g. write payload sizes, extents per file).
 #[derive(Debug, Clone)]
-pub struct ExtentsBucket {
+pub struct HistogramBucket<T> {
     pub label: &'static str,
-    pub min: usize,
-    pub max: usize,
+    pub min: T,
+    pub max: T,
     pub count: usize,
+    pub total_bytes: u64,
 }
 
-impl ExtentsBucket {
-    pub fn new(label: &'static str, min: usize, max: usize) -> Self {
+impl<T: PartialOrd + Copy> HistogramBucket<T> {
+    pub fn new(label: &'static str, min: T, max: T) -> Self {
         Self {
             label,
             min,
             max,
             count: 0,
+            total_bytes: 0,
         }
     }
 
-    pub fn matches(&self, extents: usize) -> bool {
-        extents >= self.min && extents <= self.max
+    pub fn matches(&self, val: T) -> bool {
+        val >= self.min && val <= self.max
+    }
+
+    pub fn add(&mut self, bytes: u64) {
+        self.count += 1;
+        self.total_bytes += bytes;
     }
 }
+
+pub type ExtentsBucket = HistogramBucket<usize>;
+pub type WriteBucket = HistogramBucket<u64>;
 
 /// Represents the status of a single decoded record or EOF anomaly.
 #[derive(Debug, Clone)]
@@ -92,37 +102,6 @@ pub enum DumpRecordEntry {
 pub struct OpCodeStats {
     pub count: usize,
     pub payload_bytes: u64,
-}
-
-/// Bucket for the write payload size histogram.
-#[derive(Debug, Clone)]
-pub struct WriteBucket {
-    pub label: &'static str,
-    pub min_bytes: u64,
-    pub max_bytes: u64,
-    pub count: usize,
-    pub total_bytes: u64,
-}
-
-impl WriteBucket {
-    pub fn new(label: &'static str, min_bytes: u64, max_bytes: u64) -> Self {
-        Self {
-            label,
-            min_bytes,
-            max_bytes,
-            count: 0,
-            total_bytes: 0,
-        }
-    }
-
-    pub fn matches(&self, size: u64) -> bool {
-        size >= self.min_bytes && size <= self.max_bytes
-    }
-
-    pub fn add(&mut self, size: u64) {
-        self.count += 1;
-        self.total_bytes += size;
-    }
 }
 
 /// Reads and analyzes a single `.log` file, formatting the output based on `verbosity`:
