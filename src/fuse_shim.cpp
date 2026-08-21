@@ -81,6 +81,8 @@ typedef void (*shim_rename_fn)(shim_req_t req, uint64_t parent, const char *name
                                const char *newname, void *userdata);
 typedef void (*shim_link_fn)(shim_req_t req, uint64_t ino, uint64_t newparent, const char *newname, void *userdata);
 typedef void (*shim_fsync_fn)(shim_req_t req, uint64_t ino, int datasync, uint64_t fh, void *userdata);
+typedef void (*shim_fallocate_fn)(shim_req_t req, uint64_t ino, int32_t mode, int64_t offset, int64_t length,
+                                  uint64_t fh, void *userdata);
 typedef void (*shim_release_fn)(shim_req_t req, uint64_t ino, uint64_t fh, void *userdata);
 typedef void (*shim_releasedir_fn)(shim_req_t req, uint64_t ino, uint64_t fh, void *userdata);
 typedef void (*shim_fsyncdir_fn)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
@@ -118,6 +120,7 @@ struct RustLowlevelOps {
   shim_rename_fn rename;
   shim_link_fn link;
   shim_fsync_fn fsync;
+  shim_fallocate_fn fallocate;
   shim_release_fn release;
   shim_releasedir_fn releasedir;
   shim_fsyncdir_fn fsyncdir;
@@ -335,6 +338,18 @@ static void ll_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_f
   }
 }
 
+static void ll_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t length,
+                         struct fuse_file_info *fi) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.fallocate) {
+    uint64_t fh = fi ? fi->fh : 0;
+    ctx->ops.fallocate(static_cast<shim_req_t>(req), ino, static_cast<int32_t>(mode),
+                       static_cast<int64_t>(offset), static_cast<int64_t>(length), fh, ctx->userdata);
+  } else {
+    fuse_reply_err(req, 38);
+  }
+}
+
 static void ll_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.release) {
@@ -540,6 +555,7 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   ll_ops.rename = ll_rename;
   ll_ops.link = ll_link;
   ll_ops.fsync = ll_fsync;
+  ll_ops.fallocate = ll_fallocate;
   ll_ops.release = ll_release;
   ll_ops.releasedir = ll_releasedir;
   ll_ops.fsyncdir = ll_fsyncdir;

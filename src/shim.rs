@@ -139,6 +139,9 @@ struct RustLowlevelOps {
     link:
         Option<extern "C" fn(req: shim_req_t, ino: u64, newparent: u64, newname: *const c_char, userdata: *mut c_void)>,
     fsync: Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, fh: u64, userdata: *mut c_void)>,
+    fallocate: Option<
+        extern "C" fn(req: shim_req_t, ino: u64, mode: i32, offset: i64, length: i64, fh: u64, userdata: *mut c_void),
+    >,
     release: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void)>,
     releasedir: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void)>,
     fsyncdir: Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void)>,
@@ -534,6 +537,7 @@ pub trait Filesystem {
     fn rename(&self, req: Request, parent: u64, name: &str, newparent: u64, newname: &str);
     fn link(&self, req: Request, ino: u64, newparent: u64, newname: &str);
     fn fsync(&self, req: Request, ino: u64, datasync: bool, fh: u64);
+    fn fallocate(&self, req: Request, ino: u64, mode: i32, offset: i64, length: i64, fh: u64);
     fn release(&self, req: Request, ino: u64, fh: u64);
     fn releasedir(&self, req: Request, ino: u64, fh: u64);
     fn fsyncdir(&self, req: Request, ino: u64, datasync: bool);
@@ -771,6 +775,19 @@ extern "C" fn fsync_bridge(req: shim_req_t, ino: u64, datasync: c_int, fh: u64, 
     fs.fsync(Request { req }, ino, datasync != 0, fh);
 }
 
+extern "C" fn fallocate_bridge(
+    req: shim_req_t,
+    ino: u64,
+    mode: i32,
+    offset: i64,
+    length: i64,
+    fh: u64,
+    userdata: *mut c_void,
+) {
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    fs.fallocate(Request { req }, ino, mode, offset, length, fh);
+}
+
 extern "C" fn release_bridge(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     fs.release(Request { req }, ino, fh);
@@ -928,6 +945,7 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
         rename: Some(rename_bridge),
         link: Some(link_bridge),
         fsync: Some(fsync_bridge),
+        fallocate: Some(fallocate_bridge),
         release: Some(release_bridge),
         releasedir: Some(releasedir_bridge),
         fsyncdir: Some(fsyncdir_bridge),

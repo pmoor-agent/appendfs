@@ -299,6 +299,115 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
     Ok(())
 }
 
+/// Raises a file's recorded size to `new_size`, without writing anything.
+///
+/// The gap needs no extents: reads zero-fill anything the extent map does not cover, so
+/// growing the size alone is enough to make the new range read as zeros.
+fn grow_size_to(fs: &InMemoryFS, ino: u64, new_size: u64) -> Result<(), i32> {
+    let now = fs.clock.now();
+    {
+        let mut live = fs.live.write().unwrap();
+        if !live.contains_key(&ino) && !fs.exists_below_live(ino) {
+            return Err(libc::ENOENT);
+        }
+        let entry = live
+            .entry(ino)
+            .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
+        if let EntryDelta::Node(NodeDelta::File(f)) = entry {
+            // As in `write_core`: only trust `f.size` if this delta already touched the
+            // file, otherwise re-resolve from below `live`, since a flush may have frozen
+            // the previous delta out from under us.
+            let current = f
+                .size
+                .or_else(|| fs.attr_below_live(ino).map(|a| a.size as u64))
+                .unwrap_or(0);
+            if new_size > current {
+                f.size = Some(new_size);
+                f.attr_delta.mtime = Some(now);
+                f.attr_delta.ctime = Some(now);
+            }
+        }
+    }
+
+    fs.notify_mutation(0);
+    Ok(())
+}
+
+/// `fallocate(2)`.
+///
+/// Hole punching and zeroing are the modes that carry real weight here: they are how a
+/// caller tells a log-structured filesystem that data is dead, which is what lets
+/// compaction reclaim it.
+///
+/// Plain allocation cannot be honoured literally - there is no space to reserve in an
+/// append-only log - so it only extends the file. That is a partial lie, but the honest
+/// alternative is worse: glibc's `posix_fallocate` responds to `EOPNOTSUPP` by writing
+/// zeros over the whole range by hand, so refusing a 1 GiB preallocation would push 1 GiB
+/// of zeros through the write path.
+pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length: i64) -> Result<(), i32> {
+    log::trace!(
+        "fallocate(ino={}, mode=0x{:x}, offset={}, length={})",
+        ino,
+        mode,
+        offset,
+        length
+    );
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+    if offset < 0 || length <= 0 {
+        return Err(libc::EINVAL);
+    }
+
+    const SUPPORTED: i32 = libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE;
+    if mode & !SUPPORTED != 0 {
+        // Notably COLLAPSE_RANGE and INSERT_RANGE, which shift every byte above the range
+        // and would mean re-keying every extent above `offset` in every layer - including
+        // expressing that shift in a delta relative to `base`. Refusing is spec-legal.
+        return Err(libc::EOPNOTSUPP);
+    }
+
+    let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
+    if attr.file_type != FileType::RegularFile {
+        return Err(libc::EISDIR);
+    }
+
+    let start = offset as u64;
+    let len = length as u64;
+    let end = start.saturating_add(len);
+
+    if mode & libc::FALLOC_FL_PUNCH_HOLE != 0 {
+        // The kernel requires the pairing, and enforcing it keeps callers from assuming a
+        // punch might extend the file.
+        if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
+            return Err(libc::EINVAL);
+        }
+        return punch_hole_core(fs, ino, start, len);
+    }
+
+    if mode & libc::FALLOC_FL_ZERO_RANGE != 0 {
+        punch_hole_core(fs, ino, start, len)?;
+        // Unlike a punch, zeroing past EOF grows the file unless KEEP_SIZE says otherwise.
+        if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
+            grow_size_to(fs, ino, end)?;
+        }
+        return Ok(());
+    }
+
+    if mode & libc::FALLOC_FL_KEEP_SIZE != 0 {
+        // Nothing to reserve and nothing to resize.
+        return Ok(());
+    }
+    grow_size_to(fs, ino, end)
+}
+
+pub fn fallocate(fs: &InMemoryFS, req: Request, ino: u64, mode: i32, offset: i64, length: i64, _fh: u64) {
+    match fallocate_core(fs, ino, mode, offset, length) {
+        Ok(()) => req.reply_err(0),
+        Err(e) => req.reply_err(e),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn setattr(
     fs: &InMemoryFS,
@@ -435,5 +544,98 @@ pub fn release(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
     match release_core(fs, ino, fh) {
         Ok(()) => req.reply_err(0),
         Err(e) => req.reply_err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::InMemoryFS;
+
+    fn file_with(fs: &InMemoryFS, contents: &[u8]) -> u64 {
+        let attr = create_core(fs, 1, "f.bin", 0o644, 0, 1000, 1000).unwrap();
+        write_core(fs, attr.ino, contents, 0).unwrap();
+        attr.ino
+    }
+
+    #[test]
+    fn test_fallocate_mode_dispatch() {
+        let fs = InMemoryFS::new();
+        let ino = file_with(&fs, &[0xAB; 512]);
+
+        // Modes that shift file contents are refused outright. Silently ignoring the flag
+        // and allocating instead would leave the caller's data at the wrong offsets.
+        for mode in [libc::FALLOC_FL_COLLAPSE_RANGE, libc::FALLOC_FL_INSERT_RANGE] {
+            assert_eq!(fallocate_core(&fs, ino, mode, 0, 128), Err(libc::EOPNOTSUPP));
+        }
+
+        // `vfs_fallocate` screens this pairing before FUSE sees it, but the check still has
+        // to hold for direct callers.
+        assert_eq!(
+            fallocate_core(&fs, ino, libc::FALLOC_FL_PUNCH_HOLE, 0, 128),
+            Err(libc::EINVAL)
+        );
+
+        assert_eq!(fallocate_core(&fs, ino, 0, -1, 128), Err(libc::EINVAL));
+        assert_eq!(fallocate_core(&fs, ino, 0, 0, 0), Err(libc::EINVAL));
+
+        // KEEP_SIZE alone has nothing to reserve, so it must leave the file untouched.
+        assert_eq!(fallocate_core(&fs, ino, libc::FALLOC_FL_KEEP_SIZE, 0, 4096), Ok(()));
+        assert_eq!(fs.get_attr(ino).unwrap().size, 512);
+
+        // Plain allocation extends, and the new range reads as zeros.
+        assert_eq!(fallocate_core(&fs, ino, 0, 512, 512), Ok(()));
+        assert_eq!(fs.get_attr(ino).unwrap().size, 1024);
+        let data = fs.read_file_data(ino, 0, 1024).unwrap();
+        assert_eq!(&data[..512], &[0xAB; 512]);
+        assert!(data[512..].iter().all(|&b| b == 0));
+
+        // ...but allocating within the existing size must never shrink it.
+        assert_eq!(fallocate_core(&fs, ino, 0, 0, 16), Ok(()));
+        assert_eq!(fs.get_attr(ino).unwrap().size, 1024);
+    }
+
+    #[test]
+    fn test_fallocate_zero_range_honours_keep_size() {
+        // Without KEEP_SIZE, zeroing past EOF grows the file.
+        let fs = InMemoryFS::new();
+        let ino = file_with(&fs, &[0xCD; 512]);
+        fallocate_core(&fs, ino, libc::FALLOC_FL_ZERO_RANGE, 256, 512).unwrap();
+        assert_eq!(fs.get_attr(ino).unwrap().size, 768);
+        let data = fs.read_file_data(ino, 0, 768).unwrap();
+        assert_eq!(&data[..256], &[0xCD; 256]);
+        assert!(data[256..].iter().all(|&b| b == 0));
+
+        // With KEEP_SIZE it zeroes the live part without extending.
+        let fs2 = InMemoryFS::new();
+        let ino2 = file_with(&fs2, &[0xCD; 512]);
+        fallocate_core(
+            &fs2,
+            ino2,
+            libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE,
+            256,
+            512,
+        )
+        .unwrap();
+        assert_eq!(
+            fs2.get_attr(ino2).unwrap().size,
+            512,
+            "KEEP_SIZE must suppress the extension"
+        );
+        let data2 = fs2.read_file_data(ino2, 0, 512).unwrap();
+        assert_eq!(&data2[..256], &[0xCD; 256]);
+        assert!(data2[256..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_fallocate_rejected_on_read_only_mount() {
+        let fs = InMemoryFS::new();
+        let ino = file_with(&fs, &[0xEF; 128]);
+        fs.set_read_only(true);
+        assert_eq!(
+            fallocate_core(&fs, ino, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, 0, 64),
+            Err(libc::EROFS)
+        );
+        assert_eq!(punch_hole_core(&fs, ino, 0, 64), Err(libc::EROFS));
     }
 }

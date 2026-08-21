@@ -98,6 +98,10 @@ impl Filesystem for InMemoryFS {
         read_write::fsync(self, req, ino, datasync, fh);
     }
 
+    fn fallocate(&self, req: Request, ino: u64, mode: i32, offset: i64, length: i64, fh: u64) {
+        read_write::fallocate(self, req, ino, mode, offset, length, fh);
+    }
+
     fn release(&self, req: Request, ino: u64, fh: u64) {
         read_write::release(self, req, ino, fh);
     }

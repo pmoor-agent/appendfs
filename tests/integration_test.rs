@@ -1871,3 +1871,124 @@ fn test_special_permission_bits_live_folded_and_recovery() {
         "Summary-recovered directory must retain sticky bit"
     );
 }
+
+fn sys_fallocate(path: &std::path::Path, mode: i32, offset: i64, len: i64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    let res = unsafe { libc::fallocate(file.as_raw_fd(), mode, offset, len) };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Drives `fallocate(2)` through a real mount: the punched range has to read back as zeros
+/// with the surrounding data intact, the file size must not move, unsupported modes have to
+/// be refused rather than silently misapplied, and the hole has to survive recovery.
+#[test]
+fn test_fallocate_punch_hole_zero_range_and_recovery() {
+    let clock = Arc::new(appendfs::SystemClock);
+    let log_dir = tempfile::Builder::new()
+        .prefix("appendfs_fallocate_log_")
+        .tempdir()
+        .unwrap();
+    let log_path = log_dir.path().to_path_buf();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
+
+    let writer = Arc::new(
+        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+    );
+    let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+    let mount_dir = tempfile::Builder::new()
+        .prefix("appendfs_fallocate_mnt_")
+        .tempdir()
+        .unwrap();
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, fs_instance, false);
+    let mount_path = mount.path().to_path_buf();
+
+    let file_path = mount_path.join("holey.bin");
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251 + 1) as u8).collect();
+    fs::write(&file_path, &payload).unwrap();
+    assert_eq!(fs::metadata(&file_path).unwrap().len(), 4096);
+
+    // 1. Punch a hole in the middle. Size must not move; the range reads as zeros.
+    sys_fallocate(
+        &file_path,
+        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+        1024,
+        1024,
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::metadata(&file_path).unwrap().len(),
+        4096,
+        "punching must not change the file size"
+    );
+    let after_punch = fs::read(&file_path).unwrap();
+    assert_eq!(&after_punch[..1024], &payload[..1024], "data before the hole");
+    assert!(
+        after_punch[1024..2048].iter().all(|&b| b == 0),
+        "punched range must read as zeros"
+    );
+    assert_eq!(&after_punch[2048..], &payload[2048..], "data after the hole");
+
+    // 2. PUNCH_HOLE without KEEP_SIZE must be refused rather than treated as a plain
+    //    punch. `vfs_fallocate` screens this pairing before the request reaches FUSE and
+    //    answers EOPNOTSUPP, so the filesystem's own EINVAL is only reachable by calling
+    //    `fallocate_core` directly - covered by a unit test. Accept either here.
+    let unpaired_err = sys_fallocate(&file_path, libc::FALLOC_FL_PUNCH_HOLE, 0, 512).unwrap_err();
+    assert!(
+        matches!(unpaired_err.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::EINVAL)),
+        "PUNCH_HOLE without KEEP_SIZE should be refused, got {:?}",
+        unpaired_err
+    );
+
+    // 3. COLLAPSE_RANGE shifts file contents, which this filesystem does not implement.
+    //    Refusing is spec-legal; silently ignoring the flag would corrupt data.
+    let collapse_err = sys_fallocate(&file_path, libc::FALLOC_FL_COLLAPSE_RANGE, 0, 512).unwrap_err();
+    assert!(
+        matches!(collapse_err.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)),
+        "COLLAPSE_RANGE should be refused, got {:?}",
+        collapse_err
+    );
+
+    // 4. ZERO_RANGE over live data zeroes it, and past EOF it grows the file.
+    sys_fallocate(&file_path, libc::FALLOC_FL_ZERO_RANGE, 3072, 2048).unwrap();
+    assert_eq!(
+        fs::metadata(&file_path).unwrap().len(),
+        5120,
+        "ZERO_RANGE past EOF must extend the file"
+    );
+    let after_zero = fs::read(&file_path).unwrap();
+    assert!(
+        after_zero[3072..5120].iter().all(|&b| b == 0),
+        "zeroed range must read as zeros"
+    );
+    assert_eq!(
+        &after_zero[2048..3072],
+        &payload[2048..3072],
+        "data before the zeroed range"
+    );
+
+    // 5. Plain allocation cannot reserve space here, but must still extend the file.
+    sys_fallocate(&file_path, 0, 5120, 1024).unwrap();
+    assert_eq!(fs::metadata(&file_path).unwrap().len(), 6144);
+
+    let before_unmount = fs::read(&file_path).unwrap();
+    mount.unmount();
+
+    // 6. All of it has to survive replay - a dropped hole would resurrect the old bytes.
+    let recovered_fs = appendfs::recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
+    let ino = recovered_fs.lookup_child(1, "holey.bin").expect("file must survive");
+    let recovered = recovered_fs.read_file_data(ino, 0, 6144).unwrap();
+    assert_eq!(recovered.len(), 6144);
+    assert_eq!(recovered, before_unmount, "content must be identical after recovery");
+}
