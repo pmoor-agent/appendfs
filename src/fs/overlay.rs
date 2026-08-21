@@ -99,7 +99,6 @@ impl InMemoryFS {
                     EntryDelta::Node(NodeDelta::File(FileDelta {
                         extents: RangeMap::new(),
                         size: None,
-                        truncate_mask: None,
                         attr_delta: delta,
                     })),
                 );

@@ -84,7 +84,6 @@ pub fn mknod_core(
                 NodeDelta::File(FileDelta {
                     extents: RangeMap::new(),
                     size: Some(0),
-                    truncate_mask: None,
                     attr_delta,
                 }),
                 FileType::RegularFile,

@@ -30,14 +30,19 @@ pub enum ExtentState {
     /// distinction is what makes hole punching work in a delta layer rather than silently
     /// resurrecting the punched data at the next read. Folding into `base` may collapse
     /// `Zero` back to absence, since nothing sits below `base` to mask.
-    Zero { length: u32 },
+    ///
+    /// The length is `u64`, unlike the other variants: a hole has no backing payload to
+    /// index into, so the `u32` ceiling that bounds a real extent does not apply. That
+    /// matters because truncating a file emits a hole spanning everything it discarded,
+    /// which stays a single extent however large the file was.
+    Zero { length: u64 },
 }
 
 impl ExtentState {
-    pub fn length(&self) -> u32 {
+    pub fn length(&self) -> u64 {
         match self {
-            ExtentState::Staged { length, .. } => *length,
-            ExtentState::Disk { length, .. } => *length,
+            ExtentState::Staged { length, .. } => *length as u64,
+            ExtentState::Disk { length, .. } => *length as u64,
             ExtentState::Zero { length } => *length,
         }
     }
@@ -46,7 +51,7 @@ impl ExtentState {
     pub fn allocated_len(&self) -> u64 {
         match self {
             ExtentState::Zero { .. } => 0,
-            other => other.length() as u64,
+            other => other.length(),
         }
     }
 }
@@ -66,7 +71,7 @@ enum StoredExtent {
         length: u32,
     },
     Zero {
-        length: u32,
+        length: u64,
     },
 }
 
@@ -86,7 +91,24 @@ impl Clone for SharedExtentState {
 /// sentinel rather than widening `SerializedExtent`/`LogExtent` into an enum keeps the
 /// on-disk shape flat: an enum discriminant would otherwise be paid on *every* extent in
 /// every summary and delta record, and holes are the rare case.
+///
+/// When the sentinel is set, the descriptor is reinterpreted: a hole's length needs 64 bits
+/// but the `length` field is only 32, so it is carried in `record_log_offset` instead - a
+/// field that has no meaning for a hole anyway. `zero_extent_len` and `zero_extent_fields`
+/// are the only places that encoding is applied; nothing else should read those fields
+/// without checking the generation first.
 pub const ZERO_EXTENT_GENERATION: u64 = 0;
+
+/// Decodes a hole's length from an on-disk extent descriptor. See [`ZERO_EXTENT_GENERATION`].
+pub fn zero_extent_len(record_log_offset: u64) -> u64 {
+    record_log_offset
+}
+
+/// Encodes a hole as `(generation, record_log_offset, payload_offset, length)` for an
+/// on-disk extent descriptor. See [`ZERO_EXTENT_GENERATION`].
+pub fn zero_extent_fields(length: u64) -> (u64, u64, u32, u32) {
+    (ZERO_EXTENT_GENERATION, length, 0, 0)
+}
 
 /// On-disk shape of a `SharedExtentState`, used for summary (de)serialization. Kept
 /// identical to the pre-existing `ExtentState::Disk` field layout so `.summary` files
@@ -119,13 +141,16 @@ impl Serialize for SharedExtentState {
                 length,
             }
             .serialize(serializer),
-            ExtentState::Zero { length } => SerializedExtent {
-                generation: ZERO_EXTENT_GENERATION,
-                record_log_offset: 0,
-                payload_offset: 0,
-                length,
+            ExtentState::Zero { length } => {
+                let (generation, record_log_offset, payload_offset, length) = zero_extent_fields(length);
+                SerializedExtent {
+                    generation,
+                    record_log_offset,
+                    payload_offset,
+                    length,
+                }
+                .serialize(serializer)
             }
-            .serialize(serializer),
             ExtentState::Staged { .. } => Err(serde::ser::Error::custom(
                 "cannot serialize an extent that has not been flushed to disk",
             )),
@@ -140,7 +165,7 @@ impl<'de> Deserialize<'de> for SharedExtentState {
     {
         let s = SerializedExtent::deserialize(deserializer)?;
         if s.generation == ZERO_EXTENT_GENERATION {
-            return Ok(Self::new_zero(s.length));
+            return Ok(Self::new_zero(zero_extent_len(s.record_log_offset)));
         }
         Ok(Self::new_disk(
             s.generation,
@@ -170,7 +195,7 @@ impl SharedExtentState {
     }
 
     /// Creates a hole of `length` bytes - reads as zeros, occupies nothing on disk.
-    pub fn new_zero(length: u32) -> Self {
+    pub fn new_zero(length: u64) -> Self {
         Self(Arc::new(RwLock::new(StoredExtent::Zero { length })))
     }
 
@@ -249,7 +274,7 @@ impl RangeValue for SharedExtentState {
                 *length = std::cmp::min(*length, new_len as u32);
             }
             StoredExtent::Zero { length } => {
-                *length = std::cmp::min(*length, new_len as u32);
+                *length = std::cmp::min(*length, new_len);
             }
         }
     }
@@ -276,7 +301,7 @@ impl RangeValue for SharedExtentState {
             // A hole has no backing payload to seek into, so trimming from the left is
             // just a shortening.
             StoredExtent::Zero { length } => {
-                *length = length.saturating_sub(shift_u32);
+                *length = length.saturating_sub(shift);
             }
         }
     }

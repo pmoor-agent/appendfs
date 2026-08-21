@@ -9,7 +9,7 @@ pub mod summary;
 pub mod writer;
 
 pub use cache::LogFileCache;
-pub use extent::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION};
+pub use extent::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION, zero_extent_fields, zero_extent_len};
 pub use flusher::BackgroundFlusher;
 pub use manifest::{GenerationLiveStats, LogFileInfo, LogManifest};
 pub use reader::{LogReader, LogRecord};

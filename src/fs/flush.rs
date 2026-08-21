@@ -664,6 +664,72 @@ mod tests {
         expect_holed(&from_summary.read_file_data(ino, 0, 1000).unwrap());
     }
 
+    /// Two truncations in a row, then a grow. The second truncate must not narrow the
+    /// masked range down to the size the first one left behind: everything the file ever
+    /// held above the final cut has to stay masked, or growing back re-exposes whatever is
+    /// still sitting in `base` between the two cut points.
+    #[test]
+    fn test_successive_truncates_keep_masking_the_full_discarded_range() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+        let writer = Arc::new(
+            LogWriter::create(
+                Arc::clone(&storage),
+                1,
+                &SystemClock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_log(writer);
+
+        let attr = crate::operations::read_write::create_core(&fs, 1, "t.bin", 0o644, 0, 1000, 1000).unwrap();
+        let ino = attr.ino;
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251 + 1) as u8).collect();
+        write_core(&fs, ino, &payload, 0).unwrap();
+
+        // Flush so the data is durable in `base` and the truncates below land in a layer
+        // above it - the case where masking actually has to do something.
+        fs.sync_log().unwrap();
+
+        let truncate_to = |size: u64| {
+            let now = fs.clock.now();
+            crate::operations::read_write::setattr_core(
+                &fs,
+                ino,
+                0,
+                0,
+                0,
+                size as i64,
+                now,
+                now,
+                crate::operations::read_write::FUSE_SET_ATTR_SIZE,
+            )
+            .unwrap();
+        };
+
+        truncate_to(500);
+        truncate_to(100);
+        // Growing back must expose zeros, not the bytes base still holds in [100, 1000).
+        truncate_to(1000);
+
+        let data = fs.read_file_data(ino, 0, 1000).unwrap();
+        assert_eq!(&data[..100], &payload[..100], "data below the final cut survives");
+        assert!(
+            data[100..].iter().all(|&b| b == 0),
+            "everything above the final cut must read as zeros, including the range between \
+             the two truncation points"
+        );
+
+        // And it must still hold once flushed and replayed.
+        fs.sync_log().unwrap();
+        let recovered = crate::log::recover_fs(storage, crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        let rec = recovered.read_file_data(ino, 0, 1000).unwrap();
+        assert_eq!(&rec[..100], &payload[..100]);
+        assert!(rec[100..].iter().all(|&b| b == 0), "after recovery");
+    }
+
     /// A punch is clamped to EOF: it must never extend the file, and punching entirely
     /// past the end is a no-op.
     #[test]

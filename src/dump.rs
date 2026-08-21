@@ -849,7 +849,7 @@ pub fn dump_summary_reader_with_path(
                                             )
                                         }
                                         ExtentState::Zero { length } => {
-                                            format!("hole (reads as zeros) [len {}]", format_bytes(length as u64))
+                                            format!("hole (reads as zeros) [len {}]", format_bytes(length))
                                         }
                                     };
                                     writeln!(

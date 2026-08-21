@@ -1,4 +1,4 @@
-use crate::log::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION};
+use crate::log::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION, zero_extent_fields, zero_extent_len};
 use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, NodeDelta, SpecialDelta, SymlinkDelta};
 use crate::range_map::RangeMap;
 use serde::{Deserialize, Serialize};
@@ -273,7 +273,6 @@ pub struct LogExtent {
 pub struct LogFileDelta {
     pub extents: Vec<LogExtent>,
     pub size: Option<u64>,
-    pub truncate_mask: Option<u64>,
     pub attr_delta: LogAttrDelta,
 }
 
@@ -297,13 +296,16 @@ impl From<&FileDelta> for LogFileDelta {
                     payload_offset,
                     length,
                 },
-                ExtentState::Zero { length } => LogExtent {
-                    file_offset: start,
-                    generation: ZERO_EXTENT_GENERATION,
-                    record_log_offset: 0,
-                    payload_offset: 0,
-                    length,
-                },
+                ExtentState::Zero { length } => {
+                    let (generation, record_log_offset, payload_offset, length) = zero_extent_fields(length);
+                    LogExtent {
+                        file_offset: start,
+                        generation,
+                        record_log_offset,
+                        payload_offset,
+                        length,
+                    }
+                }
                 // The flush that emits this record converts staged extents to `Disk`
                 // first, so anything still staged is not durable yet and must not be
                 // referenced from the log.
@@ -314,7 +316,6 @@ impl From<&FileDelta> for LogFileDelta {
         Self {
             extents,
             size: f.size,
-            truncate_mask: f.truncate_mask,
             attr_delta: LogAttrDelta::from(&f.attr_delta),
         }
     }
@@ -324,17 +325,22 @@ impl From<LogFileDelta> for FileDelta {
     fn from(l: LogFileDelta) -> Self {
         let mut extents = RangeMap::new();
         for ext in l.extents {
-            let state = if ext.generation == ZERO_EXTENT_GENERATION {
-                SharedExtentState::new_zero(ext.length)
+            // A hole carries its length in `record_log_offset`, so the range length has to
+            // come from there too - `ext.length` is meaningless for one.
+            let (range_len, state) = if ext.generation == ZERO_EXTENT_GENERATION {
+                let len = zero_extent_len(ext.record_log_offset);
+                (len, SharedExtentState::new_zero(len))
             } else {
-                SharedExtentState::new_disk(ext.generation, ext.record_log_offset, ext.payload_offset, ext.length)
+                (
+                    ext.length as u64,
+                    SharedExtentState::new_disk(ext.generation, ext.record_log_offset, ext.payload_offset, ext.length),
+                )
             };
-            extents.insert(ext.file_offset, ext.length as u64, state);
+            extents.insert(ext.file_offset, range_len, state);
         }
         Self {
             extents,
             size: l.size,
-            truncate_mask: l.truncate_mask,
             attr_delta: AttrDelta::from(l.attr_delta),
         }
     }

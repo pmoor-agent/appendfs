@@ -344,7 +344,6 @@ pub struct DirectoryDelta {
 pub struct FileDelta {
     pub extents: RangeMap<SharedExtentState>,
     pub size: Option<u64>,
-    pub truncate_mask: Option<u64>,
     pub attr_delta: AttrDelta,
 }
 
@@ -457,15 +456,17 @@ impl NodeDelta {
                 node.apply_attr_delta(&d.attr_delta);
             }
             (NodeKind::File { range_map, size }, NodeDelta::File(f)) => {
-                if let Some(mask) = f.truncate_mask {
-                    range_map.truncate(mask);
-                }
                 for (start, entry) in f.extents.iter() {
                     range_map.insert(*start, entry.length, entry.value.clone());
                 }
                 if let Some(s) = f.size {
                     *size = s;
                 }
+                // Nothing above the file's size is readable, so drop it. This is what
+                // compacts a truncation away: the `Zero` extent that masked the discarded
+                // range has done its job by overwriting those entries on the way in, and
+                // has no one left below it to mask once it reaches `base`.
+                range_map.truncate(*size);
                 node.apply_attr_delta(&f.attr_delta);
             }
             (NodeKind::Symlink { target }, NodeDelta::Symlink(s)) => {

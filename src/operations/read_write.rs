@@ -223,12 +223,22 @@ pub fn setattr_core(
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
         if let EntryDelta::Node(NodeDelta::File(f)) = entry {
-            f.extents.truncate(new_size);
+            // One unbounded hole from the cut upwards. It does both jobs at once: it
+            // replaces this delta's own extents above `new_size`, and it masks the layers
+            // below, so a later grow re-exposes zeros rather than whatever `base` still
+            // holds there. The size clamp in `read_file_data` hides that only for as long
+            // as the file stays short.
+            //
+            // Unbounded rather than sized to the current file length, because a later
+            // truncate overwrites this hole: sizing the replacement by the size the
+            // *previous* truncate left behind would stop short of what that one had
+            // masked, and the range between the two cuts would come back to life on the
+            // next grow. This is exactly the reach the scalar `truncate_mask` used to
+            // have.
+            let mask_len = u64::MAX - new_size;
+            f.extents
+                .insert(new_size, mask_len, SharedExtentState::new_zero(mask_len));
             f.size = Some(new_size);
-            f.truncate_mask = Some(match f.truncate_mask {
-                Some(prev) => std::cmp::min(prev, new_size),
-                None => new_size,
-            });
             f.attr_delta.mtime = Some(now);
             f.attr_delta.ctime = Some(now);
         }
@@ -282,14 +292,8 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
         if let EntryDelta::Node(NodeDelta::File(f)) = entry {
-            // Extent lengths are u32, so a punch wider than that spans several holes.
-            let mut chunk_start = offset;
-            while chunk_start < end {
-                let chunk_len = std::cmp::min(end - chunk_start, u32::MAX as u64);
-                f.extents
-                    .insert(chunk_start, chunk_len, SharedExtentState::new_zero(chunk_len as u32));
-                chunk_start += chunk_len;
-            }
+            f.extents
+                .insert(offset, end - offset, SharedExtentState::new_zero(end - offset));
             f.attr_delta.mtime = Some(now);
             f.attr_delta.ctime = Some(now);
         }
@@ -471,7 +475,6 @@ pub fn create_core(
         let new_delta = NodeDelta::File(FileDelta {
             extents: RangeMap::new(),
             size: Some(0),
-            truncate_mask: None,
             attr_delta: AttrDelta {
                 mode: Some(mode & 0o7777),
                 nlink: Some(1),

@@ -268,7 +268,9 @@ impl<'a> InodeLayerStack<'a> {
         let mut read_buf = vec![0u8; read_len as usize];
         let mut filled = vec![false; read_len as usize];
 
-        let mut current_truncate_mask = u64::MAX;
+        // Newest layer first. Truncation and hole punching both leave `Zero` extents, which
+        // claim their range in `filled` and so stop older layers contributing there - no
+        // separate mask has to be threaded down the stack.
         let mut hit_tombstone = false;
         for delta in self.deltas.iter().rev() {
             match delta {
@@ -277,22 +279,16 @@ impl<'a> InodeLayerStack<'a> {
                     break;
                 }
                 EntryDelta::Node(NodeDelta::File(f)) => {
-                    let max_read = std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
-                    if max_read > 0 {
-                        for (ext_start, ext_len, shared_state) in f.extents.query(offset, max_read) {
-                            fs.copy_extent_data(
-                                &mut read_buf,
-                                &mut filled,
-                                offset,
-                                read_len,
-                                ext_start,
-                                ext_len,
-                                &shared_state,
-                            );
-                        }
-                    }
-                    if let Some(mask) = f.truncate_mask {
-                        current_truncate_mask = std::cmp::min(current_truncate_mask, mask);
+                    for (ext_start, ext_len, shared_state) in f.extents.query(offset, read_len) {
+                        fs.copy_extent_data(
+                            &mut read_buf,
+                            &mut filled,
+                            offset,
+                            read_len,
+                            ext_start,
+                            ext_len,
+                            &shared_state,
+                        );
                     }
                 }
                 _ => {}
@@ -302,9 +298,8 @@ impl<'a> InodeLayerStack<'a> {
         if !hit_tombstone && let Some(arc) = self.base {
             let node = arc.as_ref();
             if let NodeKind::File { range_map, .. } = &node.kind {
-                let max_base_read = std::cmp::min(read_len, current_truncate_mask.saturating_sub(offset));
-                if max_base_read > 0 {
-                    for (ext_start, ext_len, shared_state) in range_map.query(offset, max_base_read) {
+                {
+                    for (ext_start, ext_len, shared_state) in range_map.query(offset, read_len) {
                         fs.copy_extent_data(
                             &mut read_buf,
                             &mut filled,
