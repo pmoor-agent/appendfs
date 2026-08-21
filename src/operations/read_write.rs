@@ -242,6 +242,63 @@ pub fn setattr_core(
     Ok(updated_attr)
 }
 
+/// Deallocates `[offset, offset + len)`, leaving it reading as zeros without changing the
+/// file size - the core of `fallocate(FALLOC_FL_PUNCH_HOLE)`.
+///
+/// This is truncate's interior-range sibling, and works the same way: rather than removing
+/// the range from the live delta's extent map - which would leave the layer with no opinion
+/// and let the read fall through to `base`, resurrecting the punched data - it inserts an
+/// explicit `ExtentState::Zero` that masks whatever lies below.
+pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Result<(), i32> {
+    log::trace!("punch_hole(ino={}, offset={}, len={})", ino, offset, len);
+    if fs.is_read_only() {
+        return Err(libc::EROFS);
+    }
+    fs.check_flush_capacity()?;
+
+    let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
+    if attr.file_type != FileType::RegularFile {
+        return Err(libc::EISDIR);
+    }
+
+    // Past EOF there is nothing to deallocate: those bytes already read as zeros, and a
+    // punch must not extend the file.
+    let file_size = attr.size as u64;
+    let end = std::cmp::min(offset.saturating_add(len), file_size);
+    if len == 0 || offset >= end {
+        return Ok(());
+    }
+
+    let now = fs.clock.now();
+    {
+        let mut live = fs.live.write().unwrap();
+        // As in `write_core`: `get_attr` ran before this lock, so the inode may have been
+        // unlinked and its tombstone frozen out of `live` in between. Inserting a delta
+        // then would resurrect it at the next fold.
+        if !live.contains_key(&ino) && !fs.exists_below_live(ino) {
+            return Err(libc::ENOENT);
+        }
+        let entry = live
+            .entry(ino)
+            .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
+        if let EntryDelta::Node(NodeDelta::File(f)) = entry {
+            // Extent lengths are u32, so a punch wider than that spans several holes.
+            let mut chunk_start = offset;
+            while chunk_start < end {
+                let chunk_len = std::cmp::min(end - chunk_start, u32::MAX as u64);
+                f.extents
+                    .insert(chunk_start, chunk_len, SharedExtentState::new_zero(chunk_len as u32));
+                chunk_start += chunk_len;
+            }
+            f.attr_delta.mtime = Some(now);
+            f.attr_delta.ctime = Some(now);
+        }
+    }
+
+    fs.notify_mutation(0);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn setattr(
     fs: &InMemoryFS,

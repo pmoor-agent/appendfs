@@ -84,7 +84,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
 
         for step in 1..=steps {
             clock.advance(Duration::from_secs(1));
-            let op_choice = prng.gen_range(0, 15);
+            let op_choice = prng.gen_range(0, 16);
             match op_choice {
                 0 => {
                     // Create directory
@@ -527,6 +527,27 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 assert_eq!(res1, res4, "listxattr result mismatch (baseline vs crash)");
                             }
                         }
+                    }
+                }
+                15 => {
+                    // Punch a hole. Offsets and lengths deliberately overlap the write
+                    // case's range, so holes land inside, across and past the end of
+                    // existing extents - and, once a checkpoint flushes, across extent
+                    // boundaries in `base`, which is where a hole has to mask rather than
+                    // fall through.
+                    if !active_files.is_empty() {
+                        let ino = active_files[prng.gen_range(0, active_files.len() - 1)];
+                        let offset = (prng.gen_range(0, 10) * 16) as u64;
+                        let len = prng.gen_range(1, 200) as u64;
+
+                        let res1 = fs_baseline.punch(ino, offset, len);
+                        let res2 = fs_micro.punch(ino, offset, len);
+                        let res3 = fs_remount.punch(ino, offset, len);
+                        let res4 = fs_crash.punch(ino, offset, len);
+
+                        assert_eq!(res1, res2);
+                        assert_eq!(res1, res3);
+                        assert_eq!(res1, res4);
                     }
                 }
                 _ => {

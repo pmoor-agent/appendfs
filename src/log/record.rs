@@ -1,4 +1,4 @@
-use crate::log::{ExtentState, SharedExtentState};
+use crate::log::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION};
 use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, NodeDelta, SpecialDelta, SymlinkDelta};
 use crate::range_map::RangeMap;
 use serde::{Deserialize, Serialize};
@@ -255,6 +255,10 @@ impl From<LogDirectoryDelta> for DirectoryDelta {
 }
 
 /// Persisted on-disk descriptor for a single data extent.
+///
+/// A `generation` of [`ZERO_EXTENT_GENERATION`] marks a hole rather than a reference into a
+/// `.log` file; `record_log_offset` and `payload_offset` are then meaningless and written
+/// as zero.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogExtent {
     pub file_offset: u64,
@@ -277,21 +281,35 @@ impl From<&FileDelta> for LogFileDelta {
     fn from(f: &FileDelta) -> Self {
         let mut extents = Vec::new();
         for (&start, entry) in f.extents.iter() {
-            if let ExtentState::Disk {
-                generation,
-                record_log_offset,
-                payload_offset,
-                length,
-            } = entry.value.read_state()
-            {
-                extents.push(LogExtent {
+            // Matched exhaustively on purpose: an `if let` here would silently drop any
+            // state it did not name, which for a hole means losing the punch entirely and
+            // resurrecting the data it masked at the next recovery.
+            let log_extent = match entry.value.read_state() {
+                ExtentState::Disk {
+                    generation,
+                    record_log_offset,
+                    payload_offset,
+                    length,
+                } => LogExtent {
                     file_offset: start,
                     generation,
                     record_log_offset,
                     payload_offset,
                     length,
-                });
-            }
+                },
+                ExtentState::Zero { length } => LogExtent {
+                    file_offset: start,
+                    generation: ZERO_EXTENT_GENERATION,
+                    record_log_offset: 0,
+                    payload_offset: 0,
+                    length,
+                },
+                // The flush that emits this record converts staged extents to `Disk`
+                // first, so anything still staged is not durable yet and must not be
+                // referenced from the log.
+                ExtentState::Staged { .. } => continue,
+            };
+            extents.push(log_extent);
         }
         Self {
             extents,
@@ -306,11 +324,12 @@ impl From<LogFileDelta> for FileDelta {
     fn from(l: LogFileDelta) -> Self {
         let mut extents = RangeMap::new();
         for ext in l.extents {
-            extents.insert(
-                ext.file_offset,
-                ext.length as u64,
-                SharedExtentState::new_disk(ext.generation, ext.record_log_offset, ext.payload_offset, ext.length),
-            );
+            let state = if ext.generation == ZERO_EXTENT_GENERATION {
+                SharedExtentState::new_zero(ext.length)
+            } else {
+                SharedExtentState::new_disk(ext.generation, ext.record_log_offset, ext.payload_offset, ext.length)
+            };
+            extents.insert(ext.file_offset, ext.length as u64, state);
         }
         Self {
             extents,

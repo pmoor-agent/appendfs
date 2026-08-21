@@ -135,6 +135,10 @@ impl TestFS {
         appendfs::operations::read_write::read_core(&self.fs, ino, len, offset as i64)
     }
 
+    pub fn punch(&self, ino: u64, offset: u64, len: u64) -> Result<(), i32> {
+        appendfs::operations::read_write::punch_hole_core(&self.fs, ino, offset, len)
+    }
+
     pub fn unlink(&self, parent: u64, name: &str) -> Result<(), i32> {
         appendfs::operations::links::unlink_core(&self.fs, parent, name)
     }

@@ -583,6 +583,108 @@ mod tests {
         );
     }
 
+    /// The core property a hole has to have: once the data it covers is durable in `base`,
+    /// a `Zero` extent in a *later* layer must mask it. Removing the range from the delta
+    /// instead would leave that layer with no opinion, and the read would fall through and
+    /// resurrect the punched bytes.
+    #[test]
+    fn test_punched_hole_masks_flushed_data_and_survives_recovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+        let writer = Arc::new(
+            LogWriter::create(
+                Arc::clone(&storage),
+                1,
+                &SystemClock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_log(writer);
+
+        let attr = crate::operations::read_write::create_core(&fs, 1, "holey.bin", 0o644, 0, 1000, 1000).unwrap();
+        let ino = attr.ino;
+
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251 + 1) as u8).collect();
+        write_core(&fs, ino, &payload, 0).unwrap();
+
+        // Flush first, so the data is a durable `Disk` extent in `base` and the punch below
+        // lands in a fresh, higher layer - the case that actually needs masking.
+        fs.sync_log().unwrap();
+        assert_eq!(fs.read_file_data(ino, 0, 1000).unwrap(), payload);
+
+        crate::operations::read_write::punch_hole_core(&fs, ino, 200, 300).unwrap();
+
+        // Size is unchanged by a punch, and the hole reads as zeros while the data on
+        // either side is untouched.
+        let expect_holed = |buf: &[u8]| {
+            assert_eq!(&buf[..200], &payload[..200], "before the hole");
+            assert!(buf[200..500].iter().all(|&b| b == 0), "hole must read as zeros");
+            assert_eq!(&buf[500..], &payload[500..], "after the hole");
+        };
+        assert_eq!(fs.get_attr(ino).unwrap().size, 1000);
+        expect_holed(&fs.read_file_data(ino, 0, 1000).unwrap());
+
+        // A read starting inside the hole must not fall through to base either.
+        assert!(
+            fs.read_file_data(ino, 250, 100).unwrap().iter().all(|&b| b == 0),
+            "read starting inside the hole"
+        );
+
+        // Fold the punch into base, then confirm it did not become a data record: the only
+        // payload ever written was the original 1000 bytes.
+        fs.sync_log().unwrap();
+        expect_holed(&fs.read_file_data(ino, 0, 1000).unwrap());
+
+        let stats = fs.calculate_generation_live_stats();
+        let live_bytes: u64 = stats.iter().map(|s| s.live_bytes).sum();
+        assert_eq!(
+            live_bytes, 700,
+            "punched bytes must stop counting as live, so compaction can reclaim them"
+        );
+
+        // And it has to survive replay - this is where a silently-dropped Zero extent would
+        // show up, with the old data reappearing. Check both routes: replaying the `.log`
+        // (LogExtent) and loading a `.summary` (SerializedExtent), which encode the hole
+        // sentinel independently of each other.
+        let from_log = crate::log::recover_fs(
+            Arc::clone(&storage),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        assert_eq!(from_log.get_attr(ino).unwrap().size, 1000);
+        expect_holed(&from_log.read_file_data(ino, 0, 1000).unwrap());
+
+        fs.sync_and_export_summary().unwrap();
+        let from_summary =
+            crate::log::recover_fs(storage, crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        assert_eq!(from_summary.get_attr(ino).unwrap().size, 1000);
+        expect_holed(&from_summary.read_file_data(ino, 0, 1000).unwrap());
+    }
+
+    /// A punch is clamped to EOF: it must never extend the file, and punching entirely
+    /// past the end is a no-op.
+    #[test]
+    fn test_punch_hole_is_clamped_to_eof() {
+        let fs = InMemoryFS::new();
+        let attr = crate::operations::read_write::create_core(&fs, 1, "short.bin", 0o644, 0, 1000, 1000).unwrap();
+        let ino = attr.ino;
+        write_core(&fs, ino, &[0xAB; 100], 0).unwrap();
+
+        crate::operations::read_write::punch_hole_core(&fs, ino, 4096, 4096).unwrap();
+        assert_eq!(fs.get_attr(ino).unwrap().size, 100, "punch past EOF must not extend");
+        assert_eq!(fs.read_file_data(ino, 0, 100).unwrap(), vec![0xAB; 100]);
+
+        // Straddling EOF punches only the part that exists.
+        crate::operations::read_write::punch_hole_core(&fs, ino, 50, 4096).unwrap();
+        assert_eq!(fs.get_attr(ino).unwrap().size, 100, "straddling punch must not extend");
+        let data = fs.read_file_data(ino, 0, 100).unwrap();
+        assert_eq!(&data[..50], &[0xAB; 50]);
+        assert!(data[50..].iter().all(|&b| b == 0));
+    }
+
     #[test]
     fn test_directory_parent_tracking_across_mkdir_rename_and_flush() {
         let clock = Arc::new(crate::clock::MockClock(SystemTime::UNIX_EPOCH));

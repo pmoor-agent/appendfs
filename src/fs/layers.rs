@@ -369,6 +369,12 @@ impl InMemoryFS {
                     bytes_read = actual_len;
                 }
             }
+            // A hole contributes zeros, which `temp_buf` already holds. Claiming the
+            // segment is the whole point: it marks these bytes `filled`, so lower layers
+            // are not consulted and the punched-out data stays punched out.
+            ExtentState::Zero { .. } => {
+                bytes_read = seg_len;
+            }
             ExtentState::Disk {
                 generation,
                 record_log_offset,
