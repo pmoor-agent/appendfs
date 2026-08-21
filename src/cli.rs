@@ -7,6 +7,16 @@ pub const DEFAULT_MAX_LOG_SIZE: u64 = 1024 * 1024 * 1024;
 /// Default maximum staged write data in memory before triggering a flush (128 MiB).
 pub const DEFAULT_MAX_BUFFER_SIZE: usize = 128 * 1024 * 1024;
 
+/// Default maximum size of a single data extent record (4 MiB).
+///
+/// A record is the unit of decryption: AEAD authenticates a payload as a whole, so reading
+/// any byte of an encrypted record requires reading and decrypting all of it. Flushing
+/// coalesces adjacent writes, so without a cap a large sequential write becomes one huge
+/// record and every random read into it pays for the entire extent. Capping bounds that
+/// amplification, at the cost of one record header (plus one AEAD tag when encrypting) per
+/// chunk and one more entry in the file's extent map.
+pub const DEFAULT_MAX_EXTENT_SIZE: usize = 4 * 1024 * 1024;
+
 /// Default maximum staged mutation operations before triggering an automatic flush (10,000 ops).
 pub const DEFAULT_MAX_BUFFER_OPS: usize = 10_000;
 
@@ -95,6 +105,10 @@ pub struct MountArgs {
     /// Maximum log file size in bytes before rolling to next generation (default: 1 GiB)
     #[arg(short = 's', long = "max-log-size", default_value_t = DEFAULT_MAX_LOG_SIZE)]
     pub max_log_size: u64,
+
+    /// Maximum size in bytes of a single data extent record (default: 4 MiB)
+    #[arg(long = "max-extent-size", default_value_t = DEFAULT_MAX_EXTENT_SIZE)]
+    pub max_extent_size: usize,
 
     /// Additional raw FUSE options passed to libfuse (e.g. -o allow_other)
     #[arg(short = 'o', value_delimiter = ',')]

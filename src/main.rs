@@ -76,6 +76,7 @@ fn main() {
             fs_instance.log_writer = Some(Arc::clone(&writer));
             fs_instance.max_buffer_size = args.flush_threshold;
             fs_instance.max_staged_ops = args.flush_threshold_ops;
+            fs_instance.max_extent_size = args.max_extent_size;
             fs_instance
                 .flush_interval
                 .store(args.flush_interval, std::sync::atomic::Ordering::SeqCst);
@@ -84,7 +85,7 @@ fn main() {
             let fs_instance = Arc::new(fs_instance);
 
             println!(
-                "Mounting appendfs at '{}' with log-dir '{}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, foreground: {})...",
+                "Mounting appendfs at '{}' with log-dir '{}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, max-extent-size: {} bytes, foreground: {})...",
                 args.mount_point.display(),
                 args.log_dir.display(),
                 next_gen,
@@ -92,6 +93,7 @@ fn main() {
                 args.flush_threshold_ops,
                 args.flush_interval,
                 args.max_log_size,
+                args.max_extent_size,
                 args.foreground
             );
 

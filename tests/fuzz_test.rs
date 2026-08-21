@@ -23,13 +23,24 @@ fn test_differential_fuzzing_and_crash_recovery() {
         // than flaky, so they can be checked at every checkpoint alongside content.
         let clock = AdvancingClock::new(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         let fs_baseline = TestFS::new_temp_with_clock(None, Arc::new(clock.clone()));
-        let fs_micro = TestFS::new_temp_with_clock(Some(256), Arc::new(clock.clone()));
+        let mut fs_micro = TestFS::new_temp_with_clock(Some(256), Arc::new(clock.clone()));
         let mut fs_remount = TestFS::new_temp_with_clock(None, Arc::new(clock.clone()));
         // The crash instance routes its log through a FaultStorage, so each checkpoint can
         // force a mid-flush I/O failure before crashing. Every durability bug found so far
         // (the permanent wedge, mid-batch torn records, the unbounded flush queue) lived in
         // that seam and was invisible to a fuzzer that only ever saw a healthy disk.
         let mut fs_crash = TestFS::new_temp_with_fault_injection(None, Arc::new(clock.clone()));
+
+        // Split data records aggressively on every instance except the baseline, so extent
+        // chunking is itself under differential test: the same content must come back no
+        // matter how many records it was written as, and coalesced runs must be reassembled
+        // at the right offsets. The sizes are small, odd and mutually unequal - writes below
+        // are 16..256 bytes, so these split most of them, at varying boundaries. The
+        // baseline keeps the default cap and so stays effectively unchunked.
+        fs_micro.set_max_extent_size(37 + (seed as usize % 23));
+        fs_remount.set_max_extent_size(64);
+        fs_crash.set_max_extent_size(101);
+
         let mut observed_flush_failures = 0usize;
 
         // Keep track of created subdirectories (inode IDs) to perform operations on

@@ -65,7 +65,11 @@ impl InMemoryFS {
         frozen: &mut HashMap<u64, EntryDelta>,
         writer: &LogWriter,
     ) -> std::io::Result<()> {
-        if let Some(next_gen) = writer.roll_if_needed(estimate_batch_bytes(frozen), &*self.clock)? {
+        // Clamped because extent lengths are u32, and because a zero would make the
+        // chunking loop below never advance.
+        let max_extent_size = self.max_extent_size.clamp(1, u32::MAX as usize);
+
+        if let Some(next_gen) = writer.roll_if_needed(estimate_batch_bytes(frozen, max_extent_size), &*self.clock)? {
             let mut manifest = self.manifest.write().unwrap();
             manifest.record_roll(
                 next_gen,
@@ -122,13 +126,29 @@ impl InMemoryFS {
                         runs
                     };
 
-                    for (start_off, length, data) in staged_runs {
-                        let (_, generation, record_log_offset) = writer.append_record(OpCode::Data, ino, &data)?;
-                        written_count += 1;
-                        flushed_data_bytes += length as u64;
+                    // Emit each run as one or more records of at most `max_extent_size`. A
+                    // record is the unit of decryption, so an uncapped run would make a read
+                    // of any byte within it decrypt the entire coalesced write.
+                    for (start_off, _length, data) in staged_runs {
+                        let mut chunk_start = 0usize;
+                        loop {
+                            let chunk_len = std::cmp::min(max_extent_size, data.len() - chunk_start);
+                            let chunk = &data[chunk_start..chunk_start + chunk_len];
 
-                        let disk_extent = SharedExtentState::new_disk(generation, record_log_offset, 0, length);
-                        f.extents.insert(start_off, length as u64, disk_extent);
+                            let (_, generation, record_log_offset) = writer.append_record(OpCode::Data, ino, chunk)?;
+                            written_count += 1;
+                            flushed_data_bytes += chunk_len as u64;
+
+                            let disk_extent =
+                                SharedExtentState::new_disk(generation, record_log_offset, 0, chunk_len as u32);
+                            f.extents
+                                .insert(start_off + chunk_start as u64, chunk_len as u64, disk_extent);
+
+                            chunk_start += chunk_len;
+                            if chunk_start >= data.len() {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -362,14 +382,17 @@ impl InMemoryFS {
 }
 
 /// Upper bound on the bytes this batch will append.
-fn estimate_batch_bytes(frozen: &HashMap<u64, EntryDelta>) -> u64 {
+fn estimate_batch_bytes(frozen: &HashMap<u64, EntryDelta>, max_extent_size: usize) -> u64 {
     let mut estimated_bytes: u64 = RECORD_HEADER_SIZE as u64 + 64; // FlushCommit
     for entry in frozen.values() {
         match entry {
             EntryDelta::Node(NodeDelta::File(f)) => {
                 for (_, entry) in f.extents.iter() {
                     if let ExtentState::Staged { length, .. } = entry.value.read_state() {
-                        estimated_bytes += RECORD_HEADER_SIZE as u64 + length as u64;
+                        // One header per emitted chunk. Coalescing can merge adjacent staged
+                        // extents into fewer records than this, so it stays an upper bound.
+                        let chunks = (length as u64).div_ceil(max_extent_size as u64).max(1);
+                        estimated_bytes += chunks * RECORD_HEADER_SIZE as u64 + length as u64;
                     }
                 }
                 estimated_bytes += RECORD_HEADER_SIZE as u64 + 256 + f.extents.len() as u64 * 32;
@@ -470,6 +493,94 @@ mod tests {
         let data = fs.read_file_data(ino, 0, 50).unwrap();
         let expected: Vec<u8> = (0..50u8).collect();
         assert_eq!(data, expected);
+    }
+
+    /// A write far larger than `max_extent_size` must be emitted as several capped records
+    /// rather than one huge one, and must still read back byte-for-byte - including
+    /// sub-ranges that straddle chunk boundaries, and after a full replay from the log.
+    #[test]
+    fn test_large_write_is_split_into_capped_extents() {
+        const CAP: usize = 1024;
+        // Deliberately not a multiple of CAP, so the final chunk is a partial one.
+        const TOTAL: usize = 8 * CAP + 300;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+
+        let writer = Arc::new(
+            LogWriter::create(
+                Arc::clone(&storage),
+                1,
+                &SystemClock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+            )
+            .unwrap(),
+        );
+        let mut fs = InMemoryFS::with_log(writer);
+        fs.max_extent_size = CAP;
+
+        let ino = fs.allocate_inode();
+        fs.insert_new_node(
+            ino,
+            NodeDelta::File(FileDelta {
+                attr_delta: AttrDelta {
+                    mode: Some(0o644),
+                    nlink: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        );
+        fs.add_dir_entry(1, "big.bin", ino, SystemTime::now());
+
+        // A single contiguous write many times larger than the cap.
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        write_core(&fs, ino, &payload, 0).unwrap();
+        fs.sync_log().unwrap();
+
+        {
+            let base = fs.base.read().unwrap();
+            let node = base.get(&ino).expect("inode missing in base");
+            if let NodeKind::File { range_map, size, .. } = &node.kind {
+                assert_eq!(*size as usize, TOTAL);
+                assert_eq!(
+                    range_map.len(),
+                    TOTAL.div_ceil(CAP),
+                    "expected one extent per capped chunk"
+                );
+                for (_, entry) in range_map.iter() {
+                    assert!(
+                        entry.length as usize <= CAP,
+                        "extent of {} bytes exceeds the {} byte cap",
+                        entry.length,
+                        CAP
+                    );
+                }
+            } else {
+                panic!("expected NodeKind::File in base");
+            }
+        }
+
+        // Whole-file and sub-range reads, including ranges straddling chunk boundaries.
+        assert_eq!(fs.read_file_data(ino, 0, TOTAL).unwrap(), payload);
+        for (off, len) in [(0usize, 10usize), (CAP - 5, 10), (CAP * 3 + 7, CAP), (TOTAL - 10, 10)] {
+            assert_eq!(
+                fs.read_file_data(ino, off as u64, len).unwrap(),
+                payload[off..off + len],
+                "sub-range read at {}..{}",
+                off,
+                off + len
+            );
+        }
+
+        // The split must survive a full replay from the log.
+        let recovered = crate::log::recover_fs(storage, crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        assert_eq!(
+            recovered.read_file_data(ino, 0, TOTAL).unwrap(),
+            payload,
+            "after recovery"
+        );
     }
 
     #[test]

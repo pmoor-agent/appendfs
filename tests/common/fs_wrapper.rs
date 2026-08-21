@@ -327,14 +327,23 @@ impl TestFS {
         snapshot
     }
 
+    /// Overrides the data-extent cap, so a test can exercise record chunking without having
+    /// to write megabytes. Carried across `clean_remount` / `unclean_crash`.
+    pub fn set_max_extent_size(&mut self, size: usize) {
+        self.fs.max_extent_size = size;
+    }
+
     pub fn clean_remount(self) -> Self {
         let log_dir = self.log_dir.clone();
         let temp_dir = self._temp_dir.clone();
         let clock = self.fs.clock.clone();
         let fault = self.fault.clone();
+        let max_extent_size = self.fs.max_extent_size;
         let _ = self.fs.sync_and_export_summary();
         drop(self);
-        Self::recover_into(&log_dir, temp_dir, clock, fault)
+        let mut rec = Self::recover_into(&log_dir, temp_dir, clock, fault);
+        rec.fs.max_extent_size = max_extent_size;
+        rec
     }
 
     pub fn unclean_crash(mut self) -> Self {
@@ -343,10 +352,12 @@ impl TestFS {
         let clock = self.fs.clock.clone();
         let fault = self.fault.clone();
         let next_inode = self.fs.next_inode.load(Ordering::SeqCst);
+        let max_extent_size = self.fs.max_extent_size;
         let _ = self.fs.sync_log();
         self.fs.log_writer = None;
         drop(self);
-        let rec = Self::recover_into(&log_dir, temp_dir, clock, fault);
+        let mut rec = Self::recover_into(&log_dir, temp_dir, clock, fault);
+        rec.fs.max_extent_size = max_extent_size;
         rec.fs.next_inode.store(
             rec.fs.next_inode.load(Ordering::SeqCst).max(next_inode),
             Ordering::SeqCst,

@@ -86,6 +86,9 @@ pub struct InMemoryFS {
     pub max_buffer_size: usize,
     pub staged_ops: AtomicUsize,
     pub max_staged_ops: usize,
+    /// Largest payload written as a single data record. Bounds how much must be read and
+    /// decrypted to serve a read of any byte within it - see `DEFAULT_MAX_EXTENT_SIZE`.
+    pub max_extent_size: usize,
     /// Maximum frozen batches allowed to queue up before mutations are refused. See
     /// `check_flush_capacity`.
     pub max_flush_queue_depth: usize,
@@ -153,6 +156,7 @@ impl InMemoryFS {
             max_buffer_size: 128 * 1024 * 1024,
             staged_ops: AtomicUsize::new(0),
             max_staged_ops: crate::cli::DEFAULT_MAX_BUFFER_OPS,
+            max_extent_size: crate::cli::DEFAULT_MAX_EXTENT_SIZE,
             max_flush_queue_depth: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_DEPTH,
             flush_interval: AtomicU64::new(0),
             flusher: Mutex::new(None),
