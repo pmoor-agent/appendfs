@@ -305,7 +305,7 @@ mod tests {
         let writer = LogWriter::create(storage.clone(), 1, &clock, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
         assert_eq!(writer.generation(), 1);
-        let (tx, gen_num, offset) = writer.append_record(OpCode::Create, 100, b"test_data").unwrap();
+        let (tx, gen_num, offset) = writer.append_record(OpCode::Data, 100, b"test_data").unwrap();
         assert_eq!(tx, 1);
         assert_eq!(gen_num, 1);
         assert_eq!(offset, FILE_HEADER_SIZE as u64);
@@ -318,7 +318,7 @@ mod tests {
         let writer = LogWriter::create(storage.clone(), 1, &clock, 30, 1).unwrap();
 
         for _ in 0..5 {
-            let (_, gen_num, _) = writer.append_record(OpCode::Create, 1, b"0123456789").unwrap();
+            let (_, gen_num, _) = writer.append_record(OpCode::Data, 1, b"0123456789").unwrap();
             assert_eq!(gen_num, 1);
         }
         assert_eq!(writer.generation(), 1);
@@ -330,13 +330,13 @@ mod tests {
         let clock = SystemClock;
         let writer = LogWriter::create(storage.clone(), 1, &clock, 60, 1).unwrap();
 
-        writer.append_record(OpCode::Create, 1, b"0123456789").unwrap();
+        writer.append_record(OpCode::Data, 1, b"0123456789").unwrap();
         assert_eq!(writer.generation(), 1);
 
         writer.roll_if_needed(1000, &clock).unwrap();
         assert_eq!(writer.generation(), 2);
 
-        let (_, gen_num, _) = writer.append_record(OpCode::Create, 2, b"0123456789").unwrap();
+        let (_, gen_num, _) = writer.append_record(OpCode::Data, 2, b"0123456789").unwrap();
         assert_eq!(gen_num, 2);
     }
 
@@ -346,8 +346,8 @@ mod tests {
         let clock = SystemClock;
         let writer = LogWriter::create(storage.clone(), 1, &clock, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
-        writer.append_record(OpCode::Create, 1, b"payload").unwrap();
-        writer.append_record(OpCode::Write, 1, b"more").unwrap();
+        writer.append_record(OpCode::InodeDelta, 1, b"payload").unwrap();
+        writer.append_record(OpCode::Data, 1, b"more").unwrap();
         writer.emit_flush_commit(2, &clock).unwrap();
 
         let records: Vec<_> = LogReader::open(storage.as_ref(), &writer.filename())

@@ -1,10 +1,12 @@
+use crate::log::{ExtentState, SharedExtentState};
+use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, NodeDelta, SpecialDelta, SymlinkDelta};
+use crate::range_map::RangeMap;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
-// Bumped for RecordHeader's new checksum field - a breaking format change, so old logs
-// are cleanly rejected (FileHeader::from_bytes) rather than silently misparsed.
-pub const CURRENT_VERSION: u32 = 2;
+// Bumped for delta-structured log format.
+pub const CURRENT_VERSION: u32 = 3;
 pub const FILE_HEADER_SIZE: usize = 24;
 pub const RECORD_HEADER_SIZE: usize = 25;
 pub const RECORD_CHECKSUM_SIZE: usize = 4;
@@ -79,22 +81,12 @@ impl FileHeader {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpCode {
-    Create = 1,
-    Mkdir = 2,
-    Write = 3,
-    Unlink = 4,
-    Rmdir = 5,
-    Symlink = 6,
-    Rename = 7,
-    Setattr = 8,
-    Link = 9,
-    /// Trailer written once, after every other record belonging to one
-    /// flush batch. Confirms that batch is complete and safe to replay - see
-    /// `FlushCommitPayload`.
-    FlushCommit = 10,
-    Mknod = 11,
-    Setxattr = 12,
-    Removexattr = 13,
+    /// File data content written directly to log. Inode number in RecordHeader.
+    Data = 1,
+    /// Serialized LogEntryDelta (LogNodeDelta or Tombstone) for the inode in RecordHeader.
+    InodeDelta = 2,
+    /// Trailer written once per flush batch confirming completion and consistency.
+    FlushCommit = 3,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -102,19 +94,9 @@ impl TryFrom<u8> for OpCode {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(OpCode::Create),
-            2 => Ok(OpCode::Mkdir),
-            3 => Ok(OpCode::Write),
-            4 => Ok(OpCode::Unlink),
-            5 => Ok(OpCode::Rmdir),
-            6 => Ok(OpCode::Symlink),
-            7 => Ok(OpCode::Rename),
-            8 => Ok(OpCode::Setattr),
-            9 => Ok(OpCode::Link),
-            10 => Ok(OpCode::FlushCommit),
-            11 => Ok(OpCode::Mknod),
-            12 => Ok(OpCode::Setxattr),
-            13 => Ok(OpCode::Removexattr),
+            1 => Ok(OpCode::Data),
+            2 => Ok(OpCode::InodeDelta),
+            3 => Ok(OpCode::FlushCommit),
             _ => Err("Unknown operation code"),
         }
     }
@@ -123,19 +105,9 @@ impl TryFrom<u8> for OpCode {
 impl std::fmt::Display for OpCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
-            OpCode::Create => "Create",
-            OpCode::Mkdir => "Mkdir",
-            OpCode::Write => "Write",
-            OpCode::Unlink => "Unlink",
-            OpCode::Rmdir => "Rmdir",
-            OpCode::Symlink => "Symlink",
-            OpCode::Rename => "Rename",
-            OpCode::Setattr => "Setattr",
-            OpCode::Link => "Link",
+            OpCode::Data => "Data",
+            OpCode::InodeDelta => "InodeDelta",
             OpCode::FlushCommit => "FlushCommit",
-            OpCode::Mknod => "Mknod",
-            OpCode::Setxattr => "Setxattr",
-            OpCode::Removexattr => "Removexattr",
         };
         f.pad(name)
     }
@@ -183,16 +155,6 @@ impl RecordHeader {
 
 /// Payload for the `OpCode::FlushCommit` trailer written once per flush
 /// batch, after all of that batch's other records.
-///
-/// Recovery buffers records as it reads them and only replays them into filesystem
-/// state once it reaches the matching `FlushCommit` for that run - a trailing group of
-/// records at end-of-file with no `FlushCommit` after them (a crash mid-flush) is
-/// discarded rather than partially applied. `record_count` is a defensive cross-check
-/// only (this codebase has no per-record checksums yet): recovery verifies it matches
-/// the number of records actually buffered since the previous commit, and treats a
-/// mismatch the same as a missing trailer.
-///
-/// Also carries the flush's wall-clock time, for point-in-time replay/time-travel.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlushCommitPayload {
     #[serde(with = "crate::clock::serde_system_time")]
@@ -200,205 +162,315 @@ pub struct FlushCommitPayload {
     pub record_count: u32,
 }
 
-/// Metadata payload preceding write bytes for file write operations (`OP_WRITE`).
-///
-/// `op_time` is the wall-clock time this write happened, applied to mtime/ctime on
-/// replay (not atime - a write doesn't update atime, matching live behavior). Without
-/// it, replay has no choice but to stamp the *replay* time instead of when the write
-/// actually occurred.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WriteMeta {
-    pub file_offset: u64,
-    #[serde(with = "crate::clock::serde_system_time")]
-    pub op_time: SystemTime,
-}
-
-/// Structured metadata payload for file creation operations (`OP_CREATE`).
-///
-/// `created_at` is applied to atime/mtime/ctime of the new node on replay - see
-/// `WriteMeta::op_time` for why this needs to be carried explicitly.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct CreatePayload {
-    pub parent: u64,
-    pub name: String,
-    pub mode: u32,
-    #[serde(default)]
-    pub uid: u32,
-    #[serde(default)]
-    pub gid: u32,
-    #[serde(with = "crate::clock::serde_system_time")]
-    pub created_at: SystemTime,
-}
-
-/// Structured metadata payload for directory creation operations (`OP_MKDIR`).
-///
-/// `created_at` is applied to atime/mtime/ctime of the new directory on replay - see
-/// `WriteMeta::op_time` for why this needs to be carried explicitly.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct MkdirPayload {
-    pub parent: u64,
-    pub name: String,
-    pub mode: u32,
-    #[serde(default)]
-    pub uid: u32,
-    #[serde(default)]
-    pub gid: u32,
-    #[serde(with = "crate::clock::serde_system_time")]
-    pub created_at: SystemTime,
-}
-
-/// Structured metadata payload for file unlink operations (`OP_UNLINK`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct UnlinkPayload {
-    pub parent: u64,
-    pub name: String,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
-    pub op_time: SystemTime,
-}
-
-/// Structured metadata payload for directory removal operations (`OP_RMDIR`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct RmdirPayload {
-    pub parent: u64,
-    pub name: String,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
-    pub op_time: SystemTime,
-}
-
-/// Structured metadata payload for symlink creation operations (`OP_SYMLINK`).
-///
-/// `created_at` is applied to atime/mtime/ctime of the new symlink on replay - see
-/// `WriteMeta::op_time` for why this needs to be carried explicitly.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct SymlinkPayload {
-    pub parent: u64,
-    pub name: String,
-    pub target: String,
-    #[serde(default)]
-    pub uid: u32,
-    #[serde(default)]
-    pub gid: u32,
-    #[serde(with = "crate::clock::serde_system_time")]
-    pub created_at: SystemTime,
-}
-
-/// Structured metadata payload for file and directory rename operations (`OP_RENAME`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct RenamePayload {
-    pub old_parent: u64,
-    pub old_name: String,
-    pub new_parent: u64,
-    pub new_name: String,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
-    pub op_time: SystemTime,
-}
-
-/// Structured metadata payload for metadata updates (`OP_SETATTR`).
-///
-/// `atime` and `mtime` are optional: when `Some`, replay restores the exact timestamp
-/// requested by `utimensat`/`setattr`. When `None`, they are left untouched. `op_time` is
-/// different: it's the wall-clock time this setattr call happened, applied to ctime
-/// whenever any other field is `Some` - mirroring live, which touches ctime inside
-/// each individual to_set-bit branch, never on a call that changes nothing. `op_time`
-/// is also applied to mtime specifically when `size` is `Some` (POSIX truncate
-/// semantics touch both mtime and ctime, unlike mode/uid/gid, which only touch ctime).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct SetattrPayload {
-    #[serde(default)]
+/// Persisted on-disk representation of an attribute delta.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogAttrDelta {
     pub mode: Option<u32>,
-    #[serde(default)]
     pub uid: Option<u32>,
-    #[serde(default)]
     pub gid: Option<u32>,
-    #[serde(default)]
-    pub size: Option<u64>,
+    pub nlink: Option<u32>,
     #[serde(default, with = "crate::clock::serde_system_time_opt")]
     pub atime: Option<SystemTime>,
     #[serde(default, with = "crate::clock::serde_system_time_opt")]
     pub mtime: Option<SystemTime>,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
-    pub op_time: SystemTime,
+    #[serde(default, with = "crate::clock::serde_system_time_opt")]
+    pub ctime: Option<SystemTime>,
+    #[serde(default, with = "crate::clock::serde_system_time_opt")]
+    pub created_at: Option<SystemTime>,
+    #[serde(default)]
+    pub xattrs: Option<Vec<(String, Option<Vec<u8>>)>>,
 }
 
-/// Structured metadata payload for hard link operations (`OP_LINK`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct LinkPayload {
-    pub ino: u64,
-    pub new_parent: u64,
-    pub new_name: String,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
-    pub op_time: SystemTime,
+impl From<&AttrDelta> for LogAttrDelta {
+    fn from(a: &AttrDelta) -> Self {
+        let xattrs = a.xattrs.as_ref().map(|map| {
+            let mut entries: Vec<(String, Option<Vec<u8>>)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            entries.sort_by(|x, y| x.0.cmp(&y.0));
+            entries
+        });
+        Self {
+            mode: a.mode,
+            uid: a.uid,
+            gid: a.gid,
+            nlink: a.nlink,
+            atime: a.atime,
+            mtime: a.mtime,
+            ctime: a.ctime,
+            created_at: a.created_at,
+            xattrs,
+        }
+    }
 }
 
-/// Structured metadata payload for special node creation operations (`OP_MKNOD`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct MknodPayload {
-    pub parent: u64,
-    pub name: String,
-    pub mode: u32,
+impl From<LogAttrDelta> for AttrDelta {
+    fn from(l: LogAttrDelta) -> Self {
+        let xattrs = l.xattrs.map(|vec| vec.into_iter().collect());
+        Self {
+            mode: l.mode,
+            uid: l.uid,
+            gid: l.gid,
+            nlink: l.nlink,
+            atime: l.atime,
+            mtime: l.mtime,
+            ctime: l.ctime,
+            created_at: l.created_at,
+            xattrs,
+        }
+    }
+}
+
+/// Persisted on-disk representation of a directory delta.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogDirectoryDelta {
+    pub parent: Option<u64>,
+    pub added: Vec<(String, u64)>,
+    pub removed: Vec<String>,
+    pub attr_delta: LogAttrDelta,
+}
+
+impl From<&DirectoryDelta> for LogDirectoryDelta {
+    fn from(d: &DirectoryDelta) -> Self {
+        let mut added: Vec<(String, u64)> = d.added.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        added.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut removed: Vec<String> = d.removed.iter().cloned().collect();
+        removed.sort();
+        Self {
+            parent: d.parent,
+            added,
+            removed,
+            attr_delta: LogAttrDelta::from(&d.attr_delta),
+        }
+    }
+}
+
+impl From<LogDirectoryDelta> for DirectoryDelta {
+    fn from(l: LogDirectoryDelta) -> Self {
+        Self {
+            parent: l.parent,
+            added: l.added.into_iter().collect(),
+            removed: l.removed.into_iter().collect(),
+            attr_delta: AttrDelta::from(l.attr_delta),
+        }
+    }
+}
+
+/// Persisted on-disk descriptor for a single data extent.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogExtent {
+    pub file_offset: u64,
+    pub generation: u64,
+    pub record_log_offset: u64,
+    pub payload_offset: u32,
+    pub length: u32,
+}
+
+/// Persisted on-disk representation of a regular file delta.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogFileDelta {
+    pub extents: Vec<LogExtent>,
+    pub size: Option<u64>,
+    pub truncate_mask: Option<u64>,
+    pub attr_delta: LogAttrDelta,
+}
+
+impl From<&FileDelta> for LogFileDelta {
+    fn from(f: &FileDelta) -> Self {
+        let mut extents = Vec::new();
+        for (&start, entry) in f.extents.iter() {
+            if let ExtentState::Disk {
+                generation,
+                record_log_offset,
+                payload_offset,
+                length,
+            } = entry.value.read_state()
+            {
+                extents.push(LogExtent {
+                    file_offset: start,
+                    generation,
+                    record_log_offset,
+                    payload_offset,
+                    length,
+                });
+            }
+        }
+        Self {
+            extents,
+            size: f.size,
+            truncate_mask: f.truncate_mask,
+            attr_delta: LogAttrDelta::from(&f.attr_delta),
+        }
+    }
+}
+
+impl From<LogFileDelta> for FileDelta {
+    fn from(l: LogFileDelta) -> Self {
+        let mut extents = RangeMap::new();
+        for ext in l.extents {
+            extents.insert(
+                ext.file_offset,
+                ext.length as u64,
+                SharedExtentState::new_disk(ext.generation, ext.record_log_offset, ext.payload_offset, ext.length),
+            );
+        }
+        Self {
+            extents,
+            size: l.size,
+            truncate_mask: l.truncate_mask,
+            attr_delta: AttrDelta::from(l.attr_delta),
+        }
+    }
+}
+
+/// Persisted on-disk representation of a symlink delta.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogSymlinkDelta {
+    pub target: Option<String>,
+    pub attr_delta: LogAttrDelta,
+}
+
+impl From<&SymlinkDelta> for LogSymlinkDelta {
+    fn from(s: &SymlinkDelta) -> Self {
+        Self {
+            target: s.target.clone(),
+            attr_delta: LogAttrDelta::from(&s.attr_delta),
+        }
+    }
+}
+
+impl From<LogSymlinkDelta> for SymlinkDelta {
+    fn from(l: LogSymlinkDelta) -> Self {
+        Self {
+            target: l.target,
+            attr_delta: AttrDelta::from(l.attr_delta),
+        }
+    }
+}
+
+/// Persisted on-disk representation of special file deltas (FIFO, Char/Block devices, Sockets).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogSpecialDelta {
     pub rdev: u32,
-    #[serde(default)]
-    pub uid: u32,
-    #[serde(default)]
-    pub gid: u32,
-    #[serde(with = "crate::clock::serde_system_time")]
-    pub created_at: SystemTime,
+    pub attr_delta: LogAttrDelta,
 }
 
-/// Structured metadata payload for extended attribute set operations (`OP_SETXATTR`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct SetxattrPayload {
-    pub name: String,
-    pub value: Vec<u8>,
-    #[serde(default)]
-    pub flags: u32,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
-    pub op_time: SystemTime,
+impl From<&SpecialDelta> for LogSpecialDelta {
+    fn from(s: &SpecialDelta) -> Self {
+        Self {
+            rdev: s.rdev,
+            attr_delta: LogAttrDelta::from(&s.attr_delta),
+        }
+    }
 }
 
-/// Structured metadata payload for extended attribute remove operations (`OP_REMOVEXATTR`).
+impl From<LogSpecialDelta> for SpecialDelta {
+    fn from(l: LogSpecialDelta) -> Self {
+        Self {
+            rdev: l.rdev,
+            attr_delta: AttrDelta::from(l.attr_delta),
+        }
+    }
+}
+
+/// Persisted on-disk enum covering all node types.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct RemovexattrPayload {
-    pub name: String,
-    #[serde(default = "crate::clock::default_epoch", with = "crate::clock::serde_system_time")]
-    pub op_time: SystemTime,
+pub enum LogNodeDelta {
+    Directory(LogDirectoryDelta),
+    File(LogFileDelta),
+    Symlink(LogSymlinkDelta),
+    Fifo(LogSpecialDelta),
+    CharDevice(LogSpecialDelta),
+    BlockDevice(LogSpecialDelta),
+    Socket(LogSpecialDelta),
+}
+
+impl From<&NodeDelta> for LogNodeDelta {
+    fn from(n: &NodeDelta) -> Self {
+        match n {
+            NodeDelta::Directory(d) => LogNodeDelta::Directory(LogDirectoryDelta::from(d)),
+            NodeDelta::File(f) => LogNodeDelta::File(LogFileDelta::from(f)),
+            NodeDelta::Symlink(s) => LogNodeDelta::Symlink(LogSymlinkDelta::from(s)),
+            NodeDelta::Fifo(s) => LogNodeDelta::Fifo(LogSpecialDelta::from(s)),
+            NodeDelta::CharDevice(s) => LogNodeDelta::CharDevice(LogSpecialDelta::from(s)),
+            NodeDelta::BlockDevice(s) => LogNodeDelta::BlockDevice(LogSpecialDelta::from(s)),
+            NodeDelta::Socket(s) => LogNodeDelta::Socket(LogSpecialDelta::from(s)),
+        }
+    }
+}
+
+impl From<LogNodeDelta> for NodeDelta {
+    fn from(l: LogNodeDelta) -> Self {
+        match l {
+            LogNodeDelta::Directory(d) => NodeDelta::Directory(DirectoryDelta::from(d)),
+            LogNodeDelta::File(f) => NodeDelta::File(FileDelta::from(f)),
+            LogNodeDelta::Symlink(s) => NodeDelta::Symlink(SymlinkDelta::from(s)),
+            LogNodeDelta::Fifo(s) => NodeDelta::Fifo(SpecialDelta::from(s)),
+            LogNodeDelta::CharDevice(s) => NodeDelta::CharDevice(SpecialDelta::from(s)),
+            LogNodeDelta::BlockDevice(s) => NodeDelta::BlockDevice(SpecialDelta::from(s)),
+            LogNodeDelta::Socket(s) => NodeDelta::Socket(SpecialDelta::from(s)),
+        }
+    }
+}
+
+/// Persisted on-disk representation of an entry delta (Node delta or Tombstone).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum LogEntryDelta {
+    Node(LogNodeDelta),
+    Tombstone,
+}
+
+impl From<&EntryDelta> for LogEntryDelta {
+    fn from(e: &EntryDelta) -> Self {
+        match e {
+            EntryDelta::Node(n) => LogEntryDelta::Node(LogNodeDelta::from(n)),
+            EntryDelta::Tombstone => LogEntryDelta::Tombstone,
+        }
+    }
+}
+
+impl From<LogEntryDelta> for EntryDelta {
+    fn from(l: LogEntryDelta) -> Self {
+        match l {
+            LogEntryDelta::Node(n) => EntryDelta::Node(NodeDelta::from(n)),
+            LogEntryDelta::Tombstone => EntryDelta::Tombstone,
+        }
+    }
+}
+
+impl LogEntryDelta {
+    pub fn op_time(&self) -> Option<SystemTime> {
+        match self {
+            LogEntryDelta::Node(n) => {
+                let attr = match n {
+                    LogNodeDelta::Directory(d) => &d.attr_delta,
+                    LogNodeDelta::File(f) => &f.attr_delta,
+                    LogNodeDelta::Symlink(s) => &s.attr_delta,
+                    LogNodeDelta::Fifo(s)
+                    | LogNodeDelta::CharDevice(s)
+                    | LogNodeDelta::BlockDevice(s)
+                    | LogNodeDelta::Socket(s) => &s.attr_delta,
+                };
+                attr.created_at.or(attr.ctime).or(attr.mtime)
+            }
+            LogEntryDelta::Tombstone => None,
+        }
+    }
 }
 
 /// Unified typed representation of any decoded log record payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedPayload<'a> {
-    Create(CreatePayload),
-    Mkdir(MkdirPayload),
-    Write { meta: WriteMeta, data: &'a [u8] },
-    Unlink(UnlinkPayload),
-    Rmdir(RmdirPayload),
-    Symlink(SymlinkPayload),
-    Rename(RenamePayload),
-    Setattr(SetattrPayload),
-    Link(LinkPayload),
+    Data(&'a [u8]),
+    InodeDelta(LogEntryDelta),
     FlushCommit(FlushCommitPayload),
-    Mknod(MknodPayload),
-    Setxattr(SetxattrPayload),
-    Removexattr(RemovexattrPayload),
 }
 
 impl DecodedPayload<'_> {
     /// Extracts the timestamp associated with this operation (either creation time, operation time, or flush timestamp).
     pub fn op_time(&self) -> Option<SystemTime> {
         match self {
-            DecodedPayload::Create(p) => Some(p.created_at),
-            DecodedPayload::Mkdir(p) => Some(p.created_at),
-            DecodedPayload::Write { meta, .. } => Some(meta.op_time),
-            DecodedPayload::Unlink(p) => Some(p.op_time),
-            DecodedPayload::Rmdir(p) => Some(p.op_time),
-            DecodedPayload::Symlink(p) => Some(p.created_at),
-            DecodedPayload::Rename(p) => Some(p.op_time),
-            DecodedPayload::Setattr(p) => Some(p.op_time),
-            DecodedPayload::Link(p) => Some(p.op_time),
+            DecodedPayload::Data(_) => None,
+            DecodedPayload::InodeDelta(delta) => delta.op_time(),
             DecodedPayload::FlushCommit(p) => Some(p.timestamp),
-            DecodedPayload::Mknod(p) => Some(p.created_at),
-            DecodedPayload::Setxattr(p) => Some(p.op_time),
-            DecodedPayload::Removexattr(p) => Some(p.op_time),
         }
     }
 }
@@ -406,6 +478,7 @@ impl DecodedPayload<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_file_header_serialization() {
@@ -421,7 +494,7 @@ mod tests {
     #[test]
     fn test_record_header_serialization() {
         let header = RecordHeader {
-            op_code: OpCode::Write,
+            op_code: OpCode::Data,
             tx_id: 1001,
             inode: 5,
             payload_len: 4096,
@@ -447,17 +520,40 @@ mod tests {
     }
 
     #[test]
-    fn test_bincode_payload_serialization() {
-        let create = CreatePayload {
-            parent: 1,
-            name: "hello.txt".to_string(),
-            mode: 0o644,
-            uid: 1000,
-            gid: 1000,
-            created_at: crate::clock::unix_to_system_time(1_721_838_000, 0),
-        };
-        let bytes = bincode::serialize(&create).unwrap();
-        let deserialized: CreatePayload = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(create, deserialized);
+    fn test_log_entry_delta_serialization_round_trip() {
+        let mut added = HashMap::new();
+        added.insert("child.txt".to_string(), 10);
+        let mut removed = HashSet::new();
+        removed.insert("old.txt".to_string());
+        let dir_delta = EntryDelta::Node(NodeDelta::Directory(DirectoryDelta {
+            parent: Some(1),
+            added,
+            removed,
+            attr_delta: AttrDelta {
+                mode: Some(0o755),
+                uid: Some(1000),
+                gid: Some(1000),
+                nlink: Some(3),
+                ..Default::default()
+            },
+        }));
+
+        let log_delta = LogEntryDelta::from(&dir_delta);
+        let serialized = bincode::serialize(&log_delta).unwrap();
+        let deserialized: LogEntryDelta = bincode::deserialize(&serialized).unwrap();
+        let reconstructed = EntryDelta::from(deserialized);
+
+        match (dir_delta, reconstructed) {
+            (EntryDelta::Node(NodeDelta::Directory(d1)), EntryDelta::Node(NodeDelta::Directory(d2))) => {
+                assert_eq!(d1.parent, d2.parent);
+                assert_eq!(d1.added, d2.added);
+                assert_eq!(d1.removed, d2.removed);
+                assert_eq!(d1.attr_delta.mode, d2.attr_delta.mode);
+                assert_eq!(d1.attr_delta.uid, d2.attr_delta.uid);
+                assert_eq!(d1.attr_delta.gid, d2.attr_delta.gid);
+                assert_eq!(d1.attr_delta.nlink, d2.attr_delta.nlink);
+            }
+            _ => panic!("Type mismatch in round trip"),
+        }
     }
 }

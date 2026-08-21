@@ -1,7 +1,7 @@
 use crate::fs::InMemoryFS;
 use crate::log::LogFileCache;
 use crate::log::extent::ExtentState;
-use crate::log::record::{OpCode, RECORD_HEADER_SIZE, checksum_payload};
+use crate::log::record::{OpCode, RECORD_HEADER_SIZE, RecordHeader, checksum_payload};
 use crate::node::NodeKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -599,46 +599,59 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                                 ),
                                             ));
                                         } else {
-                                            let opcode = hdr_buf[0];
-                                            let rec_ino = u64::from_le_bytes(hdr_buf[9..17].try_into().unwrap());
-                                            let payload_len =
-                                                u32::from_le_bytes(hdr_buf[17..21].try_into().unwrap()) as usize;
-                                            let stored_checksum = &hdr_buf[21..25];
-
-                                            if opcode != OpCode::Write as u8 {
-                                                report.issues.push(IntegrityIssue::error(
-                                                        "CORRUPT_LOG_RECORD",
-                                                        Some(ino),
-                                                        format!("Record at offset 0x{:x} in {} has OpCode {} instead of OpCode::Write", record_log_offset, log_filename, opcode),
-                                                    ));
-                                            } else if rec_ino != ino {
-                                                report.issues.push(IntegrityIssue::error(
-                                                        "CORRUPT_LOG_RECORD",
-                                                        Some(ino),
-                                                        format!("Record at offset 0x{:x} in {} belongs to inode {}, expected inode {}", record_log_offset, log_filename, rec_ino, ino),
-                                                    ));
-                                            } else {
-                                                let mut payload = vec![0u8; payload_len];
-                                                if let Err(e) = reader.read_exact_at(
-                                                    record_log_offset + RECORD_HEADER_SIZE as u64,
-                                                    &mut payload,
-                                                ) {
+                                            match RecordHeader::from_bytes(&hdr_buf) {
+                                                Err(e) => {
                                                     report.issues.push(IntegrityIssue::error(
                                                         "CORRUPT_LOG_RECORD",
                                                         Some(ino),
                                                         format!(
-                                                            "Failed to read payload at offset 0x{:x} in {}: {}",
+                                                            "Invalid record header at offset 0x{:x} in {}: {}",
                                                             record_log_offset, log_filename, e
                                                         ),
                                                     ));
-                                                } else {
-                                                    let computed = checksum_payload(&payload);
-                                                    if &computed[..] != stored_checksum {
+                                                }
+                                                Ok(rec_header) => {
+                                                    let opcode = rec_header.op_code as u8;
+                                                    let rec_ino = rec_header.inode;
+                                                    let payload_len = rec_header.payload_len as usize;
+                                                    let stored_checksum = rec_header.checksum;
+
+                                                    if opcode != OpCode::Data as u8 {
                                                         report.issues.push(IntegrityIssue::error(
+                                                            "CORRUPT_LOG_RECORD",
+                                                            Some(ino),
+                                                            format!("Record at offset 0x{:x} in {} has OpCode {} instead of OpCode::Data", record_log_offset, log_filename, opcode),
+                                                        ));
+                                                    } else if rec_ino != ino {
+                                                        report.issues.push(IntegrityIssue::error(
+                                                            "CORRUPT_LOG_RECORD",
+                                                            Some(ino),
+                                                            format!("Record at offset 0x{:x} in {} belongs to inode {}, expected inode {}", record_log_offset, log_filename, rec_ino, ino),
+                                                        ));
+                                                    } else {
+                                                        let mut payload = vec![0u8; payload_len];
+                                                        if let Err(e) = reader.read_exact_at(
+                                                            record_log_offset + RECORD_HEADER_SIZE as u64,
+                                                            &mut payload,
+                                                        ) {
+                                                            report.issues.push(IntegrityIssue::error(
                                                                 "CORRUPT_LOG_RECORD",
                                                                 Some(ino),
-                                                                format!("BLAKE3 checksum mismatch for record at offset 0x{:x} in {}", record_log_offset, log_filename),
+                                                                format!(
+                                                                    "Failed to read payload at offset 0x{:x} in {}: {}",
+                                                                    record_log_offset, log_filename, e
+                                                                ),
                                                             ));
+                                                        } else {
+                                                            let computed = checksum_payload(&payload);
+                                                            if computed[..] != stored_checksum {
+                                                                report.issues.push(IntegrityIssue::error(
+                                                                    "CORRUPT_LOG_RECORD",
+                                                                    Some(ino),
+                                                                    format!("BLAKE3 checksum mismatch for record at offset 0x{:x} in {}", record_log_offset, log_filename),
+                                                                ));
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }

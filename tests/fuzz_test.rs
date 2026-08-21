@@ -1,12 +1,12 @@
 mod common;
 use appendfs::LogWriter;
 use appendfs::clock::{AdvancingClock, Clock, MockClock, SystemClock};
-use appendfs::log::{CreatePayload, MkdirPayload, OpCode, recover_fs};
+use appendfs::log::{LogAttrDelta, LogDirectoryDelta, LogEntryDelta, LogFileDelta, LogNodeDelta, OpCode, recover_fs};
 use appendfs::node::NodeKind;
 use appendfs::storage::{OsStorage, Storage};
 use common::{SnapshotNode, TestFS, TestRng};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 #[test]
 fn test_differential_fuzzing_and_crash_recovery() {
@@ -906,31 +906,41 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
 
     // Batch 1: mkdir "committed_dir" under root (ino 1), properly committed with a
     // trailing FlushCommit - simulates a flush() call that completed successfully.
-    let mkdir_payload = MkdirPayload {
-        parent: 1,
-        name: "committed_dir".to_string(),
-        mode: 0o755,
-        uid: 1000,
-        gid: 1000,
-        created_at: SystemTime::UNIX_EPOCH,
-    };
-    let bytes = bincode::serialize(&mkdir_payload).unwrap();
-    writer.append_record(OpCode::Mkdir, 2, &bytes).unwrap();
-    writer.emit_flush_commit(1, &clock).unwrap();
+    let root_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta {
+        parent: None,
+        added: vec![("committed_dir".to_string(), 2)],
+        removed: vec![],
+        attr_delta: LogAttrDelta::default(),
+    }));
+    let bytes = bincode::serialize(&root_delta).unwrap();
+    writer.append_record(OpCode::InodeDelta, 1, &bytes).unwrap();
+
+    let dir_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta {
+        parent: Some(1),
+        added: vec![],
+        removed: vec![],
+        attr_delta: LogAttrDelta {
+            mode: Some(0o755),
+            uid: Some(1000),
+            gid: Some(1000),
+            ..Default::default()
+        },
+    }));
+    let bytes = bincode::serialize(&dir_delta).unwrap();
+    writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
+    writer.emit_flush_commit(2, &clock).unwrap();
 
     // Batch 2: create "should_not_exist.txt" inside root, but WITHOUT ever writing its
     // FlushCommit trailer - simulates a crash exactly mid-flush, after the record was
     // physically appended but before the batch was confirmed complete.
-    let create_payload = CreatePayload {
-        parent: 1,
-        name: "should_not_exist.txt".to_string(),
-        mode: 0o644,
-        uid: 1000,
-        gid: 1000,
-        created_at: SystemTime::UNIX_EPOCH,
-    };
-    let bytes = bincode::serialize(&create_payload).unwrap();
-    writer.append_record(OpCode::Create, 3, &bytes).unwrap();
+    let uncommitted_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta {
+        parent: None,
+        added: vec![("should_not_exist.txt".to_string(), 3)],
+        removed: vec![],
+        attr_delta: LogAttrDelta::default(),
+    }));
+    let bytes = bincode::serialize(&uncommitted_delta).unwrap();
+    writer.append_record(OpCode::InodeDelta, 1, &bytes).unwrap();
     // Deliberately no emit_flush_commit() call here - this is the crash point.
 
     writer.sync().unwrap();
@@ -971,16 +981,17 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     let clock = SystemClock;
     let writer = LogWriter::create(storage.clone(), 1, &clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
-    let create_payload = CreatePayload {
-        parent: 1,
-        name: "orphan.txt".to_string(),
-        mode: 0o644,
-        uid: 1000,
-        gid: 1000,
-        created_at: SystemTime::UNIX_EPOCH,
-    };
-    let bytes = bincode::serialize(&create_payload).unwrap();
-    writer.append_record(OpCode::Create, 2, &bytes).unwrap();
+    let file_delta = LogEntryDelta::Node(LogNodeDelta::File(LogFileDelta {
+        attr_delta: LogAttrDelta {
+            mode: Some(0o644),
+            uid: Some(1000),
+            gid: Some(1000),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let bytes = bincode::serialize(&file_delta).unwrap();
+    writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
     // Claim 2 records preceded this trailer, when only 1 actually did.
     writer.emit_flush_commit(2, &clock).unwrap();
     writer.sync().unwrap();
@@ -1003,16 +1014,17 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     let clock = SystemClock;
     let writer = LogWriter::create(storage.clone(), 1, &clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
-    let create_payload = CreatePayload {
-        parent: 1,
-        name: "important.txt".to_string(),
-        mode: 0o644,
-        uid: 1000,
-        gid: 1000,
-        created_at: SystemTime::UNIX_EPOCH,
-    };
-    let bytes = bincode::serialize(&create_payload).unwrap();
-    writer.append_record(OpCode::Create, 2, &bytes).unwrap();
+    let file_delta = LogEntryDelta::Node(LogNodeDelta::File(LogFileDelta {
+        attr_delta: LogAttrDelta {
+            mode: Some(0o644),
+            uid: Some(1000),
+            gid: Some(1000),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let bytes = bincode::serialize(&file_delta).unwrap();
+    writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
     writer.emit_flush_commit(1, &clock).unwrap();
     writer.sync().unwrap();
     let path = dir.path().join(writer.filename());
@@ -1023,12 +1035,12 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     assert!(recovered.get_attr(2).is_some());
     drop(recovered);
 
-    // Flip one bit inside the Create record's payload region, well past the file
-    // header (24B) and this record's header (25B) - simulating a bitrotted byte in
+    // Flip one bit inside the record's payload region, well past the file
+    // header (24B) and this record's header (26B) - simulating a bitrotted byte in
     // otherwise-intact, previously-committed data.
     use std::io::{Read, Seek, SeekFrom, Write};
     let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
-    let corrupt_offset = 24 + 25 + 2; // a few bytes into the CreatePayload
+    let corrupt_offset = 24 + 26 + 2; // a few bytes into the payload
     file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
     let mut byte = [0u8; 1];
     file.read_exact(&mut byte).unwrap();

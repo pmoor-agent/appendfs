@@ -1,11 +1,10 @@
 use crate::clock::Clock;
 use crate::fs::InMemoryFS;
-use crate::log::extent::SharedExtentState;
 use crate::log::reader::{LogReader, LogRecord};
 use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode};
 use crate::log::summary::SummaryReader;
-use crate::node::{InodeMeta, Node, NodeKind};
-use crate::range_map::RangeMap;
+use crate::node::EntryDelta;
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -172,6 +171,8 @@ pub fn recover_fs(
 
                 committed_records_count += commit.record_count + 1;
 
+                let mut current_batch: HashMap<u64, EntryDelta> = HashMap::new();
+
                 for buffered in pending.drain(..) {
                     // Check if this record exceeds point-in-time recovery target
                     match target {
@@ -200,14 +201,30 @@ pub fn recover_fs(
                         max_inode = target_ino;
                     }
 
-                    if let Ok(DecodedPayload::Write { data, .. }) = buffered.decode() {
-                        log_data_bytes += data.len() as u64;
+                    let decoded = match buffered.decode() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            log::warn!("Failed to decode record for inode {}: {}", target_ino, e);
+                            continue;
+                        }
+                    };
+
+                    match decoded {
+                        DecodedPayload::Data(data) => {
+                            log_data_bytes += data.len() as u64;
+                        }
+                        DecodedPayload::InodeDelta(log_delta) => {
+                            if let Some(op_time) = log_delta.op_time() {
+                                last_op_time = Some(op_time);
+                            }
+                            let entry_delta = EntryDelta::from(log_delta);
+                            current_batch.insert(target_ino, entry_delta);
+                        }
+                        DecodedPayload::FlushCommit(_) => {}
                     }
-                    if let Some(op_time) = buffered.op_time() {
-                        last_op_time = Some(op_time);
-                    }
-                    apply_record(&fs_instance, gen_num, &buffered);
                 }
+
+                fs_instance.fold_flushed_batch(current_batch);
 
                 if target_cutoff_reached {
                     break;
@@ -275,374 +292,6 @@ pub fn recover_fs(
     Ok(fs_instance)
 }
 
-/// Applies one already-committed log record to `fs_instance`'s in-memory state. Only
-/// ever called for records that were confirmed complete by a matching `FlushCommit` -
-/// see `recover_fs`.
-fn apply_record(fs_instance: &InMemoryFS, gen_num: u64, record: &LogRecord) {
-    let target_ino = record.header.inode;
-    let decoded = match record.decode() {
-        Ok(d) => d,
-        Err(e) => {
-            log::warn!("Failed to decode record for inode {}: {}", target_ino, e);
-            return;
-        }
-    };
-
-    match decoded {
-        DecodedPayload::Create(create) => {
-            let now = create.created_at;
-            let new_node = Arc::new(Node {
-                meta: InodeMeta::new(create.mode & 0o7777, 1, create.uid, create.gid, now),
-                kind: NodeKind::File {
-                    range_map: RangeMap::new(),
-                    size: 0,
-                },
-            });
-
-            let mut map = fs_instance.base.write().unwrap();
-            map.insert(target_ino, new_node);
-
-            if let Some(parent_node_arc) = map.get_mut(&create.parent) {
-                let parent_node = Arc::make_mut(parent_node_arc);
-                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
-                    entries.push((create.name, target_ino));
-                    parent_node.meta.mtime = now;
-                    parent_node.meta.ctime = now;
-                }
-            }
-        }
-        DecodedPayload::Mkdir(mkdir) => {
-            let now = mkdir.created_at;
-            let new_node = Arc::new(Node {
-                meta: InodeMeta::new(mkdir.mode & 0o7777, 2, mkdir.uid, mkdir.gid, now),
-                kind: NodeKind::Directory {
-                    parent: mkdir.parent,
-                    entries: Vec::new(),
-                },
-            });
-
-            let mut map = fs_instance.base.write().unwrap();
-            map.insert(target_ino, new_node);
-
-            if let Some(parent_node_arc) = map.get_mut(&mkdir.parent) {
-                let parent_node = Arc::make_mut(parent_node_arc);
-                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
-                    entries.push((mkdir.name, target_ino));
-                    parent_node.meta.nlink += 1;
-                    parent_node.meta.mtime = now;
-                    parent_node.meta.ctime = now;
-                }
-            }
-        }
-        DecodedPayload::Write { meta: write_meta, data } => {
-            let meta_size = (record.payload.len() - data.len()) as u32;
-            let write_data_len = data.len() as u32;
-
-            let shared_state =
-                SharedExtentState::new_disk(gen_num, record.record_log_offset, meta_size, write_data_len);
-
-            let mut map = fs_instance.base.write().unwrap();
-            if let Some(node_arc) = map.get_mut(&target_ino) {
-                let node = Arc::make_mut(node_arc);
-                if let NodeKind::File { range_map, size } = &mut node.kind {
-                    let end_offset = write_meta.file_offset + write_data_len as u64;
-                    if end_offset > *size {
-                        *size = end_offset;
-                    }
-                    let now = write_meta.op_time;
-                    node.meta.mtime = now;
-                    node.meta.ctime = now;
-                    range_map.insert(write_meta.file_offset, write_data_len as u64, shared_state);
-                }
-            }
-        }
-        DecodedPayload::Unlink(unlink) => {
-            let now = unlink.op_time;
-            let mut map = fs_instance.base.write().unwrap();
-            if let Some(parent_node_arc) = map.get_mut(&unlink.parent) {
-                let parent_node = Arc::make_mut(parent_node_arc);
-                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
-                    entries.retain(|(name, ino)| !(name == &unlink.name && *ino == target_ino));
-                    parent_node.meta.mtime = now;
-                    parent_node.meta.ctime = now;
-                }
-            }
-
-            let mut should_delete = false;
-            if let Some(child_node_arc) = map.get_mut(&target_ino) {
-                let child_node = Arc::make_mut(child_node_arc);
-                if child_node.is_dir() {
-                    should_delete = true;
-                } else {
-                    if child_node.meta.nlink > 0 {
-                        child_node.meta.nlink -= 1;
-                        child_node.meta.ctime = now;
-                    }
-                    if child_node.meta.nlink == 0 {
-                        should_delete = true;
-                    }
-                }
-            }
-            if should_delete {
-                map.remove(&target_ino);
-            }
-        }
-        DecodedPayload::Rmdir(rmdir) => {
-            let now = rmdir.op_time;
-            let mut map = fs_instance.base.write().unwrap();
-            if let Some(parent_node_arc) = map.get_mut(&rmdir.parent) {
-                let parent_node = Arc::make_mut(parent_node_arc);
-                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
-                    entries.retain(|(name, ino)| !(name == &rmdir.name && *ino == target_ino));
-                    parent_node.meta.nlink = parent_node.meta.nlink.saturating_sub(1);
-                    parent_node.meta.mtime = now;
-                    parent_node.meta.ctime = now;
-                }
-            }
-            map.remove(&target_ino);
-        }
-        DecodedPayload::Symlink(symlink) => {
-            let now = symlink.created_at;
-            let new_node = Arc::new(Node {
-                meta: InodeMeta::new(0o777, 1, symlink.uid, symlink.gid, now),
-                kind: NodeKind::Symlink { target: symlink.target },
-            });
-
-            let mut map = fs_instance.base.write().unwrap();
-            map.insert(target_ino, new_node);
-
-            if let Some(parent_node_arc) = map.get_mut(&symlink.parent) {
-                let parent_node = Arc::make_mut(parent_node_arc);
-                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
-                    entries.push((symlink.name, target_ino));
-                    parent_node.meta.mtime = now;
-                    parent_node.meta.ctime = now;
-                }
-            }
-        }
-        DecodedPayload::Rename(rename) => {
-            let now = rename.op_time;
-            let mut map = fs_instance.base.write().unwrap();
-
-            let target_is_dir = map.get(&target_ino).is_some_and(|node| node.is_dir());
-
-            let overwritten_ino = if rename.old_parent == rename.new_parent {
-                let mut overwritten = None;
-                if let Some(parent_node_arc) = map.get_mut(&rename.old_parent) {
-                    let parent_node = Arc::make_mut(parent_node_arc);
-                    if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
-                        if let Some(dest_pos) = entries
-                            .iter()
-                            .position(|(n, ino)| n == &rename.new_name && *ino != target_ino)
-                        {
-                            overwritten = Some(entries.remove(dest_pos).1);
-                        }
-                        if let Some(src_pos) = entries
-                            .iter()
-                            .position(|(n, ino)| n == &rename.old_name && *ino == target_ino)
-                        {
-                            entries[src_pos].0 = rename.new_name.clone();
-                        }
-                        parent_node.meta.mtime = now;
-                        parent_node.meta.ctime = now;
-                    }
-                }
-                overwritten
-            } else {
-                // Remove source entry
-                if let Some(parent_node_arc) = map.get_mut(&rename.old_parent) {
-                    let parent_node = Arc::make_mut(parent_node_arc);
-                    if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
-                        entries.retain(|(name, ino)| !(name == &rename.old_name && *ino == target_ino));
-                        if target_is_dir {
-                            parent_node.meta.nlink = parent_node.meta.nlink.saturating_sub(1);
-                        }
-                        parent_node.meta.mtime = now;
-                        parent_node.meta.ctime = now;
-                    }
-                }
-
-                // Add new entry, capturing any destination inode it clobbers
-                let overwritten = if let Some(newparent_node_arc) = map.get_mut(&rename.new_parent) {
-                    let newparent_node = Arc::make_mut(newparent_node_arc);
-                    if let NodeKind::Directory { entries, .. } = &mut newparent_node.kind {
-                        let dest_pos = entries
-                            .iter()
-                            .position(|(name, ino)| name == &rename.new_name && *ino != target_ino);
-                        let overwritten = dest_pos.map(|pos| entries.remove(pos).1);
-                        entries.push((rename.new_name.clone(), target_ino));
-                        newparent_node.meta.mtime = now;
-                        newparent_node.meta.ctime = now;
-                        overwritten
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                if target_is_dir {
-                    let dest_was_dir = overwritten
-                        .and_then(|dest_ino| map.get(&dest_ino))
-                        .is_some_and(|node| node.is_dir());
-                    if !dest_was_dir && let Some(newparent_node_arc) = map.get_mut(&rename.new_parent) {
-                        let newparent_node = Arc::make_mut(newparent_node_arc);
-                        newparent_node.meta.nlink += 1;
-                    }
-                }
-
-                overwritten
-            };
-
-            if rename.old_parent != rename.new_parent
-                && let Some(target_node_arc) = map.get_mut(&target_ino)
-            {
-                let target_node = Arc::make_mut(target_node_arc);
-                if let NodeKind::Directory { parent, .. } = &mut target_node.kind {
-                    *parent = rename.new_parent;
-                }
-            }
-
-            if let Some(dest_ino) = overwritten_ino
-                && dest_ino != target_ino
-            {
-                let mut should_delete = false;
-                if let Some(dest_node_arc) = map.get_mut(&dest_ino) {
-                    let dest_node = Arc::make_mut(dest_node_arc);
-                    if dest_node.is_dir() {
-                        should_delete = true;
-                    } else {
-                        if dest_node.meta.nlink > 0 {
-                            dest_node.meta.nlink -= 1;
-                            dest_node.meta.ctime = now;
-                        }
-                        if dest_node.meta.nlink == 0 {
-                            should_delete = true;
-                        }
-                    }
-                }
-                if should_delete {
-                    map.remove(&dest_ino);
-                }
-            }
-        }
-        DecodedPayload::Setattr(setattr) => {
-            let mut map = fs_instance.base.write().unwrap();
-            if let Some(node_arc) = map.get_mut(&target_ino) {
-                let node = Arc::make_mut(node_arc);
-                let now = setattr.op_time;
-
-                if let Some(m) = setattr.mode {
-                    node.meta.perm = m & 0o7777;
-                }
-                if let Some(u) = setattr.uid {
-                    node.meta.uid = u;
-                }
-                if let Some(g) = setattr.gid {
-                    node.meta.gid = g;
-                }
-                if let Some(s) = setattr.size
-                    && let NodeKind::File { range_map, size } = &mut node.kind
-                {
-                    if s < *size {
-                        range_map.truncate(s);
-                    }
-                    *size = s;
-                    node.meta.mtime = now;
-                }
-                if let Some(t) = setattr.atime {
-                    node.meta.atime = t;
-                }
-                if let Some(t) = setattr.mtime {
-                    node.meta.mtime = t;
-                }
-                node.meta.ctime = now;
-            }
-        }
-        DecodedPayload::Link(link) => {
-            let now = link.op_time;
-            let mut map = fs_instance.base.write().unwrap();
-            if let Some(newparent_node_arc) = map.get_mut(&link.new_parent) {
-                let newparent_node = Arc::make_mut(newparent_node_arc);
-                if let NodeKind::Directory { entries, .. } = &mut newparent_node.kind {
-                    entries.push((link.new_name, target_ino));
-                    newparent_node.meta.mtime = now;
-                    newparent_node.meta.ctime = now;
-                }
-            }
-
-            if let Some(node_arc) = map.get_mut(&target_ino) {
-                let node = Arc::make_mut(node_arc);
-                node.meta.nlink += 1;
-                node.meta.ctime = now;
-            }
-        }
-        DecodedPayload::Mknod(mknod) => {
-            let now = mknod.created_at;
-            let file_type_bits = mknod.mode & libc::S_IFMT;
-            let perm = mknod.mode & 0o7777;
-
-            let kind = match file_type_bits {
-                libc::S_IFIFO => NodeKind::Fifo,
-                libc::S_IFCHR => NodeKind::CharDevice { rdev: mknod.rdev },
-                libc::S_IFBLK => NodeKind::BlockDevice { rdev: mknod.rdev },
-                libc::S_IFSOCK => NodeKind::Socket,
-                _ => NodeKind::File {
-                    range_map: RangeMap::new(),
-                    size: 0,
-                },
-            };
-
-            let new_node = Arc::new(Node {
-                meta: InodeMeta::new(perm, 1, mknod.uid, mknod.gid, now),
-                kind,
-            });
-
-            let mut map = fs_instance.base.write().unwrap();
-            map.insert(target_ino, new_node);
-
-            if let Some(parent_node_arc) = map.get_mut(&mknod.parent) {
-                let parent_node = Arc::make_mut(parent_node_arc);
-                if let NodeKind::Directory { entries, .. } = &mut parent_node.kind {
-                    entries.push((mknod.name, target_ino));
-                    parent_node.meta.mtime = now;
-                    parent_node.meta.ctime = now;
-                }
-            }
-        }
-        DecodedPayload::Setxattr(setxattr) => {
-            let mut map = fs_instance.base.write().unwrap();
-            if let Some(node_arc) = map.get_mut(&target_ino) {
-                let node = Arc::make_mut(node_arc);
-                let now = setxattr.op_time;
-                let mut xattrs = match node.meta.xattrs.take() {
-                    Some(arc) => (*arc).clone(),
-                    None => std::collections::BTreeMap::new(),
-                };
-                xattrs.insert(setxattr.name, setxattr.value);
-                node.meta.xattrs = Some(Arc::new(xattrs));
-                node.meta.ctime = now;
-            }
-        }
-        DecodedPayload::Removexattr(removexattr) => {
-            let mut map = fs_instance.base.write().unwrap();
-            if let Some(node_arc) = map.get_mut(&target_ino) {
-                let node = Arc::make_mut(node_arc);
-                let now = removexattr.op_time;
-                if let Some(arc) = node.meta.xattrs.take() {
-                    let mut xattrs = (*arc).clone();
-                    xattrs.remove(&removexattr.name);
-                    if !xattrs.is_empty() {
-                        node.meta.xattrs = Some(Arc::new(xattrs));
-                    }
-                }
-                node.meta.ctime = now;
-            }
-        }
-        DecodedPayload::FlushCommit(_) => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,16 +314,18 @@ mod tests {
         fs.log_writer = Some(writer);
         fs.set_storage(storage.clone());
 
-        // Tx 1: Create dir "step1"
+        // Tx 1-3: Create dir "step1"
         let d1 = crate::operations::dir::mkdir_core(&fs, 1, "step1", 0o755, 1000, 1000).unwrap();
         fs.sync_log().unwrap();
+        let tx_after_step1 = fs.log_writer.as_ref().unwrap().last_tx_id();
 
-        // Tx 2: Create file "file1.txt" inside "step1"
+        // Tx 4-7: Create file "file1.txt" inside "step1"
         let f1 = crate::operations::read_write::create_core(&fs, d1.ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f1.ino, b"version 1", 0).unwrap();
         fs.sync_log().unwrap();
+        let tx_after_file1 = fs.log_writer.as_ref().unwrap().last_tx_id();
 
-        // Tx 3: Create file "file2.txt" inside "step1"
+        // Tx 8-11: Create file "file2.txt" inside "step1"
         let f2 = crate::operations::read_write::create_core(&fs, d1.ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f2.ino, b"version 2", 0).unwrap();
         fs.sync_log().unwrap();
@@ -686,15 +337,25 @@ mod tests {
         assert!(fs_latest.lookup_child(d1_ino, "file1.txt").is_some());
         assert!(fs_latest.lookup_child(d1_ino, "file2.txt").is_some());
 
-        // 2. Recover to TxId(1) or TxId(4) -> only step1 exists, no file1.txt or file2.txt
-        let fs_tx1 = recover_fs(storage.clone(), RecoveryTarget::TxId(1), Arc::new(SystemClock)).unwrap();
+        // 2. Recover to tx_after_step1 -> only step1 exists, no file1.txt or file2.txt
+        let fs_tx1 = recover_fs(
+            storage.clone(),
+            RecoveryTarget::TxId(tx_after_step1),
+            Arc::new(SystemClock),
+        )
+        .unwrap();
         assert!(fs_tx1.lookup_child(1, "step1").is_some());
         let d1_tx1 = fs_tx1.lookup_child(1, "step1").unwrap();
         assert!(fs_tx1.lookup_child(d1_tx1, "file1.txt").is_none());
         assert!(fs_tx1.lookup_child(d1_tx1, "file2.txt").is_none());
 
-        // 3. Recover to TxId(6) -> step1 and file1.txt exist, but not file2.txt
-        let fs_tx6 = recover_fs(storage.clone(), RecoveryTarget::TxId(6), Arc::new(SystemClock)).unwrap();
+        // 3. Recover to tx_after_file1 -> step1 and file1.txt exist, but not file2.txt
+        let fs_tx6 = recover_fs(
+            storage.clone(),
+            RecoveryTarget::TxId(tx_after_file1),
+            Arc::new(SystemClock),
+        )
+        .unwrap();
         let d1_tx6 = fs_tx6.lookup_child(1, "step1").unwrap();
         assert!(fs_tx6.lookup_child(d1_tx6, "file1.txt").is_some());
         assert!(fs_tx6.lookup_child(d1_tx6, "file2.txt").is_none());

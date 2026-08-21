@@ -14,9 +14,9 @@ pub use flusher::BackgroundFlusher;
 pub use manifest::{GenerationLiveStats, LogFileInfo, LogManifest};
 pub use reader::{LogReader, LogRecord};
 pub use record::{
-    CreatePayload, FileHeader, FlushCommitPayload, LinkPayload, MkdirPayload, MknodPayload, OpCode, RECORD_HEADER_SIZE,
-    RecordHeader, RemovexattrPayload, RenamePayload, RmdirPayload, SetattrPayload, SetxattrPayload, SymlinkPayload,
-    UnlinkPayload, WriteMeta,
+    DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LogAttrDelta, LogDirectoryDelta, LogEntryDelta,
+    LogExtent, LogFileDelta, LogNodeDelta, LogSpecialDelta, LogSymlinkDelta, OpCode, RECORD_CHECKSUM_SIZE,
+    RECORD_HEADER_SIZE, RecordHeader, checksum_payload,
 };
 pub use recovery::{RecoveryTarget, recover_fs};
 pub use summary::{SummaryFooter, SummaryHeader, SummaryIndexEntry, SummaryReader, export_summary, init_volume};

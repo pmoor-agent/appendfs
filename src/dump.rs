@@ -1,7 +1,5 @@
 use crate::log::ExtentState;
-use crate::log::record::{
-    DecodedPayload, FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader, checksum_payload,
-};
+use crate::log::record::{FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader, checksum_payload};
 use crate::log::summary::{SUMMARY_MAGIC, SummaryReader};
 use crate::node::NodeKind;
 use crate::storage::{Storage, StorageReader};
@@ -133,7 +131,7 @@ pub fn dump_log_reader_with_path(
     let mut records: Vec<DumpRecordEntry> = Vec::new();
     let mut current_offset = FILE_HEADER_SIZE as u64;
 
-    let mut op_counts: [OpCodeStats; 14] = Default::default();
+    let mut op_counts: [OpCodeStats; 4] = Default::default();
     let mut write_buckets = vec![
         WriteBucket::new("< 64 B", 0, 63),
         WriteBucket::new("64 B .. 511 B", 64, 511),
@@ -240,13 +238,8 @@ pub fn dump_log_reader_with_path(
             op_counts[op_idx].payload_bytes += header.payload_len as u64;
         }
 
-        let log_rec = crate::log::reader::LogRecord {
-            header,
-            payload: payload.clone(),
-            record_log_offset: record_offset,
-        };
-        if let Ok(DecodedPayload::Write { data, .. }) = log_rec.decode() {
-            let data_len = data.len() as u64;
+        if header.op_code == OpCode::Data {
+            let data_len = payload.len() as u64;
             for b in &mut write_buckets {
                 if b.matches(data_len) {
                     b.add(data_len);
@@ -341,7 +334,7 @@ pub fn dump_log_reader_with_path(
         .filter(|r| matches!(r, DumpRecordEntry::Valid { .. }))
         .count();
 
-    for code in 1..=13u8 {
+    for code in 1..=3u8 {
         if let Ok(opcode) = OpCode::try_from(code) {
             let stats = &op_counts[code as usize];
             let pct = if total_valid > 0 {
@@ -364,7 +357,7 @@ pub fn dump_log_reader_with_path(
     writeln!(out).unwrap();
 
     // Write size histogram
-    let total_writes = op_counts[OpCode::Write as usize].count;
+    let total_writes = op_counts[OpCode::Data as usize].count;
     if total_writes > 0 {
         writeln!(out, "--- Write Payload Size Histogram ---").unwrap();
         writeln!(
@@ -957,129 +950,15 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
         record_log_offset: 0,
     };
     match dummy_record.decode() {
-        Ok(crate::log::record::DecodedPayload::Create(c)) => {
-            writeln!(
-                out,
-                "      parent: {}, name: {:?}, mode: 0o{:o}, uid: {}, gid: {}, created_at: {}",
-                c.parent,
-                c.name,
-                c.mode,
-                c.uid,
-                c.gid,
-                format_system_time(c.created_at)
-            )
-            .unwrap();
-        }
-        Ok(crate::log::record::DecodedPayload::Mkdir(m)) => {
-            writeln!(
-                out,
-                "      parent: {}, name: {:?}, mode: 0o{:o}, uid: {}, gid: {}, created_at: {}",
-                m.parent,
-                m.name,
-                m.mode,
-                m.uid,
-                m.gid,
-                format_system_time(m.created_at)
-            )
-            .unwrap();
-        }
-        Ok(crate::log::record::DecodedPayload::Write { meta: w, data }) => {
-            writeln!(
-                out,
-                "      file_offset: {}, data_len: {}, op_time: {}",
-                w.file_offset,
-                format_bytes(data.len() as u64),
-                format_system_time(w.op_time)
-            )
-            .unwrap();
+        Ok(crate::log::record::DecodedPayload::Data(data)) => {
+            writeln!(out, "      data_len: {}", format_bytes(data.len() as u64)).unwrap();
 
             if dump_data_hex && !data.is_empty() {
                 out.push_str(&format_hexdump(data, 256));
             }
         }
-        Ok(crate::log::record::DecodedPayload::Unlink(u)) => {
-            writeln!(
-                out,
-                "      parent: {}, name: {:?}, op_time: {}",
-                u.parent,
-                u.name,
-                format_system_time(u.op_time)
-            )
-            .unwrap();
-        }
-        Ok(crate::log::record::DecodedPayload::Rmdir(r)) => {
-            writeln!(
-                out,
-                "      parent: {}, name: {:?}, op_time: {}",
-                r.parent,
-                r.name,
-                format_system_time(r.op_time)
-            )
-            .unwrap();
-        }
-        Ok(crate::log::record::DecodedPayload::Symlink(s)) => {
-            writeln!(
-                out,
-                "      parent: {}, name: {:?}, target: {:?}, uid: {}, gid: {}, created_at: {}",
-                s.parent,
-                s.name,
-                s.target,
-                s.uid,
-                s.gid,
-                format_system_time(s.created_at)
-            )
-            .unwrap();
-        }
-        Ok(crate::log::record::DecodedPayload::Rename(r)) => {
-            writeln!(
-                out,
-                "      old_parent: {}, old_name: {:?} -> new_parent: {}, new_name: {:?}, op_time: {}",
-                r.old_parent,
-                r.old_name,
-                r.new_parent,
-                r.new_name,
-                format_system_time(r.op_time)
-            )
-            .unwrap();
-        }
-        Ok(crate::log::record::DecodedPayload::Setattr(s)) => {
-            let mut changes = Vec::new();
-            if let Some(m) = s.mode {
-                changes.push(format!("mode: 0o{:o}", m));
-            }
-            if let Some(u) = s.uid {
-                changes.push(format!("uid: {}", u));
-            }
-            if let Some(g) = s.gid {
-                changes.push(format!("gid: {}", g));
-            }
-            if let Some(sz) = s.size {
-                changes.push(format!("size: {}", sz));
-            }
-            if let Some(a) = s.atime {
-                changes.push(format!("atime: {}", format_system_time(a)));
-            }
-            if let Some(m) = s.mtime {
-                changes.push(format!("mtime: {}", format_system_time(m)));
-            }
-            writeln!(
-                out,
-                "      changes: [{}], op_time: {}",
-                changes.join(", "),
-                format_system_time(s.op_time)
-            )
-            .unwrap();
-        }
-        Ok(crate::log::record::DecodedPayload::Link(l)) => {
-            writeln!(
-                out,
-                "      target_ino: {}, new_parent: {}, new_name: {:?}, op_time: {}",
-                l.ino,
-                l.new_parent,
-                l.new_name,
-                format_system_time(l.op_time)
-            )
-            .unwrap();
+        Ok(crate::log::record::DecodedPayload::InodeDelta(delta)) => {
+            writeln!(out, "      delta: {:?}", delta).unwrap();
         }
         Ok(crate::log::record::DecodedPayload::FlushCommit(b)) => {
             writeln!(
@@ -1087,42 +966,6 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
                 "      batch_record_count: {}, commit_timestamp: {}",
                 b.record_count,
                 format_system_time(b.timestamp)
-            )
-            .unwrap();
-        }
-        Ok(crate::log::record::DecodedPayload::Mknod(m)) => {
-            writeln!(
-                out,
-                "      parent: {}, name: {:?}, mode: 0o{:o}, rdev: 0x{:x}, uid: {}, gid: {}, created_at: {}",
-                m.parent,
-                m.name,
-                m.mode,
-                m.rdev,
-                m.uid,
-                m.gid,
-                format_system_time(m.created_at)
-            )
-            .unwrap();
-        }
-        Ok(crate::log::record::DecodedPayload::Setxattr(x)) => {
-            writeln!(
-                out,
-                "      name: {:?}, value_len: {}, op_time: {}",
-                x.name,
-                format_bytes(x.value.len() as u64),
-                format_system_time(x.op_time)
-            )
-            .unwrap();
-            if dump_data_hex && !x.value.is_empty() {
-                out.push_str(&format_hexdump(&x.value, 256));
-            }
-        }
-        Ok(crate::log::record::DecodedPayload::Removexattr(x)) => {
-            writeln!(
-                out,
-                "      name: {:?}, op_time: {}",
-                x.name,
-                format_system_time(x.op_time)
             )
             .unwrap();
         }
@@ -1193,38 +1036,35 @@ mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
     use crate::log::LogWriter;
-    use crate::log::record::{CreatePayload, WriteMeta};
     use crate::storage::OsStorage;
     use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
     fn test_dump_log_file_summary_and_verbosity() {
+        use crate::log::record::{LogAttrDelta, LogDirectoryDelta, LogEntryDelta, LogNodeDelta};
+
         let dir = tempdir().unwrap();
         let storage = Arc::new(OsStorage::new(dir.path()));
         let clock = SystemClock;
         let writer = LogWriter::create(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
-        // Write Create record
-        let create_p = CreatePayload {
-            parent: 1,
-            name: "test.txt".to_string(),
-            mode: 0o644,
-            uid: 1000,
-            gid: 1000,
-            created_at: clock.now(),
-        };
-        let create_bytes = bincode::serialize(&create_p).unwrap();
-        writer.append_record(OpCode::Create, 2, &create_bytes).unwrap();
+        // Write InodeDelta record
+        let dir_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta {
+            parent: Some(1),
+            added: vec![("test.txt".to_string(), 2)],
+            removed: vec![],
+            attr_delta: LogAttrDelta {
+                mode: Some(0o755),
+                ..Default::default()
+            },
+        }));
+        let delta_bytes = bincode::serialize(&dir_delta).unwrap();
+        writer.append_record(OpCode::InodeDelta, 1, &delta_bytes).unwrap();
 
-        // Write Write record with 100 bytes
-        let write_m = WriteMeta {
-            file_offset: 0,
-            op_time: clock.now(),
-        };
-        let mut write_bytes = bincode::serialize(&write_m).unwrap();
-        write_bytes.extend_from_slice(&[0x42; 100]);
-        writer.append_record(OpCode::Write, 2, &write_bytes).unwrap();
+        // Write Data record with 100 bytes
+        let data_bytes = vec![0x42; 100];
+        writer.append_record(OpCode::Data, 2, &data_bytes).unwrap();
 
         // Commit batch
         writer.emit_flush_commit(2, &clock).unwrap();
@@ -1237,14 +1077,14 @@ mod tests {
         assert!(summary_dump.contains("Total Valid Records: 3"));
         assert!(summary_dump.contains("Committed Flushes:   1"));
         assert!(summary_dump.contains("Trailing Batch:      None"));
-        assert!(summary_dump.contains("Write"));
+        assert!(summary_dump.contains("Data"));
         assert!(summary_dump.contains("64 B .. 511 B"));
 
         // Level 1: Records
         let v1_dump = dump_log_file(storage.as_ref(), "000001.log", 1).unwrap();
         assert!(v1_dump.contains("Sequential Record Stream"));
-        assert!(v1_dump.contains("Create"));
-        assert!(v1_dump.contains("Write"));
+        assert!(v1_dump.contains("InodeDelta"));
+        assert!(v1_dump.contains("Data"));
         assert!(v1_dump.contains("FlushCommit"));
         assert!(v1_dump.contains("[COMMITTED]"));
 
@@ -1255,22 +1095,24 @@ mod tests {
 
     #[test]
     fn test_dump_log_file_detects_interrupted_flush_trailing_records() {
+        use crate::log::record::{LogAttrDelta, LogDirectoryDelta, LogEntryDelta, LogNodeDelta};
+
         let dir = tempdir().unwrap();
         let storage = Arc::new(OsStorage::new(dir.path()));
         let clock = SystemClock;
         let writer = LogWriter::create(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
-        // Write Create and Write records WITHOUT FlushCommit trailer
-        let create_p = CreatePayload {
-            parent: 1,
-            name: "uncommitted.txt".to_string(),
-            mode: 0o644,
-            uid: 1000,
-            gid: 1000,
-            created_at: clock.now(),
-        };
-        let create_bytes = bincode::serialize(&create_p).unwrap();
-        writer.append_record(OpCode::Create, 2, &create_bytes).unwrap();
+        let dir_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta {
+            parent: Some(1),
+            added: vec![("uncommitted.txt".to_string(), 2)],
+            removed: vec![],
+            attr_delta: LogAttrDelta {
+                mode: Some(0o755),
+                ..Default::default()
+            },
+        }));
+        let delta_bytes = bincode::serialize(&dir_delta).unwrap();
+        writer.append_record(OpCode::InodeDelta, 1, &delta_bytes).unwrap();
         drop(writer);
 
         let dump = dump_log_file(storage.as_ref(), "000001.log", 1).unwrap();

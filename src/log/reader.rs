@@ -1,7 +1,6 @@
 use crate::log::record::{
-    CreatePayload, DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LinkPayload, MkdirPayload,
-    MknodPayload, OpCode, RECORD_HEADER_SIZE, RecordHeader, RemovexattrPayload, RenamePayload, RmdirPayload,
-    SetattrPayload, SetxattrPayload, SymlinkPayload, UnlinkPayload, WriteMeta,
+    DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LogEntryDelta, OpCode, RECORD_HEADER_SIZE,
+    RecordHeader,
 };
 use crate::storage::{Storage, StorageReader};
 use std::io;
@@ -20,30 +19,10 @@ impl LogRecord {
     /// Decodes the raw binary payload into a strongly-typed `DecodedPayload`.
     pub fn decode(&self) -> Result<DecodedPayload<'_>, bincode::Error> {
         match self.header.op_code {
-            OpCode::Create => bincode::deserialize::<CreatePayload>(&self.payload).map(DecodedPayload::Create),
-            OpCode::Mkdir => bincode::deserialize::<MkdirPayload>(&self.payload).map(DecodedPayload::Mkdir),
-            OpCode::Write => {
-                let meta = bincode::deserialize::<WriteMeta>(&self.payload)?;
-                let meta_bytes = bincode::serialize(&meta)?;
-                let data_offset = meta_bytes.len().min(self.payload.len());
-                Ok(DecodedPayload::Write {
-                    meta,
-                    data: &self.payload[data_offset..],
-                })
-            }
-            OpCode::Unlink => bincode::deserialize::<UnlinkPayload>(&self.payload).map(DecodedPayload::Unlink),
-            OpCode::Rmdir => bincode::deserialize::<RmdirPayload>(&self.payload).map(DecodedPayload::Rmdir),
-            OpCode::Symlink => bincode::deserialize::<SymlinkPayload>(&self.payload).map(DecodedPayload::Symlink),
-            OpCode::Rename => bincode::deserialize::<RenamePayload>(&self.payload).map(DecodedPayload::Rename),
-            OpCode::Setattr => bincode::deserialize::<SetattrPayload>(&self.payload).map(DecodedPayload::Setattr),
-            OpCode::Link => bincode::deserialize::<LinkPayload>(&self.payload).map(DecodedPayload::Link),
+            OpCode::Data => Ok(DecodedPayload::Data(&self.payload)),
+            OpCode::InodeDelta => bincode::deserialize::<LogEntryDelta>(&self.payload).map(DecodedPayload::InodeDelta),
             OpCode::FlushCommit => {
                 bincode::deserialize::<FlushCommitPayload>(&self.payload).map(DecodedPayload::FlushCommit)
-            }
-            OpCode::Mknod => bincode::deserialize::<MknodPayload>(&self.payload).map(DecodedPayload::Mknod),
-            OpCode::Setxattr => bincode::deserialize::<SetxattrPayload>(&self.payload).map(DecodedPayload::Setxattr),
-            OpCode::Removexattr => {
-                bincode::deserialize::<RemovexattrPayload>(&self.payload).map(DecodedPayload::Removexattr)
             }
         }
     }
@@ -157,8 +136,8 @@ mod tests {
         let clock = SystemClock;
         let writer = LogWriter::create(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
 
-        writer.append_record(OpCode::Mkdir, 2, b"payload1").unwrap();
-        writer.append_record(OpCode::Write, 3, b"payload22").unwrap();
+        writer.append_record(OpCode::Data, 2, b"payload1").unwrap();
+        writer.append_record(OpCode::InodeDelta, 3, b"payload22").unwrap();
         writer.sync().unwrap();
 
         let reader = LogReader::open(&storage, &writer.filename()).unwrap();
@@ -166,9 +145,9 @@ mod tests {
 
         let records: Vec<LogRecord> = reader.map(|r| r.unwrap()).collect();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].header.op_code, OpCode::Mkdir);
+        assert_eq!(records[0].header.op_code, OpCode::Data);
         assert_eq!(records[0].payload, b"payload1");
-        assert_eq!(records[1].header.op_code, OpCode::Write);
+        assert_eq!(records[1].header.op_code, OpCode::InodeDelta);
         assert_eq!(records[1].payload, b"payload22");
     }
 }

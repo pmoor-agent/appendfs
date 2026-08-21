@@ -603,7 +603,9 @@ fn dump_log_records_for_inode(log_dir: &std::path::Path, ino: u64) {
             let decoded = rec.decode().ok();
             let mentions = rec.header.inode == ino
                 || match &decoded {
-                    Some(DecodedPayload::Link(p)) => p.ino == ino,
+                    Some(DecodedPayload::InodeDelta(appendfs::log::LogEntryDelta::Node(
+                        appendfs::log::LogNodeDelta::Directory(d),
+                    ))) => d.added.iter().any(|(_, target_ino)| *target_ino == ino),
                     _ => false,
                 };
             if mentions {
