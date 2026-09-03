@@ -49,7 +49,7 @@ mod tests {
     fn sample() -> Sample {
         Sample {
             magic: *b"APPS",
-            version: 9,
+            version: 1,
             generation: 258,
         }
     }
@@ -59,7 +59,7 @@ mod tests {
         let bytes = serialize(&sample()).unwrap();
         // `version` follows the 4 magic bytes; big-endian puts its most significant byte
         // first, so a small value reads as leading zeroes rather than trailing ones.
-        assert_eq!(&bytes[4..8], &9u32.to_be_bytes());
+        assert_eq!(&bytes[4..8], &1u32.to_be_bytes());
         assert_eq!(&bytes[8..16], &258u64.to_be_bytes());
     }
 

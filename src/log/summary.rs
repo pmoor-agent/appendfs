@@ -13,14 +13,7 @@ use std::sync::Arc;
 pub const SUMMARY_FOOTER_SIZE: usize = 60;
 pub const SUMMARY_INDEX_ENTRY_SIZE: usize = 16;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
-// Bumped to 10: every integer in a summary is now big-endian - both the hand-written framing
-// and everything routed through bincode. Version 9 wrote the plaintext VolumeHeader blob for
-// every volume and gave it a compression setting; 8 dropped SummaryHeader's redundant
-// `cipher` and `key_id` bytes and moved the volume header out of LogManifest. Every one of
-// these layouts deserializes from the others' bytes without erroring - an older file is a
-// valid encoding of different values - so this version check is the only thing standing
-// between an older volume and being silently misread.
-pub const CURRENT_SUMMARY_VERSION: u32 = 10;
+pub const CURRENT_SUMMARY_VERSION: u32 = 1;
 pub const SUMMARY_HEADER_SIZE: usize = 60;
 
 /// Fixed-size header written at offset 0 of `{:06}.summary`, exactly `SUMMARY_HEADER_SIZE`
@@ -989,15 +982,15 @@ mod tests {
         )
         .unwrap();
 
-        // Restamp the version field (bytes 4..8) as the previous format. The volume header
+        // Restamp the version field (bytes 4..8) as a different format version. The volume header
         // blob that follows would still deserialize into something plausible, so without
         // an explicit version check this would be misread rather than refused.
         let mut bytes = storage.get_file_bytes("000000.summary").unwrap();
-        bytes[4..8].copy_from_slice(&(CURRENT_SUMMARY_VERSION - 1).to_be_bytes());
+        bytes[4..8].copy_from_slice(&(CURRENT_SUMMARY_VERSION + 1).to_be_bytes());
         storage.insert_file("000000.summary", bytes);
 
         let Err(err) = SummaryReader::open(storage.as_ref(), "000000.summary", VolumeKey::plaintext_arc()) else {
-            panic!("summary from an older format version must not open");
+            panic!("summary from a different format version must not open");
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(
