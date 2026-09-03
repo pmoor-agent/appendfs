@@ -125,6 +125,15 @@ impl InMemoryFS {
         Self::with_clock_and_log(clock, None)
     }
 
+    pub fn with_clock_and_uids(clock: Arc<dyn Clock>, uid: u32, gid: u32) -> Self {
+        let fs = Self::with_clock(clock.clone());
+        let now = clock.now();
+        if let Some(root) = fs.base.write().unwrap().get_mut(&1) {
+            *root = Arc::new(Node::new_dir(1, 0o755, uid, gid, now));
+        }
+        fs
+    }
+
     pub fn with_log(log_writer: Arc<LogWriter>) -> Self {
         Self::with_clock_and_log(Arc::new(SystemClock), Some(log_writer))
     }

@@ -23,5 +23,6 @@ pub use record::{
 pub use recovery::{RecoveryTarget, recover_fs};
 pub use summary::{
     SummaryFooter, SummaryHeader, SummaryIndexEntry, SummaryReader, SummarySnapshot, export_summary, init_volume,
+    init_volume_with_clock,
 };
 pub use writer::LogWriter;

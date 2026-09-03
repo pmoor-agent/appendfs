@@ -410,6 +410,22 @@ pub fn init_volume(
     volume_key: &VolumeKey,
     volume_header: crate::crypto::VolumeHeader,
 ) -> io::Result<String> {
+    init_volume_with_clock(
+        storage,
+        branch,
+        volume_key,
+        volume_header,
+        Arc::new(crate::clock::SystemClock),
+    )
+}
+
+pub fn init_volume_with_clock(
+    storage: Arc<dyn Storage>,
+    branch: Option<&str>,
+    volume_key: &VolumeKey,
+    volume_header: crate::crypto::VolumeHeader,
+    clock: Arc<dyn crate::clock::Clock>,
+) -> io::Result<String> {
     let files = storage.list_files()?;
     for file in files {
         if file.ends_with(".summary") || file.ends_with(".log") {
@@ -420,7 +436,7 @@ pub fn init_volume(
         }
     }
 
-    let fs = InMemoryFS::new();
+    let fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
     let snapshot = fs.snapshot_all();
     let branch_name = branch.unwrap_or("main");
     let manifest = crate::log::LogManifest {
@@ -438,7 +454,7 @@ pub fn init_volume(
             generation: 0,
             last_tx_id: 0,
             next_inode: 2,
-            created_at: std::time::SystemTime::now(),
+            created_at: clock.now(),
         },
         storage.as_ref(),
         volume_key,
