@@ -1,3 +1,19 @@
+//! Compatibility tests verifying that earlier on-disk storage format versions can be
+//! reliably recovered, loaded, and written to by the current codebase.
+//!
+//! # Generating Golden Fixtures
+//! To generate or regenerate golden fixtures for any version:
+//! ```bash
+//! # For v1:
+//! cargo run --bin generate_compat_fixture tests/fixtures/v1
+//!
+//! # For a new format version (e.g. v2):
+//! cargo run --bin generate_compat_fixture tests/fixtures/v2
+//! ```
+//!
+//! Any subdirectories placed into `tests/fixtures/` are automatically discovered
+//! and tested by `test_all_fixture_versions`.
+
 use appendfs::compat::{create_canonical_compat_volume, verify_compat_tree};
 use appendfs::operations::read_write::{create_core, read_core, write_core};
 use appendfs::storage::OsStorage;

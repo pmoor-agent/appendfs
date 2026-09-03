@@ -1,3 +1,14 @@
+//! Generates deterministic AppendFS golden compatibility fixtures.
+//!
+//! # Usage
+//! ```bash
+//! # Regenerate v1 fixtures:
+//! cargo run --bin generate_compat_fixture tests/fixtures/v1
+//!
+//! # Generate fixtures for a new format version (e.g. v2):
+//! cargo run --bin generate_compat_fixture tests/fixtures/v2
+//! ```
+
 use std::path::PathBuf;
 
 fn main() {

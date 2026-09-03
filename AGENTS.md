@@ -49,3 +49,31 @@ Certain test suites (differential fuzzing and concurrent stress testing) support
   ```bash
   FUZZ_STEPS=500 FUZZ_SEEDS=20 cargo test --release --test fuzz_test -- --nocapture
   ```
+
+## On-Disk Format Compatibility & Golden Fixtures
+
+AppendFS maintains a suite of checked-in golden fixture files in `tests/fixtures/` to verify that older on-disk formats can be reliably recovered and mounted by current and future versions.
+
+### Running Compatibility Tests
+```bash
+cargo test --test compat_test
+```
+`tests/compat_test.rs` automatically discovers and runs full recovery checks against all `tests/fixtures/v*` directories.
+
+### Generating or Updating Golden Fixtures
+Golden fixtures are produced deterministically via the `generate_compat_fixture` binary:
+
+- **Regenerate existing v1 fixtures**:
+  ```bash
+  cargo run --bin generate_compat_fixture tests/fixtures/v1
+  ```
+
+- **Generate fixtures for a new format version (e.g. v2)**:
+  ```bash
+  cargo run --bin generate_compat_fixture tests/fixtures/v2
+  ```
+
+The generator produces:
+- `000000.summary`: Initial volume snapshot with deterministic mock timestamp.
+- `000001.log`: 3 flushed commit batches covering directories, files, symlinks, special files, and xattrs.
+- `000001.summary`: Exported snapshot of all populated inodes.
