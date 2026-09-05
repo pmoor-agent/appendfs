@@ -922,17 +922,7 @@ pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemor
     mount_arc(args, fs)
 }
 
-pub fn mount_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), i32> {
-    let force_multi = if let Some(pos) = args.iter().position(|a| a == "--multithread") {
-        args.remove(pos);
-        true
-    } else {
-        false
-    };
-    if !force_multi && !args.iter().any(|a| a == "-s" || a == "--singlethread") {
-        args.push("-s".to_string());
-    }
-
+pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), i32> {
     let c_args_owners: Vec<CString> = args.into_iter().map(|arg| CString::new(arg).unwrap()).collect();
 
     let c_args: Vec<*const c_char> = c_args_owners.iter().map(|arg| arg.as_ptr()).collect();

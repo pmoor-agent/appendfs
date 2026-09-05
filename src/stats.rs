@@ -422,8 +422,8 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     let dir_handles_count = fs.dir_handles.read().unwrap().len();
     let virtual_handles_count = fs.virtual_handles.read().unwrap().len();
     let open_inodes_count = fs.open_counts.read().unwrap().len();
-    let flock_count = fs.flock_table.lock().unwrap().len();
-    let range_lock_count = fs.range_lock_table.lock().unwrap().len();
+    let flock_count = fs.locks.flock_count();
+    let range_lock_count = fs.locks.range_lock_count();
 
     out.push_str("[Handles & Locks]\n");
     out.push_str(&format!("  Open File Handles:  {}\n", file_handles_count));

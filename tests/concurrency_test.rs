@@ -762,12 +762,12 @@ fn run_concurrent_stress(seed: u64) {
         seed
     );
     assert!(
-        fs.flock_table.lock().unwrap().is_empty(),
+        fs.locks.flock_table.lock().unwrap().is_empty(),
         "seed {}: leaked flock entries",
         seed
     );
     assert!(
-        fs.range_lock_table.lock().unwrap().is_empty(),
+        fs.locks.range_lock_table.lock().unwrap().is_empty(),
         "seed {}: leaked range lock entries",
         seed
     );

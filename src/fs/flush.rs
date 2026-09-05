@@ -325,9 +325,13 @@ impl InMemoryFS {
     }
 
     /// Wakes up the background periodic flusher immediately to drain pending batches.
-    pub fn trigger_flusher(&self) {
+    /// Returns true if a background flusher is active and was notified, false otherwise.
+    pub fn trigger_flusher(&self) -> bool {
         if let Some(ref flusher) = *self.flusher.lock().unwrap() {
             flusher.trigger();
+            true
+        } else {
+            false
         }
     }
 
@@ -341,13 +345,10 @@ impl InMemoryFS {
         let staged_o = self.staged_ops.fetch_add(1, Ordering::Relaxed) + 1;
 
         if staged_b >= self.max_buffer_size || staged_o >= self.max_staged_ops {
-            let has_flusher = self.flusher.lock().unwrap().is_some();
-            if has_flusher {
-                // In-memory freeze of active live delta into flushing queue (< 1 µs)
-                self.begin_flush();
-                // Signal background flusher thread to drain to disk asynchronously
-                self.trigger_flusher();
-            } else {
+            // In-memory freeze of active live delta into flushing queue (< 1 µs)
+            self.begin_flush();
+            // Signal background flusher thread to drain to disk asynchronously; if none present, flush inline
+            if !self.trigger_flusher() {
                 // In standalone / unmounted test environments without background flusher thread, flush inline
                 let _ = self.flush_log();
             }
