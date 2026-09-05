@@ -317,7 +317,7 @@ impl<'a> InodeLayerStack<'a> {
                         let cached = fs
                             .log_cache
                             .as_ref()
-                            .and_then(|c| c.decrypted_cache.get(generation, record_log_offset));
+                            .and_then(|c| c.get_cached_record(generation, record_log_offset));
                         if let Some(cached_data) = cached {
                             let src_offset = payload_offset as usize + inner_offset;
                             ReadSliceSource::Memory {

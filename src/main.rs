@@ -18,13 +18,12 @@ use zeroize::Zeroizing;
 /// The volume header lives in summary files, so this is the entry point for anything that
 /// needs to identify a volume or verify a key.
 fn latest_summary_file(storage: &OsStorage) -> std::io::Result<Option<String>> {
-    let mut latest: Option<(u64, String)> = None;
+    let mut latest: Option<((u64, u32), String)> = None;
     for file in storage.list_files()? {
-        if let Some(stem) = file.strip_suffix(".summary")
-            && let Ok(gen_num) = stem.parse::<u64>()
-            && latest.as_ref().is_none_or(|(g, _)| gen_num > *g)
+        if let Some((generation, rev)) = appendfs::log::parse_summary_filename(&file)
+            && latest.as_ref().is_none_or(|(gr, _)| (generation, rev) > *gr)
         {
-            latest = Some((gen_num, file));
+            latest = Some(((generation, rev), file));
         }
     }
     Ok(latest.map(|(_, f)| f))

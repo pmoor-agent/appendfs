@@ -14,15 +14,16 @@ pub const SUMMARY_FOOTER_SIZE: usize = 60;
 pub const SUMMARY_INDEX_ENTRY_SIZE: usize = 16;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
 pub const CURRENT_SUMMARY_VERSION: u32 = 1;
-pub const SUMMARY_HEADER_SIZE: usize = 60;
+pub const SUMMARY_HEADER_SIZE: usize = 64;
 
-/// Fixed-size header written at offset 0 of `{:06}.summary`, exactly `SUMMARY_HEADER_SIZE`
-/// bytes - readers seek past it by that constant, so the two must agree.
+/// Fixed-size header written at offset 0 of `{:06}.summary` (or `{:06}_r{}.summary`),
+/// exactly `SUMMARY_HEADER_SIZE` bytes - readers seek past it by that constant, so the two must agree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryHeader {
     pub magic: [u8; 4],
     pub version: u32,
     pub generation: u64,
+    pub revision: u32,
     pub last_tx_id: u64,
     pub next_inode: u64,
     #[serde(with = "crate::clock::serde_system_time")]
@@ -45,10 +46,23 @@ impl SummaryHeader {
         iv: [u8; 12],
         volume_header_len: u32,
     ) -> Self {
+        Self::new_with_revision(generation, 0, last_tx_id, next_inode, created_at, iv, volume_header_len)
+    }
+
+    pub fn new_with_revision(
+        generation: u64,
+        revision: u32,
+        last_tx_id: u64,
+        next_inode: u64,
+        created_at: std::time::SystemTime,
+        iv: [u8; 12],
+        volume_header_len: u32,
+    ) -> Self {
         Self {
             magic: *SUMMARY_MAGIC,
             version: CURRENT_SUMMARY_VERSION,
             generation,
+            revision,
             last_tx_id,
             next_inode,
             created_at,
@@ -279,6 +293,20 @@ fn coalesce_extents(range_map: &RangeMap<SharedExtentState>) -> RangeMap<SharedE
     coalesced
 }
 
+/// Returns the physical filename for a given summary snapshot (e.g. "000001.summary").
+pub fn summary_filename(generation: u64) -> String {
+    summary_filename_with_revision(generation, 0)
+}
+
+/// Returns the physical filename for a given summary generation and revision (e.g. "000001_r2.summary").
+pub fn summary_filename_with_revision(generation: u64, revision: u32) -> String {
+    if revision == 0 {
+        format!("{:06}.summary", generation)
+    } else {
+        format!("{:06}_r{}.summary", generation, revision)
+    }
+}
+
 /// Everything that goes into one summary snapshot.
 ///
 /// Grouped into a struct rather than passed positionally: the eight-argument version needed
@@ -290,6 +318,7 @@ pub struct SummarySnapshot<'a> {
     /// Volume identity and key-check material, written unencrypted ahead of the body.
     pub volume_header: &'a crate::crypto::VolumeHeader,
     pub generation: u64,
+    pub revision: u32,
     pub last_tx_id: u64,
     pub next_inode: u64,
     pub created_at: std::time::SystemTime,
@@ -310,6 +339,7 @@ pub fn export_summary(
         manifest,
         volume_header,
         generation,
+        revision,
         last_tx_id,
         next_inode,
         created_at,
@@ -318,8 +348,8 @@ pub fn export_summary(
     // Sort by inode so physical serialization order is deterministic
     inodes_snapshot.sort_by_key(|(ino, _)| *ino);
 
-    let filename = format!("{:06}.summary", generation);
-    let tmp_filename = format!("{:06}.summary.tmp", generation);
+    let filename = summary_filename_with_revision(generation, revision);
+    let tmp_filename = format!("{}.tmp", filename);
 
     let mut writer = storage.open_writer(&tmp_filename, WriteMode::Overwrite)?;
     let mut hasher = blake3::Hasher::new();
@@ -336,8 +366,9 @@ pub fn export_summary(
     let volume_header_bytes =
         crate::wire::serialize(volume_header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    let header = SummaryHeader::new(
+    let header = SummaryHeader::new_with_revision(
         generation,
+        revision,
         last_tx_id,
         next_inode,
         created_at,
@@ -465,6 +496,7 @@ pub fn init_volume_with_clock_and_uids(
             manifest: &manifest,
             volume_header: &volume_header,
             generation: 0,
+            revision: 0,
             last_tx_id: 0,
             next_inode: 2,
             created_at: clock.now(),
@@ -870,6 +902,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
+                revision: 0,
                 last_tx_id: 42,
                 next_inode: 3,
                 created_at: SystemTime::now(),
@@ -937,6 +970,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 4,
+                revision: 0,
                 last_tx_id: 999,
                 next_inode: 51,
                 created_at: SystemTime::now(),
@@ -1100,6 +1134,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
+                revision: 0,
                 last_tx_id: 42,
                 next_inode: 3,
                 created_at: SystemTime::UNIX_EPOCH,
@@ -1121,6 +1156,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
+                revision: 0,
                 last_tx_id: 42,
                 next_inode: 3,
                 created_at: SystemTime::UNIX_EPOCH,

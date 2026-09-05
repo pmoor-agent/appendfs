@@ -130,8 +130,9 @@ pub fn dump_log_reader_with_path(
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             format!(
-                "Log file {:?} is smaller than the 24-byte FileHeader ({} bytes)",
+                "Log file {:?} is smaller than the {}-byte FileHeader ({} bytes)",
                 display_path.unwrap_or("<log>"),
+                FILE_HEADER_SIZE,
                 file_len
             ),
         ));
@@ -313,6 +314,7 @@ pub fn dump_log_reader_with_path(
         writeln!(out, "File:                <in-memory>").unwrap();
     }
     writeln!(out, "Generation:          {}", file_header.generation).unwrap();
+    writeln!(out, "Revision:            {}", file_header.revision).unwrap();
     writeln!(out, "Format Version:      {}", file_header.version).unwrap();
     writeln!(
         out,
@@ -540,6 +542,7 @@ fn dump_encrypted_summary_without_key(
     writeln!(out, "=== appendfs Summary File Dump ===").unwrap();
     writeln!(out, "File:                {:?}", filename).unwrap();
     writeln!(out, "Generation:          {}", header.generation).unwrap();
+    writeln!(out, "Revision:            {}", header.revision).unwrap();
     writeln!(out, "Format Version:      {}", header.version).unwrap();
     writeln!(out, "Last Transaction ID: {}", header.last_tx_id).unwrap();
     writeln!(out, "Next Inode:          {}", header.next_inode).unwrap();
@@ -1330,6 +1333,7 @@ mod tests {
             logs: vec![
                 crate::log::LogFileInfo {
                     generation: 1,
+                    revision: 0,
                     filename: "000001.log".to_string(),
                     created_at: std::time::UNIX_EPOCH,
                     record_count: 50,
@@ -1339,6 +1343,7 @@ mod tests {
                 },
                 crate::log::LogFileInfo {
                     generation: 2,
+                    revision: 0,
                     filename: "000002.log".to_string(),
                     created_at: std::time::UNIX_EPOCH,
                     record_count: 50,
@@ -1356,6 +1361,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
+                revision: 0,
                 last_tx_id: 100,
                 next_inode: 4,
                 created_at: std::time::SystemTime::now(),

@@ -79,7 +79,7 @@ impl TieredStorageReader {
         {
             let mut buf = vec![0u8; block_len as usize];
             if reader.read_exact_at(block_start, &mut buf).is_ok() {
-                let _ = self.block_cache.write_block(self.generation, block_idx, &buf);
+                let _ = self.block_cache.write_block(&self.filename, block_idx, &buf);
                 return Ok(buf);
             }
         }
@@ -117,7 +117,7 @@ impl TieredStorageReader {
                     Ok(bytes_read) => {
                         if bytes_read == block_len {
                             // Successfully fetched block!
-                            let _ = self.block_cache.write_block(self.generation, block_idx, &buf);
+                            let _ = self.block_cache.write_block(&self.filename, block_idx, &buf);
                             return Ok(buf);
                         }
                         last_err = Some(io::Error::new(
@@ -152,13 +152,13 @@ impl TieredStorageReader {
     }
 
     fn get_or_fetch_block(&self, block_idx: u64) -> io::Result<Arc<Vec<u8>>> {
-        if let Ok(Some(cached)) = self.block_cache.read_block(self.generation, block_idx) {
+        if let Ok(Some(cached)) = self.block_cache.read_block(&self.filename, block_idx) {
             return Ok(Arc::new(cached));
         }
 
-        self.coalescer.coalesce((self.generation, block_idx), || {
+        self.coalescer.coalesce(&self.filename, block_idx, || {
             // Re-check block cache inside leader closure in case a preceding fetch just populated it
-            if let Ok(Some(cached)) = self.block_cache.read_block(self.generation, block_idx) {
+            if let Ok(Some(cached)) = self.block_cache.read_block(&self.filename, block_idx) {
                 return Ok(Arc::new(cached));
             }
             let data = self.fetch_block_from_remotes(block_idx)?;
@@ -249,8 +249,8 @@ mod tests {
         assert_eq!(slice, [0x42u8; 100]);
 
         // Block 0 is now cached
-        assert!(cache.read_block(1, 0).unwrap().is_some());
-        assert!(cache.read_block(1, 1).unwrap().is_none());
+        assert!(cache.read_block("000001", 0).unwrap().is_some());
+        assert!(cache.read_block("000001", 1).unwrap().is_none());
 
         // Read spanning across block 0 and block 1 boundary
         let cross_offset = BLOCK_SIZE - 50;
@@ -259,7 +259,7 @@ mod tests {
         assert_eq!(cross_buf, [0x42u8; 100]);
 
         // Block 1 is now also cached
-        assert!(cache.read_block(1, 1).unwrap().is_some());
+        assert!(cache.read_block("000001", 1).unwrap().is_some());
     }
 
     #[test]
@@ -287,7 +287,7 @@ mod tests {
             cache.clone(),
         );
 
-        assert!(cache.read_block(1, 0).unwrap().is_none());
+        assert!(cache.read_block("000001", 0).unwrap().is_none());
 
         // Read from reader: should read from local storage AND write to block cache!
         let mut slice = [0u8; 64];
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(slice, [0x99u8; 64]);
 
         // Block 0 MUST now be pre-warmed in block cache!
-        assert!(cache.read_block(1, 0).unwrap().is_some());
+        assert!(cache.read_block("000001", 0).unwrap().is_some());
 
         // Now drop/truncate the local file to simulate local log purging!
         memory_storage.remove_file("000001.log").unwrap();

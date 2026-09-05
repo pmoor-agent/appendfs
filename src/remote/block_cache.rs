@@ -33,8 +33,8 @@ pub struct DecryptedRecordCache {
 
 #[derive(Debug)]
 struct DecryptedLruInner {
-    map: HashMap<(u64, u64), Arc<Vec<u8>>>,
-    queue: VecDeque<(u64, u64)>,
+    map: HashMap<(u64, u32, u64), Arc<Vec<u8>>>,
+    queue: VecDeque<(u64, u32, u64)>,
     current_bytes: usize,
 }
 
@@ -86,14 +86,15 @@ impl DecryptedRecordCache {
         self.entries.lock().unwrap().map.is_empty()
     }
 
-    pub fn get(&self, generation: u64, record_log_offset: u64) -> Option<Arc<Vec<u8>>> {
+    pub fn get(&self, generation: u64, revision: u32, record_log_offset: u64) -> Option<Arc<Vec<u8>>> {
         let mut guard = self.entries.lock().unwrap();
-        if let Some(val) = guard.map.get(&(generation, record_log_offset)) {
+        let key = (generation, revision, record_log_offset);
+        if let Some(val) = guard.map.get(&key) {
             let res = Arc::clone(val);
             // Move key to back of queue (most recently used)
-            if let Some(pos) = guard.queue.iter().position(|k| *k == (generation, record_log_offset)) {
+            if let Some(pos) = guard.queue.iter().position(|k| *k == key) {
                 guard.queue.remove(pos);
-                guard.queue.push_back((generation, record_log_offset));
+                guard.queue.push_back(key);
             }
             Some(res)
         } else {
@@ -101,9 +102,9 @@ impl DecryptedRecordCache {
         }
     }
 
-    pub fn insert(&self, generation: u64, record_log_offset: u64, payload: Arc<Vec<u8>>) {
+    pub fn insert(&self, generation: u64, revision: u32, record_log_offset: u64, payload: Arc<Vec<u8>>) {
         let mut guard = self.entries.lock().unwrap();
-        let key = (generation, record_log_offset);
+        let key = (generation, revision, record_log_offset);
         let new_len = payload.len();
 
         let max_b = self.max_bytes.load(Ordering::SeqCst);
@@ -175,12 +176,13 @@ impl OnDiskBlockCache {
         &self.coalescer
     }
 
-    fn block_path(&self, generation: u64, block_idx: u64) -> PathBuf {
-        self.cache_dir.join(format!("{:06}_{:06}.bin", generation, block_idx))
+    fn block_path(&self, file_stem: &str, block_idx: u64) -> PathBuf {
+        let stem = clean_file_stem(file_stem);
+        self.cache_dir.join(format!("{}_{:06}.bin", stem, block_idx))
     }
 
-    pub fn read_block(&self, generation: u64, block_idx: u64) -> io::Result<Option<Vec<u8>>> {
-        let path = self.block_path(generation, block_idx);
+    pub fn read_block(&self, file_stem: &str, block_idx: u64) -> io::Result<Option<Vec<u8>>> {
+        let path = self.block_path(file_stem, block_idx);
         if !path.exists() {
             return Ok(None);
         }
@@ -196,12 +198,13 @@ impl OnDiskBlockCache {
         Ok(Some(buf))
     }
 
-    pub fn write_block(&self, generation: u64, block_idx: u64, data: &[u8]) -> io::Result<()> {
+    pub fn write_block(&self, file_stem: &str, block_idx: u64, data: &[u8]) -> io::Result<()> {
         let _guard = self.access_lock.lock().unwrap();
-        let target_path = self.block_path(generation, block_idx);
+        let target_path = self.block_path(file_stem, block_idx);
+        let stem = clean_file_stem(file_stem);
         let tmp_path = self
             .cache_dir
-            .join(format!("{:06}_{:06}.tmp.{}", generation, block_idx, std::process::id()));
+            .join(format!("{}_{:06}.tmp.{}", stem, block_idx, std::process::id()));
 
         {
             let mut file = OpenOptions::new()
@@ -254,12 +257,24 @@ impl OnDiskBlockCache {
     }
 }
 
+/// Helper extracting a sanitized file stem from a filename or relative path.
+pub fn clean_file_stem(name: &str) -> &str {
+    let filename = name.rsplit('/').next().unwrap_or(name);
+    if let Some(stem) = filename.strip_suffix(".log") {
+        stem
+    } else if let Some(stem) = filename.strip_suffix(".summary") {
+        stem
+    } else {
+        filename
+    }
+}
+
 /// Common interface for local 1 MiB raw block caches (on-disk or in-memory).
 pub trait BlockCache: Send + Sync + std::fmt::Debug {
     /// Reads a 1 MiB block from cache if present.
-    fn read_block(&self, generation: u64, block_idx: u64) -> io::Result<Option<Vec<u8>>>;
+    fn read_block(&self, file_stem: &str, block_idx: u64) -> io::Result<Option<Vec<u8>>>;
     /// Writes a 1 MiB block into cache, pruning oldest entries if capacity is exceeded.
-    fn write_block(&self, generation: u64, block_idx: u64, data: &[u8]) -> io::Result<()>;
+    fn write_block(&self, file_stem: &str, block_idx: u64, data: &[u8]) -> io::Result<()>;
     /// Prunes excess cached blocks if capacity is exceeded.
     fn prune_if_needed(&self) -> io::Result<()>;
     /// Reference to the single-flight request coalescer associated with this block cache.
@@ -271,12 +286,12 @@ pub trait BlockCache: Send + Sync + std::fmt::Debug {
 }
 
 impl BlockCache for OnDiskBlockCache {
-    fn read_block(&self, generation: u64, block_idx: u64) -> io::Result<Option<Vec<u8>>> {
-        self.read_block(generation, block_idx)
+    fn read_block(&self, file_stem: &str, block_idx: u64) -> io::Result<Option<Vec<u8>>> {
+        self.read_block(file_stem, block_idx)
     }
 
-    fn write_block(&self, generation: u64, block_idx: u64, data: &[u8]) -> io::Result<()> {
-        self.write_block(generation, block_idx, data)
+    fn write_block(&self, file_stem: &str, block_idx: u64, data: &[u8]) -> io::Result<()> {
+        self.write_block(file_stem, block_idx, data)
     }
 
     fn prune_if_needed(&self) -> io::Result<()> {
@@ -305,7 +320,7 @@ struct MemoryCacheEntry {
 /// In-memory LRU block cache storing raw encrypted 1 MiB chunks without touching local disk.
 #[derive(Debug)]
 pub struct MemoryBlockCache {
-    entries: Mutex<HashMap<(u64, u64), MemoryCacheEntry>>,
+    entries: Mutex<HashMap<(String, u64), MemoryCacheEntry>>,
     access_counter: std::sync::atomic::AtomicU64,
     max_bytes: usize,
     coalescer: Arc<super::RemoteReadCoalescer>,
@@ -332,20 +347,22 @@ impl MemoryBlockCache {
 }
 
 impl BlockCache for MemoryBlockCache {
-    fn read_block(&self, generation: u64, block_idx: u64) -> io::Result<Option<Vec<u8>>> {
+    fn read_block(&self, file_stem: &str, block_idx: u64) -> io::Result<Option<Vec<u8>>> {
+        let stem = clean_file_stem(file_stem);
         let mut guard = self.entries.lock().unwrap();
-        if let Some(entry) = guard.get_mut(&(generation, block_idx)) {
+        if let Some(entry) = guard.get_mut(&(stem.to_string(), block_idx)) {
             entry.last_access = self.access_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(Some(entry.data.clone()));
         }
         Ok(None)
     }
 
-    fn write_block(&self, generation: u64, block_idx: u64, data: &[u8]) -> io::Result<()> {
+    fn write_block(&self, file_stem: &str, block_idx: u64, data: &[u8]) -> io::Result<()> {
+        let stem = clean_file_stem(file_stem);
         let ticket = self.access_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut guard = self.entries.lock().unwrap();
         guard.insert(
-            (generation, block_idx),
+            (stem.to_string(), block_idx),
             MemoryCacheEntry {
                 last_access: ticket,
                 data: data.to_vec(),
@@ -359,17 +376,18 @@ impl BlockCache for MemoryBlockCache {
         let mut guard = self.entries.lock().unwrap();
         let mut current_bytes: usize = guard.values().map(|v| v.data.len()).sum();
         if current_bytes > self.max_bytes {
-            let mut items: Vec<((u64, u64), u64, usize)> =
-                guard.iter().map(|(k, v)| (*k, v.last_access, v.data.len())).collect();
+            let mut items: Vec<((String, u64), u64, usize)> = guard
+                .iter()
+                .map(|(k, v)| (k.clone(), v.last_access, v.data.len()))
+                .collect();
             items.sort_by_key(|(_, access, _)| *access);
 
             for (k, _, len) in items {
                 if current_bytes <= self.max_bytes {
                     break;
                 }
-                if guard.remove(&k).is_some() {
-                    current_bytes = current_bytes.saturating_sub(len);
-                }
+                guard.remove(&k);
+                current_bytes = current_bytes.saturating_sub(len);
             }
         }
         Ok(())
@@ -410,37 +428,37 @@ mod tests {
     fn test_decrypted_lru_cache() {
         // 6 bytes limit: holds exactly two 3-byte records
         let cache = DecryptedRecordCache::new(6);
-        assert!(cache.get(1, 100).is_none());
+        assert!(cache.get(1, 0, 100).is_none());
         assert_eq!(cache.current_bytes(), 0);
 
-        cache.insert(1, 100, Arc::new(vec![1, 2, 3]));
+        cache.insert(1, 0, 100, Arc::new(vec![1, 2, 3]));
         assert_eq!(cache.current_bytes(), 3);
 
-        cache.insert(1, 200, Arc::new(vec![4, 5, 6]));
+        cache.insert(1, 0, 200, Arc::new(vec![4, 5, 6]));
         assert_eq!(cache.current_bytes(), 6);
 
-        assert_eq!(cache.get(1, 100).unwrap().as_slice(), &[1, 2, 3]);
+        assert_eq!(cache.get(1, 0, 100).unwrap().as_slice(), &[1, 2, 3]);
 
         // Insert 3rd entry (3 bytes) evicts oldest (which is 200 because 100 was just accessed)
-        cache.insert(1, 300, Arc::new(vec![7, 8, 9]));
+        cache.insert(1, 0, 300, Arc::new(vec![7, 8, 9]));
         assert_eq!(cache.current_bytes(), 6);
         assert_eq!(cache.len(), 2);
-        assert!(cache.get(1, 200).is_none());
-        assert!(cache.get(1, 100).is_some());
-        assert!(cache.get(1, 300).is_some());
+        assert!(cache.get(1, 0, 200).is_none());
+        assert!(cache.get(1, 0, 100).is_some());
+        assert!(cache.get(1, 0, 300).is_some());
 
         // Oversized payload (> 6 bytes) is rejected and not cached
-        cache.insert(1, 400, Arc::new(vec![0u8; 10]));
-        assert!(cache.get(1, 400).is_none());
+        cache.insert(1, 0, 400, Arc::new(vec![0u8; 10]));
+        assert!(cache.get(1, 0, 400).is_none());
         assert_eq!(cache.current_bytes(), 6);
     }
 
     #[test]
     fn test_decrypted_record_cache_dynamic_resizing() {
         let cache = DecryptedRecordCache::new(100);
-        cache.insert(1, 1, Arc::new(vec![1; 30]));
-        cache.insert(1, 2, Arc::new(vec![2; 30]));
-        cache.insert(1, 3, Arc::new(vec![3; 30]));
+        cache.insert(1, 0, 1, Arc::new(vec![1; 30]));
+        cache.insert(1, 0, 2, Arc::new(vec![2; 30]));
+        cache.insert(1, 0, 3, Arc::new(vec![3; 30]));
         assert_eq!(cache.current_bytes(), 90);
         assert_eq!(cache.len(), 3);
 
@@ -449,9 +467,9 @@ mod tests {
         assert_eq!(cache.max_bytes(), 50);
         assert!(cache.current_bytes() <= 50);
         assert_eq!(cache.len(), 1);
-        assert!(cache.get(1, 1).is_none());
-        assert!(cache.get(1, 2).is_none());
-        assert!(cache.get(1, 3).is_some());
+        assert!(cache.get(1, 0, 1).is_none());
+        assert!(cache.get(1, 0, 2).is_none());
+        assert!(cache.get(1, 0, 3).is_some());
     }
 
     #[test]
@@ -459,48 +477,67 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = OnDiskBlockCache::new(dir.path(), 2500).unwrap(); // max 2500 bytes
 
-        assert_eq!(cache.read_block(1, 0).unwrap(), None);
+        assert_eq!(cache.read_block("000001", 0).unwrap(), None);
 
         let data1 = vec![0xAA; 1000];
-        cache.write_block(1, 0, &data1).unwrap();
-        assert_eq!(cache.read_block(1, 0).unwrap().unwrap(), data1);
+        cache.write_block("000001", 0, &data1).unwrap();
+        assert_eq!(cache.read_block("000001", 0).unwrap().unwrap(), data1);
 
         let data2 = vec![0xBB; 1000];
-        cache.write_block(1, 1, &data2).unwrap();
+        cache.write_block("000001", 1, &data2).unwrap();
 
         // 3rd write causes prune
         let data3 = vec![0xCC; 1000];
-        cache.write_block(1, 2, &data3).unwrap();
+        cache.write_block("000001", 2, &data3).unwrap();
 
         // One of the older blocks was pruned to stay under 2500 bytes
         let remaining = [
-            cache.read_block(1, 0).unwrap().is_some(),
-            cache.read_block(1, 1).unwrap().is_some(),
-            cache.read_block(1, 2).unwrap().is_some(),
+            cache.read_block("000001", 0).unwrap().is_some(),
+            cache.read_block("000001", 1).unwrap().is_some(),
+            cache.read_block("000001", 2).unwrap().is_some(),
         ];
         assert_eq!(remaining.iter().filter(|&&b| b).count(), 2);
+    }
+
+    #[test]
+    fn test_revision_block_cache_separation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OnDiskBlockCache::new(dir.path(), 50000).unwrap();
+
+        let base_data = vec![0x11; 512];
+        let r1_data = vec![0x22; 512];
+
+        // Write block 0 for base generation 1 (from 000001.log)
+        cache.write_block("000001.log", 0, &base_data).unwrap();
+
+        // Write block 0 for revision 1 of generation 1 (from 000001_r1.log)
+        cache.write_block("000001_r1.log", 0, &r1_data).unwrap();
+
+        // Must read distinct data without aliasing or collision
+        assert_eq!(cache.read_block("000001", 0).unwrap().unwrap(), base_data);
+        assert_eq!(cache.read_block("000001_r1", 0).unwrap().unwrap(), r1_data);
     }
 
     #[test]
     fn test_memory_block_cache_write_read_and_prune() {
         let cache = MemoryBlockCache::new(2500);
 
-        assert_eq!(cache.read_block(1, 0).unwrap(), None);
+        assert_eq!(cache.read_block("000001", 0).unwrap(), None);
 
         let data1 = vec![0xAA; 1000];
-        cache.write_block(1, 0, &data1).unwrap();
-        assert_eq!(cache.read_block(1, 0).unwrap().unwrap(), data1);
+        cache.write_block("000001", 0, &data1).unwrap();
+        assert_eq!(cache.read_block("000001", 0).unwrap().unwrap(), data1);
 
         let data2 = vec![0xBB; 1000];
-        cache.write_block(1, 1, &data2).unwrap();
+        cache.write_block("000001", 1, &data2).unwrap();
 
         let data3 = vec![0xCC; 1000];
-        cache.write_block(1, 2, &data3).unwrap();
+        cache.write_block("000001", 2, &data3).unwrap();
 
         let remaining = [
-            cache.read_block(1, 0).unwrap().is_some(),
-            cache.read_block(1, 1).unwrap().is_some(),
-            cache.read_block(1, 2).unwrap().is_some(),
+            cache.read_block("000001", 0).unwrap().is_some(),
+            cache.read_block("000001", 1).unwrap().is_some(),
+            cache.read_block("000001", 2).unwrap().is_some(),
         ];
         assert_eq!(remaining.iter().filter(|&&b| b).count(), 2);
     }

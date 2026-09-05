@@ -54,7 +54,7 @@ impl InFlightCall {
 /// network requests or duplicate cache writes.
 #[derive(Debug, Default)]
 pub struct RemoteReadCoalescer {
-    calls: Mutex<HashMap<(u64, u64), Arc<InFlightCall>>>,
+    calls: Mutex<HashMap<(String, u64), Arc<InFlightCall>>>,
     coalesced_requests: AtomicU64,
     leader_requests: AtomicU64,
     in_flight_count: AtomicUsize,
@@ -64,7 +64,7 @@ pub struct RemoteReadCoalescer {
 /// waiting follower threads are promptly notified with an error rather than deadlocking.
 struct LeaderGuard<'a> {
     coalescer: &'a RemoteReadCoalescer,
-    key: (u64, u64),
+    key: (String, u64),
     call: Arc<InFlightCall>,
     completed: bool,
 }
@@ -111,12 +111,14 @@ impl RemoteReadCoalescer {
         self.in_flight_count.load(Ordering::SeqCst)
     }
 
-    /// Executes `fetch` for `key` if no fetch is currently in flight.
+    /// Executes `fetch` for `(file_stem, block_idx)` if no fetch is currently in flight.
     /// If an identical fetch is already in flight, awaits its completion and shares the result.
-    pub fn coalesce<F>(&self, key: (u64, u64), fetch: F) -> io::Result<Arc<Vec<u8>>>
+    pub fn coalesce<F>(&self, file_stem: &str, block_idx: u64, fetch: F) -> io::Result<Arc<Vec<u8>>>
     where
         F: FnOnce() -> io::Result<Arc<Vec<u8>>>,
     {
+        let stem = crate::remote::block_cache::clean_file_stem(file_stem);
+        let key = (stem.to_string(), block_idx);
         let call = {
             let mut calls = self.calls.lock().unwrap();
             if let Some(existing) = calls.get(&key) {
@@ -128,7 +130,7 @@ impl RemoteReadCoalescer {
                 self.leader_requests.fetch_add(1, Ordering::SeqCst);
                 self.in_flight_count.fetch_add(1, Ordering::SeqCst);
                 let call = Arc::new(InFlightCall::new());
-                calls.insert(key, Arc::clone(&call));
+                calls.insert(key.clone(), Arc::clone(&call));
 
                 let mut guard = LeaderGuard {
                     coalescer: self,
@@ -205,7 +207,7 @@ mod tests {
             let c = Arc::clone(&coalescer);
             let inv = Arc::clone(&invocations);
             handles.push(thread::spawn(move || {
-                c.coalesce((1, 0), || {
+                c.coalesce("000001", 0, || {
                     inv.fetch_add(1, Ordering::SeqCst);
                     thread::sleep(Duration::from_millis(50));
                     Ok(Arc::new(vec![42u8; 1024]))
@@ -243,7 +245,7 @@ mod tests {
         let c1 = Arc::clone(&coalescer);
         let i1 = Arc::clone(&inv1);
         let h1 = thread::spawn(move || {
-            c1.coalesce((1, 0), || {
+            c1.coalesce("000001", 0, || {
                 i1.fetch_add(1, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(20));
                 Ok(Arc::new(vec![1u8; 10]))
@@ -254,7 +256,7 @@ mod tests {
         let c2 = Arc::clone(&coalescer);
         let i2 = Arc::clone(&inv2);
         let h2 = thread::spawn(move || {
-            c2.coalesce((1, 1), || {
+            c2.coalesce("000001", 1, || {
                 i2.fetch_add(1, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(20));
                 Ok(Arc::new(vec![2u8; 10]))
@@ -281,7 +283,7 @@ mod tests {
         for _ in 0..5 {
             let c = Arc::clone(&coalescer);
             handles.push(thread::spawn(move || {
-                c.coalesce((1, 0), || {
+                c.coalesce("000001", 0, || {
                     thread::sleep(Duration::from_millis(20));
                     Err(io::Error::new(io::ErrorKind::ConnectionReset, "network dropped"))
                 })
@@ -306,7 +308,7 @@ mod tests {
 
         let c1 = Arc::clone(&coalescer);
         let h1 = thread::spawn(move || {
-            c1.coalesce((1, 0), || -> io::Result<Arc<Vec<u8>>> {
+            c1.coalesce("000001", 0, || -> io::Result<Arc<Vec<u8>>> {
                 thread::sleep(Duration::from_millis(20));
                 panic!("leader thread simulated crash");
             })
@@ -316,7 +318,7 @@ mod tests {
         let h2 = thread::spawn(move || {
             // Give leader thread a few millis to become leader
             thread::sleep(Duration::from_millis(5));
-            c2.coalesce((1, 0), || Ok(Arc::new(vec![0u8])))
+            c2.coalesce("000001", 0, || Ok(Arc::new(vec![0u8])))
         });
 
         // h1 panics

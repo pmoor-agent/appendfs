@@ -290,12 +290,12 @@ fn test_fuse_with_log_writer() {
     file.sync_data().unwrap();
     drop(file);
 
-    // Verify .log file exists in log_dir and has size > FILE_HEADER_SIZE (24 bytes)
+    // Verify .log file exists in log_dir and has size > FILE_HEADER_SIZE
     let log_file_path = mount.log_path.join("000001.log");
     assert!(log_file_path.exists());
     let log_size = fs::metadata(&log_file_path).unwrap().len();
     assert!(
-        log_size > 24,
+        log_size > appendfs::log::record::FILE_HEADER_SIZE as u64,
         "Log file should contain logged record entries beyond header, size = {}",
         log_size
     );

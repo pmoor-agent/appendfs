@@ -1,11 +1,12 @@
 use crate::clock::Clock;
 use crate::crypto::VolumeKey;
 use crate::fs::InMemoryFS;
+use crate::log::manifest::{parse_log_filename, parse_summary_filename};
 use crate::log::reader::{LogReader, LogRecord};
 use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode};
 use crate::log::summary::SummaryReader;
 use crate::node::EntryDelta;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -35,28 +36,29 @@ pub fn recover_fs(
     let files = storage.list_files()?;
 
     // 1. Scan for eligible single-file .summary snapshots matching the target
-    let mut latest_summary: Option<(u64, SummaryReader)> = None;
+    let mut latest_summary: Option<(u64, u32, SummaryReader)> = None;
     let mut unreadable: Vec<String> = Vec::new();
     for file in &files {
-        if file.ends_with(".summary") {
-            let stem = file.trim_end_matches(".summary");
-            if let Ok(gen_num) = stem.parse::<u64>() {
-                match SummaryReader::open(storage.as_ref(), file, volume_key.clone()) {
-                    Ok(reader) => {
-                        let eligible = match target {
-                            RecoveryTarget::Latest => true,
-                            RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
-                            RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
-                            RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
-                        };
-                        if eligible && latest_summary.as_ref().is_none_or(|(g, _)| gen_num > *g) {
-                            latest_summary = Some((gen_num, reader));
-                        }
+        if let Some((gen_num, rev_num)) = parse_summary_filename(file) {
+            match SummaryReader::open(storage.as_ref(), file, volume_key.clone()) {
+                Ok(reader) => {
+                    let eligible = match target {
+                        RecoveryTarget::Latest => true,
+                        RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
+                        RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
+                        RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
+                    };
+                    if eligible
+                        && latest_summary
+                            .as_ref()
+                            .is_none_or(|(g, r, _)| (gen_num, rev_num) > (*g, *r))
+                    {
+                        latest_summary = Some((gen_num, rev_num, reader));
                     }
-                    Err(e) => {
-                        log::warn!("Ignoring unreadable summary {}: {}", file, e);
-                        unreadable.push(format!("{}: {}", file, e));
-                    }
+                }
+                Err(e) => {
+                    log::warn!("Ignoring unreadable summary {}: {}", file, e);
+                    unreadable.push(format!("{}: {}", file, e));
                 }
             }
         }
@@ -78,17 +80,22 @@ pub fn recover_fs(
         ));
     }
 
-    let mut log_files = Vec::new();
+    let mut log_files_map: BTreeMap<u64, (u32, String)> = BTreeMap::new();
     for file in &files {
-        if file.ends_with(".log") {
-            let stem = file.trim_end_matches(".log");
-            if let Ok(gen_num) = stem.parse::<u64>() {
-                log_files.push((gen_num, file.clone()));
+        if let Some((gen_num, rev_num)) = parse_log_filename(file) {
+            match log_files_map.get(&gen_num) {
+                Some((existing_rev, _)) if *existing_rev >= rev_num => {}
+                _ => {
+                    log_files_map.insert(gen_num, (rev_num, file.clone()));
+                }
             }
         }
     }
 
-    log_files.sort_by_key(|(gen_num, _)| *gen_num);
+    let log_files: Vec<(u64, String)> = log_files_map
+        .into_iter()
+        .map(|(gen_num, (_, file))| (gen_num, file))
+        .collect();
 
     let mut fs_instance = InMemoryFS::with_clock_storage_and_volume_key(clock, storage.clone(), volume_key.clone());
 
@@ -111,7 +118,7 @@ pub fn recover_fs(
     let mut last_tx_id = 0u64;
 
     // 2. Fast-recover from summary file if available
-    if let Some((summary_gen, reader)) = latest_summary {
+    if let Some((summary_gen, _rev, reader)) = latest_summary {
         log::info!(
             "Fast-recovering appendfs state from summary file (generation: {}, inodes: {}, last_tx_id: {})...",
             summary_gen,
