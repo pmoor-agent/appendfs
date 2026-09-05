@@ -1,6 +1,4 @@
-use crate::crypto::cipher::{
-    CipherSuite, CryptoError, decrypt_payload, decrypt_payload_detached, encrypt_payload, encrypt_payload_detached,
-};
+use crate::crypto::cipher::{CipherSuite, CryptoError, decrypt_payload, encrypt_payload};
 use crate::crypto::kdf::MasterKey;
 use crate::crypto::nonce::{derive_record_nonce, generate_random_16, generate_random_iv};
 use serde::{Deserialize, Serialize};
@@ -25,8 +23,8 @@ fn derive_subkey(context: &str, master: &[u8; 32]) -> [u8; 32] {
 /// volumes to make a wrong key look right.
 fn compute_kcv(master: &[u8; 32], volume_id: &[u8; 16], iv: &[u8; 12]) -> Result<[u8; 16], CryptoError> {
     let kcv_key = derive_subkey(KCV_KEY_CONTEXT, master);
-    let tag = encrypt_payload(CipherSuite::ChaCha20Poly1305, &kcv_key, iv, volume_id, &[])?;
-    tag.try_into().map_err(|_| CryptoError::InvalidKeyLength)
+    let (_, tag) = encrypt_payload(CipherSuite::ChaCha20Poly1305, &kcv_key, iv, volume_id, &[])?;
+    Ok(tag)
 }
 
 /// Which credentials a volume's key is built from.
@@ -177,6 +175,7 @@ impl VolumeHeader {
             &kcv_key,
             &self.kcv_iv,
             &self.volume_id,
+            &[],
             &self.kcv_tag,
         )
         .map_err(|_| CryptoError::WrongKey)?;
@@ -279,7 +278,7 @@ impl VolumeKey {
     ) -> Result<(Vec<u8>, [u8; 16]), CryptoError> {
         let nonce = derive_record_nonce(generation, tx_id);
         let aad = record_aad(op_code, tx_id, inode);
-        encrypt_payload_detached(self.cipher, &self.key, &nonce, &aad, payload)
+        encrypt_payload(self.cipher, &self.key, &nonce, &aad, payload)
     }
 
     /// Decrypts a record payload and verifies the authentication tag.
@@ -297,7 +296,7 @@ impl VolumeKey {
     ) -> Result<Vec<u8>, CryptoError> {
         let nonce = derive_record_nonce(generation, tx_id);
         let aad = record_aad(op_code, tx_id, inode);
-        decrypt_payload_detached(self.cipher, &self.key, &nonce, &aad, ciphertext, expected_tag)
+        decrypt_payload(self.cipher, &self.key, &nonce, &aad, ciphertext, expected_tag)
     }
 
     /// Encrypts summary data with an explicit IV and AAD.
@@ -305,7 +304,9 @@ impl VolumeKey {
         if self.cipher == CipherSuite::None {
             return Ok(plaintext.to_vec());
         }
-        encrypt_payload(self.cipher, &self.key, iv, aad, plaintext)
+        let (mut ct, tag) = encrypt_payload(self.cipher, &self.key, iv, aad, plaintext)?;
+        ct.extend_from_slice(&tag);
+        Ok(ct)
     }
 
     /// Decrypts summary data with an explicit IV and AAD.
@@ -313,7 +314,12 @@ impl VolumeKey {
         if self.cipher == CipherSuite::None {
             return Ok(ciphertext.to_vec());
         }
-        decrypt_payload(self.cipher, &self.key, iv, aad, ciphertext)
+        if ciphertext.len() < 16 {
+            return Err(CryptoError::AuthFailed);
+        }
+        let (ct, tag) = ciphertext.split_at(ciphertext.len() - 16);
+        let tag: &[u8; 16] = tag.try_into().unwrap();
+        decrypt_payload(self.cipher, &self.key, iv, aad, ct, tag)
     }
 }
 
