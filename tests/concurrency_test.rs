@@ -21,12 +21,12 @@ use appendfs::operations::read_write::{
 };
 use appendfs::operations::xattr::{getxattr_core, listxattr_core, removexattr_core, setxattr_core};
 use appendfs::shim::{FileType, ShimFlock};
-use common::TestRng;
+use common::{TestRng, wait_until};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const UID: u32 = 1000;
 const GID: u32 = 1000;
@@ -728,10 +728,10 @@ fn run_concurrent_stress(seed: u64) {
     // still inside its first `flush_log`, which made this assertion fail on scheduling luck
     // rather than on anything the test is trying to catch.
     const MIN_FLUSHES: u64 = 2;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while flush_count.load(Ordering::Relaxed) < MIN_FLUSHES && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_until(
+        || flush_count.load(Ordering::Relaxed) >= MIN_FLUSHES,
+        Duration::from_secs(60),
+    );
 
     stop_flusher.store(true, Ordering::Relaxed);
     flusher

@@ -3,6 +3,8 @@ pub mod mount;
 pub mod rng;
 
 #[allow(unused_imports)]
+pub use appendfs::wait_until;
+#[allow(unused_imports)]
 pub use fs_wrapper::{SnapshotNode, TestFS};
 #[allow(unused_imports)]
 pub use mount::{TestMount, unmount_fuse};

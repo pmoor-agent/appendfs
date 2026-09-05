@@ -97,9 +97,10 @@ mod tests {
             Duration::from_millis(50),
         );
 
-        thread::sleep(Duration::from_millis(150));
-
-        assert!(count.load(Ordering::SeqCst) >= 2);
+        assert!(crate::wait_until(
+            || count.load(Ordering::SeqCst) >= 2,
+            Duration::from_secs(3)
+        ));
 
         flusher.stop();
     }
@@ -122,12 +123,16 @@ mod tests {
 
         // Trigger manually
         flusher.trigger();
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(crate::wait_until(
+            || count.load(Ordering::SeqCst) == 1,
+            Duration::from_secs(3)
+        ));
 
         flusher.trigger();
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(crate::wait_until(
+            || count.load(Ordering::SeqCst) == 2,
+            Duration::from_secs(3)
+        ));
 
         flusher.stop();
     }
