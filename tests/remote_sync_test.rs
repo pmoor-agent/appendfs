@@ -9,7 +9,7 @@ use appendfs::remote::{
     MockRemoteStore, RemoteRegistry, RemoteStore, RemoteTargetConfig, check_remote_integrity,
 };
 use appendfs::storage::MemoryStorage;
-use appendfs::{Clock, InMemoryFS, Storage};
+use appendfs::{Clock, InMemoryFS, Storage, wait_until};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -1102,18 +1102,11 @@ fn test_event_driven_immediate_replication_on_log_roll() {
     fs_arc.notify_replication();
 
     // Poll for up to 2 seconds for the remote to receive 000001.log
-    let start = std::time::Instant::now();
-    let mut replicated = false;
-    while start.elapsed() < std::time::Duration::from_secs(2) {
-        if remote.head_object("000001.log").unwrap().is_some() {
-            replicated = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-
     assert!(
-        replicated,
+        wait_until(
+            || remote.head_object("000001.log").unwrap().is_some(),
+            std::time::Duration::from_secs(2)
+        ),
         "Log generation 1 must be replicated immediately via event-driven wake-up without waiting for the 3600s poll interval!"
     );
 

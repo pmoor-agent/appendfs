@@ -1,7 +1,7 @@
 mod common;
 use appendfs::Clock;
 use appendfs::storage::{MemoryStorage, OsStorage, Storage};
-use common::TestMount;
+use common::{TestMount, wait_until};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -1130,17 +1130,11 @@ fn test_background_flusher_in_mount_session() {
     assert_eq!(fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst), 2);
 
     // Wait up to 5 seconds for the background flusher to flush staged ops
-    let start = std::time::Instant::now();
-    let mut flushed = false;
-    while start.elapsed() < std::time::Duration::from_secs(5) {
-        if fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            flushed = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
     assert!(
-        flushed,
+        wait_until(
+            || fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst) == 0,
+            std::time::Duration::from_secs(5)
+        ),
         "Staged ops ({}) must be flushed to 0 by the background flusher",
         fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst)
     );
@@ -1367,27 +1361,28 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
     drop(fs1);
 
     // 5. Subsequent RW Mount: must now succeed cleanly
-    let mut writer2_res = appendfs::LogWriter::create_lazy(
-        storage.clone(),
-        1,
-        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-        1,
-        appendfs::VolumeKey::plaintext_arc(),
+    let mut writer2_res = None;
+    assert!(
+        wait_until(
+            || {
+                let res = appendfs::LogWriter::create_lazy(
+                    storage.clone(),
+                    1,
+                    appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+                    1,
+                    appendfs::VolumeKey::plaintext_arc(),
+                );
+                let ok = res.is_ok();
+                writer2_res = Some(res);
+                ok
+            },
+            std::time::Duration::from_secs(2)
+        ),
+        "Subsequent RW mount must succeed after previous RW mount is dropped"
     );
-    for _ in 0..20 {
-        if writer2_res.is_ok() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-        writer2_res = appendfs::LogWriter::create_lazy(
-            storage.clone(),
-            1,
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            appendfs::VolumeKey::plaintext_arc(),
-        );
-    }
-    let writer2 = writer2_res.expect("Subsequent RW mount must succeed after previous RW mount is dropped");
+    let writer2 = writer2_res
+        .unwrap()
+        .expect("Subsequent RW mount must succeed after previous RW mount is dropped");
     drop(writer2);
 }
 

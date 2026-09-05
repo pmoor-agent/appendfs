@@ -12,16 +12,16 @@ use std::thread;
 use std::time::Duration;
 
 pub fn unmount_fuse(mount_path: &str) {
-    for _ in 0..10 {
-        let status = Command::new("fusermount3").arg("-u").arg(mount_path).status();
-        if let Ok(s) = status
-            && s.success()
-        {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
+    let unmounted = appendfs::wait_until(
+        || {
+            let status = Command::new("fusermount3").arg("-u").arg(mount_path).status();
+            matches!(status, Ok(s) if s.success())
+        },
+        Duration::from_millis(500),
+    );
+    if !unmounted {
+        let _ = Command::new("fusermount3").arg("-u").arg("-z").arg(mount_path).status();
     }
-    let _ = Command::new("fusermount3").arg("-u").arg("-z").arg(mount_path).status();
 }
 
 #[allow(dead_code)]
@@ -151,27 +151,24 @@ impl TestMount {
         .unwrap();
         let next_gen = appendfs::find_latest_generation_in_storage(storage.as_ref()) + 1;
         let start_tx = fs.last_tx_id.load(Ordering::SeqCst) + 1;
-        let mut writer_res = appendfs::LogWriter::create_lazy(
-            storage.clone(),
-            next_gen,
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            start_tx,
-            VolumeKey::plaintext_arc(),
+        let mut writer_res = None;
+        let acquired = appendfs::wait_until(
+            || {
+                let res = appendfs::LogWriter::create_lazy(
+                    storage.clone(),
+                    next_gen,
+                    appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+                    start_tx,
+                    VolumeKey::plaintext_arc(),
+                );
+                let ok = res.is_ok();
+                writer_res = Some(res);
+                ok
+            },
+            Duration::from_millis(500),
         );
-        for _ in 0..20 {
-            if writer_res.is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(25));
-            writer_res = appendfs::LogWriter::create_lazy(
-                storage.clone(),
-                next_gen,
-                appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-                start_tx,
-                VolumeKey::plaintext_arc(),
-            );
-        }
-        let writer = Arc::new(writer_res.unwrap());
+        assert!(acquired, "Failed to acquire log writer on remount_rw");
+        let writer = Arc::new(writer_res.unwrap().unwrap());
         fs.log_writer = Some(writer);
         fs.set_log_dir(&self.log_path);
 
