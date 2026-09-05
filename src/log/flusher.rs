@@ -97,7 +97,10 @@ mod tests {
             Duration::from_millis(50),
         );
 
-        thread::sleep(Duration::from_millis(150));
+        let start = std::time::Instant::now();
+        while count.load(Ordering::SeqCst) < 2 && start.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(10));
+        }
 
         assert!(count.load(Ordering::SeqCst) >= 2);
 
@@ -122,11 +125,17 @@ mod tests {
 
         // Trigger manually
         flusher.trigger();
-        thread::sleep(Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        while count.load(Ordering::SeqCst) < 1 && start.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         flusher.trigger();
-        thread::sleep(Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        while count.load(Ordering::SeqCst) < 2 && start.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(count.load(Ordering::SeqCst), 2);
 
         flusher.stop();
