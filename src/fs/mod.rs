@@ -16,6 +16,7 @@ mod layers;
 mod overlay;
 pub mod virtual_files;
 
+pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use virtual_files::{VIRTUAL_FH_FLAG, VIRTUAL_INO_BASE, VirtualFileRegistry};
 
@@ -23,7 +24,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::log::{BackgroundFlusher, LogFileCache, LogManifest, LogWriter};
 use crate::node::{EntryDelta, Node};
 use crate::storage::Storage;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -39,21 +40,6 @@ pub type DirSnapshot = Arc<Vec<(String, u64)>>;
 pub type FileHandleMap = HashMap<u64, FileHandle>;
 pub type DirectoryHandleMap = HashMap<u64, DirSnapshot>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FlockState {
-    Shared(HashSet<u64>),
-    Exclusive(u64),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RangeLock {
-    pub lock_type: i16,
-    pub start: u64,
-    pub end: u64,
-    pub owner: u64,
-    pub pid: i32,
-}
-
 pub struct InMemoryFS {
     /// Resting consolidated state loaded from `.summary` at mount, folded forward over
     /// generations.
@@ -67,12 +53,8 @@ pub struct InMemoryFS {
     pub file_handles: RwLock<FileHandleMap>,
     /// Active open directory handle snapshots keyed by allocated file handle ID (`fh`).
     pub dir_handles: RwLock<DirectoryHandleMap>,
-    /// Active whole-file BSD flock locks keyed by inode number.
-    pub flock_table: Mutex<HashMap<u64, FlockState>>,
-    pub flock_cond: Condvar,
-    /// Active POSIX byte-range record locks keyed by inode number.
-    pub range_lock_table: Mutex<HashMap<u64, Vec<RangeLock>>>,
-    pub range_lock_cond: Condvar,
+    /// Whole-file BSD flock and POSIX byte-range record lock manager.
+    pub locks: LockManager,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
     pub open_counts: RwLock<HashMap<u64, u32>>,
     /// Atomic counter for allocating unique file and directory handle IDs (`fh`).
@@ -190,10 +172,7 @@ impl InMemoryFS {
             live: RwLock::new(HashMap::new()),
             file_handles: RwLock::new(HashMap::new()),
             dir_handles: RwLock::new(HashMap::new()),
-            flock_table: Mutex::new(HashMap::new()),
-            flock_cond: Condvar::new(),
-            range_lock_table: Mutex::new(HashMap::new()),
-            range_lock_cond: Condvar::new(),
+            locks: LockManager::new(),
             open_counts: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             manifest,

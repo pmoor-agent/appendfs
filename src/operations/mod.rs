@@ -94,8 +94,11 @@ impl Filesystem for InMemoryFS {
         links::link(self, req, ino, newparent, newname);
     }
 
-    fn fsync(&self, req: Request, ino: u64, datasync: bool, fh: u64) {
-        read_write::fsync(self, req, ino, datasync, fh);
+    fn fsync(&self, req: Request, ino: u64, _datasync: bool, fh: u64) {
+        match read_write::fsync_core(self, ino, fh) {
+            Ok(()) => req.reply_err(0),
+            Err(e) => req.reply_err(e),
+        }
     }
 
     fn fallocate(&self, req: Request, ino: u64, mode: i32, offset: i64, length: i64, fh: u64) {
@@ -110,8 +113,11 @@ impl Filesystem for InMemoryFS {
         dir::releasedir(self, req, ino, fh);
     }
 
-    fn fsyncdir(&self, req: Request, ino: u64, datasync: bool) {
-        dir::fsyncdir(self, req, ino, datasync);
+    fn fsyncdir(&self, req: Request, _ino: u64, _datasync: bool) {
+        match dir::fsyncdir_core(self) {
+            Ok(()) => req.reply_err(0),
+            Err(e) => req.reply_err(e),
+        }
     }
 
     fn statfs(&self, req: Request, ino: u64) {

@@ -774,7 +774,7 @@ extern "C" fn link_bridge(req: shim_req_t, ino: u64, newparent: u64, newname: *c
 
 extern "C" fn fsync_bridge(req: shim_req_t, ino: u64, datasync: c_int, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.fsync(Request { req }, ino, datasync != 0, fh);
+    crate::operations::read_write::fsync(fs, Request { req }, ino, datasync != 0, fh);
 }
 
 extern "C" fn fallocate_bridge(
@@ -802,7 +802,7 @@ extern "C" fn releasedir_bridge(req: shim_req_t, ino: u64, fh: u64, userdata: *m
 
 extern "C" fn fsyncdir_bridge(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.fsyncdir(Request { req }, ino, datasync != 0);
+    crate::operations::dir::fsyncdir(fs, Request { req }, ino, datasync != 0);
 }
 
 extern "C" fn statfs_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
@@ -812,7 +812,7 @@ extern "C" fn statfs_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
 
 extern "C" fn flock_bridge(req: shim_req_t, ino: u64, fh: u64, lock_owner: u64, op: c_int, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.flock(Request { req }, ino, fh, lock_owner, op);
+    crate::operations::locks::flock(fs, Request { req }, ino, fh, lock_owner, op);
 }
 
 extern "C" fn getlk_bridge(
@@ -839,7 +839,7 @@ extern "C" fn setlk_bridge(
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let sh_lock = unsafe { *lock };
-    fs.setlk(Request { req }, ino, fh, lock_owner, sh_lock, sleep != 0);
+    crate::operations::locks::setlk(fs, Request { req }, ino, fh, lock_owner, sh_lock, sleep != 0);
 }
 
 extern "C" fn getxattr_bridge(req: shim_req_t, ino: u64, name: *const c_char, size: usize, userdata: *mut c_void) {

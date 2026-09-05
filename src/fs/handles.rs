@@ -5,7 +5,7 @@
 //! Directory handles hold an immutable snapshot of the listing taken at `opendir`, so a
 //! paginated `readdir` is isolated from concurrent mutations.
 
-use super::{FileHandle, FlockState, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
+use super::{FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -91,8 +91,9 @@ impl InMemoryFS {
         if counts.get(&ino) == Some(&0) {
             counts.remove(&ino);
             // Clean up POSIX range locks if all handles on inode are closed
-            self.range_lock_table.lock().unwrap().remove(&ino);
-            self.range_lock_cond.notify_all();
+            self.release_range_locks(ino, fh);
+        } else {
+            self.cancel_range_lock_waiters(ino, fh);
         }
         let remaining = counts.get(&ino).copied().unwrap_or(0);
         if remaining == 0
@@ -105,23 +106,15 @@ impl InMemoryFS {
     }
 
     pub fn release_flock(&self, ino: u64, fh: u64) {
-        let mut table = self.flock_table.lock().unwrap();
-        if let Some(state) = table.get_mut(&ino) {
-            match state {
-                FlockState::Shared(set) => {
-                    set.remove(&fh);
-                    if set.is_empty() {
-                        table.remove(&ino);
-                    }
-                }
-                FlockState::Exclusive(holder) => {
-                    if *holder == fh {
-                        table.remove(&ino);
-                    }
-                }
-            }
-            self.flock_cond.notify_all();
-        }
+        self.locks.release_flock(ino, fh);
+    }
+
+    pub fn cancel_range_lock_waiters(&self, ino: u64, fh: u64) {
+        self.locks.cancel_range_lock_waiters(ino, fh);
+    }
+
+    pub fn release_range_locks(&self, ino: u64, fh: u64) {
+        self.locks.release_range_locks(ino, fh);
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {

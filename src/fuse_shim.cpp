@@ -582,11 +582,7 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
 
   fuse_daemonize(opts.foreground);
 
-  if (opts.singlethread) {
-    ret = fuse_session_loop(se);
-  } else {
-    ret = fuse_session_loop_mt(se, 0);
-  }
+  ret = fuse_session_loop(se);
 
   fuse_session_unmount(se);
 err_out2:

@@ -554,7 +554,17 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
     }
 }
 
-pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
+pub fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
+    if fh != 0 {
+        match fs.get_file_handle(fh) {
+            Some(h) if h.ino == ino => {}
+            _ => return Err(libc::EBADF),
+        }
+    }
+    fs.sync_log().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+pub fn fsync(fs: &Arc<InMemoryFS>, req: Request, ino: u64, datasync: bool, fh: u64) {
     log::trace!("fsync(ino={}, datasync={}, fh={})", ino, datasync, fh);
     if fh != 0 {
         match fs.get_file_handle(fh) {
@@ -565,8 +575,19 @@ pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
             }
         }
     }
-    let _ = fs.sync_log();
-    req.reply_err(0);
+    if fs.log_writer.is_none() {
+        req.reply_err(0);
+        return;
+    }
+    let fs_clone = Arc::clone(fs);
+    crate::async_runtime::spawn(async move {
+        let res = tokio::task::spawn_blocking(move || fs_clone.sync_log()).await;
+        match res {
+            Ok(Ok(())) => req.reply_err(0),
+            Ok(Err(e)) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
+            Err(_) => req.reply_err(libc::EIO),
+        }
+    });
 }
 
 pub fn release_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
