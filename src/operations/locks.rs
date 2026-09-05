@@ -107,7 +107,10 @@ impl LockManager {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.flock_table.lock().unwrap().is_empty() && self.range_lock_table.lock().unwrap().is_empty()
+        self.flock_table.lock().unwrap().is_empty()
+            && self.range_lock_table.lock().unwrap().is_empty()
+            && self.flock_waiters.lock().unwrap().is_empty()
+            && self.range_lock_waiters.lock().unwrap().is_empty()
     }
 
     pub fn flock_count(&self) -> usize {
@@ -116,6 +119,14 @@ impl LockManager {
 
     pub fn range_lock_count(&self) -> usize {
         self.range_lock_table.lock().unwrap().len()
+    }
+
+    pub fn flock_waiter_count(&self) -> usize {
+        self.flock_waiters.lock().unwrap().values().map(|q| q.len()).sum()
+    }
+
+    pub fn range_lock_waiter_count(&self) -> usize {
+        self.range_lock_waiters.lock().unwrap().values().map(|q| q.len()).sum()
     }
 
     pub fn wake_flock_waiters(&self, ino: u64) {
@@ -864,7 +875,8 @@ mod tests {
         // 6. Release handle cleans up locks
         assert_eq!(fs.release_file_handle(fh1, ino), Ok(()));
         assert_eq!(fs.release_file_handle(fh2, ino), Ok(()));
-        assert!(fs.locks.flock_table.lock().unwrap().get(&ino).is_none());
+        assert_eq!(fs.locks.flock_count(), 0);
+        assert!(fs.locks.is_empty());
     }
 
     #[test]

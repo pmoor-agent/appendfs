@@ -761,16 +761,14 @@ fn run_concurrent_stress(seed: u64) {
         "seed {}: leaked file handles",
         seed
     );
-    assert!(
-        fs.locks.flock_table.lock().unwrap().is_empty(),
-        "seed {}: leaked flock entries",
-        seed
-    );
-    assert!(
-        fs.locks.range_lock_table.lock().unwrap().is_empty(),
+    assert_eq!(fs.locks.flock_count(), 0, "seed {}: leaked flock entries", seed);
+    assert_eq!(
+        fs.locks.range_lock_count(),
+        0,
         "seed {}: leaked range lock entries",
         seed
     );
+    assert!(fs.locks.is_empty(), "seed {}: leaked lock manager state", seed);
     assert!(
         fs.open_counts.read().unwrap().is_empty(),
         "seed {}: leaked open_counts",
