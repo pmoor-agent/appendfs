@@ -324,6 +324,13 @@ impl InMemoryFS {
         })
     }
 
+    /// Wakes up the background periodic flusher immediately to drain pending batches.
+    pub fn trigger_flusher(&self) {
+        if let Some(ref flusher) = *self.flusher.lock().unwrap() {
+            flusher.trigger();
+        }
+    }
+
     /// Increments mutation counters (ops & bytes) and triggers an automatic flush if thresholds are reached.
     pub fn notify_mutation(&self, additional_bytes: usize) {
         let staged_b = if additional_bytes > 0 {
@@ -334,7 +341,16 @@ impl InMemoryFS {
         let staged_o = self.staged_ops.fetch_add(1, Ordering::Relaxed) + 1;
 
         if staged_b >= self.max_buffer_size || staged_o >= self.max_staged_ops {
-            let _ = self.flush_log();
+            let has_flusher = self.flusher.lock().unwrap().is_some();
+            if has_flusher {
+                // In-memory freeze of active live delta into flushing queue (< 1 µs)
+                self.begin_flush();
+                // Signal background flusher thread to drain to disk asynchronously
+                self.trigger_flusher();
+            } else {
+                // In standalone / unmounted test environments without background flusher thread, flush inline
+                let _ = self.flush_log();
+            }
         }
     }
 

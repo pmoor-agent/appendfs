@@ -3175,3 +3175,110 @@ fn test_fuse_async_read_concurrency() {
 
     mount.unmount();
 }
+
+#[test]
+fn test_fuse_async_fsync_and_singlethread_loop() {
+    let mut mount = TestMount::new_rw();
+    let mount_path = mount.path().to_path_buf();
+
+    let subdir = mount_path.join("syncdir");
+    fs::create_dir(&subdir).unwrap();
+
+    let mut threads = Vec::new();
+
+    // Thread 1: Writer + fsync worker (repeatedly writes and fsyncs)
+    {
+        let p = mount_path.join("fsync_file.bin");
+        threads.push(thread::spawn(move || {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&p)
+                .unwrap();
+            let chunk = vec![0x33u8; 16 * 1024];
+            for _ in 0..20 {
+                file.write_all(&chunk).unwrap();
+                file.sync_all().unwrap(); // Triggers async fsync over FUSE
+            }
+        }));
+    }
+
+    // Thread 2: Directory fsync worker (creates files and fsyncs directory handle)
+    {
+        let sub = subdir.clone();
+        threads.push(thread::spawn(move || {
+            for i in 0..15 {
+                let file_p = sub.join(format!("entry_{}.txt", i));
+                fs::write(&file_p, format!("content {}", i)).unwrap();
+                // Open directory and call sync_all (triggers FUSE fsyncdir)
+                let dir_f = fs::File::open(&sub).unwrap();
+                dir_f.sync_all().unwrap();
+            }
+        }));
+    }
+
+    // Thread 3: Large streaming writes that repeatedly trigger notify_mutation thresholds
+    {
+        let p = mount_path.join("large_stream.bin");
+        threads.push(thread::spawn(move || {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&p)
+                .unwrap();
+            // 64 KiB chunks * 16 = 1 MiB total data, triggering auto-flush thresholds
+            let chunk = vec![0x77u8; 64 * 1024];
+            for _ in 0..16 {
+                file.write_all(&chunk).unwrap();
+            }
+            file.sync_all().unwrap();
+        }));
+    }
+
+    // Thread 4: Concurrent reader verifying in-flight stability
+    {
+        let sub = subdir.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..25 {
+                thread::sleep(Duration::from_millis(5));
+                if let Ok(entries) = fs::read_dir(&sub) {
+                    for entry in entries.flatten() {
+                        let _ = fs::read_to_string(entry.path());
+                    }
+                }
+            }
+        }));
+    }
+
+    for t in threads {
+        t.join().expect("Concurrent async fsync worker thread panicked");
+    }
+
+    // Remount volume to verify all fsynced data is durable on storage
+    mount.remount_rw();
+    let remount_path = mount.path().to_path_buf();
+
+    // 1. Verify fsync_file.bin size (20 * 16 KiB = 320 KiB)
+    let fsync_file = remount_path.join("fsync_file.bin");
+    let fsync_data = fs::read(&fsync_file).unwrap();
+    assert_eq!(fsync_data.len(), 20 * 16 * 1024);
+    assert!(fsync_data.iter().all(|&b| b == 0x33));
+
+    // 2. Verify syncdir entries
+    let sub_remount = remount_path.join("syncdir");
+    for i in 0..15 {
+        let entry_p = sub_remount.join(format!("entry_{}.txt", i));
+        let content = fs::read_to_string(&entry_p).unwrap();
+        assert_eq!(content, format!("content {}", i));
+    }
+
+    // 3. Verify large_stream.bin (16 * 64 KiB = 1024 KiB)
+    let stream_file = remount_path.join("large_stream.bin");
+    let stream_data = fs::read(&stream_file).unwrap();
+    assert_eq!(stream_data.len(), 16 * 64 * 1024);
+    assert!(stream_data.iter().all(|&b| b == 0x77));
+
+    mount.unmount();
+}

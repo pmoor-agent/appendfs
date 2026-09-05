@@ -94,8 +94,11 @@ impl Filesystem for InMemoryFS {
         links::link(self, req, ino, newparent, newname);
     }
 
-    fn fsync(&self, req: Request, ino: u64, datasync: bool, fh: u64) {
-        read_write::fsync(self, req, ino, datasync, fh);
+    fn fsync(&self, req: Request, ino: u64, _datasync: bool, fh: u64) {
+        match read_write::fsync_core(self, ino, fh) {
+            Ok(()) => req.reply_err(0),
+            Err(e) => req.reply_err(e),
+        }
     }
 
     fn fallocate(&self, req: Request, ino: u64, mode: i32, offset: i64, length: i64, fh: u64) {
@@ -110,8 +113,11 @@ impl Filesystem for InMemoryFS {
         dir::releasedir(self, req, ino, fh);
     }
 
-    fn fsyncdir(&self, req: Request, ino: u64, datasync: bool) {
-        dir::fsyncdir(self, req, ino, datasync);
+    fn fsyncdir(&self, req: Request, _ino: u64, _datasync: bool) {
+        match dir::fsyncdir_core(self) {
+            Ok(()) => req.reply_err(0),
+            Err(e) => req.reply_err(e),
+        }
     }
 
     fn statfs(&self, req: Request, ino: u64) {
@@ -119,7 +125,10 @@ impl Filesystem for InMemoryFS {
     }
 
     fn flock(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
-        locks::flock(self, req, ino, fh, lock_owner, op);
+        match locks::flock_core(self, ino, fh, lock_owner, op) {
+            Ok(()) => req.reply_err(0),
+            Err(e) => req.reply_err(e),
+        }
     }
 
     fn getlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) {
@@ -127,7 +136,10 @@ impl Filesystem for InMemoryFS {
     }
 
     fn setlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
-        locks::setlk(self, req, ino, fh, lock_owner, lock, sleep);
+        match locks::setlk_core(self, ino, fh, lock_owner, lock, sleep) {
+            Ok(()) => req.reply_err(0),
+            Err(e) => req.reply_err(e),
+        }
     }
 
     fn getxattr(&self, req: Request, ino: u64, name: &str, size: usize) {

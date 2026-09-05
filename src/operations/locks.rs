@@ -1,12 +1,41 @@
 use crate::fs::{FlockState, InMemoryFS, RangeLock};
 use crate::shim::{Request, ShimFlock};
 use std::collections::HashSet;
+use std::sync::Arc;
 
-pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
+pub fn flock(fs: &Arc<InMemoryFS>, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
     log::trace!("flock(ino={}, fh={}, lock_owner={}, op={})", ino, fh, lock_owner, op);
-    match flock_core(fs, ino, fh, lock_owner, op) {
-        Ok(()) => req.reply_err(0),
-        Err(err) => req.reply_err(err),
+    let non_blocking = (op & libc::LOCK_NB) != 0;
+    if non_blocking {
+        match flock_core(fs, ino, fh, lock_owner, op) {
+            Ok(()) => req.reply_err(0),
+            Err(err) => req.reply_err(err),
+        }
+        return;
+    }
+
+    // Try acquiring non-blocking first (zero context switch or suspension if uncontented)
+    let try_op = op | libc::LOCK_NB;
+    match flock_core(fs, ino, fh, lock_owner, try_op) {
+        Ok(()) => {
+            req.reply_err(0);
+        }
+        Err(libc::EWOULDBLOCK) => {
+            let fs_clone = Arc::clone(fs);
+            crate::async_runtime::spawn(async move {
+                let res = tokio::task::spawn_blocking(move || flock_core(&fs_clone, ino, fh, lock_owner, op))
+                    .await
+                    .unwrap_or(Err(libc::EIO));
+
+                match res {
+                    Ok(()) => req.reply_err(0),
+                    Err(err) => req.reply_err(err),
+                }
+            });
+        }
+        Err(err) => {
+            req.reply_err(err);
+        }
     }
 }
 
@@ -24,7 +53,7 @@ pub fn getlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     }
 }
 
-pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
+pub fn setlk(fs: &Arc<InMemoryFS>, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
     log::trace!(
         "setlk(ino={}, fh={}, lock_owner={}, lock={:?}, sleep={})",
         ino,
@@ -33,9 +62,35 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
         lock,
         sleep
     );
-    match setlk_core(fs, ino, fh, lock_owner, lock, sleep) {
-        Ok(()) => req.reply_err(0),
-        Err(err) => req.reply_err(err),
+    if !sleep {
+        match setlk_core(fs, ino, fh, lock_owner, lock, false) {
+            Ok(()) => req.reply_err(0),
+            Err(err) => req.reply_err(err),
+        }
+        return;
+    }
+
+    // Blocking POSIX lock (F_SETLKW): try non-blocking inline first (zero context switch if uncontented)
+    match setlk_core(fs, ino, fh, lock_owner, lock, false) {
+        Ok(()) => {
+            req.reply_err(0);
+        }
+        Err(libc::EWOULDBLOCK) => {
+            let fs_clone = Arc::clone(fs);
+            crate::async_runtime::spawn(async move {
+                let res = tokio::task::spawn_blocking(move || setlk_core(&fs_clone, ino, fh, lock_owner, lock, true))
+                    .await
+                    .unwrap_or(Err(libc::EIO));
+
+                match res {
+                    Ok(()) => req.reply_err(0),
+                    Err(err) => req.reply_err(err),
+                }
+            });
+        }
+        Err(err) => {
+            req.reply_err(err);
+        }
     }
 }
 

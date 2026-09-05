@@ -2,6 +2,7 @@ use crate::fs::{InMemoryFS, find_parent_inode};
 use crate::node::{AttrDelta, DirectoryDelta, NodeDelta};
 use crate::shim::{self, FileAttr, FileType, Request};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 pub fn lookup(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
     log::trace!("lookup(parent={}, name={})", parent, name);
@@ -330,10 +331,25 @@ pub fn releasedir(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
     }
 }
 
-pub fn fsyncdir(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool) {
+pub fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), i32> {
+    fs.sync_log().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+pub fn fsyncdir(fs: &Arc<InMemoryFS>, req: Request, ino: u64, datasync: bool) {
     log::trace!("fsyncdir(ino={}, datasync={})", ino, datasync);
-    let _ = fs.sync_log();
-    req.reply_err(0);
+    if fs.log_writer.is_none() {
+        req.reply_err(0);
+        return;
+    }
+    let fs_clone = Arc::clone(fs);
+    crate::async_runtime::spawn(async move {
+        let res = tokio::task::spawn_blocking(move || fs_clone.sync_log()).await;
+        match res {
+            Ok(Ok(())) => req.reply_err(0),
+            Ok(Err(e)) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
+            Err(_) => req.reply_err(libc::EIO),
+        }
+    });
 }
 
 #[cfg(test)]

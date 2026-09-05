@@ -774,7 +774,7 @@ extern "C" fn link_bridge(req: shim_req_t, ino: u64, newparent: u64, newname: *c
 
 extern "C" fn fsync_bridge(req: shim_req_t, ino: u64, datasync: c_int, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.fsync(Request { req }, ino, datasync != 0, fh);
+    crate::operations::read_write::fsync(fs, Request { req }, ino, datasync != 0, fh);
 }
 
 extern "C" fn fallocate_bridge(
@@ -802,7 +802,7 @@ extern "C" fn releasedir_bridge(req: shim_req_t, ino: u64, fh: u64, userdata: *m
 
 extern "C" fn fsyncdir_bridge(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.fsyncdir(Request { req }, ino, datasync != 0);
+    crate::operations::dir::fsyncdir(fs, Request { req }, ino, datasync != 0);
 }
 
 extern "C" fn statfs_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
@@ -812,7 +812,7 @@ extern "C" fn statfs_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
 
 extern "C" fn flock_bridge(req: shim_req_t, ino: u64, fh: u64, lock_owner: u64, op: c_int, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.flock(Request { req }, ino, fh, lock_owner, op);
+    crate::operations::locks::flock(fs, Request { req }, ino, fh, lock_owner, op);
 }
 
 extern "C" fn getlk_bridge(
@@ -839,7 +839,7 @@ extern "C" fn setlk_bridge(
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let sh_lock = unsafe { *lock };
-    fs.setlk(Request { req }, ino, fh, lock_owner, sh_lock, sleep != 0);
+    crate::operations::locks::setlk(fs, Request { req }, ino, fh, lock_owner, sh_lock, sleep != 0);
 }
 
 extern "C" fn getxattr_bridge(req: shim_req_t, ino: u64, name: *const c_char, size: usize, userdata: *mut c_void) {
@@ -922,7 +922,17 @@ pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemor
     mount_arc(args, fs)
 }
 
-pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), i32> {
+pub fn mount_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), i32> {
+    let force_multi = if let Some(pos) = args.iter().position(|a| a == "--multithread") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
+    if !force_multi && !args.iter().any(|a| a == "-s" || a == "--singlethread") {
+        args.push("-s".to_string());
+    }
+
     let c_args_owners: Vec<CString> = args.into_iter().map(|arg| CString::new(arg).unwrap()).collect();
 
     let c_args: Vec<*const c_char> = c_args_owners.iter().map(|arg| arg.as_ptr()).collect();
