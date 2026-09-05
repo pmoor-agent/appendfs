@@ -2576,13 +2576,13 @@ fn test_tampered_record_header_is_rejected_not_served() {
     }
 
     // Flip a bit in every record header's `inode` field, simulating an attacker with write
-    // access but no key. Layout is op_code(1) tx_id(8) inode(8) payload_len(4) checksum(4).
+    // access but no key. Layout is op_code(1) tx_id(8) inode(8) payload_len(4) auth_tag(16).
     let mut bytes = storage.get_file_bytes("000001.log").unwrap();
     let header_size = appendfs::log::record::RECORD_HEADER_SIZE;
     let mut off = appendfs::log::record::FILE_HEADER_SIZE;
     let mut tampered = 0;
     while off + header_size <= bytes.len() {
-        let payload_len = u32::from_le_bytes(bytes[off + 17..off + 21].try_into().unwrap()) as usize;
+        let payload_len = u32::from_be_bytes(bytes[off + 17..off + 21].try_into().unwrap()) as usize;
         bytes[off + 9] ^= 0x01;
         tampered += 1;
         off += header_size + payload_len;

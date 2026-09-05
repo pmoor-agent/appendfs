@@ -23,8 +23,8 @@ fn derive_subkey(context: &str, master: &[u8; 32]) -> [u8; 32] {
 /// volumes to make a wrong key look right.
 fn compute_kcv(master: &[u8; 32], volume_id: &[u8; 16], iv: &[u8; 12]) -> Result<[u8; 16], CryptoError> {
     let kcv_key = derive_subkey(KCV_KEY_CONTEXT, master);
-    let tag = encrypt_payload(CipherSuite::ChaCha20Poly1305, &kcv_key, iv, volume_id, &[])?;
-    tag.try_into().map_err(|_| CryptoError::InvalidKeyLength)
+    let (_, tag) = encrypt_payload(CipherSuite::ChaCha20Poly1305, &kcv_key, iv, volume_id, &[])?;
+    Ok(tag)
 }
 
 /// Which credentials a volume's key is built from.
@@ -175,6 +175,7 @@ impl VolumeHeader {
             &kcv_key,
             &self.kcv_iv,
             &self.volume_id,
+            &[],
             &self.kcv_tag,
         )
         .map_err(|_| CryptoError::WrongKey)?;
@@ -274,27 +275,16 @@ impl VolumeKey {
         op_code: u8,
         inode: u64,
         payload: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
-        if self.cipher == CipherSuite::None {
-            return Ok(payload.to_vec());
-        }
-
+    ) -> Result<(Vec<u8>, [u8; 16]), CryptoError> {
         let nonce = derive_record_nonce(generation, tx_id);
         let aad = record_aad(op_code, tx_id, inode);
         encrypt_payload(self.cipher, &self.key, &nonce, &aad, payload)
     }
 
-    /// Decrypts a record payload. A plaintext volume returns it untouched.
-    ///
-    /// Whether a payload is encrypted follows from the volume's cipher alone. Records used
-    /// to carry their own `key_id` byte saying so, which was the wrong shape: the record
-    /// header is not covered by the payload checksum, so that byte arrived unauthenticated,
-    /// and honouring a cleared one let anyone who could write to the storage have the
-    /// filesystem hand back raw ciphertext as file contents. A volume-level fact belongs in
-    /// the volume header, where the key check value vouches for it.
+    /// Decrypts a record payload and verifies the authentication tag.
     ///
     /// Fails with `AuthFailed` if `op_code` or `inode` no longer match the values bound at
-    /// write time, even when the ciphertext itself is intact.
+    /// write time, or if the payload has been tampered with or corrupted.
     pub fn decrypt_record(
         &self,
         generation: u64,
@@ -302,15 +292,11 @@ impl VolumeKey {
         op_code: u8,
         inode: u64,
         ciphertext: &[u8],
+        expected_tag: &[u8; 16],
     ) -> Result<Vec<u8>, CryptoError> {
-        if self.cipher == CipherSuite::None {
-            return Ok(ciphertext.to_vec());
-        }
-
         let nonce = derive_record_nonce(generation, tx_id);
         let aad = record_aad(op_code, tx_id, inode);
-
-        decrypt_payload(self.cipher, &self.key, &nonce, &aad, ciphertext)
+        decrypt_payload(self.cipher, &self.key, &nonce, &aad, ciphertext, expected_tag)
     }
 
     /// Encrypts summary data with an explicit IV and AAD.
@@ -318,7 +304,9 @@ impl VolumeKey {
         if self.cipher == CipherSuite::None {
             return Ok(plaintext.to_vec());
         }
-        encrypt_payload(self.cipher, &self.key, iv, aad, plaintext)
+        let (mut ct, tag) = encrypt_payload(self.cipher, &self.key, iv, aad, plaintext)?;
+        ct.extend_from_slice(&tag);
+        Ok(ct)
     }
 
     /// Decrypts summary data with an explicit IV and AAD.
@@ -326,7 +314,12 @@ impl VolumeKey {
         if self.cipher == CipherSuite::None {
             return Ok(ciphertext.to_vec());
         }
-        decrypt_payload(self.cipher, &self.key, iv, aad, ciphertext)
+        if ciphertext.len() < 16 {
+            return Err(CryptoError::AuthFailed);
+        }
+        let (ct, tag) = ciphertext.split_at(ciphertext.len() - 16);
+        let tag: &[u8; 16] = tag.try_into().unwrap();
+        decrypt_payload(self.cipher, &self.key, iv, aad, ct, tag)
     }
 }
 
@@ -350,12 +343,12 @@ mod tests {
         assert_eq!(header.cipher, CipherSuite::ChaCha20Poly1305);
 
         let payload = b"Record payload for the volume key";
-        let ct = key.encrypt_record(1, 100, OP, 5, payload).unwrap();
+        let (ct, tag) = key.encrypt_record(1, 100, OP, 5, payload).unwrap();
         assert_ne!(&ct[..], &payload[..]);
 
         // A key recovered by unlocking the stored header decrypts what the original wrote.
         let reopened = header.unlock(&master).unwrap();
-        assert_eq!(reopened.decrypt_record(1, 100, OP, 5, &ct).unwrap(), payload);
+        assert_eq!(reopened.decrypt_record(1, 100, OP, 5, &ct, &tag).unwrap(), payload);
         assert_eq!(reopened.volume_id, header.volume_id);
     }
 
@@ -427,31 +420,31 @@ mod tests {
         .unwrap();
 
         let payload = b"extent belonging to inode 5";
-        let ct = key.encrypt_record(1, 100, OP, 5, payload).unwrap();
+        let (ct, tag) = key.encrypt_record(1, 100, OP, 5, payload).unwrap();
 
         // Baseline: the untampered record round-trips.
-        assert_eq!(key.decrypt_record(1, 100, OP, 5, &ct).unwrap(), payload);
+        assert_eq!(key.decrypt_record(1, 100, OP, 5, &ct, &tag).unwrap(), payload);
 
         // Reattributing the payload to a different inode must fail, even though the
         // ciphertext is byte-for-byte intact.
         assert_eq!(
-            key.decrypt_record(1, 100, OP, 6, &ct).unwrap_err(),
+            key.decrypt_record(1, 100, OP, 6, &ct, &tag).unwrap_err(),
             CryptoError::AuthFailed
         );
 
         // Relabelling the record as a different opcode must fail too.
         assert_eq!(
-            key.decrypt_record(1, 100, OP + 1, 5, &ct).unwrap_err(),
+            key.decrypt_record(1, 100, OP + 1, 5, &ct, &tag).unwrap_err(),
             CryptoError::AuthFailed
         );
 
         // Generation and tx_id remain bound via the nonce.
         assert_eq!(
-            key.decrypt_record(2, 100, OP, 5, &ct).unwrap_err(),
+            key.decrypt_record(2, 100, OP, 5, &ct, &tag).unwrap_err(),
             CryptoError::AuthFailed
         );
         assert_eq!(
-            key.decrypt_record(1, 101, OP, 5, &ct).unwrap_err(),
+            key.decrypt_record(1, 101, OP, 5, &ct, &tag).unwrap_err(),
             CryptoError::AuthFailed
         );
     }
@@ -461,9 +454,9 @@ mod tests {
         let key = VolumeKey::plaintext();
         let payload = b"unencrypted bytes";
 
-        let ct = key.encrypt_record(1, 100, OP, 5, payload).unwrap();
+        let (ct, tag) = key.encrypt_record(1, 100, OP, 5, payload).unwrap();
         assert_eq!(&ct[..], &payload[..]);
-        assert_eq!(key.decrypt_record(1, 100, OP, 5, &ct).unwrap(), payload);
+        assert_eq!(key.decrypt_record(1, 100, OP, 5, &ct, &tag).unwrap(), payload);
     }
 
     #[test]

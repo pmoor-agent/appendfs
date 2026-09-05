@@ -1,6 +1,6 @@
 use crate::crypto::VolumeKey;
 use crate::log::ExtentState;
-use crate::log::record::{FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader, checksum_payload};
+use crate::log::record::{FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader};
 use crate::log::summary::{SUMMARY_MAGIC, SummaryReader};
 use crate::node::NodeKind;
 use crate::storage::{Storage, StorageReader};
@@ -149,7 +149,7 @@ pub fn dump_log_reader_with_path(
     let mut records: Vec<DumpRecordEntry> = Vec::new();
     let mut current_offset = FILE_HEADER_SIZE as u64;
 
-    let mut op_counts: [OpCodeStats; 4] = Default::default();
+    let mut op_counts: [OpCodeStats; 5] = Default::default();
     let mut write_buckets = vec![
         WriteBucket::new("< 64 B", 0, 63),
         WriteBucket::new("64 B .. 511 B", 64, 511),
@@ -230,28 +230,36 @@ pub fn dump_log_reader_with_path(
             break;
         }
 
-        if checksum_payload(&raw_payload) != header.checksum {
-            records.push(DumpRecordEntry::TornRecord {
-                offset: record_offset,
-                reason: "Payload BLAKE3 checksum mismatch (corrupted / bitrot)".to_string(),
-                partial_bytes: raw_payload,
-            });
-            break;
-        }
-
-        // Without a key, or when decryption fails, the raw bytes are shown as-is: this is a
-        // diagnostic tool and seeing what is physically on disk is the point.
-        // Every record carries a compression envelope, whether or not the volume compresses
-        // anything - a compressed volume still stores incompressible records raw, so the tag
-        // has to be unconditional for readers to interpret bytes without consulting volume
-        // policy. Unwrap it here too, or a dump shows payloads shifted by the tag byte.
         let id = crate::log::codec::RecordId {
             generation: file_header.generation,
             tx_id: header.tx_id,
             op_code: header.op_code as u8,
             inode: header.inode,
         };
-        let unwrapped = crate::log::codec::decode(volume_key.unwrap_or(&plaintext_key), id, &raw_payload).ok();
+
+        if let Some(key) = volume_key {
+            match key.decrypt_record(
+                file_header.generation,
+                header.tx_id,
+                header.op_code as u8,
+                header.inode,
+                &raw_payload,
+                &header.auth_tag,
+            ) {
+                Ok(_) => {}
+                Err(e) => {
+                    records.push(DumpRecordEntry::TornRecord {
+                        offset: record_offset,
+                        reason: format!("Payload authentication failed (corrupted / bitrot): {}", e),
+                        partial_bytes: raw_payload,
+                    });
+                    break;
+                }
+            }
+        }
+
+        let unwrapped =
+            crate::log::codec::decode(volume_key.unwrap_or(&plaintext_key), id, &raw_payload, &header.auth_tag).ok();
 
         // Falling back to the raw bytes keeps a keyless or corrupt dump useful: seeing what
         // is physically on disk is the point of this tool.
@@ -274,7 +282,7 @@ pub fn dump_log_reader_with_path(
             op_counts[op_idx].payload_bytes += header.payload_len as u64;
         }
 
-        if header.op_code == OpCode::Data {
+        if header.op_code == OpCode::Data || header.op_code == OpCode::DataZstd {
             let data_len = payload.len() as u64;
             for b in &mut write_buckets {
                 if b.matches(data_len) {
@@ -371,7 +379,7 @@ pub fn dump_log_reader_with_path(
         .filter(|r| matches!(r, DumpRecordEntry::Valid { .. }))
         .count();
 
-    for code in 1..=3u8 {
+    for code in 1..=4u8 {
         if let Ok(opcode) = OpCode::try_from(code) {
             let stats = &op_counts[code as usize];
             let pct = if total_valid > 0 {
@@ -394,7 +402,7 @@ pub fn dump_log_reader_with_path(
     writeln!(out).unwrap();
 
     // Write size histogram
-    let total_writes = op_counts[OpCode::Data as usize].count;
+    let total_writes = op_counts[OpCode::Data as usize].count + op_counts[OpCode::DataZstd as usize].count;
     if total_writes > 0 {
         writeln!(out, "--- Write Payload Size Histogram ---").unwrap();
         writeln!(
@@ -442,7 +450,7 @@ pub fn dump_log_reader_with_path(
 
                     writeln!(
                         out,
-                        "#{:<5} [0x{:08x} / {:<8}] {:<14} inode {:<5} tx {:<5} len {:<8} checksum {:02x}{:02x}{:02x}{:02x} {}",
+                        "#{:<5} [0x{:08x} / {:<8}] {:<14} inode {:<5} tx {:<5} len {:<8} tag {:02x}{:02x}{:02x}{:02x} {}",
                         i + 1,
                         offset,
                         offset,
@@ -450,10 +458,10 @@ pub fn dump_log_reader_with_path(
                         header.inode,
                         header.tx_id,
                         format_bytes(header.payload_len as u64),
-                        header.checksum[0],
-                        header.checksum[1],
-                        header.checksum[2],
-                        header.checksum[3],
+                        header.auth_tag[0],
+                        header.auth_tag[1],
+                        header.auth_tag[2],
+                        header.auth_tag[3],
                         commit_tag,
                     )
                     .unwrap();
@@ -1065,7 +1073,7 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
         tx_id: 0,
         inode: 0,
         payload_len: payload.len() as u32,
-        checksum: [0; crate::log::record::RECORD_CHECKSUM_SIZE],
+        auth_tag: [0; crate::log::record::AUTH_TAG_SIZE],
     };
     let dummy_record = crate::log::reader::LogRecord {
         header: dummy_header,

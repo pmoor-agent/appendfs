@@ -1,7 +1,7 @@
 use crate::fs::InMemoryFS;
 use crate::log::LogFileCache;
 use crate::log::extent::ExtentState;
-use crate::log::record::{OpCode, RECORD_HEADER_SIZE, RecordHeader, checksum_payload};
+use crate::log::record::{OpCode, RECORD_HEADER_SIZE, RecordHeader};
 use crate::node::NodeKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -623,13 +623,13 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                                     let opcode = rec_header.op_code as u8;
                                                     let rec_ino = rec_header.inode;
                                                     let payload_len = rec_header.payload_len as usize;
-                                                    let stored_checksum = rec_header.checksum;
 
-                                                    if opcode != OpCode::Data as u8 {
+                                                    if opcode != OpCode::Data as u8 && opcode != OpCode::DataZstd as u8
+                                                    {
                                                         report.issues.push(IntegrityIssue::error(
                                                             "CORRUPT_LOG_RECORD",
                                                             Some(ino),
-                                                            format!("Record at offset 0x{:x} in {} has OpCode {} instead of OpCode::Data", record_log_offset, log_filename, opcode),
+                                                            format!("Record at offset 0x{:x} in {} has OpCode {} instead of OpCode::Data / OpCode::DataZstd", record_log_offset, log_filename, opcode),
                                                         ));
                                                     } else if rec_ino != ino {
                                                         report.issues.push(IntegrityIssue::error(
@@ -664,15 +664,19 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                                                     record_log_offset, log_filename, e
                                                                 ),
                                                             ));
-                                                        } else {
-                                                            let computed = checksum_payload(&payload);
-                                                            if computed[..] != stored_checksum {
-                                                                report.issues.push(IntegrityIssue::error(
-                                                                    "CORRUPT_LOG_RECORD",
-                                                                    Some(ino),
-                                                                    format!("BLAKE3 checksum mismatch for record at offset 0x{:x} in {}", record_log_offset, log_filename),
-                                                                ));
-                                                            }
+                                                        } else if let Err(e) = fs.volume_key.decrypt_record(
+                                                            generation,
+                                                            rec_header.tx_id,
+                                                            rec_header.op_code as u8,
+                                                            rec_ino,
+                                                            &payload,
+                                                            &rec_header.auth_tag,
+                                                        ) {
+                                                            report.issues.push(IntegrityIssue::error(
+                                                                "CORRUPT_LOG_RECORD",
+                                                                Some(ino),
+                                                                format!("Authentication tag mismatch for record at offset 0x{:x} in {}: {}", record_log_offset, log_filename, e),
+                                                            ));
                                                         }
                                                     }
                                                 }
