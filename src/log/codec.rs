@@ -9,6 +9,7 @@
 
 use crate::compress::Compression;
 use crate::crypto::VolumeKey;
+use crate::log::record::OpCode;
 use std::io;
 
 /// The fields that identify a record for authentication.
@@ -23,21 +24,39 @@ pub struct RecordId {
     pub inode: u64,
 }
 
-/// Turns a payload into the bytes written to the log.
-pub fn encode(key: &VolumeKey, compression: Compression, id: RecordId, payload: &[u8]) -> io::Result<Vec<u8>> {
-    // Compress first: ciphertext does not compress, and the resulting tag ends up inside the
-    // encrypted region where it is authenticated.
-    let packed = crate::compress::pack(payload, compression);
-    key.encrypt_record(id.generation, id.tx_id, id.op_code, id.inode, &packed)
-        .map_err(io::Error::from)
+/// Turns a payload into the bytes written to the log, returning `(actual_op, ciphertext, auth_tag)`.
+pub fn encode(
+    key: &VolumeKey,
+    compression: Compression,
+    id: RecordId,
+    payload: &[u8],
+) -> io::Result<(OpCode, Vec<u8>, [u8; 16])> {
+    let (actual_op, data_to_encrypt) = if id.op_code == OpCode::Data as u8 && compression == Compression::Zstd {
+        match crate::compress::compress_zstd(payload) {
+            Some(compressed) => (OpCode::DataZstd, compressed),
+            None => (OpCode::Data, payload.to_vec()),
+        }
+    } else {
+        let op = OpCode::try_from(id.op_code).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        (op, payload.to_vec())
+    };
+
+    let (ciphertext, auth_tag) = key
+        .encrypt_record(id.generation, id.tx_id, actual_op as u8, id.inode, &data_to_encrypt)
+        .map_err(io::Error::from)?;
+    Ok((actual_op, ciphertext, auth_tag))
 }
 
 /// Recovers the original payload from bytes read out of the log.
-pub fn decode(key: &VolumeKey, id: RecordId, stored: &[u8]) -> io::Result<Vec<u8>> {
+pub fn decode(key: &VolumeKey, id: RecordId, stored: &[u8], auth_tag: &[u8; 16]) -> io::Result<Vec<u8>> {
     let plain = key
-        .decrypt_record(id.generation, id.tx_id, id.op_code, id.inode, stored)
+        .decrypt_record(id.generation, id.tx_id, id.op_code, id.inode, stored, auth_tag)
         .map_err(io::Error::from)?;
-    crate::compress::unpack(&plain)
+    if id.op_code == OpCode::DataZstd as u8 {
+        crate::compress::decompress_zstd(&plain)
+    } else {
+        Ok(plain)
+    }
 }
 
 #[cfg(test)]
@@ -66,9 +85,13 @@ mod tests {
         for compression in [Compression::None, Compression::Zstd] {
             // Unencrypted volume.
             let plain_key = VolumeKey::plaintext();
-            let stored = encode(&plain_key, compression, ID, &data).unwrap();
+            let (op, stored, tag) = encode(&plain_key, compression, ID, &data).unwrap();
+            let rec_id = RecordId {
+                op_code: op as u8,
+                ..ID
+            };
             assert_eq!(
-                decode(&plain_key, ID, &stored).unwrap(),
+                decode(&plain_key, rec_id, &stored, &tag).unwrap(),
                 data,
                 "plaintext/{}",
                 compression
@@ -76,9 +99,18 @@ mod tests {
 
             // Encrypted volume.
             let (_h, key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile, compression).unwrap();
-            let stored = encode(&key, compression, ID, &data).unwrap();
+            let (op, stored, tag) = encode(&key, compression, ID, &data).unwrap();
             assert_ne!(stored, data, "encrypted/{} left the payload readable", compression);
-            assert_eq!(decode(&key, ID, &stored).unwrap(), data, "encrypted/{}", compression);
+            let rec_id = RecordId {
+                op_code: op as u8,
+                ..ID
+            };
+            assert_eq!(
+                decode(&key, rec_id, &stored, &tag).unwrap(),
+                data,
+                "encrypted/{}",
+                compression
+            );
         }
     }
 
@@ -86,8 +118,10 @@ mod tests {
     fn test_compression_shrinks_the_stored_bytes() {
         let key = VolumeKey::plaintext();
         let data = payload();
-        let plain = encode(&key, Compression::None, ID, &data).unwrap();
-        let squeezed = encode(&key, Compression::Zstd, ID, &data).unwrap();
+        let (op_plain, plain, _) = encode(&key, Compression::None, ID, &data).unwrap();
+        assert_eq!(op_plain, OpCode::Data);
+        let (op_squeezed, squeezed, _) = encode(&key, Compression::Zstd, ID, &data).unwrap();
+        assert_eq!(op_squeezed, OpCode::DataZstd);
         assert!(
             squeezed.len() * 4 < plain.len(),
             "expected a large saving on repetitive data: {} -> {}",
@@ -100,19 +134,27 @@ mod tests {
     fn test_decode_rejects_a_reattributed_record() {
         let master = MasterKey::new([0x21u8; 32]);
         let (_h, key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile, Compression::Zstd).unwrap();
-        let stored = encode(&key, Compression::Zstd, ID, &payload()).unwrap();
+        let (op, stored, tag) = encode(&key, Compression::Zstd, ID, &payload()).unwrap();
+        let actual_id = RecordId {
+            op_code: op as u8,
+            ..ID
+        };
 
         // The identity is bound into the AAD, so an intact record cannot be moved onto
         // another inode or relabelled as another record type.
         let other_inode = RecordId {
             inode: ID.inode + 1,
-            ..ID
+            ..actual_id
         };
-        assert!(decode(&key, other_inode, &stored).is_err());
+        assert!(decode(&key, other_inode, &stored, &tag).is_err());
         let other_op = RecordId {
-            op_code: ID.op_code + 1,
-            ..ID
+            op_code: if op == OpCode::DataZstd {
+                OpCode::Data as u8
+            } else {
+                OpCode::DataZstd as u8
+            },
+            ..actual_id
         };
-        assert!(decode(&key, other_op, &stored).is_err());
+        assert!(decode(&key, other_op, &stored, &tag).is_err());
     }
 }

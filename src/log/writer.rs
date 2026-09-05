@@ -273,7 +273,7 @@ impl LogWriter {
         };
 
         let generation = active.generation;
-        let cipher_payload = crate::log::codec::encode(
+        let (actual_op, cipher_payload, auth_tag) = crate::log::codec::encode(
             &self.volume_key,
             self.compression,
             crate::log::codec::RecordId {
@@ -286,11 +286,11 @@ impl LogWriter {
         )?;
 
         let header = RecordHeader {
-            op_code,
+            op_code: actual_op,
             tx_id: tx,
             inode,
             payload_len: cipher_payload.len() as u32,
-            checksum: crate::log::record::checksum_payload(&cipher_payload),
+            auth_tag,
         };
         let header_bytes = header.to_bytes();
         let total_bytes = header_bytes.len() + cipher_payload.len();

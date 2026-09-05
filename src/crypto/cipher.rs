@@ -115,6 +115,75 @@ pub fn decrypt_payload(
     }
 }
 
+/// Encrypts `plaintext` producing ciphertext and a detached 16-byte authentication tag.
+/// For plaintext volumes (`CipherSuite::None`), produces a 16-byte BLAKE3 tag over `(aad || plaintext)`.
+pub fn encrypt_payload_detached(
+    cipher: CipherSuite,
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, [u8; 16]), CryptoError> {
+    match cipher {
+        CipherSuite::None => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(aad);
+            hasher.update(plaintext);
+            let mut tag = [0u8; 16];
+            tag.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+            Ok((plaintext.to_vec(), tag))
+        }
+        CipherSuite::ChaCha20Poly1305 => {
+            use chacha20poly1305::aead::AeadInPlace;
+            let key = Key::from_slice(key);
+            let cipher = ChaCha20Poly1305::new(key);
+            let nonce = Nonce::from_slice(nonce);
+            let mut buffer = plaintext.to_vec();
+            let tag = cipher
+                .encrypt_in_place_detached(nonce, aad, &mut buffer)
+                .map_err(|_| CryptoError::AuthFailed)?;
+            let mut tag_bytes = [0u8; 16];
+            tag_bytes.copy_from_slice(&tag);
+            Ok((buffer, tag_bytes))
+        }
+    }
+}
+
+/// Decrypts and verifies `ciphertext` using a detached 16-byte authentication tag.
+/// For plaintext volumes (`CipherSuite::None`), verifies the 16-byte BLAKE3 tag over `(aad || ciphertext)`.
+pub fn decrypt_payload_detached(
+    cipher: CipherSuite,
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    expected_tag: &[u8; 16],
+) -> Result<Vec<u8>, CryptoError> {
+    match cipher {
+        CipherSuite::None => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(aad);
+            hasher.update(ciphertext);
+            if &hasher.finalize().as_bytes()[..16] != expected_tag {
+                return Err(CryptoError::AuthFailed);
+            }
+            Ok(ciphertext.to_vec())
+        }
+        CipherSuite::ChaCha20Poly1305 => {
+            use chacha20poly1305::aead::AeadInPlace;
+            let key = Key::from_slice(key);
+            let cipher = ChaCha20Poly1305::new(key);
+            let nonce = Nonce::from_slice(nonce);
+            let mut buffer = ciphertext.to_vec();
+            let tag = chacha20poly1305::Tag::from_slice(expected_tag);
+            cipher
+                .decrypt_in_place_detached(nonce, aad, &mut buffer, tag)
+                .map_err(|_| CryptoError::AuthFailed)?;
+            Ok(buffer)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

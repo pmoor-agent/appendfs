@@ -226,6 +226,7 @@ impl LogFileCache {
                         inode: header.inode,
                     },
                     &raw_payload,
+                    &header.auth_tag,
                 )?;
 
                 let arc_dec = Arc::new(dec);

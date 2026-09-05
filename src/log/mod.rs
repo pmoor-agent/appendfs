@@ -19,9 +19,9 @@ pub use manifest::{
 };
 pub use reader::{LogReader, LogRecord};
 pub use record::{
-    DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LogAttrDelta, LogDirectoryDelta, LogEntryDelta,
-    LogExtent, LogFileDelta, LogNodeDelta, LogSpecialDelta, LogSymlinkDelta, OpCode, RECORD_CHECKSUM_SIZE,
-    RECORD_HEADER_SIZE, RecordHeader, checksum_payload,
+    AUTH_TAG_SIZE, DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LogAttrDelta, LogDirectoryDelta,
+    LogEntryDelta, LogExtent, LogFileDelta, LogNodeDelta, LogSpecialDelta, LogSymlinkDelta, OpCode, RECORD_HEADER_SIZE,
+    RecordHeader,
 };
 pub use recovery::{RecoveryTarget, recover_fs};
 pub use summary::{

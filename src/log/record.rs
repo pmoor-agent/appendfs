@@ -1,4 +1,4 @@
-use crate::log::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION, zero_extent_fields, zero_extent_len};
+use crate::log::{ExtentState, SharedExtentState};
 use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, NodeDelta, SpecialDelta, SymlinkDelta};
 use crate::range_map::RangeMap;
 use serde::{Deserialize, Serialize};
@@ -8,21 +8,8 @@ pub const FILE_MAGIC: [u8; 4] = *b"APPF";
 pub const CURRENT_VERSION: u32 = 1;
 /// magic(4) + version(4) + generation(8) + revision(4) + created_at seconds(8) + nanoseconds(4).
 pub const FILE_HEADER_SIZE: usize = 32;
-pub const RECORD_HEADER_SIZE: usize = 25;
-pub const RECORD_CHECKSUM_SIZE: usize = 4;
-
-/// Computes the truncated-BLAKE3 checksum stored in a record's header, over that
-/// record's payload bytes. 4 bytes (1-in-4-billion false-negative rate) is far more
-/// than needed to detect accidental bitrot/corruption - this is not a security
-/// mechanism (an adversary who can modify the payload can trivially recompute a
-/// matching checksum, since it's unkeyed), just a way for recovery to notice when a
-/// record's content no longer matches what was actually written.
-pub fn checksum_payload(payload: &[u8]) -> [u8; RECORD_CHECKSUM_SIZE] {
-    let hash = blake3::hash(payload);
-    let mut out = [0u8; RECORD_CHECKSUM_SIZE];
-    out.copy_from_slice(&hash.as_bytes()[..RECORD_CHECKSUM_SIZE]);
-    out
-}
+pub const RECORD_HEADER_SIZE: usize = 37;
+pub const AUTH_TAG_SIZE: usize = 16;
 
 /// Fixed-size header written at offset 0 of every `.log` file.
 #[repr(C)]
@@ -91,12 +78,14 @@ impl FileHeader {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpCode {
-    /// File data content written directly to log. Inode number in RecordHeader.
+    /// Uncompressed file data content written directly to log. Inode number in RecordHeader.
     Data = 1,
+    /// Zstd-compressed file data content. Inode number in RecordHeader.
+    DataZstd = 2,
     /// Serialized LogEntryDelta (LogNodeDelta or Tombstone) for the inode in RecordHeader.
-    InodeDelta = 2,
+    InodeDelta = 3,
     /// Trailer written once per flush batch confirming completion and consistency.
-    FlushCommit = 3,
+    FlushCommit = 4,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -105,8 +94,9 @@ impl TryFrom<u8> for OpCode {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(OpCode::Data),
-            2 => Ok(OpCode::InodeDelta),
-            3 => Ok(OpCode::FlushCommit),
+            2 => Ok(OpCode::DataZstd),
+            3 => Ok(OpCode::InodeDelta),
+            4 => Ok(OpCode::FlushCommit),
             _ => Err("Unknown operation code"),
         }
     }
@@ -116,6 +106,7 @@ impl std::fmt::Display for OpCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
             OpCode::Data => "Data",
+            OpCode::DataZstd => "DataZstd",
             OpCode::InodeDelta => "InodeDelta",
             OpCode::FlushCommit => "FlushCommit",
         };
@@ -123,12 +114,15 @@ impl std::fmt::Display for OpCode {
     }
 }
 
-/// Compact per-record header (25 bytes).
+/// Compact per-record header (37 bytes).
 ///
 /// Deliberately carries no `key_id`: whether a payload is encrypted is a property of the
 /// volume, recorded once in the volume header where the key check value vouches for it.
-/// A per-record copy would be unauthenticated - this header is not covered by `checksum` -
+/// A per-record copy would be unauthenticated - this header is not covered by `auth_tag` -
 /// and clearing it used to downgrade an encrypted read into a raw one.
+///
+/// The 16-byte `auth_tag` protects both header metadata (via AEAD AAD: `[op_code, tx_id, inode]`)
+/// and payload bytes across both encrypted (Poly1305 detached tag) and unencrypted (BLAKE3 16-byte hash) volumes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordHeader {
@@ -136,8 +130,8 @@ pub struct RecordHeader {
     pub tx_id: u64,
     pub inode: u64,
     pub payload_len: u32,
-    /// Truncated BLAKE3 checksum of the payload - see `checksum_payload`.
-    pub checksum: [u8; RECORD_CHECKSUM_SIZE],
+    /// 16-byte authentication tag (Poly1305 or BLAKE3) covering `AAD || payload`.
+    pub auth_tag: [u8; AUTH_TAG_SIZE],
 }
 
 impl RecordHeader {
@@ -147,7 +141,7 @@ impl RecordHeader {
         buf[1..9].copy_from_slice(&self.tx_id.to_be_bytes());
         buf[9..17].copy_from_slice(&self.inode.to_be_bytes());
         buf[17..21].copy_from_slice(&self.payload_len.to_be_bytes());
-        buf[21..25].copy_from_slice(&self.checksum);
+        buf[21..37].copy_from_slice(&self.auth_tag);
         buf
     }
 
@@ -156,14 +150,14 @@ impl RecordHeader {
         let tx_id = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
         let inode = u64::from_be_bytes(bytes[9..17].try_into().unwrap());
         let payload_len = u32::from_be_bytes(bytes[17..21].try_into().unwrap());
-        let checksum = bytes[21..25].try_into().unwrap();
+        let auth_tag = bytes[21..37].try_into().unwrap();
 
         Ok(Self {
             op_code,
             tx_id,
             inode,
             payload_len,
-            checksum,
+            auth_tag,
         })
     }
 }
@@ -269,18 +263,16 @@ impl From<LogDirectoryDelta> for DirectoryDelta {
     }
 }
 
-/// Persisted on-disk descriptor for a single data extent.
+/// Persisted on-disk descriptor for a single data extent in a delta record (24 bytes).
 ///
-/// A `generation` of [`ZERO_EXTENT_GENERATION`] marks a hole rather than a reference into a
-/// `.log` file; `record_log_offset` and `payload_offset` are then meaningless and written
-/// as zero.
+/// A `record_log_offset` of 0 marks a hole rather than a reference into a `.log` file
+/// (since valid records start at offset >= 28 past FileHeader). `length` holds the extent
+/// or hole length in bytes (u64 allows holes > 32 bits).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogExtent {
     pub file_offset: u64,
-    pub generation: u64,
     pub record_log_offset: u64,
-    pub payload_offset: u32,
-    pub length: u32,
+    pub length: u64,
 }
 
 /// Persisted on-disk representation of a regular file delta.
@@ -300,27 +292,19 @@ impl From<&FileDelta> for LogFileDelta {
             // resurrecting the data it masked at the next recovery.
             let log_extent = match entry.value.read_state() {
                 ExtentState::Disk {
-                    generation,
                     record_log_offset,
-                    payload_offset,
                     length,
+                    ..
                 } => LogExtent {
                     file_offset: start,
-                    generation,
                     record_log_offset,
-                    payload_offset,
+                    length: length as u64,
+                },
+                ExtentState::Zero { length } => LogExtent {
+                    file_offset: start,
+                    record_log_offset: 0,
                     length,
                 },
-                ExtentState::Zero { length } => {
-                    let (generation, record_log_offset, payload_offset, length) = zero_extent_fields(length);
-                    LogExtent {
-                        file_offset: start,
-                        generation,
-                        record_log_offset,
-                        payload_offset,
-                        length,
-                    }
-                }
                 // The flush that emits this record converts staged extents to `Disk`
                 // first, so anything still staged is not durable yet and must not be
                 // referenced from the log.
@@ -336,28 +320,28 @@ impl From<&FileDelta> for LogFileDelta {
     }
 }
 
+impl LogFileDelta {
+    pub fn into_file_delta(self, generation: u64) -> FileDelta {
+        let mut extents = RangeMap::new();
+        for ext in self.extents {
+            let state = if ext.record_log_offset == 0 {
+                SharedExtentState::new_zero(ext.length)
+            } else {
+                SharedExtentState::new_disk(generation, ext.record_log_offset, 0, ext.length as u32)
+            };
+            extents.insert(ext.file_offset, ext.length, state);
+        }
+        FileDelta {
+            extents,
+            size: self.size,
+            attr_delta: AttrDelta::from(self.attr_delta),
+        }
+    }
+}
+
 impl From<LogFileDelta> for FileDelta {
     fn from(l: LogFileDelta) -> Self {
-        let mut extents = RangeMap::new();
-        for ext in l.extents {
-            // A hole carries its length in `record_log_offset`, so the range length has to
-            // come from there too - `ext.length` is meaningless for one.
-            let (range_len, state) = if ext.generation == ZERO_EXTENT_GENERATION {
-                let len = zero_extent_len(ext.record_log_offset);
-                (len, SharedExtentState::new_zero(len))
-            } else {
-                (
-                    ext.length as u64,
-                    SharedExtentState::new_disk(ext.generation, ext.record_log_offset, ext.payload_offset, ext.length),
-                )
-            };
-            extents.insert(ext.file_offset, range_len, state);
-        }
-        Self {
-            extents,
-            size: l.size,
-            attr_delta: AttrDelta::from(l.attr_delta),
-        }
+        l.into_file_delta(0)
     }
 }
 
@@ -437,11 +421,11 @@ impl From<&NodeDelta> for LogNodeDelta {
     }
 }
 
-impl From<LogNodeDelta> for NodeDelta {
-    fn from(l: LogNodeDelta) -> Self {
-        match l {
+impl LogNodeDelta {
+    pub fn into_node_delta(self, generation: u64) -> NodeDelta {
+        match self {
             LogNodeDelta::Directory(d) => NodeDelta::Directory(DirectoryDelta::from(d)),
-            LogNodeDelta::File(f) => NodeDelta::File(FileDelta::from(f)),
+            LogNodeDelta::File(f) => NodeDelta::File(f.into_file_delta(generation)),
             LogNodeDelta::Symlink(s) => NodeDelta::Symlink(SymlinkDelta::from(s)),
             LogNodeDelta::Fifo(s) => NodeDelta::Fifo(SpecialDelta::from(s)),
             LogNodeDelta::CharDevice(s) => NodeDelta::CharDevice(SpecialDelta::from(s)),
@@ -451,11 +435,121 @@ impl From<LogNodeDelta> for NodeDelta {
     }
 }
 
+impl From<LogNodeDelta> for NodeDelta {
+    fn from(l: LogNodeDelta) -> Self {
+        l.into_node_delta(0)
+    }
+}
+
 /// Persisted on-disk representation of an entry delta (Node delta or Tombstone).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// Serialized with a single 1-byte discriminant tag (0 = Tombstone, 1..=7 = Node variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogEntryDelta {
     Node(LogNodeDelta),
     Tombstone,
+}
+
+impl Serialize for LogEntryDelta {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            LogEntryDelta::Tombstone => (0u8,).serialize(serializer),
+            LogEntryDelta::Node(LogNodeDelta::Directory(d)) => (1u8, d).serialize(serializer),
+            LogEntryDelta::Node(LogNodeDelta::File(f)) => (2u8, f).serialize(serializer),
+            LogEntryDelta::Node(LogNodeDelta::Symlink(s)) => (3u8, s).serialize(serializer),
+            LogEntryDelta::Node(LogNodeDelta::Fifo(s)) => (4u8, s).serialize(serializer),
+            LogEntryDelta::Node(LogNodeDelta::CharDevice(s)) => (5u8, s).serialize(serializer),
+            LogEntryDelta::Node(LogNodeDelta::BlockDevice(s)) => (6u8, s).serialize(serializer),
+            LogEntryDelta::Node(LogNodeDelta::Socket(s)) => (7u8, s).serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LogEntryDelta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = LogEntryDelta;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a 1-byte tagged LogEntryDelta")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let tag: u8 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                match tag {
+                    0 => Ok(LogEntryDelta::Tombstone),
+                    1 => {
+                        let d = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        Ok(LogEntryDelta::Node(LogNodeDelta::Directory(d)))
+                    }
+                    2 => {
+                        let f = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        Ok(LogEntryDelta::Node(LogNodeDelta::File(f)))
+                    }
+                    3 => {
+                        let s = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        Ok(LogEntryDelta::Node(LogNodeDelta::Symlink(s)))
+                    }
+                    4 => {
+                        let s = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        Ok(LogEntryDelta::Node(LogNodeDelta::Fifo(s)))
+                    }
+                    5 => {
+                        let s = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        Ok(LogEntryDelta::Node(LogNodeDelta::CharDevice(s)))
+                    }
+                    6 => {
+                        let s = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        Ok(LogEntryDelta::Node(LogNodeDelta::BlockDevice(s)))
+                    }
+                    7 => {
+                        let s = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        Ok(LogEntryDelta::Node(LogNodeDelta::Socket(s)))
+                    }
+                    other => Err(serde::de::Error::custom(format!(
+                        "unknown LogEntryDelta tag: {}",
+                        other
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_tuple(2, Visitor)
+    }
+}
+
+impl LogEntryDelta {
+    pub fn into_entry_delta(self, generation: u64) -> EntryDelta {
+        match self {
+            LogEntryDelta::Node(n) => EntryDelta::Node(n.into_node_delta(generation)),
+            LogEntryDelta::Tombstone => EntryDelta::Tombstone,
+        }
+    }
 }
 
 impl From<&EntryDelta> for LogEntryDelta {
@@ -469,10 +563,7 @@ impl From<&EntryDelta> for LogEntryDelta {
 
 impl From<LogEntryDelta> for EntryDelta {
     fn from(l: LogEntryDelta) -> Self {
-        match l {
-            LogEntryDelta::Node(n) => EntryDelta::Node(NodeDelta::from(n)),
-            LogEntryDelta::Tombstone => EntryDelta::Tombstone,
-        }
+        l.into_entry_delta(0)
     }
 }
 
@@ -561,7 +652,7 @@ mod tests {
             tx_id: 1001,
             inode: 5,
             payload_len: 4096,
-            checksum: [0xAA, 0xBB, 0xCC, 0xDD],
+            auth_tag: [0xAA; AUTH_TAG_SIZE],
         };
         let bytes = header.to_bytes();
         assert_eq!(bytes.len(), RECORD_HEADER_SIZE);
@@ -571,15 +662,34 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_payload_detects_bitflip() {
-        let original = b"the quick brown fox".to_vec();
-        let checksum = checksum_payload(&original);
+    fn test_log_entry_delta_1_byte_tag_overhead() {
+        // Tombstone must serialize to exactly 1 byte (the 0u8 tag).
+        let tombstone = LogEntryDelta::Tombstone;
+        let tomb_bytes = crate::wire::serialize(&tombstone).unwrap();
+        assert_eq!(tomb_bytes.len(), 1);
+        assert_eq!(tomb_bytes[0], 0);
+        assert_eq!(
+            crate::wire::deserialize::<LogEntryDelta>(&tomb_bytes).unwrap(),
+            LogEntryDelta::Tombstone
+        );
 
-        let mut corrupted = original.clone();
-        corrupted[3] ^= 0x01; // flip one bit
-        assert_ne!(checksum_payload(&corrupted), checksum);
+        // Directory delta must start with tag 1u8.
+        let dir_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta::default()));
+        let dir_bytes = crate::wire::serialize(&dir_delta).unwrap();
+        assert_eq!(dir_bytes[0], 1);
+        assert_eq!(
+            crate::wire::deserialize::<LogEntryDelta>(&dir_bytes).unwrap(),
+            dir_delta
+        );
 
-        assert_eq!(checksum_payload(&original), checksum);
+        // File delta must start with tag 2u8.
+        let file_delta = LogEntryDelta::Node(LogNodeDelta::File(LogFileDelta::default()));
+        let file_bytes = crate::wire::serialize(&file_delta).unwrap();
+        assert_eq!(file_bytes[0], 2);
+        assert_eq!(
+            crate::wire::deserialize::<LogEntryDelta>(&file_bytes).unwrap(),
+            file_delta
+        );
     }
 
     #[test]

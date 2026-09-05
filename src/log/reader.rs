@@ -19,7 +19,7 @@ impl LogRecord {
     /// Decodes the raw binary payload into a strongly-typed `DecodedPayload`.
     pub fn decode(&self) -> Result<DecodedPayload<'_>, bincode::Error> {
         match self.header.op_code {
-            OpCode::Data => Ok(DecodedPayload::Data(&self.payload)),
+            OpCode::Data | OpCode::DataZstd => Ok(DecodedPayload::Data(&self.payload)),
             OpCode::InodeDelta => {
                 crate::wire::deserialize::<LogEntryDelta>(&self.payload).map(DecodedPayload::InodeDelta)
             }
@@ -109,17 +109,6 @@ impl Iterator for LogReader {
 
         self.current_offset += RECORD_HEADER_SIZE as u64 + header.payload_len as u64;
 
-        let actual_checksum = crate::log::record::checksum_payload(&raw_payload);
-        if actual_checksum != header.checksum {
-            return Some(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "checksum mismatch at offset {}: expected {:?}, computed {:?} (possible bitrot)",
-                    record_offset, header.checksum, actual_checksum
-                ),
-            )));
-        }
-
         let decrypted_payload = match crate::log::codec::decode(
             &self.volume_key,
             crate::log::codec::RecordId {
@@ -129,6 +118,7 @@ impl Iterator for LogReader {
                 inode: header.inode,
             },
             &raw_payload,
+            &header.auth_tag,
         ) {
             Ok(p) => p,
             Err(e) => return Some(Err(e)),

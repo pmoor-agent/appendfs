@@ -602,7 +602,7 @@ fn estimate_batch_bytes(frozen: &HashMap<u64, EntryDelta>, max_extent_size: usiz
                         estimated_bytes += chunks * RECORD_HEADER_SIZE as u64 + length as u64;
                     }
                 }
-                estimated_bytes += RECORD_HEADER_SIZE as u64 + 256 + f.extents.len() as u64 * 32;
+                estimated_bytes += RECORD_HEADER_SIZE as u64 + 256 + f.extents.len() as u64 * 24;
             }
             EntryDelta::Node(NodeDelta::Directory(d)) => {
                 estimated_bytes += RECORD_HEADER_SIZE as u64 + 256 + (d.added.len() + d.removed.len()) as u64 * 64;
@@ -1752,5 +1752,143 @@ mod tests {
         assert_eq!(fs.flush_queue_depth(), 0);
         crate::operations::read_write::create_core(&fs, 1, "after.txt", 0o644, 0, 1000, 1000)
             .expect("mutations must be accepted again once the log drains");
+    }
+
+    #[test]
+    fn test_extent_map_hole_larger_than_32_bits() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::log::init_volume(
+            storage.clone(),
+            &crate::crypto::VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+        let ino = crate::operations::read_write::create_core(&fs, 1, "sparse_5g.bin", 0o644, 0, 1000, 1000)
+            .unwrap()
+            .ino;
+
+        let start_data = vec![0xABu8; 100];
+        crate::operations::read_write::write_core(&fs, ino, &start_data, 0).unwrap();
+
+        // 5 GiB hole length (> 32-bit: 5 * 1024 * 1024 * 1024 = 5,368,709,120 > 4,294,967,295)
+        let hole_len: u64 = 5 * 1024 * 1024 * 1024;
+        let end_offset: u64 = 100 + hole_len;
+
+        let end_data = vec![0xCDu8; 100];
+        crate::operations::read_write::write_core(&fs, ino, &end_data, end_offset as i64).unwrap();
+
+        crate::operations::read_write::punch_hole_core(&fs, ino, 100, hole_len).unwrap();
+
+        let total_size = (end_offset + 100) as i64;
+        assert_eq!(fs.get_attr(ino).unwrap().size, total_size);
+
+        assert_eq!(fs.read_file_data(ino, 0, 100).unwrap(), start_data);
+        assert_eq!(fs.read_file_data(ino, end_offset, 100).unwrap(), end_data);
+        assert!(fs.read_file_data(ino, 100, 50).unwrap().iter().all(|&b| b == 0));
+        assert!(
+            fs.read_file_data(ino, end_offset - 50, 50)
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0)
+        );
+
+        // Flush delta to log
+        fs.sync_log().unwrap();
+
+        // Verify recovery from .log replay
+        let from_log = crate::log::recover_fs(
+            Arc::clone(&storage),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        assert_eq!(from_log.get_attr(ino).unwrap().size, total_size);
+        assert_eq!(from_log.read_file_data(ino, 0, 100).unwrap(), start_data);
+        assert_eq!(from_log.read_file_data(ino, end_offset, 100).unwrap(), end_data);
+        assert!(from_log.read_file_data(ino, 100, 50).unwrap().iter().all(|&b| b == 0));
+        assert!(
+            from_log
+                .read_file_data(ino, end_offset - 50, 50)
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0)
+        );
+
+        {
+            let base = from_log.base.read().unwrap();
+            let node = base.get(&ino).unwrap();
+            if let crate::node::NodeKind::File { ref range_map, .. } = node.kind {
+                let hole_entry = range_map
+                    .iter()
+                    .find(|(start, _)| **start == 100)
+                    .expect("hole entry at offset 100")
+                    .1;
+                assert_eq!(hole_entry.length, hole_len);
+                assert!(matches!(hole_entry.value.read_state(), ExtentState::Zero { length } if length == hole_len));
+            } else {
+                panic!("Expected file node");
+            }
+        }
+
+        // Export summary snapshot and verify recovery from summary snapshot
+        fs.sync_and_export_summary().unwrap();
+        let from_summary = crate::log::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        assert_eq!(from_summary.get_attr(ino).unwrap().size, total_size);
+        assert_eq!(from_summary.read_file_data(ino, 0, 100).unwrap(), start_data);
+        assert_eq!(from_summary.read_file_data(ino, end_offset, 100).unwrap(), end_data);
+        assert!(
+            from_summary
+                .read_file_data(ino, 100, 50)
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0)
+        );
+        assert!(
+            from_summary
+                .read_file_data(ino, end_offset - 50, 50)
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0)
+        );
+
+        {
+            let base = from_summary.base.read().unwrap();
+            let node = base.get(&ino).unwrap();
+            if let crate::node::NodeKind::File { ref range_map, .. } = node.kind {
+                let hole_entry = range_map
+                    .iter()
+                    .find(|(start, _)| **start == 100)
+                    .expect("hole entry at offset 100 in summary")
+                    .1;
+                assert_eq!(hole_entry.length, hole_len);
+                assert!(matches!(hole_entry.value.read_state(), ExtentState::Zero { length } if length == hole_len));
+            } else {
+                panic!("Expected file node");
+            }
+        }
     }
 }

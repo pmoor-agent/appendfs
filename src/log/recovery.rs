@@ -250,7 +250,7 @@ pub fn recover_fs(
                             if let Some(op_time) = log_delta.op_time() {
                                 last_op_time = Some(op_time);
                             }
-                            let entry_delta = EntryDelta::from(log_delta);
+                            let entry_delta = log_delta.into_entry_delta(gen_num);
                             current_batch.insert(target_ino, entry_delta);
                         }
                         DecodedPayload::FlushCommit(_) => {}

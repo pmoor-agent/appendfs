@@ -1336,11 +1336,10 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     assert!(recovered.get_attr(2).is_some());
     drop(recovered);
 
-    // Flip one bit inside the record's payload region, well past the file
-    // header (FILE_HEADER_SIZE) and this record's header (RECORD_HEADER_SIZE) - simulating a bitrotted byte in
+    // header and this record's header - simulating a bitrotted byte in
     // otherwise-intact, previously-committed data.
     let mut file_bytes = mem_storage.get_file_bytes(&filename).unwrap();
-    let corrupt_offset = appendfs::log::record::FILE_HEADER_SIZE + appendfs::log::record::RECORD_HEADER_SIZE + 2; // a few bytes into the payload
+    let corrupt_offset = appendfs::log::FILE_HEADER_SIZE + appendfs::log::RECORD_HEADER_SIZE + 2;
     file_bytes[corrupt_offset] ^= 0xFF;
     mem_storage.insert_file(&filename, file_bytes);
 
