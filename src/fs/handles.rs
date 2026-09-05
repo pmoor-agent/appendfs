@@ -6,6 +6,7 @@
 //! paginated `readdir` is isolated from concurrent mutations.
 
 use super::{FileHandle, FlockState, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -91,8 +92,9 @@ impl InMemoryFS {
         if counts.get(&ino) == Some(&0) {
             counts.remove(&ino);
             // Clean up POSIX range locks if all handles on inode are closed
-            self.range_lock_table.lock().unwrap().remove(&ino);
-            self.range_lock_cond.notify_all();
+            self.release_range_locks(ino, fh);
+        } else {
+            self.cancel_range_lock_waiters(ino, fh);
         }
         let remaining = counts.get(&ino).copied().unwrap_or(0);
         if remaining == 0
@@ -105,23 +107,78 @@ impl InMemoryFS {
     }
 
     pub fn release_flock(&self, ino: u64, fh: u64) {
-        let mut table = self.flock_table.lock().unwrap();
-        if let Some(state) = table.get_mut(&ino) {
-            match state {
-                FlockState::Shared(set) => {
-                    set.remove(&fh);
-                    if set.is_empty() {
-                        table.remove(&ino);
+        let mut canceled_replies = Vec::new();
+        {
+            let mut table = self.flock_table.lock().unwrap();
+            let mut waiters = self.flock_waiters.lock().unwrap();
+            if let Some(state) = table.get_mut(&ino) {
+                match state {
+                    FlockState::Shared(set) => {
+                        set.remove(&fh);
+                        if set.is_empty() {
+                            table.remove(&ino);
+                        }
+                    }
+                    FlockState::Exclusive(holder) => {
+                        if *holder == fh {
+                            table.remove(&ino);
+                        }
                     }
                 }
-                FlockState::Exclusive(holder) => {
-                    if *holder == fh {
-                        table.remove(&ino);
+                self.flock_cond.notify_all();
+            }
+            if let Some(queue) = waiters.get_mut(&ino) {
+                let mut kept = VecDeque::with_capacity(queue.len());
+                for w in queue.drain(..) {
+                    if w.fh == fh {
+                        canceled_replies.push(w.req);
+                    } else {
+                        kept.push_back(w);
                     }
+                }
+                if kept.is_empty() {
+                    waiters.remove(&ino);
+                } else {
+                    *queue = kept;
                 }
             }
-            self.flock_cond.notify_all();
         }
+        for req in canceled_replies {
+            req.reply_err(libc::EBADF);
+        }
+        crate::operations::locks::wake_flock_waiters(self, ino);
+    }
+
+    pub fn cancel_range_lock_waiters(&self, ino: u64, fh: u64) {
+        let mut canceled_replies = Vec::new();
+        {
+            let mut waiters = self.range_lock_waiters.lock().unwrap();
+            if let Some(queue) = waiters.get_mut(&ino) {
+                let mut kept = VecDeque::with_capacity(queue.len());
+                for w in queue.drain(..) {
+                    if w.fh == fh {
+                        canceled_replies.push(w.req);
+                    } else {
+                        kept.push_back(w);
+                    }
+                }
+                if kept.is_empty() {
+                    waiters.remove(&ino);
+                } else {
+                    *queue = kept;
+                }
+            }
+        }
+        for req in canceled_replies {
+            req.reply_err(libc::EBADF);
+        }
+    }
+
+    pub fn release_range_locks(&self, ino: u64, fh: u64) {
+        self.cancel_range_lock_waiters(ino, fh);
+        self.range_lock_table.lock().unwrap().remove(&ino);
+        self.range_lock_cond.notify_all();
+        crate::operations::locks::wake_range_lock_waiters(self, ino);
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {

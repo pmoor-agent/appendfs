@@ -1,42 +1,133 @@
-use crate::fs::{FlockState, InMemoryFS, RangeLock};
+use crate::fs::{FlockState, FlockWaiter, InMemoryFS, RangeLock, RangeLockWaiter};
 use crate::shim::{Request, ShimFlock};
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 
-pub fn flock(fs: &Arc<InMemoryFS>, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
-    log::trace!("flock(ino={}, fh={}, lock_owner={}, op={})", ino, fh, lock_owner, op);
-    let non_blocking = (op & libc::LOCK_NB) != 0;
-    if non_blocking {
-        match flock_core(fs, ino, fh, lock_owner, op) {
-            Ok(()) => req.reply_err(0),
-            Err(err) => req.reply_err(err),
+pub(crate) fn can_grant_flock(table: &HashMap<u64, FlockState>, ino: u64, fh: u64, base_op: i32) -> bool {
+    match base_op {
+        libc::LOCK_SH => match table.get(&ino) {
+            None => true,
+            Some(FlockState::Shared(_)) => true,
+            Some(FlockState::Exclusive(holder)) => *holder == fh,
+        },
+        libc::LOCK_EX => match table.get(&ino) {
+            None => true,
+            Some(FlockState::Shared(set)) => set.len() == 1 && set.contains(&fh),
+            Some(FlockState::Exclusive(holder)) => *holder == fh,
+        },
+        _ => false,
+    }
+}
+
+pub(crate) fn grant_flock(table: &mut HashMap<u64, FlockState>, ino: u64, fh: u64, base_op: i32) {
+    match base_op {
+        libc::LOCK_SH => match table.get_mut(&ino) {
+            None => {
+                let mut set = HashSet::new();
+                set.insert(fh);
+                table.insert(ino, FlockState::Shared(set));
+            }
+            Some(FlockState::Shared(set)) => {
+                set.insert(fh);
+            }
+            Some(FlockState::Exclusive(holder)) => {
+                if *holder == fh {
+                    let mut set = HashSet::new();
+                    set.insert(fh);
+                    table.insert(ino, FlockState::Shared(set));
+                }
+            }
+        },
+        libc::LOCK_EX => {
+            table.insert(ino, FlockState::Exclusive(fh));
         }
+        _ => {}
+    }
+}
+
+pub fn wake_flock_waiters(fs: &InMemoryFS, ino: u64) {
+    let mut ready_replies = Vec::new();
+    {
+        let mut table = fs.flock_table.lock().unwrap();
+        let mut waiters = fs.flock_waiters.lock().unwrap();
+        if let Some(queue) = waiters.get_mut(&ino) {
+            while let Some(front) = queue.front() {
+                let base_op = front.op & !libc::LOCK_NB;
+                if can_grant_flock(&table, ino, front.fh, base_op) {
+                    let waiter = queue.pop_front().unwrap();
+                    grant_flock(&mut table, ino, waiter.fh, base_op);
+                    ready_replies.push(waiter.req);
+                    if base_op == libc::LOCK_EX {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if queue.is_empty() {
+                waiters.remove(&ino);
+            }
+        }
+        fs.flock_cond.notify_all();
+    }
+    for req in ready_replies {
+        req.reply_err(0);
+    }
+}
+
+pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
+    log::trace!("flock(ino={}, fh={}, lock_owner={}, op={})", ino, fh, lock_owner, op);
+
+    // 1. Verify file handle
+    match fs.get_file_handle(fh) {
+        Some(h) if h.ino == ino => {}
+        _ => {
+            req.reply_err(libc::EBADF);
+            return;
+        }
+    }
+
+    let non_blocking = (op & libc::LOCK_NB) != 0;
+    let base_op = op & !libc::LOCK_NB;
+
+    if base_op == libc::LOCK_UN {
+        let res = flock_core(fs, ino, fh, lock_owner, op);
+        req.reply_err(res.err().unwrap_or(0));
         return;
     }
 
-    // Try acquiring non-blocking first (zero context switch or suspension if uncontented)
-    let try_op = op | libc::LOCK_NB;
-    match flock_core(fs, ino, fh, lock_owner, try_op) {
-        Ok(()) => {
-            req.reply_err(0);
-        }
-        Err(libc::EWOULDBLOCK) => {
-            let fs_clone = Arc::clone(fs);
-            crate::async_runtime::spawn(async move {
-                let res = tokio::task::spawn_blocking(move || flock_core(&fs_clone, ino, fh, lock_owner, op))
-                    .await
-                    .unwrap_or(Err(libc::EIO));
-
-                match res {
-                    Ok(()) => req.reply_err(0),
-                    Err(err) => req.reply_err(err),
-                }
-            });
-        }
-        Err(err) => {
-            req.reply_err(err);
-        }
+    if base_op != libc::LOCK_SH && base_op != libc::LOCK_EX {
+        req.reply_err(libc::EINVAL);
+        return;
     }
+
+    let mut table = fs.flock_table.lock().unwrap();
+    let mut waiters = fs.flock_waiters.lock().unwrap();
+
+    let has_waiters = waiters.get(&ino).is_some_and(|q| !q.is_empty());
+
+    if !has_waiters && can_grant_flock(&table, ino, fh, base_op) {
+        grant_flock(&mut table, ino, fh, base_op);
+        fs.flock_cond.notify_all();
+        drop(waiters);
+        drop(table);
+        req.reply_err(0);
+        return;
+    }
+
+    if non_blocking {
+        drop(waiters);
+        drop(table);
+        req.reply_err(libc::EWOULDBLOCK);
+        return;
+    }
+
+    // Blocking request with contention: park request in the waiter queue (0 threads used)
+    waiters.entry(ino).or_default().push_back(FlockWaiter {
+        req,
+        fh,
+        lock_owner,
+        op,
+    });
 }
 
 pub fn getlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) {
@@ -53,7 +144,115 @@ pub fn getlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     }
 }
 
-pub fn setlk(fs: &Arc<InMemoryFS>, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
+pub(crate) fn check_range_conflict(ranges: &[RangeLock], lock_owner: u64, start: u64, end: u64, req_type: i16) -> bool {
+    for r in ranges {
+        if r.owner != lock_owner
+            && ranges_overlap(start, end, r.start, r.end)
+            && (req_type == libc::F_WRLCK as i16 || r.lock_type == libc::F_WRLCK as i16)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn grant_range_lock(
+    ranges: &mut Vec<RangeLock>,
+    lock_owner: u64,
+    start: u64,
+    end: u64,
+    req_type: i16,
+    pid: i32,
+) {
+    let mut new_ranges = Vec::new();
+    for r in ranges.drain(..) {
+        if r.owner == lock_owner && ranges_overlap(start, end, r.start, r.end) {
+            if r.start < start {
+                new_ranges.push(RangeLock {
+                    lock_type: r.lock_type,
+                    start: r.start,
+                    end: start,
+                    owner: r.owner,
+                    pid: r.pid,
+                });
+            }
+            if r.end > end {
+                new_ranges.push(RangeLock {
+                    lock_type: r.lock_type,
+                    start: end,
+                    end: r.end,
+                    owner: r.owner,
+                    pid: r.pid,
+                });
+            }
+        } else {
+            new_ranges.push(r);
+        }
+    }
+    new_ranges.push(RangeLock {
+        lock_type: req_type,
+        start,
+        end,
+        owner: lock_owner,
+        pid,
+    });
+    coalesce_ranges(&mut new_ranges);
+    *ranges = new_ranges;
+}
+
+pub fn wake_range_lock_waiters(fs: &InMemoryFS, ino: u64) {
+    let mut ready_replies = Vec::new();
+    {
+        let mut table = fs.range_lock_table.lock().unwrap();
+        let mut waiters = fs.range_lock_waiters.lock().unwrap();
+        if let Some(queue) = waiters.get_mut(&ino) {
+            let mut i = 0;
+            while i < queue.len() {
+                let waiter = &queue[i];
+                let req_type = waiter.lock.lock_type;
+                let ranges = table.entry(ino).or_default();
+
+                let conflict = check_range_conflict(ranges, waiter.lock_owner, waiter.start, waiter.end, req_type);
+
+                let mut prior_waiter_conflict = false;
+                for prior in queue.iter().take(i) {
+                    if prior.lock_owner != waiter.lock_owner
+                        && ranges_overlap(waiter.start, waiter.end, prior.start, prior.end)
+                        && (req_type == libc::F_WRLCK as i16 || prior.lock.lock_type == libc::F_WRLCK as i16)
+                    {
+                        prior_waiter_conflict = true;
+                        break;
+                    }
+                }
+
+                if !conflict && !prior_waiter_conflict {
+                    let waiter = queue.remove(i).unwrap();
+                    let ranges = table.entry(ino).or_default();
+                    grant_range_lock(
+                        ranges,
+                        waiter.lock_owner,
+                        waiter.start,
+                        waiter.end,
+                        req_type,
+                        waiter.lock.pid,
+                    );
+                    ready_replies.push(waiter.req);
+                } else {
+                    i += 1;
+                }
+            }
+            if queue.is_empty() {
+                waiters.remove(&ino);
+            }
+        }
+        fs.range_lock_cond.notify_all();
+    }
+    for req in ready_replies {
+        req.reply_err(0);
+    }
+}
+
+pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
     log::trace!(
         "setlk(ino={}, fh={}, lock_owner={}, lock={:?}, sleep={})",
         ino,
@@ -62,36 +261,80 @@ pub fn setlk(fs: &Arc<InMemoryFS>, req: Request, ino: u64, fh: u64, lock_owner: 
         lock,
         sleep
     );
-    if !sleep {
-        match setlk_core(fs, ino, fh, lock_owner, lock, false) {
-            Ok(()) => req.reply_err(0),
-            Err(err) => req.reply_err(err),
+
+    match fs.get_file_handle(fh) {
+        Some(h) if h.ino == ino => {}
+        _ => {
+            req.reply_err(libc::EBADF);
+            return;
         }
+    }
+
+    let (start, end) = match normalize_range(fs, ino, &lock) {
+        Ok(range) => range,
+        Err(err) => {
+            req.reply_err(err);
+            return;
+        }
+    };
+
+    let req_type = lock.lock_type;
+
+    if req_type == libc::F_UNLCK as i16 {
+        let res = setlk_core(fs, ino, fh, lock_owner, lock, false);
+        req.reply_err(res.err().unwrap_or(0));
         return;
     }
 
-    // Blocking POSIX lock (F_SETLKW): try non-blocking inline first (zero context switch if uncontented)
-    match setlk_core(fs, ino, fh, lock_owner, lock, false) {
-        Ok(()) => {
-            req.reply_err(0);
-        }
-        Err(libc::EWOULDBLOCK) => {
-            let fs_clone = Arc::clone(fs);
-            crate::async_runtime::spawn(async move {
-                let res = tokio::task::spawn_blocking(move || setlk_core(&fs_clone, ino, fh, lock_owner, lock, true))
-                    .await
-                    .unwrap_or(Err(libc::EIO));
+    if req_type != libc::F_RDLCK as i16 && req_type != libc::F_WRLCK as i16 {
+        req.reply_err(libc::EINVAL);
+        return;
+    }
 
-                match res {
-                    Ok(()) => req.reply_err(0),
-                    Err(err) => req.reply_err(err),
-                }
-            });
-        }
-        Err(err) => {
-            req.reply_err(err);
+    let mut table = fs.range_lock_table.lock().unwrap();
+    let mut waiters = fs.range_lock_waiters.lock().unwrap();
+
+    let ranges = table.entry(ino).or_default();
+    let conflict = check_range_conflict(ranges, lock_owner, start, end, req_type);
+
+    let mut waiter_conflict = false;
+    if let Some(queue) = waiters.get(&ino) {
+        for prior in queue {
+            if prior.lock_owner != lock_owner
+                && ranges_overlap(start, end, prior.start, prior.end)
+                && (req_type == libc::F_WRLCK as i16 || prior.lock.lock_type == libc::F_WRLCK as i16)
+            {
+                waiter_conflict = true;
+                break;
+            }
         }
     }
+
+    if !conflict && !waiter_conflict {
+        grant_range_lock(ranges, lock_owner, start, end, req_type, lock.pid);
+        fs.range_lock_cond.notify_all();
+        drop(waiters);
+        drop(table);
+        req.reply_err(0);
+        return;
+    }
+
+    if !sleep {
+        drop(waiters);
+        drop(table);
+        req.reply_err(libc::EWOULDBLOCK);
+        return;
+    }
+
+    // Park request in the waiter queue (0 threads used)
+    waiters.entry(ino).or_default().push_back(RangeLockWaiter {
+        req,
+        fh,
+        lock_owner,
+        lock,
+        start,
+        end,
+    });
 }
 
 pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32) -> Result<(), i32> {
@@ -182,6 +425,8 @@ pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32)
                 }
                 fs.flock_cond.notify_all();
             }
+            drop(table);
+            wake_flock_waiters(fs, ino);
             Ok(())
         }
         _ => Err(libc::EINVAL),
@@ -400,6 +645,8 @@ pub fn setlk_core(
 
         // Notify waiting lock requests that ranges have been unlocked
         fs.range_lock_cond.notify_all();
+        drop(table);
+        wake_range_lock_waiters(fs, ino);
         Ok(())
     } else {
         Err(libc::EINVAL)

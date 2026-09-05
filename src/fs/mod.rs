@@ -22,6 +22,7 @@ pub use virtual_files::{VIRTUAL_FH_FLAG, VIRTUAL_INO_BASE, VirtualFileRegistry};
 use crate::clock::{Clock, SystemClock};
 use crate::log::{BackgroundFlusher, LogFileCache, LogManifest, LogWriter};
 use crate::node::{EntryDelta, Node};
+use crate::shim::{Request, ShimFlock};
 use crate::storage::Storage;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -54,6 +55,22 @@ pub struct RangeLock {
     pub pid: i32,
 }
 
+pub struct FlockWaiter {
+    pub req: Request,
+    pub fh: u64,
+    pub lock_owner: u64,
+    pub op: i32,
+}
+
+pub struct RangeLockWaiter {
+    pub req: Request,
+    pub fh: u64,
+    pub lock_owner: u64,
+    pub lock: ShimFlock,
+    pub start: u64,
+    pub end: u64,
+}
+
 pub struct InMemoryFS {
     /// Resting consolidated state loaded from `.summary` at mount, folded forward over
     /// generations.
@@ -70,9 +87,13 @@ pub struct InMemoryFS {
     /// Active whole-file BSD flock locks keyed by inode number.
     pub flock_table: Mutex<HashMap<u64, FlockState>>,
     pub flock_cond: Condvar,
+    /// Pending parked FUSE BSD flock requests waiting on lock acquisition.
+    pub flock_waiters: Mutex<HashMap<u64, VecDeque<FlockWaiter>>>,
     /// Active POSIX byte-range record locks keyed by inode number.
     pub range_lock_table: Mutex<HashMap<u64, Vec<RangeLock>>>,
     pub range_lock_cond: Condvar,
+    /// Pending parked FUSE POSIX byte-range record lock requests waiting on lock acquisition.
+    pub range_lock_waiters: Mutex<HashMap<u64, VecDeque<RangeLockWaiter>>>,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
     pub open_counts: RwLock<HashMap<u64, u32>>,
     /// Atomic counter for allocating unique file and directory handle IDs (`fh`).
@@ -192,8 +213,10 @@ impl InMemoryFS {
             dir_handles: RwLock::new(HashMap::new()),
             flock_table: Mutex::new(HashMap::new()),
             flock_cond: Condvar::new(),
+            flock_waiters: Mutex::new(HashMap::new()),
             range_lock_table: Mutex::new(HashMap::new()),
             range_lock_cond: Condvar::new(),
+            range_lock_waiters: Mutex::new(HashMap::new()),
             open_counts: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             manifest,

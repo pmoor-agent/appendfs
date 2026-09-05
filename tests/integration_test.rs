@@ -1476,6 +1476,169 @@ with open("{}", "r+") as f:
 }
 
 #[test]
+fn test_fuse_flock_and_posix_waiter_queue_parking() {
+    use std::os::unix::io::AsRawFd;
+
+    let mut mount = common::TestMount::new_rw();
+    let file_path = mount.path().join("park_queue_test.txt");
+    std::fs::write(&file_path, b"initial content").unwrap();
+
+    let f1 = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .unwrap();
+
+    // 1. Parent process acquires exclusive lock on f1
+    let ret_ex = unsafe { libc::flock(f1.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(ret_ex, 0, "flock(f1, LOCK_EX) should succeed");
+
+    // 2. Child 1: Attempts blocking exclusive lock, will be parked in flock_waiters queue
+    let py_child1 = format!(
+        r#"
+import fcntl, time
+with open("{}", "r+") as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    f.write("child1_acquired\n")
+    f.flush()
+    time.sleep(0.1)
+    fcntl.flock(f, fcntl.LOCK_UN)
+"#,
+        file_path.display()
+    );
+
+    let mut child1 = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&py_child1)
+        .spawn()
+        .unwrap();
+
+    // Ensure child 1 has reached FUSE and is parked in the waiter queue
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        child1.try_wait().unwrap(),
+        None,
+        "Child 1 should be parked waiting for exclusive lock"
+    );
+
+    // 3. Child 2: Attempts blocking shared lock, will be parked behind child1 in the waiter queue
+    let py_child2 = format!(
+        r#"
+import fcntl
+with open("{}", "r") as f:
+    fcntl.flock(f, fcntl.LOCK_SH)
+    content = f.read()
+    assert "child1_acquired" in content
+    fcntl.flock(f, fcntl.LOCK_UN)
+"#,
+        file_path.display()
+    );
+
+    let mut child2 = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&py_child2)
+        .spawn()
+        .unwrap();
+
+    // Verify both child1 and child2 are blocked and parked in the in-memory queue
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        child1.try_wait().unwrap(),
+        None,
+        "Child 1 should be parked waiting for exclusive lock"
+    );
+    assert_eq!(
+        child2.try_wait().unwrap(),
+        None,
+        "Child 2 should be parked waiting behind Child 1"
+    );
+
+    // 4. Unlock f1 -> wakes child1 from queue -> child1 writes and unlocks -> wakes child2
+    let ret_un = unsafe { libc::flock(f1.as_raw_fd(), libc::LOCK_UN) };
+    assert_eq!(ret_un, 0, "flock(f1, LOCK_UN) should succeed");
+
+    let status1 = child1.wait().unwrap();
+    assert!(
+        status1.success(),
+        "Child 1 should acquire exclusive lock, write, and exit successfully"
+    );
+
+    let status2 = child2.wait().unwrap();
+    assert!(
+        status2.success(),
+        "Child 2 should acquire shared lock and verify content written by Child 1"
+    );
+
+    // 5. Test POSIX byte range parking across non-overlapping and overlapping ranges
+    let mut fl1: libc::flock = unsafe { std::mem::zeroed() };
+    fl1.l_type = libc::F_WRLCK as i16;
+    fl1.l_whence = libc::SEEK_SET as i16;
+    fl1.l_start = 0;
+    fl1.l_len = 100;
+
+    let ret_p1 = unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_SETLK, &fl1) };
+    assert_eq!(ret_p1, 0, "Parent acquires write lock on [0..100)");
+
+    // Child 3 locks non-overlapping range [200..300) -> should acquire immediately despite parent's lock
+    let py_child3 = format!(
+        r#"
+import fcntl
+with open("{}", "r+") as f:
+    fcntl.lockf(f, fcntl.LOCK_EX, 100, 200, 0)
+    fcntl.lockf(f, fcntl.LOCK_UN, 100, 200, 0)
+"#,
+        file_path.display()
+    );
+    let mut child3 = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&py_child3)
+        .spawn()
+        .unwrap();
+    let status3 = child3.wait().unwrap();
+    assert!(
+        status3.success(),
+        "Non-overlapping range lock should succeed immediately without waiting"
+    );
+
+    // Child 4 locks overlapping range [50..150) -> should be parked in range_lock_waiters
+    let py_child4 = format!(
+        r#"
+import fcntl
+with open("{}", "r+") as f:
+    fcntl.lockf(f, fcntl.LOCK_EX, 100, 50, 0)
+    fcntl.lockf(f, fcntl.LOCK_UN, 100, 50, 0)
+"#,
+        file_path.display()
+    );
+    let mut child4 = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&py_child4)
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        child4.try_wait().unwrap(),
+        None,
+        "Child 4 should be parked on overlapping range [50..150)"
+    );
+
+    // Parent unlocks [0..100) -> wakes Child 4
+    fl1.l_type = libc::F_UNLCK as i16;
+    let ret_un_p = unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_SETLK, &fl1) };
+    assert_eq!(ret_un_p, 0);
+
+    let status4 = child4.wait().unwrap();
+    assert!(
+        status4.success(),
+        "Child 4 should unblock and succeed after parent unlocks overlapping range"
+    );
+
+    drop(f1);
+    mount.unmount();
+}
+
+#[test]
 fn test_special_file_types_and_recovery() {
     use std::os::unix::net::UnixListener;
 

@@ -125,10 +125,7 @@ impl Filesystem for InMemoryFS {
     }
 
     fn flock(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
-        match locks::flock_core(self, ino, fh, lock_owner, op) {
-            Ok(()) => req.reply_err(0),
-            Err(e) => req.reply_err(e),
-        }
+        locks::flock(self, req, ino, fh, lock_owner, op);
     }
 
     fn getlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) {
@@ -136,10 +133,7 @@ impl Filesystem for InMemoryFS {
     }
 
     fn setlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
-        match locks::setlk_core(self, ino, fh, lock_owner, lock, sleep) {
-            Ok(()) => req.reply_err(0),
-            Err(e) => req.reply_err(e),
-        }
+        locks::setlk(self, req, ino, fh, lock_owner, lock, sleep);
     }
 
     fn getxattr(&self, req: Request, ino: u64, name: &str, size: usize) {
