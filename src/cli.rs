@@ -482,13 +482,10 @@ pub fn find_latest_generation_in_storage(storage: &dyn crate::storage::Storage) 
     let mut max_gen = 0u64;
     if let Ok(files) = storage.list_files() {
         for file in files {
-            if file.ends_with(".log") {
-                let stem = file.trim_end_matches(".log");
-                if let Ok(gen_num) = stem.parse::<u64>()
-                    && gen_num > max_gen
-                {
-                    max_gen = gen_num;
-                }
+            if let Some((gen_num, _rev)) = crate::log::parse_log_filename(&file)
+                && gen_num > max_gen
+            {
+                max_gen = gen_num;
             }
         }
     }

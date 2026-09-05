@@ -13,7 +13,10 @@ pub use cache::LogFileCache;
 pub use codec::{RecordId, decode as decode_record, encode as encode_record};
 pub use extent::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION, zero_extent_fields, zero_extent_len};
 pub use flusher::BackgroundFlusher;
-pub use manifest::{GenerationLiveStats, LogFileInfo, LogManifest, log_filename};
+pub use manifest::{
+    GenerationLiveStats, LogFileInfo, LogManifest, log_filename, log_filename_with_revision, parse_log_filename,
+    parse_summary_filename,
+};
 pub use reader::{LogReader, LogRecord};
 pub use record::{
     DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LogAttrDelta, LogDirectoryDelta, LogEntryDelta,
@@ -23,6 +26,6 @@ pub use record::{
 pub use recovery::{RecoveryTarget, recover_fs};
 pub use summary::{
     SummaryFooter, SummaryHeader, SummaryIndexEntry, SummaryReader, SummarySnapshot, export_summary, init_volume,
-    init_volume_with_clock, init_volume_with_clock_and_uids,
+    init_volume_with_clock, init_volume_with_clock_and_uids, summary_filename, summary_filename_with_revision,
 };
 pub use writer::LogWriter;

@@ -6,7 +6,10 @@ use std::time::SystemTime;
 pub struct LogFileInfo {
     /// Monotonic generation sequence number (e.g. 1 for 000001.log).
     pub generation: u64,
-    /// Physical filename on disk (e.g. "000001.log").
+    /// Compaction revision sequence number (0 for original uncompacted roll, 1+ for compacted revisions).
+    #[serde(default)]
+    pub revision: u32,
+    /// Physical filename on disk (e.g. "000001.log" or "000001_r1.log").
     pub filename: String,
     /// Creation timestamp for this log generation.
     #[serde(with = "crate::clock::serde_system_time")]
@@ -28,14 +31,69 @@ pub struct LogFileInfo {
 
 /// Returns the physical filename for a given log generation (e.g. "000001.log").
 pub fn log_filename(generation: u64) -> String {
-    format!("{:06}.log", generation)
+    log_filename_with_revision(generation, 0)
+}
+
+/// Returns the physical filename for a given log generation and revision (e.g. "000001_r2.log").
+pub fn log_filename_with_revision(generation: u64, revision: u32) -> String {
+    if revision == 0 {
+        format!("{:06}.log", generation)
+    } else {
+        format!("{:06}_r{}.log", generation, revision)
+    }
+}
+
+/// Parses a `.log` filename into its `(generation, revision)` components.
+///
+/// Supports both base names (e.g. "000001.log" -> (1, 0)) and revision names
+/// (e.g. "000001_r2.log" -> (1, 2)). Returns `None` if the format is unrecognized.
+pub fn parse_log_filename(filename: &str) -> Option<(u64, u32)> {
+    parse_generation_revision_filename(filename, ".log")
+}
+
+/// Parses a `.summary` filename into its `(generation, revision)` components.
+///
+/// Supports both base names (e.g. "000001.summary" -> (1, 0)) and revision names
+/// (e.g. "000001_r2.summary" -> (1, 2)). Returns `None` if the format is unrecognized.
+pub fn parse_summary_filename(filename: &str) -> Option<(u64, u32)> {
+    parse_generation_revision_filename(filename, ".summary")
+}
+
+fn parse_generation_revision_filename(filename: &str, extension: &str) -> Option<(u64, u32)> {
+    let name = filename.rsplit('/').next().unwrap_or(filename);
+    if !name.ends_with(extension) {
+        return None;
+    }
+    let stem = &name[..name.len() - extension.len()];
+    if let Some((gen_str, rev_str)) = stem.split_once("_r") {
+        let generation = gen_str.parse::<u64>().ok()?;
+        let rev = rev_str.parse::<u32>().ok()?;
+        Some((generation, rev))
+    } else {
+        let generation = stem.parse::<u64>().ok()?;
+        Some((generation, 0))
+    }
 }
 
 impl LogFileInfo {
     pub fn new(generation: u64, created_at: SystemTime, initial_header_size: u64) -> Self {
         Self {
             generation,
+            revision: 0,
             filename: log_filename(generation),
+            created_at,
+            record_count: 0,
+            total_bytes: initial_header_size,
+            total_data_bytes: 0,
+            md5: None,
+        }
+    }
+
+    pub fn new_with_revision(generation: u64, revision: u32, created_at: SystemTime, initial_header_size: u64) -> Self {
+        Self {
+            generation,
+            revision,
+            filename: log_filename_with_revision(generation, revision),
             created_at,
             record_count: 0,
             total_bytes: initial_header_size,
@@ -75,12 +133,29 @@ impl LogManifest {
 
     /// Appends a new rolled log generation and advances `next_generation`.
     pub fn record_roll(&mut self, next_gen: u64, created_at: SystemTime, initial_header_size: u64) {
-        if self.logs.iter().any(|l| l.generation == next_gen) {
+        self.record_roll_with_revision(next_gen, 0, created_at, initial_header_size);
+    }
+
+    /// Appends a new rolled log generation with an explicit revision and advances `next_generation` if applicable.
+    pub fn record_roll_with_revision(
+        &mut self,
+        next_gen: u64,
+        revision: u32,
+        created_at: SystemTime,
+        initial_header_size: u64,
+    ) {
+        if self
+            .logs
+            .iter()
+            .any(|l| l.generation == next_gen && l.revision == revision)
+        {
             return;
         }
-        let entry = LogFileInfo::new(next_gen, created_at, initial_header_size);
+        let entry = LogFileInfo::new_with_revision(next_gen, revision, created_at, initial_header_size);
         self.logs.push(entry);
-        self.next_generation = next_gen + 1;
+        if next_gen >= self.next_generation {
+            self.next_generation = next_gen + 1;
+        }
     }
 
     /// Sets the MD5 digest for a specific sealed generation.
@@ -168,5 +243,30 @@ mod tests {
         let bytes = crate::wire::serialize(&manifest).unwrap();
         let deserialized: LogManifest = crate::wire::deserialize(&bytes).unwrap();
         assert_eq!(manifest, deserialized);
+    }
+
+    #[test]
+    fn test_filename_parsing_and_revisions() {
+        assert_eq!(log_filename(1), "000001.log");
+        assert_eq!(log_filename_with_revision(1, 0), "000001.log");
+        assert_eq!(log_filename_with_revision(1, 2), "000001_r2.log");
+
+        assert_eq!(parse_log_filename("000001.log"), Some((1, 0)));
+        assert_eq!(parse_log_filename("000001_r2.log"), Some((1, 2)));
+        assert_eq!(parse_log_filename("/path/to/000042_r10.log"), Some((42, 10)));
+        assert_eq!(parse_log_filename("invalid.log"), None);
+        assert_eq!(parse_log_filename("000001.summary"), None);
+
+        assert_eq!(parse_summary_filename("000001.summary"), Some((1, 0)));
+        assert_eq!(parse_summary_filename("000001_r3.summary"), Some((1, 3)));
+        assert_eq!(parse_summary_filename("/var/data/000100_r1.summary"), Some((100, 1)));
+        assert_eq!(parse_summary_filename("000001.log"), None);
+
+        let mut manifest = LogManifest::new_with_time(1, SystemTime::UNIX_EPOCH);
+        manifest.record_roll_with_revision(1, 1, SystemTime::UNIX_EPOCH, 32);
+        assert_eq!(manifest.logs.len(), 2);
+        assert_eq!(manifest.logs[1].generation, 1);
+        assert_eq!(manifest.logs[1].revision, 1);
+        assert_eq!(manifest.logs[1].filename, "000001_r1.log");
     }
 }

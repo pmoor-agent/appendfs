@@ -14,15 +14,16 @@ pub const SUMMARY_FOOTER_SIZE: usize = 60;
 pub const SUMMARY_INDEX_ENTRY_SIZE: usize = 16;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
 pub const CURRENT_SUMMARY_VERSION: u32 = 1;
-pub const SUMMARY_HEADER_SIZE: usize = 60;
+pub const SUMMARY_HEADER_SIZE: usize = 64;
 
-/// Fixed-size header written at offset 0 of `{:06}.summary`, exactly `SUMMARY_HEADER_SIZE`
-/// bytes - readers seek past it by that constant, so the two must agree.
+/// Fixed-size header written at offset 0 of `{:06}.summary` (or `{:06}_r{}.summary`),
+/// exactly `SUMMARY_HEADER_SIZE` bytes - readers seek past it by that constant, so the two must agree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryHeader {
     pub magic: [u8; 4],
     pub version: u32,
     pub generation: u64,
+    pub revision: u32,
     pub last_tx_id: u64,
     pub next_inode: u64,
     #[serde(with = "crate::clock::serde_system_time")]
@@ -49,6 +50,7 @@ impl SummaryHeader {
             magic: *SUMMARY_MAGIC,
             version: CURRENT_SUMMARY_VERSION,
             generation,
+            revision: 0,
             last_tx_id,
             next_inode,
             created_at,
@@ -279,6 +281,20 @@ fn coalesce_extents(range_map: &RangeMap<SharedExtentState>) -> RangeMap<SharedE
     coalesced
 }
 
+/// Returns the physical filename for a given summary snapshot (e.g. "000001.summary").
+pub fn summary_filename(generation: u64) -> String {
+    summary_filename_with_revision(generation, 0)
+}
+
+/// Returns the physical filename for a given summary generation and revision (e.g. "000001_r2.summary").
+pub fn summary_filename_with_revision(generation: u64, revision: u32) -> String {
+    if revision == 0 {
+        format!("{:06}.summary", generation)
+    } else {
+        format!("{:06}_r{}.summary", generation, revision)
+    }
+}
+
 /// Everything that goes into one summary snapshot.
 ///
 /// Grouped into a struct rather than passed positionally: the eight-argument version needed
@@ -318,8 +334,8 @@ pub fn export_summary(
     // Sort by inode so physical serialization order is deterministic
     inodes_snapshot.sort_by_key(|(ino, _)| *ino);
 
-    let filename = format!("{:06}.summary", generation);
-    let tmp_filename = format!("{:06}.summary.tmp", generation);
+    let filename = summary_filename(generation);
+    let tmp_filename = format!("{}.tmp", filename);
 
     let mut writer = storage.open_writer(&tmp_filename, WriteMode::Overwrite)?;
     let mut hasher = blake3::Hasher::new();

@@ -54,11 +54,12 @@ fn fetch_and_verify_summary(
     remote_stores: &[RemoteReadTarget],
     storage: &dyn Storage,
     gen_num: u64,
+    rev_num: u32,
     volume_key: Arc<VolumeKey>,
     target: RecoveryTarget,
 ) -> io::Result<Option<SummaryReader>> {
-    let summary_name = format!("{:06}.summary", gen_num);
-    let tmp_name = format!("{:06}.summary.tmp", gen_num);
+    let summary_name = crate::log::summary_filename_with_revision(gen_num, rev_num);
+    let tmp_name = format!("{}.tmp", summary_name);
 
     for target_remote in remote_stores {
         let mut writer = match storage.open_writer(&tmp_name, WriteMode::Overwrite) {
@@ -133,17 +134,14 @@ pub fn prepare_remote_recovery_for_target(
     let files = storage.list_files()?;
     let mut local_summaries = Vec::new();
     for file in &files {
-        if file.ends_with(".summary") {
-            let stem = file.trim_end_matches(".summary");
-            if let Ok(gen_num) = stem.parse::<u64>() {
-                local_summaries.push((gen_num, file.clone()));
-            }
+        if let Some((gen_num, rev_num)) = crate::log::parse_summary_filename(file) {
+            local_summaries.push(((gen_num, rev_num), file.clone()));
         }
     }
-    local_summaries.sort_by_key(|(g, _)| *g);
+    local_summaries.sort_by_key(|(gr, _)| *gr);
 
-    let mut best_local_eligible: Option<(u64, crate::log::SummaryHeader)> = None;
-    for (gen_num, file) in &local_summaries {
+    let mut best_local_eligible: Option<(u64, u32, crate::log::SummaryHeader)> = None;
+    for ((gen_num, rev_num), file) in &local_summaries {
         if let Ok(reader) = SummaryReader::open(storage, file, volume_key.clone()) {
             let eligible = match target {
                 RecoveryTarget::Latest => true,
@@ -151,8 +149,12 @@ pub fn prepare_remote_recovery_for_target(
                 RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
                 RecoveryTarget::Generation(max_gen) => *gen_num <= max_gen,
             };
-            if eligible && best_local_eligible.as_ref().is_none_or(|(g, _)| *gen_num > *g) {
-                best_local_eligible = Some((*gen_num, reader.header));
+            if eligible
+                && best_local_eligible
+                    .as_ref()
+                    .is_none_or(|(g, r, _)| (*gen_num, *rev_num) > (*g, *r))
+            {
+                best_local_eligible = Some((*gen_num, *rev_num, reader.header));
             }
         }
     }
@@ -163,27 +165,25 @@ pub fn prepare_remote_recovery_for_target(
         for target_remote in remote_stores {
             if let Ok(objs) = target_remote.store.list_objects("") {
                 for obj in objs {
-                    if obj.key.ends_with(".summary") {
-                        let stem = obj.key.trim_end_matches(".summary");
-                        if let Ok(gen_num) = stem.parse::<u64>() {
-                            remote_summary_gens.insert(gen_num);
-                        }
+                    if let Some((gen_num, rev_num)) = crate::log::parse_summary_filename(&obj.key) {
+                        remote_summary_gens.insert((gen_num, rev_num));
                     }
                 }
             }
         }
 
-        if let Some(&latest_remote_gen) = remote_summary_gens.last()
+        if let Some(&(latest_remote_gen, latest_remote_rev)) = remote_summary_gens.last()
             && let Ok(Some(reader)) = fetch_and_verify_summary(
                 remote_stores,
                 storage,
                 latest_remote_gen,
+                latest_remote_rev,
                 volume_key.clone(),
                 RecoveryTarget::Latest,
             )
         {
-            let summary_name = format!("{:06}.summary", latest_remote_gen);
-            local_summaries.push((latest_remote_gen, summary_name));
+            let summary_name = crate::log::summary_filename_with_revision(latest_remote_gen, latest_remote_rev);
+            local_summaries.push(((latest_remote_gen, latest_remote_rev), summary_name));
             let eligible = match target {
                 RecoveryTarget::Latest => true,
                 RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
@@ -191,7 +191,7 @@ pub fn prepare_remote_recovery_for_target(
                 RecoveryTarget::Generation(max_gen) => latest_remote_gen <= max_gen,
             };
             if eligible {
-                best_local_eligible = Some((latest_remote_gen, reader.header));
+                best_local_eligible = Some((latest_remote_gen, latest_remote_rev, reader.header));
             }
         }
     }
@@ -229,7 +229,7 @@ pub fn prepare_remote_recovery_for_target(
         RecoveryTarget::TxId(_) => max_manifest_gen,
     };
 
-    let mut chosen_summary_gen = best_local_eligible.as_ref().map(|(g, _)| *g);
+    let mut chosen_summary_gen = best_local_eligible.as_ref().map(|(g, _, _)| *g);
 
     for cand_gen in (0..=candidate_upper).rev() {
         if let Some(best_gen) = chosen_summary_gen
@@ -238,12 +238,12 @@ pub fn prepare_remote_recovery_for_target(
             break;
         }
 
-        let summary_name = format!("{:06}.summary", cand_gen);
+        let summary_name = crate::log::summary_filename(cand_gen);
         if storage.exists(&summary_name) {
             continue;
         }
 
-        if let Ok(Some(_)) = fetch_and_verify_summary(remote_stores, storage, cand_gen, volume_key.clone(), target) {
+        if let Ok(Some(_)) = fetch_and_verify_summary(remote_stores, storage, cand_gen, 0, volume_key.clone(), target) {
             chosen_summary_gen = Some(cand_gen);
             break;
         }
@@ -264,7 +264,12 @@ pub fn prepare_remote_recovery_for_target(
         };
 
         for log_gen in (base_gen + 1)..=replay_upper {
-            let log_name = crate::log::log_filename(log_gen);
+            let log_name = manifest
+                .logs
+                .iter()
+                .find(|l| l.generation == log_gen)
+                .map(|l| l.filename.clone())
+                .unwrap_or_else(|| crate::log::log_filename(log_gen));
             if !storage.exists(&log_name) && fetch_object_from_remotes(remote_stores, storage, &log_name, &log_name)? {
                 log::info!(
                     "Fetched missing log file {} from remote for historical replay",
@@ -274,5 +279,5 @@ pub fn prepare_remote_recovery_for_target(
         }
     }
 
-    Ok(chosen_summary_gen.map(|g| format!("{:06}.summary", g)))
+    Ok(chosen_summary_gen.map(crate::log::summary_filename))
 }

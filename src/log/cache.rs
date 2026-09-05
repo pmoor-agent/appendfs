@@ -78,15 +78,17 @@ impl LogFileCache {
             return Ok(Arc::clone(reader));
         }
 
-        let filename = super::log_filename(generation);
-
-        let (is_sealed, mut expected_len) = if let Some(ref m) = self.manifest {
+        let (filename, is_sealed, mut expected_len) = if let Some(ref m) = self.manifest {
             let man = m.read().unwrap();
             let is_sealed = generation < man.next_generation - 1;
-            let expected_len = man.get_by_generation(generation).map(|l| l.total_bytes).unwrap_or(0);
-            (is_sealed, expected_len)
+            let log_entry = man.get_by_generation(generation);
+            let expected_len = log_entry.map(|l| l.total_bytes).unwrap_or(0);
+            let filename = log_entry
+                .map(|l| l.filename.clone())
+                .unwrap_or_else(|| super::log_filename(generation));
+            (filename, is_sealed, expected_len)
         } else {
-            (false, 0)
+            (super::log_filename(generation), false, 0)
         };
 
         // If expected_len is not yet in manifest but local file exists:
@@ -108,7 +110,7 @@ impl LogFileCache {
             let remotes = self.remotes.read().unwrap().clone();
             let reader: Arc<dyn StorageReader> = Arc::new(TieredStorageReader::with_local_storage(
                 generation,
-                filename,
+                filename.clone(),
                 expected_len,
                 Some(self.storage.clone()),
                 remotes,
@@ -133,6 +135,20 @@ impl LogFileCache {
                     return Err(e);
                 }
 
+                let expected_len = match self.manifest {
+                    Some(ref m) => m
+                        .read()
+                        .unwrap()
+                        .get_by_generation(generation)
+                        .map(|l| l.total_bytes)
+                        .unwrap_or(0),
+                    None => return Err(e),
+                };
+
+                if expected_len == 0 {
+                    return Err(e);
+                }
+
                 let block_cache = match self.block_cache {
                     Some(ref bc) => Arc::clone(bc),
                     None => return Err(e),
@@ -154,9 +170,20 @@ impl LogFileCache {
         Ok(reader)
     }
 
-    /// Reads a slice from an extent stored on disk or fetched via S3 range requests.
+    /// Returns the cached decrypted record payload for `(generation, record_log_offset)` if present in memory.
+    pub fn get_cached_record(&self, generation: u64, record_log_offset: u64) -> Option<Arc<Vec<u8>>> {
+        let revision = self
+            .manifest
+            .as_ref()
+            .and_then(|m| m.read().ok())
+            .and_then(|m| m.get_by_generation(generation).map(|l| l.revision))
+            .unwrap_or(0);
+        self.decrypted_cache.get(generation, revision, record_log_offset)
+    }
+
+    /// Reads an extent payload slice directly from the in-memory decrypted record cache or decodes it from disk.
     ///
-    /// If the decrypted record payload is already present in the in-memory LRU cache,
+    /// If the decrypted payload for `(generation, record_log_offset)` is already present in `decrypted_cache`,
     /// it is copied directly with ZERO disk I/O and ZERO decryption overhead.
     pub fn read_extent_payload(
         &self,
@@ -167,37 +194,45 @@ impl LogFileCache {
         dst_buf: &mut [u8],
         volume_key: &crate::crypto::VolumeKey,
     ) -> io::Result<usize> {
-        let decrypted: Arc<Vec<u8>> = if let Some(cached) = self.decrypted_cache.get(generation, record_log_offset) {
-            cached
-        } else {
-            let reader = self.get_or_open(generation)?;
-            let mut header_buf = [0u8; crate::log::record::RECORD_HEADER_SIZE];
-            reader.read_exact_at(record_log_offset, &mut header_buf)?;
-            let header = crate::log::record::RecordHeader::from_bytes(&header_buf)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let revision = self
+            .manifest
+            .as_ref()
+            .and_then(|m| m.read().ok())
+            .and_then(|m| m.get_by_generation(generation).map(|l| l.revision))
+            .unwrap_or(0);
 
-            let mut raw_payload = vec![0u8; header.payload_len as usize];
-            reader.read_exact_at(
-                record_log_offset + crate::log::record::RECORD_HEADER_SIZE as u64,
-                &mut raw_payload,
-            )?;
+        let decrypted: Arc<Vec<u8>> =
+            if let Some(cached) = self.decrypted_cache.get(generation, revision, record_log_offset) {
+                cached
+            } else {
+                let reader = self.get_or_open(generation)?;
+                let mut header_buf = [0u8; crate::log::record::RECORD_HEADER_SIZE];
+                reader.read_exact_at(record_log_offset, &mut header_buf)?;
+                let header = crate::log::record::RecordHeader::from_bytes(&header_buf)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-            let dec = crate::log::codec::decode(
-                volume_key,
-                crate::log::codec::RecordId {
-                    generation,
-                    tx_id: header.tx_id,
-                    op_code: header.op_code as u8,
-                    inode: header.inode,
-                },
-                &raw_payload,
-            )?;
+                let mut raw_payload = vec![0u8; header.payload_len as usize];
+                reader.read_exact_at(
+                    record_log_offset + crate::log::record::RECORD_HEADER_SIZE as u64,
+                    &mut raw_payload,
+                )?;
 
-            let arc_dec = Arc::new(dec);
-            self.decrypted_cache
-                .insert(generation, record_log_offset, Arc::clone(&arc_dec));
-            arc_dec
-        };
+                let dec = crate::log::codec::decode(
+                    volume_key,
+                    crate::log::codec::RecordId {
+                        generation,
+                        tx_id: header.tx_id,
+                        op_code: header.op_code as u8,
+                        inode: header.inode,
+                    },
+                    &raw_payload,
+                )?;
+
+                let arc_dec = Arc::new(dec);
+                self.decrypted_cache
+                    .insert(generation, revision, record_log_offset, Arc::clone(&arc_dec));
+                arc_dec
+            };
 
         let start = payload_offset as u64 + slice_offset as u64;
         let slice = usize::try_from(start)
@@ -296,7 +331,8 @@ mod tests {
         assert_eq!(&buf1, b"cached");
 
         // Verify entry is in decrypted cache
-        assert!(cache.decrypted_cache.get(gen_num, offset).is_some());
+        assert!(cache.decrypted_cache.get(gen_num, 0, offset).is_some());
+        assert!(cache.get_cached_record(gen_num, offset).is_some());
 
         // Second read hits in-memory cache directly
         let mut buf2 = [0u8; 6];

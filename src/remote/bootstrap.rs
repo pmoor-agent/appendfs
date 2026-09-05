@@ -25,27 +25,24 @@ pub fn bootstrap_from_remote(
     }
 
     // 2. Find newest .summary file
-    let mut latest_summary: Option<(u64, String)> = None;
+    let mut latest_summary: Option<((u64, u32), String)> = None;
     for obj in &objects {
-        if obj.key.ends_with(".summary") {
-            let stem = obj.key.trim_end_matches(".summary");
-            if let Ok(gen_num) = stem.parse::<u64>()
-                && latest_summary.as_ref().is_none_or(|(g, _)| gen_num > *g)
-            {
-                latest_summary = Some((gen_num, obj.key.clone()));
-            }
+        if let Some((generation, rev)) = crate::log::parse_summary_filename(&obj.key)
+            && latest_summary.as_ref().is_none_or(|(gr, _)| (generation, rev) > *gr)
+        {
+            latest_summary = Some(((generation, rev), obj.key.clone()));
         }
     }
 
-    let (summary_gen, summary_key) = latest_summary.ok_or_else(|| {
+    let ((summary_gen, summary_rev), summary_key) = latest_summary.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "No valid .summary checkpoint files found in remote store",
         )
     })?;
 
-    let local_summary_name = format!("{:06}.summary", summary_gen);
-    let tmp_summary_name = format!("{:06}.summary.tmp", summary_gen);
+    let local_summary_name = crate::log::summary_filename_with_revision(summary_gen, summary_rev);
+    let tmp_summary_name = format!("{}.tmp", local_summary_name);
 
     // 3. Download summary snapshot to tmp and verify
     {

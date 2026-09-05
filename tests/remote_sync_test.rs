@@ -200,7 +200,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
 
     // Verify that the memory block cache now holds block 0
     assert!(
-        block_cache.read_block(1, 0).unwrap().is_some(),
+        block_cache.read_block("000001", 0).unwrap().is_some(),
         "Block 0 must now be cached in block cache"
     );
 
@@ -573,7 +573,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
 
     // Verify block cache populated
     assert!(
-        block_cache.read_block(1, 0).unwrap().is_some(),
+        block_cache.read_block("000001", 0).unwrap().is_some(),
         "Block 0 must now be cached"
     );
 }
@@ -632,8 +632,8 @@ fn test_local_read_populates_block_cache_before_purge() {
     fs.log_cache = Some(log_cache.clone());
 
     // Verify cache is empty before any reads
-    assert!(block_cache.read_block(1, 0).unwrap().is_none());
-    assert!(block_cache.read_block(2, 0).unwrap().is_none());
+    assert!(block_cache.read_block("000001", 0).unwrap().is_none());
+    assert!(block_cache.read_block("000002", 0).unwrap().is_none());
 
     // 5. Read sealed generation 1 file while 000001.log is STILL in storage:
     // Should read from storage AND pre-warm into block cache!
@@ -641,13 +641,13 @@ fn test_local_read_populates_block_cache_before_purge() {
     assert_eq!(read_sealed, payload1);
 
     // Block 0 of generation 1 MUST now be cached!
-    assert!(block_cache.read_block(1, 0).unwrap().is_some());
+    assert!(block_cache.read_block("000001", 0).unwrap().is_some());
 
     // 6. Read active generation 2 file:
     // Must NOT write to block cache because active generation avoids partial block caching!
     let read_active = read_test(&fs, file2_ino, 0, payload2.len()).unwrap();
     assert_eq!(read_active, payload2);
-    assert!(block_cache.read_block(2, 0).unwrap().is_none());
+    assert!(block_cache.read_block("000002", 0).unwrap().is_none());
 
     // 7. Clear in-memory decrypted cache so the next read MUST hit storage / block cache
     log_cache.decrypted_cache.clear();
@@ -1049,7 +1049,7 @@ fn test_tiered_storage_reader_coalesces_concurrent_remote_reads() {
     assert_eq!(reader.coalescer.total_requests(), num_threads as u64);
 
     // 3. Block 0 is now cached
-    assert!(cache.read_block(1, 0).unwrap().is_some());
+    assert!(cache.read_block("000001", 0).unwrap().is_some());
 }
 
 #[test]

@@ -564,7 +564,7 @@ mod tests {
         fs.log_cache = Some(log_cache.clone());
 
         // Populate decrypted cache with a dummy entry
-        log_cache.decrypted_cache.insert(1, 100, Arc::new(vec![0u8; 4096]));
+        log_cache.decrypted_cache.insert(1, 0, 100, Arc::new(vec![0u8; 4096]));
 
         // Create entries: 1 subfolder, 2 files, 1 symlink
         let dir = mkdir_core(&fs, 1, "sub", 0o755, 1000, 1000).unwrap();
