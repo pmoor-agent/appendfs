@@ -1361,7 +1361,6 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
-                revision: 0,
                 last_tx_id: 100,
                 next_inode: 4,
                 created_at: std::time::SystemTime::now(),

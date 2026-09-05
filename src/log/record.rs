@@ -38,15 +38,11 @@ pub struct FileHeader {
 
 impl FileHeader {
     pub fn new(generation: u64, created_at: SystemTime) -> Self {
-        Self::new_with_revision(generation, 0, created_at)
-    }
-
-    pub fn new_with_revision(generation: u64, revision: u32, created_at: SystemTime) -> Self {
         Self {
             magic: FILE_MAGIC,
             version: CURRENT_VERSION,
             generation,
-            revision,
+            revision: 0,
             created_at,
         }
     }

@@ -77,7 +77,16 @@ fn parse_generation_revision_filename(filename: &str, extension: &str) -> Option
 
 impl LogFileInfo {
     pub fn new(generation: u64, created_at: SystemTime, initial_header_size: u64) -> Self {
-        Self::new_with_revision(generation, 0, created_at, initial_header_size)
+        Self {
+            generation,
+            revision: 0,
+            filename: log_filename(generation),
+            created_at,
+            record_count: 0,
+            total_bytes: initial_header_size,
+            total_data_bytes: 0,
+            md5: None,
+        }
     }
 
     pub fn new_with_revision(generation: u64, revision: u32, created_at: SystemTime, initial_header_size: u64) -> Self {
