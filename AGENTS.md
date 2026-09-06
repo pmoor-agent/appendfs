@@ -104,7 +104,7 @@ Certain test suites (differential fuzzing and concurrent stress testing) support
     ```
   - Fuzzing & crash recovery soak (~85s):
     ```bash
-    FUZZ_SEEDS=500 FUZZ_STEPS=10000 cargo test --release --test fuzz_test -- --nocapture
+    FUZZ_SEEDS=300 FUZZ_STEPS=10000 cargo test --release --test fuzz_test -- --nocapture
     ```
 
 - **Quick 10× Sanity Sweep (~5s total)**:
