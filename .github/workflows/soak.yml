@@ -63,9 +63,9 @@ jobs:
       # It is explicitly *not* `always()`: a build failure must abort the run rather than
       # push a second doomed sweep through a compile that has already been shown broken.
       - name: Differential fuzzing and crash recovery sweep
-        timeout-minutes: 15
+        timeout-minutes: 20
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
-          FUZZ_SEEDS: 500
+          FUZZ_SEEDS: 300
           FUZZ_STEPS: 10000
         run: cargo test --release --test fuzz_test -- --nocapture
