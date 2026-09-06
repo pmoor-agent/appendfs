@@ -61,7 +61,9 @@ pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, f
     // Async offload: cold disk/remote read or large in-memory read
     let log_cache = fs.log_cache.clone();
     let volume_key = fs.volume_key.clone();
+    let guard = fs.begin_async_op();
     crate::async_runtime::spawn(async move {
+        let _guard = guard;
         match InMemoryFS::execute_read_plan_async(plan, log_cache, volume_key).await {
             Ok(buf) => req.reply_buf(&buf),
             Err(e) => req.reply_err(e),
@@ -579,8 +581,10 @@ pub fn fsync(fs: &Arc<InMemoryFS>, req: Request, ino: u64, datasync: bool, fh: u
         req.reply_err(0);
         return;
     }
+    let guard = fs.begin_async_op();
     let fs_clone = Arc::clone(fs);
     crate::async_runtime::spawn(async move {
+        let _guard = guard;
         let res = tokio::task::spawn_blocking(move || fs_clone.sync_log()).await;
         match res {
             Ok(Ok(())) => req.reply_err(0),

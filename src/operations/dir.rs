@@ -341,8 +341,10 @@ pub fn fsyncdir(fs: &Arc<InMemoryFS>, req: Request, ino: u64, datasync: bool) {
         req.reply_err(0);
         return;
     }
+    let guard = fs.begin_async_op();
     let fs_clone = Arc::clone(fs);
     crate::async_runtime::spawn(async move {
+        let _guard = guard;
         let res = tokio::task::spawn_blocking(move || fs_clone.sync_log()).await;
         match res {
             Ok(Ok(())) => req.reply_err(0),

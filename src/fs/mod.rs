@@ -118,6 +118,8 @@ pub struct InMemoryFS {
     pub last_summary_generation: AtomicU64,
     /// Condition variable and flag to immediately notify the background replication worker of new logs/summaries.
     pub replication_notifier: Arc<(Mutex<bool>, Condvar)>,
+    /// Tracks in-flight asynchronous operations (e.g. cold reads, async fsyncs) to ensure safe unmount without use-after-free.
+    pub async_tracker: Arc<crate::async_runtime::AsyncTracker>,
 }
 
 impl InMemoryFS {
@@ -206,6 +208,7 @@ impl InMemoryFS {
             generations_since_last_summary: AtomicU64::new(0),
             last_summary_generation: AtomicU64::new(0),
             replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
+            async_tracker: Arc::new(crate::async_runtime::AsyncTracker::new()),
         };
         fs.register_runtime_status();
         fs
@@ -327,6 +330,21 @@ impl InMemoryFS {
 
     pub fn set_log_dir(&mut self, log_dir: impl AsRef<Path>) {
         self.set_storage(Arc::new(crate::storage::OsStorage::new(log_dir)));
+    }
+
+    /// Increments the in-flight asynchronous operation count and returns an RAII guard.
+    pub fn begin_async_op(&self) -> crate::async_runtime::AsyncOpGuard {
+        self.async_tracker.begin()
+    }
+
+    /// Returns the number of currently tracked in-flight asynchronous operations.
+    pub fn in_flight_async_ops(&self) -> usize {
+        self.async_tracker.in_flight()
+    }
+
+    /// Blocks until all tracked asynchronous operations complete and drop their guards.
+    pub fn drain_async_ops(&self) {
+        self.async_tracker.drain();
     }
 
     pub(crate) fn allocate_inode(&self) -> u64 {
