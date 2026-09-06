@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 ///
 /// The volume header lives in summary files, so this is the entry point for anything that
 /// needs to identify a volume or verify a key.
-fn latest_summary_file(storage: &OsStorage) -> std::io::Result<Option<String>> {
+fn latest_summary_file(storage: &dyn Storage) -> std::io::Result<Option<String>> {
     let mut latest: Option<((u64, u32), String)> = None;
     for file in storage.list_files()? {
         if let Some((generation, rev)) = appendfs::log::parse_summary_filename(&file)
@@ -43,19 +43,76 @@ fn load_remote_registry(storage: &dyn Storage) -> appendfs::remote::RemoteRegist
     }
 }
 
-fn resolve_volume_key(log_dir: &Path, key_file: Option<&Path>) -> Result<Arc<VolumeKey>, String> {
-    let storage = OsStorage::new(log_dir);
+struct VolumeHeaderInfo {
+    storage: Arc<dyn Storage>,
+    header: VolumeHeader,
+}
 
-    let Some(summary_file) = latest_summary_file(&storage).map_err(|e| e.to_string())? else {
-        return Ok(Arc::new(VolumeKey::plaintext()));
+struct OpenVolumeStorage {
+    storage: Arc<dyn Storage>,
+    volume_key: Arc<VolumeKey>,
+    volume_header: VolumeHeader,
+}
+
+struct OpenVolumeFS {
+    fs: appendfs::InMemoryFS,
+    storage: Arc<dyn Storage>,
+    volume_key: Arc<VolumeKey>,
+    volume_header: VolumeHeader,
+}
+
+/// Reads the volume header and validates that `log_dir` contains an initialized appendfs volume.
+fn read_volume_header_info(log_dir: &Path) -> Result<VolumeHeaderInfo, String> {
+    if !log_dir.exists() {
+        return Err(format!(
+            "Log directory '{}' does not exist.\nRun 'appendfs init {}' to create a new volume first.",
+            log_dir.display(),
+            log_dir.display()
+        ));
+    }
+
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
+    let summary_file = latest_summary_file(storage.as_ref())
+        .map_err(|e| format!("Error reading log directory '{}': {}", log_dir.display(), e))?;
+    let summary_file = match summary_file {
+        Some(sf) => sf,
+        None => {
+            return Err(format!(
+                "No appendfs volume found in '{}' (directory contains no summary files).\nRun 'appendfs init {}' to create a new volume first.",
+                log_dir.display(),
+                log_dir.display()
+            ));
+        }
     };
 
-    let volume_header = SummaryReader::read_volume_header(&storage, &summary_file).map_err(|e| e.to_string())?;
+    let header = SummaryReader::read_volume_header(storage.as_ref(), &summary_file).map_err(|e| e.to_string())?;
+
+    Ok(VolumeHeaderInfo { storage, header })
+}
+
+/// Opens an appendfs volume's underlying storage and resolves/unlocks its volume key.
+fn open_volume_storage(
+    log_dir: &Path,
+    key_file: Option<&Path>,
+    passphrase_flag: bool,
+) -> Result<OpenVolumeStorage, String> {
+    let VolumeHeaderInfo {
+        storage,
+        header: volume_header,
+    } = read_volume_header_info(log_dir)?;
+
     if volume_header.cipher == CipherSuite::None {
         if key_file.is_some() {
             return Err("Volume is not encrypted; --key-file does not apply to it".to_string());
         }
-        return Ok(Arc::new(VolumeKey::plaintext()));
+        if passphrase_flag {
+            return Err("Volume is not encrypted; --passphrase does not apply to it".to_string());
+        }
+        return Ok(OpenVolumeStorage {
+            storage,
+            volume_key: Arc::new(VolumeKey::plaintext_with_volume_id(volume_header.volume_id)),
+            volume_header,
+        });
     }
 
     // Which credentials to collect comes from the volume, not from which flags happen to be
@@ -70,7 +127,13 @@ fn resolve_volume_key(log_dir: &Path, key_file: Option<&Path>) -> Result<Arc<Vol
     }
     if source.needs_key_file() && key_file.is_none() {
         return Err(format!(
-            "Volume is unlocked by: {}. Pass --key-file to mount it.",
+            "Volume is unlocked by: {}. Pass --key-file to unlock it.",
+            source
+        ));
+    }
+    if passphrase_flag && !source.needs_passphrase() {
+        return Err(format!(
+            "Volume is unlocked by: {}. It does not use a passphrase, so --passphrase does not apply.",
             source
         ));
     }
@@ -112,7 +175,33 @@ fn resolve_volume_key(log_dir: &Path, key_file: Option<&Path>) -> Result<Arc<Vol
     // it a wrong key would surface as an authentication failure mid-replay, which is
     // indistinguishable from bitrot and reads to the user like their volume is destroyed.
     let volume_key = volume_header.unlock(&master_key).map_err(|e| e.to_string())?;
-    Ok(Arc::new(volume_key))
+    Ok(OpenVolumeStorage {
+        storage,
+        volume_key: Arc::new(volume_key),
+        volume_header,
+    })
+}
+
+/// Opens an appendfs volume and recovers an in-memory filesystem instance up to `target`.
+fn open_volume_fs(
+    log_dir: &Path,
+    key_file: Option<&Path>,
+    passphrase_flag: bool,
+    target: appendfs::RecoveryTarget,
+) -> Result<OpenVolumeFS, String> {
+    let OpenVolumeStorage {
+        storage,
+        volume_key,
+        volume_header,
+    } = open_volume_storage(log_dir, key_file, passphrase_flag)?;
+    let fs = recover_fs(storage.clone(), target, Arc::new(SystemClock), volume_key.clone())
+        .map_err(|e| format!("Failed to recover volume from '{}': {}", log_dir.display(), e))?;
+    Ok(OpenVolumeFS {
+        fs,
+        storage,
+        volume_key,
+        volume_header,
+    })
 }
 
 /// Collects the credentials for a brand new volume, returning the key and the KDF salt to
@@ -268,6 +357,7 @@ fn main() {
                 // still honour --compress rather than silently dropping it.
                 let mut volume_header = VolumeHeader::plaintext();
                 volume_header.compression = args.compression();
+                let volume_id = hex_string(&volume_header.volume_id);
                 match init_volume(storage, &VolumeKey::plaintext(), volume_header) {
                     Ok(summary_filename) => {
                         println!("Initialized empty appendfs volume successfully!");
@@ -275,6 +365,7 @@ fn main() {
                         println!("  Summary File:    {}", summary_filename);
                         println!("  Cipher:          Plaintext (None)");
                         println!("  Compression:     {}", args.compression());
+                        println!("  Volume ID:       {}", volume_id);
                         println!("  Root Inode:      1 (/)");
                         println!("  Next Generation: 1 (000001.log)");
                     }
@@ -287,38 +378,25 @@ fn main() {
         }
         Commands::Mount(args) => {
             let log_dir = &args.log_dir;
-            if !log_dir.exists() {
-                eprintln!("Error: Log directory '{}' does not exist.", log_dir.display());
-                eprintln!(
-                    "Run 'appendfs init {}' to create a new volume first.",
-                    log_dir.display()
-                );
-                std::process::exit(1);
-            }
-
             println!(
                 "Recovering appendfs state from log directory '{}'...",
                 log_dir.display()
             );
 
-            let volume_key = match resolve_volume_key(log_dir, args.key_file.as_deref()) {
-                Ok(kr) => kr,
-                Err(e) => {
-                    eprintln!("Authentication error: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
-            let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
-            let mut fs_instance = match recover_fs(
-                storage.clone(),
+            let OpenVolumeFS {
+                fs: mut fs_instance,
+                storage,
+                volume_key,
+                volume_header,
+            } = match open_volume_fs(
+                log_dir,
+                args.key_file.as_deref(),
+                args.passphrase,
                 appendfs::RecoveryTarget::Latest,
-                Arc::new(SystemClock),
-                volume_key.clone(),
             ) {
-                Ok(fs) => fs,
+                Ok(res) => res,
                 Err(e) => {
-                    eprintln!("Failed to recover volume from '{}': {}", log_dir.display(), e);
+                    eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -332,7 +410,7 @@ fn main() {
 
             // The volume header decides how writes are compressed; it was read back during
             // recovery, so a mount never has to be told separately.
-            let compression = fs_instance.volume_header.compression;
+            let compression = volume_header.compression;
             let max_log_age = appendfs::cli::parse_duration(&args.max_log_age).ok();
             let writer =
                 match LogWriter::create_lazy(storage.clone(), next_gen, args.max_log_size, start_tx, volume_key) {
@@ -411,19 +489,6 @@ fn main() {
         }
         Commands::MountRo(args) | Commands::Mountro(args) => {
             let log_dir = &args.log_dir;
-            if !log_dir.exists() {
-                eprintln!("Error: Log directory '{}' does not exist.", log_dir.display());
-                std::process::exit(1);
-            }
-
-            let volume_key = match resolve_volume_key(log_dir, args.key_file.as_deref()) {
-                Ok(kr) => kr,
-                Err(e) => {
-                    eprintln!("Authentication error: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
             let target = if let Some(tx_id) = args.tx_id {
                 appendfs::RecoveryTarget::TxId(tx_id)
             } else if let Some(ref time_str) = args.at_time {
@@ -445,7 +510,17 @@ fn main() {
                 target,
                 log_dir.display()
             );
-            let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
+
+            let OpenVolumeStorage {
+                storage, volume_key, ..
+            } = match open_volume_storage(log_dir, args.key_file.as_deref(), args.passphrase) {
+                Ok(res) => res,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
             let registry = load_remote_registry(storage.as_ref());
             let remote_stores = registry.build_read_stores();
 
@@ -516,30 +591,15 @@ fn main() {
             }
         }
         Commands::Stats(args) => {
-            let log_dir = &args.log_dir;
-            if !log_dir.exists() {
-                eprintln!("Error: Log directory '{}' does not exist.", log_dir.display());
-                std::process::exit(1);
-            }
-
-            let volume_key = match resolve_volume_key(log_dir, args.key_file.as_deref()) {
-                Ok(kr) => kr,
-                Err(e) => {
-                    eprintln!("Authentication error: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
-            let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
-            let fs = match recover_fs(
-                storage,
+            let OpenVolumeFS { fs, .. } = match open_volume_fs(
+                &args.log_dir,
+                args.key_file.as_deref(),
+                args.passphrase,
                 appendfs::RecoveryTarget::Latest,
-                Arc::new(SystemClock),
-                volume_key,
             ) {
-                Ok(fs) => fs,
+                Ok(res) => res,
                 Err(e) => {
-                    eprintln!("Failed to inspect volume from '{}': {}", log_dir.display(), e);
+                    eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -566,8 +626,8 @@ fn main() {
             // explicit flag, since prompting whenever a volume happens to be encrypted would
             // make scripted raw dumps hang waiting on a terminal.
             let volume_key = if args.key_file.is_some() || args.passphrase {
-                match resolve_volume_key(parent, args.key_file.as_deref()) {
-                    Ok(k) => Some(k),
+                match open_volume_storage(parent, args.key_file.as_deref(), args.passphrase) {
+                    Ok(res) => Some(res.volume_key),
                     Err(e) => {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
@@ -587,14 +647,17 @@ fn main() {
         }
         Commands::Check(args) | Commands::Fsck(args) => {
             let log_dir = &args.log_dir;
-            if !log_dir.exists() {
-                eprintln!("Error: Log directory '{}' does not exist.", log_dir.display());
-                std::process::exit(1);
-            }
-
             if let Some(ref remote_name) = args.remote {
-                let storage = OsStorage::new(log_dir);
-                let registry = load_remote_registry(&storage);
+                let OpenVolumeStorage {
+                    storage, volume_key, ..
+                } = match open_volume_storage(log_dir, args.key_file.as_deref(), args.passphrase) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let registry = load_remote_registry(storage.as_ref());
                 let remote_cfg = match registry.get_remote(remote_name) {
                     Some(c) => c,
                     None => {
@@ -603,21 +666,14 @@ fn main() {
                     }
                 };
                 let store = remote_cfg.build_store();
-                let summary_file = match latest_summary_file(&storage) {
+                let summary_file = match latest_summary_file(storage.as_ref()) {
                     Ok(Some(f)) => f,
                     _ => {
                         eprintln!("Error: No summary files found in '{}'", log_dir.display());
                         std::process::exit(1);
                     }
                 };
-                let volume_key = match resolve_volume_key(log_dir, args.key_file.as_deref()) {
-                    Ok(kr) => kr,
-                    Err(e) => {
-                        eprintln!("Authentication error: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                let snapshot = match SummaryReader::open(&storage, &summary_file, volume_key) {
+                let snapshot = match SummaryReader::open(storage.as_ref(), &summary_file, volume_key) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Failed to read summary '{}': {}", summary_file, e);
@@ -641,15 +697,16 @@ fn main() {
                 return;
             }
 
-            let volume_key = match resolve_volume_key(log_dir, args.key_file.as_deref()) {
-                Ok(kr) => kr,
+            let OpenVolumeStorage {
+                storage, volume_key, ..
+            } = match open_volume_storage(log_dir, args.key_file.as_deref(), args.passphrase) {
+                Ok(res) => res,
                 Err(e) => {
-                    eprintln!("Authentication error: {}", e);
+                    eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
 
-            let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
             match check_volume(storage, args.verify_data, volume_key) {
                 Ok(report) => {
                     print!("{}", report.format_report(Some(log_dir), args.verbose > 0));
@@ -750,24 +807,11 @@ fn main() {
             }
         },
         Commands::Key(args) => {
-            let log_dir = args.log_dir;
-            let storage = OsStorage::new(&log_dir);
-            let summary_file = match latest_summary_file(&storage) {
-                Ok(Some(f)) => f,
-                Ok(None) => {
-                    eprintln!("Error: No summary files found in '{}'", log_dir.display());
-                    std::process::exit(1);
-                }
+            let log_dir = &args.log_dir;
+            let VolumeHeaderInfo { header, .. } = match read_volume_header_info(log_dir) {
+                Ok(res) => res,
                 Err(e) => {
-                    eprintln!("Error reading directory '{}': {}", log_dir.display(), e);
-                    std::process::exit(1);
-                }
-            };
-
-            let header = match SummaryReader::read_volume_header(&storage, &summary_file) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("Error reading volume header: {}", e);
+                    eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -776,10 +820,10 @@ fn main() {
             println!("Volume:        {}", log_dir.display());
             println!("Cipher Suite:  {}", header.cipher);
             println!("Compression:   {}", header.compression);
+            println!("Volume ID:     {}", hex_string(&header.volume_id));
 
             if header.cipher.is_encrypted() {
                 println!("Unlocked by:   {}", header.key_source);
-                println!("Volume ID:     {}", hex_string(&header.volume_id));
                 println!();
                 if header.compression.is_enabled() {
                     println!("Compressed records reveal roughly how compressible their contents");

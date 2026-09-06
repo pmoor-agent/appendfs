@@ -449,7 +449,7 @@ pub fn create_canonical_compat_volume(out_dir: &Path) -> io::Result<()> {
     init_volume_with_clock_and_uids(
         storage.clone(),
         &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
+        VolumeHeader::deterministic_plaintext(crate::compress::Compression::None),
         clock.clone(),
         COMPAT_UID,
         COMPAT_GID,
@@ -469,6 +469,7 @@ pub fn create_canonical_compat_volume(out_dir: &Path) -> io::Result<()> {
     );
 
     let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
+    fs.volume_header = VolumeHeader::deterministic_plaintext(crate::compress::Compression::None);
     fs.log_writer = Some(writer);
     fs.set_log_dir(out_dir);
 

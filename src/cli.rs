@@ -313,6 +313,10 @@ pub struct MountCommonArgs {
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
 
+    /// Prompt for the volume's passphrase in order to unlock volume
+    #[arg(long = "passphrase", default_value_t = false)]
+    pub passphrase: bool,
+
     /// Maximum size in bytes of in-memory decrypted record cache (default: 128 MiB)
     #[arg(long = "decrypted-cache-size", default_value_t = DEFAULT_DECRYPTED_CACHE_SIZE)]
     pub decrypted_cache_size: usize,
@@ -431,6 +435,10 @@ pub struct StatsArgs {
     /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
+
+    /// Prompt for the volume's passphrase in order to unlock volume
+    #[arg(long = "passphrase", default_value_t = false)]
+    pub passphrase: bool,
 }
 
 #[derive(Args, Debug)]
@@ -449,6 +457,10 @@ pub struct CheckArgs {
     /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
+
+    /// Prompt for the volume's passphrase in order to unlock volume
+    #[arg(long = "passphrase", default_value_t = false)]
+    pub passphrase: bool,
 
     /// Verify remote objects on specified remote against summary manifest authenticated MD5s
     #[arg(long = "remote")]

@@ -28,12 +28,9 @@ pub struct SummaryHeader {
     pub next_inode: u64,
     #[serde(with = "crate::clock::serde_system_time")]
     pub created_at: std::time::SystemTime,
-    /// IV for the encrypted body. Zero when `volume_header_len` is 0.
+    /// IV for the encrypted body. Zero for unencrypted volumes.
     pub iv: [u8; 12],
-    /// Length of the plaintext VolumeHeader blob that follows this header; 0 means the
-    /// volume is unencrypted. This is the sole in-file marker - the `cipher` and `key_id`
-    /// bytes that used to sit here merely restated what the volume header already says, and
-    /// every unauthenticated restatement is somewhere a reader might branch wrongly.
+    /// Length of the plaintext VolumeHeader blob that follows this header.
     pub volume_header_len: u32,
 }
 
@@ -538,7 +535,10 @@ fn parse_volume_header_blob(
     header: &SummaryHeader,
 ) -> io::Result<crate::crypto::VolumeHeader> {
     if header.volume_header_len == 0 {
-        return Ok(crate::crypto::VolumeHeader::plaintext());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "summary declares a 0-byte volume header",
+        ));
     }
 
     // Bound the declared length by the file before allocating: this value is read straight
@@ -1064,6 +1064,20 @@ mod tests {
             read_back.unlock(&wrong).unwrap_err(),
             crate::crypto::CryptoError::WrongKey
         );
+    }
+
+    #[test]
+    fn test_zero_volume_header_len_fails_with_invalid_data() {
+        let storage = Arc::new(MemoryStorage::new());
+        let header = SummaryHeader::new(0, 0, 2, std::time::SystemTime::UNIX_EPOCH, [0u8; 12], 0);
+        let header_bytes = header.to_bytes();
+        let mut writer = storage.open_writer("000000.summary", WriteMode::CreateNew).unwrap();
+        writer.append(&header_bytes).unwrap();
+        writer.sync().unwrap();
+
+        let err = SummaryReader::read_volume_header(storage.as_ref(), "000000.summary").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("0-byte volume header"));
     }
 
     #[test]
