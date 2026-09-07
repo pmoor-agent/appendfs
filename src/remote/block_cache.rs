@@ -221,6 +221,46 @@ impl OnDiskBlockCache {
         Ok(())
     }
 
+    pub fn read_blocks(&self, file_stem: &str, start_block: u64, count: usize) -> io::Result<Vec<Option<Vec<u8>>>> {
+        let mut results = Vec::with_capacity(count);
+        for i in 0..count {
+            results.push(self.read_block(file_stem, start_block + i as u64)?);
+        }
+        Ok(results)
+    }
+
+    pub fn write_blocks(&self, file_stem: &str, start_block: u64, data: &[u8]) -> io::Result<()> {
+        let _guard = self.access_lock.lock().unwrap();
+        let stem = clean_file_stem(file_stem);
+        let pid = std::process::id();
+        let mut offset = 0;
+        let mut block_idx = start_block;
+
+        while offset < data.len() {
+            let chunk_len = (BLOCK_SIZE as usize).min(data.len() - offset);
+            let chunk = &data[offset..offset + chunk_len];
+            let target_path = self.block_path(file_stem, block_idx);
+            let tmp_path = self.cache_dir.join(format!("{}_{:06}.tmp.{}", stem, block_idx, pid));
+
+            {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp_path)?;
+                file.write_all(chunk)?;
+                file.flush()?;
+            }
+
+            fs::rename(tmp_path, target_path)?;
+            offset += chunk_len;
+            block_idx += 1;
+        }
+
+        self.prune_if_needed()?;
+        Ok(())
+    }
+
     fn prune_if_needed(&self) -> io::Result<()> {
         let mut entries = Vec::new();
         let mut total_size = 0u64;
@@ -275,6 +315,26 @@ pub trait BlockCache: Send + Sync + std::fmt::Debug {
     fn read_block(&self, file_stem: &str, block_idx: u64) -> io::Result<Option<Vec<u8>>>;
     /// Writes a 1 MiB block into cache, pruning oldest entries if capacity is exceeded.
     fn write_block(&self, file_stem: &str, block_idx: u64, data: &[u8]) -> io::Result<()>;
+    /// Reads multiple consecutive blocks starting from `start_block` up to `count` blocks.
+    fn read_blocks(&self, file_stem: &str, start_block: u64, count: usize) -> io::Result<Vec<Option<Vec<u8>>>> {
+        let mut results = Vec::with_capacity(count);
+        for i in 0..count {
+            results.push(self.read_block(file_stem, start_block + i as u64)?);
+        }
+        Ok(results)
+    }
+    /// Writes multiple consecutive blocks starting from `start_block`, chunking `data` into 1 MiB blocks.
+    fn write_blocks(&self, file_stem: &str, start_block: u64, data: &[u8]) -> io::Result<()> {
+        let mut offset = 0;
+        let mut block_idx = start_block;
+        while offset < data.len() {
+            let chunk_len = (BLOCK_SIZE as usize).min(data.len() - offset);
+            self.write_block(file_stem, block_idx, &data[offset..offset + chunk_len])?;
+            offset += chunk_len;
+            block_idx += 1;
+        }
+        Ok(())
+    }
     /// Prunes excess cached blocks if capacity is exceeded.
     fn prune_if_needed(&self) -> io::Result<()>;
     /// Reference to the single-flight request coalescer associated with this block cache.
@@ -290,8 +350,16 @@ impl BlockCache for OnDiskBlockCache {
         self.read_block(file_stem, block_idx)
     }
 
+    fn read_blocks(&self, file_stem: &str, start_block: u64, count: usize) -> io::Result<Vec<Option<Vec<u8>>>> {
+        self.read_blocks(file_stem, start_block, count)
+    }
+
     fn write_block(&self, file_stem: &str, block_idx: u64, data: &[u8]) -> io::Result<()> {
         self.write_block(file_stem, block_idx, data)
+    }
+
+    fn write_blocks(&self, file_stem: &str, start_block: u64, data: &[u8]) -> io::Result<()> {
+        self.write_blocks(file_stem, start_block, data)
     }
 
     fn prune_if_needed(&self) -> io::Result<()> {

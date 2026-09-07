@@ -31,6 +31,9 @@ pub struct RemoteTargetConfig {
     /// Read priority (lower numerical values are queried first during remote reads; default 10 for path/NFS, 100 for S3)
     #[serde(default = "default_read_priority")]
     pub read_priority: u32,
+    /// Maximum concurrent read requests to this remote (0 or None = unlimited)
+    #[serde(default)]
+    pub max_concurrent_reads: Option<usize>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub access_key_id_env: Option<String>,
@@ -58,6 +61,7 @@ impl RemoteTargetConfig {
             read_only: false,
             replicate_ancestors: false,
             read_priority: default_read_priority(),
+            max_concurrent_reads: None,
             access_key_id: None,
             secret_access_key: None,
             access_key_id_env: None,
@@ -77,6 +81,7 @@ impl RemoteTargetConfig {
             read_only: false,
             replicate_ancestors: false,
             read_priority: 10,
+            max_concurrent_reads: None,
             access_key_id: None,
             secret_access_key: None,
             access_key_id_env: None,
@@ -88,6 +93,11 @@ impl RemoteTargetConfig {
 
     pub fn with_read_priority(mut self, priority: u32) -> Self {
         self.read_priority = priority;
+        self
+    }
+
+    pub fn with_max_concurrent_reads(mut self, max: usize) -> Self {
+        self.max_concurrent_reads = if max > 0 { Some(max) } else { None };
         self
     }
 
@@ -232,7 +242,7 @@ impl Default for ReplicationPolicy {
 }
 
 /// Registry managing all configured remotes and policies for a volume (`remotes.toml`).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteRegistry {
     #[serde(default)]
     pub policy: ReplicationPolicy,
@@ -240,6 +250,20 @@ pub struct RemoteRegistry {
     pub remotes: BTreeMap<String, RemoteTargetConfig>,
     #[serde(skip)]
     pub store_overrides: BTreeMap<String, Arc<dyn RemoteStore>>,
+    #[serde(skip)]
+    pub limiters:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<crate::remote::limiter::ConcurrencyLimiter>>>>,
+}
+
+impl Default for RemoteRegistry {
+    fn default() -> Self {
+        Self {
+            policy: ReplicationPolicy::default(),
+            remotes: BTreeMap::new(),
+            store_overrides: BTreeMap::new(),
+            limiters: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
 }
 
 impl PartialEq for RemoteRegistry {
@@ -342,7 +366,15 @@ impl RemoteRegistry {
                     .get(name)
                     .cloned()
                     .unwrap_or_else(|| cfg.build_store());
-                crate::remote::RemoteReadTarget::new(name.clone(), store, cfg.read_priority)
+                let mut target = crate::remote::RemoteReadTarget::new(name.clone(), store, cfg.read_priority);
+                if let Some(max) = cfg.max_concurrent_reads.filter(|&m| m > 0) {
+                    let mut lim_guard = self.limiters.lock().unwrap();
+                    let limiter = lim_guard
+                        .entry(name.clone())
+                        .or_insert_with(|| Arc::new(crate::remote::limiter::ConcurrencyLimiter::new(max)));
+                    target = target.with_limiter(Arc::clone(limiter));
+                }
+                target
             })
             .collect();
         entries.sort_by(|a, b| (a.priority, &a.name).cmp(&(b.priority, &b.name)));

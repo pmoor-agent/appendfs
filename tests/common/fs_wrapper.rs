@@ -201,11 +201,7 @@ impl TestFS {
             registry.add_remote(&name, cfg);
             registry.set_store_override(&name, failing.clone());
 
-            remote_read_targets.push(appendfs::RemoteReadTarget {
-                name,
-                store: failing,
-                priority: 10 + i as u32,
-            });
+            remote_read_targets.push(appendfs::RemoteReadTarget::new(name, failing, 10 + i as u32));
         }
 
         let log_cache = Arc::new(appendfs::LogFileCache::with_remote_support(
@@ -609,11 +605,7 @@ impl TestFS {
         let mut remote_read_targets = Vec::new();
         for (i, failing) in remotes.iter().enumerate() {
             let name = format!("remote{}", i);
-            remote_read_targets.push(appendfs::RemoteReadTarget {
-                name,
-                store: failing.clone(),
-                priority: 10 + i as u32,
-            });
+            remote_read_targets.push(appendfs::RemoteReadTarget::new(name, failing.clone(), 10 + i as u32));
         }
 
         let log_cache = Arc::new(appendfs::LogFileCache::with_remote_support(

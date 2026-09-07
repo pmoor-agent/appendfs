@@ -9,6 +9,7 @@ pub mod failing;
 pub mod fs;
 #[cfg(any(test, feature = "testing"))]
 pub mod latency;
+pub mod limiter;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
 pub mod recovery;
@@ -23,7 +24,7 @@ pub use block_cache::{
     TieredCache,
 };
 pub use bootstrap::bootstrap_from_remote;
-pub use coalesce::{CoalesceError, RemoteReadCoalescer};
+pub use coalesce::{BatchLeaderGuard, CoalesceError, FollowerBlock, RemoteReadCoalescer};
 pub use config::{RemoteRegistry, RemoteTargetConfig, ReplicationPolicy};
 #[cfg(any(test, feature = "testing"))]
 pub use counting::{CountingRemoteStore, RemoteStoreMetrics};
@@ -32,6 +33,7 @@ pub use failing::FailingRemoteStore;
 pub use fs::LocalDirRemoteStore;
 #[cfg(any(test, feature = "testing"))]
 pub use latency::LatencyRemoteStore;
+pub use limiter::{ConcurrencyLimiter, ConcurrencyPermit};
 #[cfg(any(test, feature = "testing"))]
 pub use mock::MockRemoteStore;
 pub use recovery::prepare_remote_recovery_for_target;
@@ -44,12 +46,13 @@ use std::io;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// A remote target configured for tiered reading with priority.
+/// A remote target configured for tiered reading with priority and optional concurrency limiting.
 #[derive(Clone, Debug)]
 pub struct RemoteReadTarget {
     pub name: String,
     pub store: Arc<dyn RemoteStore>,
     pub priority: u32,
+    pub limiter: Option<Arc<ConcurrencyLimiter>>,
 }
 
 impl RemoteReadTarget {
@@ -58,7 +61,27 @@ impl RemoteReadTarget {
             name: name.into(),
             store,
             priority,
+            limiter: None,
         }
+    }
+
+    pub fn with_concurrency_limit(mut self, max_concurrent: usize) -> Self {
+        if max_concurrent > 0 {
+            self.limiter = Some(Arc::new(ConcurrencyLimiter::new(max_concurrent)));
+        } else {
+            self.limiter = None;
+        }
+        self
+    }
+
+    pub fn with_limiter(mut self, limiter: Arc<ConcurrencyLimiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
+    }
+
+    /// Acquires a concurrency permit if a limiter is configured for this remote.
+    pub fn acquire_permit(&self) -> Option<ConcurrencyPermit> {
+        self.limiter.as_ref().map(|l| l.acquire())
     }
 }
 
@@ -68,13 +91,19 @@ impl From<(String, Arc<dyn RemoteStore>)> for RemoteReadTarget {
             name,
             store,
             priority: 100,
+            limiter: None,
         }
     }
 }
 
 impl From<(String, Arc<dyn RemoteStore>, u32)> for RemoteReadTarget {
     fn from((name, store, priority): (String, Arc<dyn RemoteStore>, u32)) -> Self {
-        Self { name, store, priority }
+        Self {
+            name,
+            store,
+            priority,
+            limiter: None,
+        }
     }
 }
 
@@ -84,6 +113,7 @@ impl From<(&str, Arc<dyn RemoteStore>)> for RemoteReadTarget {
             name: name.to_string(),
             store,
             priority: 100,
+            limiter: None,
         }
     }
 }
@@ -94,6 +124,7 @@ impl From<(&str, Arc<dyn RemoteStore>, u32)> for RemoteReadTarget {
             name: name.to_string(),
             store,
             priority,
+            limiter: None,
         }
     }
 }
