@@ -56,8 +56,8 @@ jobs:
       - name: Install FUSE and Python test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config python3-pip python3-zstandard python3-cryptography
-          python3 -m pip install --break-system-packages blake3 argon2-cffi || python3 -m pip install blake3 argon2-cffi
+          sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config python3-pip python3-zstandard python3-cryptography python3-argon2
+          sudo apt-get install -y --no-install-recommends python3-blake3 2>/dev/null || python3 -m pip install --break-system-packages blake3 || python3 -m pip install blake3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Debug rather than release: overflow checks and debug assertions are active, and
