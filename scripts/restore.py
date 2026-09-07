@@ -29,21 +29,10 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-# Optional dependencies for encrypted/compressed volumes
-try:
-    import zstandard as zstd
-except ImportError:
-    zstd = None
-
-try:
-    import blake3
-except ImportError:
-    blake3 = None
-
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-except ImportError:
-    ChaCha20Poly1305 = None
+import argon2.low_level
+import blake3
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+import zstandard as zstd
 
 
 FILE_MAGIC = b"APPF"
@@ -212,8 +201,8 @@ def derive_record_aad(op_code: int, tx_id: int, inode: int) -> bytes:
 
 
 def parse_log_filename(name: str) -> Optional[Tuple[int, int]]:
-    """Parses a log filename like 000001.log or 000001-02.log into (generation, revision)."""
-    m = re.match(r"^(\d{6})(?:-(\d+))?\.log$", name)
+    """Parses a log filename like 000001.log or 000001_r2.log into (generation, revision)."""
+    m = re.match(r"^(\d{6})(?:_r(\d+))?\.log$", name)
     if not m:
         return None
     gen = int(m.group(1))
@@ -261,11 +250,7 @@ class VolumeDecryptor:
     def __init__(self, key_bytes: Optional[bytes] = None, no_verify: bool = False):
         self.key_bytes = key_bytes
         self.no_verify = no_verify
-        self.cipher = None
-        if key_bytes:
-            if ChaCha20Poly1305 is None:
-                raise ImportError("Decryption requires the 'cryptography' package: pip install cryptography")
-            self.cipher = ChaCha20Poly1305(key_bytes)
+        self.cipher = ChaCha20Poly1305(key_bytes) if key_bytes else None
 
     def decode_record(
         self, generation: int, tx_id: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
@@ -281,7 +266,7 @@ class VolumeDecryptor:
             data = decrypted
         else:
             # Plaintext volume
-            if not self.no_verify and blake3 is not None:
+            if not self.no_verify:
                 aad = derive_record_aad(op_code, tx_id, inode)
                 hasher = blake3.blake3()
                 hasher.update(aad)
@@ -293,36 +278,65 @@ class VolumeDecryptor:
 
         # Decompress if Zstd
         if op_code == OP_DATA_ZSTD:
-            if zstd is None:
-                raise ImportError("Zstd decompression requires the 'zstandard' package: pip install zstandard")
             dctx = zstd.ZstdDecompressor()
             data = dctx.decompress(data)
 
         return data
 
 
+DATA_KEY_CONTEXT = "appendfs-volume-key"
+
+
+def read_volume_header_from_summary(summary_path: Path) -> Tuple[bytes, bytes, bytes, bytes]:
+    """Reads (volume_id, kdf_salt, kcv_iv, kcv_tag) from an AppendFS summary file."""
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"Summary file not found: '{summary_path}'")
+    with open(summary_path, "rb") as f:
+        hdr = f.read(64)
+        if len(hdr) < 64:
+            raise ValueError(f"Corrupt or truncated summary header in '{summary_path}'")
+        magic, ver, gen, rev, tx, next_ino, sec, nsec, iv, vh_len = struct.unpack(">4sIQIQQqI12sI", hdr)
+        if magic != b"APPS":
+            raise ValueError(f"Invalid magic {magic} in '{summary_path}'")
+        if vh_len < 72:
+            raise ValueError(f"Summary '{summary_path}' does not contain an encrypted VolumeHeader")
+        vh_bytes = f.read(72)
+        if len(vh_bytes) < 72:
+            raise ValueError(f"Truncated VolumeHeader in '{summary_path}'")
+        cipher, key_source, compression, volume_id, kdf_salt, kcv_iv, kcv_tag = struct.unpack(">III16s16s12s16s", vh_bytes)
+        return (volume_id, kdf_salt, kcv_iv, kcv_tag)
+
+
 def derive_key_from_passphrase_or_file(
-    passphrase: Optional[str], key_file: Optional[str], volume_id: bytes
+    passphrase: Optional[str], key_file: Optional[str], salt: bytes
 ) -> bytes:
     """Derives the 32-byte data encryption key matching AppendFS's MasterKey and VolumeHeader."""
-    if blake3 is None:
-        raise ImportError("Key derivation requires the 'blake3' package: pip install blake3")
-
-    if key_file:
+    if key_file and passphrase:
+        with open(key_file, "r") as f:
+            hex_str = f.read().strip()
+        if len(hex_str) != 64:
+            raise ValueError(f"Expected 64 hex characters in key file '{key_file}', found {len(hex_str)}")
+        raw_key = bytes.fromhex(hex_str)
+        material = raw_key + passphrase.encode("utf-8")
+        master_key = argon2.low_level.hash_secret_raw(
+            secret=material,
+            salt=salt,
+            time_cost=3,
+            memory_cost=64 * 1024,
+            parallelism=1,
+            hash_len=32,
+            type=argon2.low_level.Type.ID,
+        )
+    elif key_file:
         with open(key_file, "r") as f:
             hex_str = f.read().strip()
         if len(hex_str) != 64:
             raise ValueError(f"Expected 64 hex characters in key file '{key_file}', found {len(hex_str)}")
         master_key = bytes.fromhex(hex_str)
     elif passphrase:
-        try:
-            import argon2.low_level
-        except ImportError:
-            raise ImportError("Passphrase decryption requires 'argon2-cffi': pip install argon2-cffi")
-        # 64 MiB, 3 passes, 1 lane matching ARGON2_M_COST_KIB / ARGON2_T_COST / ARGON2_P_COST
         master_key = argon2.low_level.hash_secret_raw(
             secret=passphrase.encode("utf-8"),
-            salt=volume_id,
+            salt=salt,
             time_cost=3,
             memory_cost=64 * 1024,
             parallelism=1,
@@ -330,7 +344,7 @@ def derive_key_from_passphrase_or_file(
             type=argon2.low_level.Type.ID,
         )
     else:
-        raise ValueError("Either --passphrase or --key-file must be provided for encrypted volumes")
+        raise ValueError("Either --passphrase, --key-file, or both must be provided for encrypted volumes")
 
     # Derivation matching derive_subkey(DATA_KEY_CONTEXT, &master.key)
     return blake3.blake3(master_key, derive_key_context=DATA_KEY_CONTEXT).digest()
@@ -668,14 +682,14 @@ def main():
     # Determine encryption key if needed
     key_bytes = None
     if args.passphrase or args.key_file:
-        # Read volume_id from first available summary or log file header
-        summary_0 = volume_path / "000000.summary" if volume_path.is_dir() else None
-        volume_id = b"\x00" * 16
-        if summary_0 and summary_0.is_file():
-            with open(summary_0, "rb") as f:
-                f.seek(16)
-                volume_id = f.read(16)
-        key_bytes = derive_key_from_passphrase_or_file(args.passphrase, args.key_file, volume_id)
+        summary_0 = volume_path / "000000.summary" if volume_path.is_dir() else volume_path.parent / "000000.summary"
+        if not summary_0.is_file():
+            raise FileNotFoundError(
+                f"Required initial summary '000000.summary' not found in '{volume_path}'. "
+                "The initial summary is required to obtain volume metadata and KDF salt."
+            )
+        volume_id, kdf_salt, kcv_iv, kcv_tag = read_volume_header_from_summary(summary_0)
+        key_bytes = derive_key_from_passphrase_or_file(args.passphrase, args.key_file, kdf_salt)
 
     decryptor = VolumeDecryptor(key_bytes=key_bytes, no_verify=args.no_verify)
     restorer = Restorer(dest_path, decryptor, verbose=args.verbose, dry_run=args.dry_run)
