@@ -184,10 +184,12 @@ impl LogFileCache {
     ///
     /// If the decrypted payload for `(generation, record_log_offset)` is already present in `decrypted_cache`,
     /// it is copied directly with ZERO disk I/O and ZERO decryption overhead.
+    #[allow(clippy::too_many_arguments)]
     pub fn read_extent_payload(
         &self,
         generation: u64,
         record_log_offset: u64,
+        record_size: u32,
         payload_offset: u32,
         slice_offset: u32,
         dst_buf: &mut [u8],
@@ -204,17 +206,33 @@ impl LogFileCache {
             if let Some(cached) = self.decrypted_cache.get(generation, revision, record_log_offset) {
                 cached
             } else {
+                if (record_size as usize) < crate::log::record::RECORD_HEADER_SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("record_size {} is smaller than record header size", record_size),
+                    ));
+                }
                 let reader = self.get_or_open(generation)?;
+                let mut raw_record = vec![0u8; record_size as usize];
+                reader.read_exact_at(record_log_offset, &mut raw_record)?;
+
                 let mut header_buf = [0u8; crate::log::record::RECORD_HEADER_SIZE];
-                reader.read_exact_at(record_log_offset, &mut header_buf)?;
+                header_buf.copy_from_slice(&raw_record[..crate::log::record::RECORD_HEADER_SIZE]);
                 let header = crate::log::record::RecordHeader::from_bytes(&header_buf)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-                let mut raw_payload = vec![0u8; header.payload_len as usize];
-                reader.read_exact_at(
-                    record_log_offset + crate::log::record::RECORD_HEADER_SIZE as u64,
-                    &mut raw_payload,
-                )?;
+                let raw_payload = &raw_record[crate::log::record::RECORD_HEADER_SIZE..];
+                if raw_payload.len() != header.payload_len as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "record_size {} implies payload_len {}, but header declared {}",
+                            record_size,
+                            raw_payload.len(),
+                            header.payload_len
+                        ),
+                    ));
+                }
 
                 let dec = crate::log::codec::decode(
                     volume_key,
@@ -224,7 +242,7 @@ impl LogFileCache {
                         op_code: header.op_code as u8,
                         inode: header.inode,
                     },
-                    &raw_payload,
+                    raw_payload,
                     &header.auth_tag,
                 )?;
 
@@ -316,7 +334,7 @@ mod tests {
         .unwrap();
 
         let payload = b"cached extent data 123456789";
-        let (_, gen_num, offset) = writer
+        let (_, gen_num, offset, rec_size) = writer
             .append_record(crate::log::record::OpCode::Data, 10, payload)
             .unwrap();
         writer.sync().unwrap();
@@ -326,7 +344,7 @@ mod tests {
         // First read populates in-memory decrypted cache
         let mut buf1 = [0u8; 6];
         cache
-            .read_extent_payload(gen_num, offset, 0, 0, &mut buf1, &key)
+            .read_extent_payload(gen_num, offset, rec_size, 0, 0, &mut buf1, &key)
             .unwrap();
         assert_eq!(&buf1, b"cached");
 
@@ -337,7 +355,7 @@ mod tests {
         // Second read hits in-memory cache directly
         let mut buf2 = [0u8; 6];
         cache
-            .read_extent_payload(gen_num, offset, 7, 0, &mut buf2, &key)
+            .read_extent_payload(gen_num, offset, rec_size, 7, 0, &mut buf2, &key)
             .unwrap();
         assert_eq!(&buf2, b"extent");
     }

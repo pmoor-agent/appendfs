@@ -241,24 +241,27 @@ fn coalesce_extents(range_map: &RangeMap<SharedExtentState>) -> RangeMap<SharedE
                     crate::log::ExtentState::Disk {
                         generation: g1,
                         record_log_offset: r1,
+                        record_size: rec_size1,
                         payload_offset: p1,
                         length: _,
                     },
                     crate::log::ExtentState::Disk {
                         generation: g2,
                         record_log_offset: r2,
+                        record_size: rec_size2,
                         payload_offset: p2,
                         length: _,
                     },
                 ) = (cur_state.read_state(), state.read_state())
                 && g1 == g2
                 && r1 == r2
+                && rec_size1 == rec_size2
                 && p1 as u64 + cur_len == p2 as u64
             {
                 current = Some((
                     cur_start,
                     cur_len + len,
-                    SharedExtentState::new_disk(g1, r1, p1, (cur_len + len) as u32),
+                    SharedExtentState::new_disk(g1, r1, rec_size1, p1, (cur_len + len) as u32),
                 ));
                 merged = true;
             }
@@ -887,7 +890,7 @@ mod tests {
         );
 
         let mut rmap = RangeMap::new();
-        rmap.insert(0, 100, SharedExtentState::new_disk(1, 24, 0, 100));
+        rmap.insert(0, 100, SharedExtentState::new_disk(1, 24, 137, 0, 100));
         snapshot.insert(
             2,
             Arc::new(Node {

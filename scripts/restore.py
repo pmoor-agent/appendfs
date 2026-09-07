@@ -171,8 +171,9 @@ def parse_entry_delta(payload: bytes) -> tuple:
         for _ in range(extents_cnt):
             file_off = r.read_u64()
             rec_log_off = r.read_u64()
+            rec_size = r.read_u32()
             length = r.read_u64()
-            extents.append((file_off, rec_log_off, length))
+            extents.append((file_off, rec_log_off, rec_size, length))
         size = r.read_opt_u64()
         attrs = parse_attr_delta(r)
         return ("file", extents, size, attrs)
@@ -583,7 +584,7 @@ class Restorer:
                 primary.parent.mkdir(parents=True, exist_ok=True)
                 open_mode = "r+b" if primary.exists() else "w+b"
                 with open(primary, open_mode) as f:
-                    for file_off, rec_log_off, length in extents:
+                    for file_off, rec_log_off, _rec_size, length in extents:
                         if rec_log_off != 0:
                             chunk = batch_chunks.get((ino, rec_log_off))
                             if chunk is not None:

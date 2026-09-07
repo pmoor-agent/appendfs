@@ -27,6 +27,7 @@ pub enum ExtentState {
     Disk {
         generation: u64,
         record_log_offset: u64, // Byte offset in .log file where RecordHeader starts
+        record_size: u32,       // Total physical record bytes on disk (RecordHeader + payload)
         payload_offset: u32,    // Offset within decrypted record payload
         length: u32,            // Length of slice
     },
@@ -63,6 +64,7 @@ enum StoredExtent {
     Disk {
         generation: u64,
         record_log_offset: u64,
+        record_size: u32,
         payload_offset: u32,
         length: u32,
     },
@@ -100,10 +102,10 @@ pub fn zero_extent_len(record_log_offset: u64) -> u64 {
     record_log_offset
 }
 
-/// Encodes a hole as `(generation, record_log_offset, payload_offset, length)` for an
+/// Encodes a hole as `(generation, record_log_offset, record_size, payload_offset, length)` for an
 /// on-disk extent descriptor. See [`ZERO_EXTENT_GENERATION`].
-pub fn zero_extent_fields(length: u64) -> (u64, u64, u32, u32) {
-    (ZERO_EXTENT_GENERATION, length, 0, 0)
+pub fn zero_extent_fields(length: u64) -> (u64, u64, u32, u32, u32) {
+    (ZERO_EXTENT_GENERATION, length, 0, 0, 0)
 }
 
 /// On-disk shape of a `SharedExtentState`, used for summary (de)serialization. Kept
@@ -115,6 +117,7 @@ pub fn zero_extent_fields(length: u64) -> (u64, u64, u32, u32) {
 struct SerializedExtent {
     generation: u64,
     record_log_offset: u64,
+    record_size: u32,
     payload_offset: u32,
     length: u32,
 }
@@ -128,20 +131,23 @@ impl Serialize for SharedExtentState {
             ExtentState::Disk {
                 generation,
                 record_log_offset,
+                record_size,
                 payload_offset,
                 length,
             } => SerializedExtent {
                 generation,
                 record_log_offset,
+                record_size,
                 payload_offset,
                 length,
             }
             .serialize(serializer),
             ExtentState::Zero { length } => {
-                let (generation, record_log_offset, payload_offset, length) = zero_extent_fields(length);
+                let (generation, record_log_offset, record_size, payload_offset, length) = zero_extent_fields(length);
                 SerializedExtent {
                     generation,
                     record_log_offset,
+                    record_size,
                     payload_offset,
                     length,
                 }
@@ -166,6 +172,7 @@ impl<'de> Deserialize<'de> for SharedExtentState {
         Ok(Self::new_disk(
             s.generation,
             s.record_log_offset,
+            s.record_size,
             s.payload_offset,
             s.length,
         ))
@@ -185,10 +192,17 @@ impl SharedExtentState {
         Self::new_staged(Arc::new(RwLock::new(bytes)), payload_offset, length)
     }
 
-    pub fn new_disk(generation: u64, record_log_offset: u64, payload_offset: u32, length: u32) -> Self {
+    pub fn new_disk(
+        generation: u64,
+        record_log_offset: u64,
+        record_size: u32,
+        payload_offset: u32,
+        length: u32,
+    ) -> Self {
         Self(Arc::new(RwLock::new(StoredExtent::Disk {
             generation,
             record_log_offset,
+            record_size,
             payload_offset,
             length,
         })))
@@ -217,11 +231,13 @@ impl SharedExtentState {
             StoredExtent::Disk {
                 generation,
                 record_log_offset,
+                record_size,
                 payload_offset,
                 length,
             } => ExtentState::Disk {
                 generation,
                 record_log_offset,
+                record_size,
                 payload_offset,
                 length,
             },
@@ -246,7 +262,14 @@ impl SharedExtentState {
     }
 
     /// Converts this extent directly to Disk state with exact disk payload offset and length.
-    pub fn convert_to_disk(&self, generation: u64, record_log_offset: u64, payload_offset: u32, length: u32) {
+    pub fn convert_to_disk(
+        &self,
+        generation: u64,
+        record_log_offset: u64,
+        record_size: u32,
+        payload_offset: u32,
+        length: u32,
+    ) {
         let mut state = match self.0.write() {
             Ok(guard) => guard,
             Err(err) => err.into_inner(),
@@ -254,6 +277,7 @@ impl SharedExtentState {
         *state = StoredExtent::Disk {
             generation,
             record_log_offset,
+            record_size,
             payload_offset,
             length,
         };
