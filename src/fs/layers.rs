@@ -525,8 +525,11 @@ pub fn execute_read_plan(
     // disk or remote S3 reads below take significant time.
     if !cold_slices.is_empty() {
         let cache = log_cache.ok_or(libc::EIO)?;
-        for slice in cold_slices {
-            match slice.source {
+
+        if cold_slices.len() == 1 {
+            // Fast single-extent path: execute synchronously on current thread with zero overhead
+            let slice = &cold_slices[0];
+            match &slice.source {
                 ReadSliceSource::Disk {
                     generation,
                     record_log_offset,
@@ -536,17 +539,117 @@ pub fn execute_read_plan(
                 } => {
                     cache
                         .read_extent_payload(
-                            generation,
-                            record_log_offset,
-                            record_size,
-                            payload_offset,
-                            slice_inner_offset,
+                            *generation,
+                            *record_log_offset,
+                            *record_size,
+                            *payload_offset,
+                            *slice_inner_offset,
                             &mut dst_buf[slice.dst_offset..slice.dst_offset + slice.len],
                             volume_key,
                         )
                         .map_err(|_| libc::EIO)?;
                 }
-                other => panic!("expected Disk slice in cold_slices, found {:?}", other),
+                _ => panic!("expected Disk slice in cold_slices"),
+            }
+        } else {
+            // Multi-extent parallel path:
+            // 1. Sort slices by (generation, record_log_offset) so that slices referencing the same
+            // record land in the same worker chunk to maximize decrypted_cache hits.
+            cold_slices.sort_by_key(|s| match &s.source {
+                ReadSliceSource::Disk {
+                    generation,
+                    record_log_offset,
+                    ..
+                } => (*generation, *record_log_offset),
+                _ => (0, 0),
+            });
+
+            let num_workers = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+                .min(cold_slices.len())
+                .min(16);
+
+            if num_workers <= 1 {
+                for slice in &cold_slices {
+                    match &slice.source {
+                        ReadSliceSource::Disk {
+                            generation,
+                            record_log_offset,
+                            record_size,
+                            payload_offset,
+                            slice_inner_offset,
+                        } => {
+                            cache
+                                .read_extent_payload(
+                                    *generation,
+                                    *record_log_offset,
+                                    *record_size,
+                                    *payload_offset,
+                                    *slice_inner_offset,
+                                    &mut dst_buf[slice.dst_offset..slice.dst_offset + slice.len],
+                                    volume_key,
+                                )
+                                .map_err(|_| libc::EIO)?;
+                        }
+                        _ => panic!("expected Disk slice in cold_slices"),
+                    }
+                }
+            } else {
+                let chunk_size = cold_slices.len().div_ceil(num_workers);
+                let chunks: Vec<&[ReadSlice]> = cold_slices.chunks(chunk_size).collect();
+
+                type ReadChunkResult = Vec<(usize, Vec<u8>)>;
+                let all_results = std::thread::scope(|s| -> Result<Vec<ReadChunkResult>, i32> {
+                    let mut handles = Vec::with_capacity(chunks.len());
+
+                    for chunk in chunks {
+                        let handle = s.spawn(move || -> Result<Vec<(usize, Vec<u8>)>, i32> {
+                            let mut chunk_res = Vec::with_capacity(chunk.len());
+                            for slice in chunk {
+                                match &slice.source {
+                                    ReadSliceSource::Disk {
+                                        generation,
+                                        record_log_offset,
+                                        record_size,
+                                        payload_offset,
+                                        slice_inner_offset,
+                                    } => {
+                                        let mut buf = vec![0u8; slice.len];
+                                        cache
+                                            .read_extent_payload(
+                                                *generation,
+                                                *record_log_offset,
+                                                *record_size,
+                                                *payload_offset,
+                                                *slice_inner_offset,
+                                                &mut buf,
+                                                volume_key,
+                                            )
+                                            .map_err(|_| libc::EIO)?;
+                                        chunk_res.push((slice.dst_offset, buf));
+                                    }
+                                    _ => panic!("expected Disk slice in cold_slices"),
+                                }
+                            }
+                            Ok(chunk_res)
+                        });
+                        handles.push(handle);
+                    }
+
+                    let mut results = Vec::with_capacity(handles.len());
+                    for h in handles {
+                        let res = h.join().map_err(|_| libc::EIO)??;
+                        results.push(res);
+                    }
+                    Ok(results)
+                })?;
+
+                for chunk_res in all_results {
+                    for (dst_offset, buf) in chunk_res {
+                        dst_buf[dst_offset..dst_offset + buf.len()].copy_from_slice(&buf);
+                    }
+                }
             }
         }
     }
@@ -813,5 +916,88 @@ mod tests {
 
         let buf = fs.execute_read_plan_sync(plan).unwrap();
         assert_eq!(buf, vec![0xCC; 100]);
+    }
+
+    #[test]
+    fn test_execute_read_plan_multi_extent_parallel() {
+        use crate::crypto::{VolumeHeader, VolumeKey};
+        use crate::log::RecoveryTarget;
+        use crate::storage::MemoryStorage;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = Arc::new(crate::clock::SystemClock);
+        let key = Arc::new(VolumeKey::plaintext());
+        crate::log::init_volume(storage.clone(), &key, VolumeHeader::plaintext()).unwrap();
+        let mut fs =
+            crate::log::recover_fs(storage.clone(), RecoveryTarget::Latest, clock.clone(), key.clone()).unwrap();
+
+        let writer = Arc::new(
+            crate::log::LogWriter::create(
+                storage.clone(),
+                1,
+                clock.as_ref(),
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                key.clone(),
+            )
+            .unwrap(),
+        );
+        fs.attach_log_writer(writer);
+
+        let attr =
+            crate::operations::read_write::create_core(&fs, 1, "multi_extent.bin", 0o644, 0, 1000, 1000).unwrap();
+
+        // Write 4 separate extents, flushing between each so they land in distinct log batches/generations
+        let data1 = vec![0x11u8; 200];
+        let data2 = vec![0x22u8; 200];
+        let data3 = vec![0x33u8; 200];
+        let data4 = vec![0x44u8; 200];
+
+        crate::operations::read_write::write_core(&fs, attr.ino, &data1, 0).unwrap();
+        fs.flush_log().unwrap();
+
+        crate::operations::read_write::write_core(&fs, attr.ino, &data2, 200).unwrap();
+        fs.flush_log().unwrap();
+
+        crate::operations::read_write::write_core(&fs, attr.ino, &data3, 400).unwrap();
+        fs.flush_log().unwrap();
+
+        crate::operations::read_write::write_core(&fs, attr.ino, &data4, 600).unwrap();
+        fs.flush_log().unwrap();
+
+        // Clear decrypted record cache to force actual cold disk decoding in parallel
+        fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
+
+        let plan = fs.plan_read_file_data(attr.ino, 0, 800).unwrap();
+        assert_eq!(plan.total_len, 800);
+        assert!(plan.has_cold_slices);
+        assert!(plan.slices.len() >= 4);
+
+        // Execute synchronously (which dispatches parallel worker threads under the hood)
+        let read_buf = fs.execute_read_plan_sync(plan.clone()).unwrap();
+        assert_eq!(&read_buf[0..200], &data1[..]);
+        assert_eq!(&read_buf[200..400], &data2[..]);
+        assert_eq!(&read_buf[400..600], &data3[..]);
+        assert_eq!(&read_buf[600..800], &data4[..]);
+
+        // Also execute asynchronously via Tokio
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let async_buf = rt
+            .block_on(InMemoryFS::execute_read_plan_async(
+                plan,
+                fs.log_cache.clone(),
+                fs.volume_key.clone(),
+            ))
+            .unwrap();
+
+        assert_eq!(&async_buf[0..200], &data1[..]);
+        assert_eq!(&async_buf[200..400], &data2[..]);
+        assert_eq!(&async_buf[400..600], &data3[..]);
+        assert_eq!(&async_buf[600..800], &data4[..]);
     }
 }

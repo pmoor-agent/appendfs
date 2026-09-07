@@ -60,28 +60,98 @@ pub struct RemoteReadCoalescer {
     in_flight_count: AtomicUsize,
 }
 
-/// RAII guard ensuring that if a leader thread panics during the fetch closure,
-/// waiting follower threads are promptly notified with an error rather than deadlocking.
-struct LeaderGuard<'a> {
-    coalescer: &'a RemoteReadCoalescer,
-    key: (String, u64),
+/// A follower block reference representing an in-flight request initiated by another thread.
+#[derive(Debug, Clone)]
+pub struct FollowerBlock {
+    pub block_idx: u64,
     call: Arc<InFlightCall>,
-    completed: bool,
 }
 
-impl Drop for LeaderGuard<'_> {
-    fn drop(&mut self) {
-        if !self.completed {
-            let mut state = self.call.state.lock().unwrap();
-            *state = CallState::Done(Err(CoalesceError {
-                kind: io::ErrorKind::Interrupted,
-                message: "in-flight remote read aborted due to thread panic".to_string(),
-            }));
-            self.call.cond.notify_all();
+impl FollowerBlock {
+    /// Awaits completion of the in-flight fetch by the leader thread and returns the result.
+    pub fn wait(&self) -> io::Result<Arc<Vec<u8>>> {
+        let mut state = self.call.state.lock().unwrap();
+        loop {
+            match *state {
+                CallState::InProgress => {
+                    state = self.call.cond.wait(state).unwrap();
+                }
+                CallState::Done(Ok(ref data)) => {
+                    return Ok(Arc::clone(data));
+                }
+                CallState::Done(Err(ref err)) => {
+                    return Err(io::Error::from(err.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// RAII guard managing in-flight calls for which the current thread is the leader.
+///
+/// If dropped before completing, any uncompleted leader calls are marked with an
+/// `Interrupted` error to ensure waiting followers never deadlock.
+pub struct BatchLeaderGuard<'a> {
+    coalescer: &'a RemoteReadCoalescer,
+    file_stem: String,
+    leaders: Vec<(u64, Arc<InFlightCall>)>,
+    completed: Vec<bool>,
+}
+
+impl<'a> BatchLeaderGuard<'a> {
+    /// Returns the block indices for which this thread is registered as the leader.
+    pub fn leader_blocks(&self) -> Vec<u64> {
+        self.leaders.iter().map(|(b, _)| *b).collect()
+    }
+
+    /// Completes the in-flight call for `block_idx` with a success or error result,
+    /// notifying all waiting followers.
+    pub fn complete(&mut self, block_idx: u64, result: Result<Arc<Vec<u8>>, &io::Error>) {
+        if let Some(pos) = self.leaders.iter().position(|(b, _)| *b == block_idx)
+            && !self.completed[pos]
+        {
+            self.completed[pos] = true;
+            let (_, call) = &self.leaders[pos];
+            {
+                let mut state = call.state.lock().unwrap();
+                match result {
+                    Ok(ref data) => {
+                        *state = CallState::Done(Ok(Arc::clone(data)));
+                    }
+                    Err(err) => {
+                        *state = CallState::Done(Err(CoalesceError::from(err)));
+                    }
+                }
+                call.cond.notify_all();
+            }
 
             let mut calls = self.coalescer.calls.lock().unwrap();
-            calls.remove(&self.key);
+            calls.remove(&(self.file_stem.clone(), block_idx));
             self.coalescer.in_flight_count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for BatchLeaderGuard<'_> {
+    fn drop(&mut self) {
+        let mut calls_guard = None;
+        for pos in 0..self.leaders.len() {
+            if !self.completed[pos] {
+                self.completed[pos] = true;
+                let (block_idx, call) = &self.leaders[pos];
+                {
+                    let mut state = call.state.lock().unwrap();
+                    *state = CallState::Done(Err(CoalesceError {
+                        kind: io::ErrorKind::Interrupted,
+                        message: "in-flight remote read aborted due to thread panic or early exit".to_string(),
+                    }));
+                    call.cond.notify_all();
+                }
+
+                let calls = calls_guard.get_or_insert_with(|| self.coalescer.calls.lock().unwrap());
+                calls.remove(&(self.file_stem.clone(), *block_idx));
+                self.coalescer.in_flight_count.fetch_sub(1, Ordering::SeqCst);
+            }
         }
     }
 }
@@ -111,77 +181,65 @@ impl RemoteReadCoalescer {
         self.in_flight_count.load(Ordering::SeqCst)
     }
 
+    /// Registers a batch of requested block indices.
+    ///
+    /// Returns a [`BatchLeaderGuard`] managing the blocks for which this caller became the leader,
+    /// and a list of [`FollowerBlock`]s for blocks already in flight by other concurrent threads.
+    pub fn register_batch<'a>(&'a self, file_stem: &str, blocks: &[u64]) -> (BatchLeaderGuard<'a>, Vec<FollowerBlock>) {
+        let stem = crate::remote::block_cache::clean_file_stem(file_stem);
+        let mut calls = self.calls.lock().unwrap();
+        let mut leaders = Vec::new();
+        let mut followers = Vec::new();
+
+        for &b in blocks {
+            let key = (stem.to_string(), b);
+            if let Some(existing) = calls.get(&key) {
+                self.coalesced_requests.fetch_add(1, Ordering::SeqCst);
+                followers.push(FollowerBlock {
+                    block_idx: b,
+                    call: Arc::clone(existing),
+                });
+            } else {
+                self.leader_requests.fetch_add(1, Ordering::SeqCst);
+                self.in_flight_count.fetch_add(1, Ordering::SeqCst);
+                let call = Arc::new(InFlightCall::new());
+                calls.insert(key, Arc::clone(&call));
+                leaders.push((b, call));
+            }
+        }
+
+        let num_leaders = leaders.len();
+        let guard = BatchLeaderGuard {
+            coalescer: self,
+            file_stem: stem.to_string(),
+            leaders,
+            completed: vec![false; num_leaders],
+        };
+
+        (guard, followers)
+    }
+
     /// Executes `fetch` for `(file_stem, block_idx)` if no fetch is currently in flight.
     /// If an identical fetch is already in flight, awaits its completion and shares the result.
     pub fn coalesce<F>(&self, file_stem: &str, block_idx: u64, fetch: F) -> io::Result<Arc<Vec<u8>>>
     where
         F: FnOnce() -> io::Result<Arc<Vec<u8>>>,
     {
-        let stem = crate::remote::block_cache::clean_file_stem(file_stem);
-        let key = (stem.to_string(), block_idx);
-        let call = {
-            let mut calls = self.calls.lock().unwrap();
-            if let Some(existing) = calls.get(&key) {
-                // Follower: join existing in-flight call
-                self.coalesced_requests.fetch_add(1, Ordering::SeqCst);
-                Arc::clone(existing)
-            } else {
-                // Leader: register new in-flight call
-                self.leader_requests.fetch_add(1, Ordering::SeqCst);
-                self.in_flight_count.fetch_add(1, Ordering::SeqCst);
-                let call = Arc::new(InFlightCall::new());
-                calls.insert(key.clone(), Arc::clone(&call));
-
-                let mut guard = LeaderGuard {
-                    coalescer: self,
-                    key,
-                    call: Arc::clone(&call),
-                    completed: false,
-                };
-
-                // Drop map lock before initiating network/storage I/O
-                drop(calls);
-
-                let result = fetch();
-
-                // Publish result to all waiting followers
-                {
-                    let mut state = guard.call.state.lock().unwrap();
-                    match result {
-                        Ok(ref data) => {
-                            *state = CallState::Done(Ok(Arc::clone(data)));
-                        }
-                        Err(ref err) => {
-                            *state = CallState::Done(Err(CoalesceError::from(err)));
-                        }
-                    }
-                    guard.call.cond.notify_all();
+        let (mut guard, followers) = self.register_batch(file_stem, &[block_idx]);
+        if guard.leader_blocks().is_empty() {
+            // Follower: wait for leader to complete the fetch
+            followers[0].wait()
+        } else {
+            // Leader: initiate fetch and publish result
+            let result = fetch();
+            match result {
+                Ok(ref data) => {
+                    guard.complete(block_idx, Ok(Arc::clone(data)));
+                    result
                 }
-
-                // Remove from in-flight calls map
-                {
-                    let mut calls = guard.coalescer.calls.lock().unwrap();
-                    calls.remove(&guard.key);
-                    guard.coalescer.in_flight_count.fetch_sub(1, Ordering::SeqCst);
-                }
-
-                guard.completed = true;
-                return result;
-            }
-        };
-
-        // Follower: wait for leader to complete the fetch
-        let mut state = call.state.lock().unwrap();
-        loop {
-            match *state {
-                CallState::InProgress => {
-                    state = call.cond.wait(state).unwrap();
-                }
-                CallState::Done(Ok(ref data)) => {
-                    return Ok(Arc::clone(data));
-                }
-                CallState::Done(Err(ref err)) => {
-                    return Err(io::Error::from(err.clone()));
+                Err(ref err) => {
+                    guard.complete(block_idx, Err(err));
+                    result
                 }
             }
         }
@@ -330,5 +388,42 @@ mod tests {
         assert_eq!(r2.unwrap_err().kind(), io::ErrorKind::Interrupted);
 
         assert_eq!(coalescer.in_flight(), 0);
+    }
+
+    #[test]
+    fn test_batch_coalescing_partial_overlap() {
+        let coalescer = Arc::new(RemoteReadCoalescer::new());
+
+        // Thread 1 registers [1, 2, 3]
+        let (mut guard1, followers1) = coalescer.register_batch("000001", &[1, 2, 3]);
+        assert_eq!(guard1.leader_blocks(), vec![1, 2, 3]);
+        assert!(followers1.is_empty());
+        assert_eq!(coalescer.in_flight(), 3);
+
+        // Thread 2 registers [2, 3, 4] while Thread 1 is in flight
+        let (mut guard2, followers2) = coalescer.register_batch("000001", &[2, 3, 4]);
+        assert_eq!(guard2.leader_blocks(), vec![4]);
+        assert_eq!(followers2.len(), 2);
+        assert_eq!(followers2[0].block_idx, 2);
+        assert_eq!(followers2[1].block_idx, 3);
+        assert_eq!(coalescer.in_flight(), 4);
+
+        // Complete Thread 1's blocks
+        guard1.complete(1, Ok(Arc::new(vec![10u8; 100])));
+        guard1.complete(2, Ok(Arc::new(vec![20u8; 100])));
+        guard1.complete(3, Ok(Arc::new(vec![30u8; 100])));
+
+        // Followers in Thread 2 can now wait and get the data from Thread 1
+        let res2 = followers2[0].wait().unwrap();
+        let res3 = followers2[1].wait().unwrap();
+        assert_eq!(&res2[..], &[20u8; 100]);
+        assert_eq!(&res3[..], &[30u8; 100]);
+
+        // Complete Thread 2's block 4
+        guard2.complete(4, Ok(Arc::new(vec![40u8; 100])));
+
+        assert_eq!(coalescer.in_flight(), 0);
+        assert_eq!(coalescer.leader_requests(), 4);
+        assert_eq!(coalescer.coalesced_requests(), 2);
     }
 }

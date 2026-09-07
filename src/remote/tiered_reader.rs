@@ -62,24 +62,25 @@ impl TieredStorageReader {
         self
     }
 
-    fn fetch_block_from_remotes(&self, block_idx: u64) -> io::Result<Vec<u8>> {
-        let block_start = block_idx * BLOCK_SIZE;
-        if block_start >= self.expected_len {
+    fn fetch_range_from_remotes(&self, start_offset: u64, total_len: u64) -> io::Result<Vec<u8>> {
+        if start_offset >= self.expected_len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("block start {} exceeds file length {}", block_start, self.expected_len),
+                format!(
+                    "start offset {} exceeds file length {}",
+                    start_offset, self.expected_len
+                ),
             ));
         }
 
-        let block_len = BLOCK_SIZE.min(self.expected_len - block_start);
+        let actual_len = total_len.min(self.expected_len - start_offset);
 
         // 1. Check local storage first (Tier 0: local file still present before purge)
         if let Some(ref storage) = self.local_storage
             && let Ok(reader) = storage.open_reader(&self.filename)
         {
-            let mut buf = vec![0u8; block_len as usize];
-            if reader.read_exact_at(block_start, &mut buf).is_ok() {
-                let _ = self.block_cache.write_block(&self.filename, block_idx, &buf);
+            let mut buf = vec![0u8; actual_len as usize];
+            if reader.read_exact_at(start_offset, &mut buf).is_ok() {
                 return Ok(buf);
             }
         }
@@ -88,7 +89,8 @@ impl TieredStorageReader {
 
         // 2. Query remotes by priority tier (lower priority number first).
         // Within an equal-priority tier, distribute traffic pseudo-randomly but
-        // deterministically based on hash(filename, block_idx).
+        // deterministically based on hash(filename, start_block).
+        let start_block = start_offset / BLOCK_SIZE;
         let mut idx = 0;
         while idx < self.remotes.len() {
             let priority = self.remotes[idx].priority;
@@ -98,42 +100,42 @@ impl TieredStorageReader {
             }
             let group = &self.remotes[group_start..idx];
 
-            let start_offset = if group.len() > 1 {
+            let start_offset_hash = if group.len() > 1 {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 self.filename.hash(&mut hasher);
-                block_idx.hash(&mut hasher);
+                start_block.hash(&mut hasher);
                 (hasher.finish() as usize) % group.len()
             } else {
                 0
             };
 
             for i in 0..group.len() {
-                let candidate = &group[(start_offset + i) % group.len()];
-                let mut buf = Vec::with_capacity(block_len as usize);
+                let candidate = &group[(start_offset_hash + i) % group.len()];
+                let _permit = candidate.acquire_permit();
+                let mut buf = Vec::with_capacity(actual_len as usize);
                 match candidate
                     .store
-                    .get_object_range(&self.filename, block_start, block_len, &mut buf)
+                    .get_object_range(&self.filename, start_offset, actual_len, &mut buf)
                 {
                     Ok(bytes_read) => {
-                        if bytes_read == block_len {
-                            // Successfully fetched block!
-                            let _ = self.block_cache.write_block(&self.filename, block_idx, &buf);
+                        if bytes_read == actual_len {
                             return Ok(buf);
                         }
                         last_err = Some(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             format!(
                                 "remote '{}' returned short range read ({} of {} bytes)",
-                                candidate.name, bytes_read, block_len
+                                candidate.name, bytes_read, actual_len
                             ),
                         ));
                     }
                     Err(e) => {
                         log::warn!(
-                            "Tiered read failed for {} (gen {}, block {}) on remote '{}': {}. Trying next remote...",
+                            "Tiered read failed for {} (gen {}, offset {} len {}) on remote '{}': {}. Trying next remote...",
                             self.filename,
                             self.generation,
-                            block_idx,
+                            start_offset,
+                            actual_len,
                             candidate.name,
                             e
                         );
@@ -146,24 +148,96 @@ impl TieredStorageReader {
         Err(last_err.unwrap_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("No remotes available to fetch block {} of {}", block_idx, self.filename),
+                format!(
+                    "No remotes available to fetch range [{}, {}) of {}",
+                    start_offset,
+                    start_offset + actual_len,
+                    self.filename
+                ),
             )
         }))
     }
 
-    fn get_or_fetch_block(&self, block_idx: u64) -> io::Result<Arc<Vec<u8>>> {
-        if let Ok(Some(cached)) = self.block_cache.read_block(&self.filename, block_idx) {
-            return Ok(Arc::new(cached));
+    /// Fetches a batch of blocks, checking the local [`BlockCache`] first, coalescing concurrent in-flight
+    /// fetches via [`RemoteReadCoalescer`], and issuing contiguous multi-megabyte Range GETs to remotes
+    /// for any missing adjacent blocks.
+    pub fn fetch_blocks_batch(&self, blocks: &[u64]) -> io::Result<std::collections::HashMap<u64, Arc<Vec<u8>>>> {
+        let mut result = std::collections::HashMap::new();
+        let mut missing = Vec::new();
+
+        for &b in blocks {
+            if let Ok(Some(cached)) = self.block_cache.read_block(&self.filename, b) {
+                result.insert(b, Arc::new(cached));
+            } else {
+                missing.push(b);
+            }
         }
 
-        self.coalescer.coalesce(&self.filename, block_idx, || {
-            // Re-check block cache inside leader closure in case a preceding fetch just populated it
-            if let Ok(Some(cached)) = self.block_cache.read_block(&self.filename, block_idx) {
-                return Ok(Arc::new(cached));
+        if missing.is_empty() {
+            return Ok(result);
+        }
+
+        let (mut guard, followers) = self.coalescer.register_batch(&self.filename, &missing);
+        let leader_blocks = guard.leader_blocks();
+
+        // Identify contiguous runs of leader blocks to fetch in single batched S3 range requests
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for &b in &leader_blocks {
+            if let Some(last) = runs.last_mut()
+                && last.1 + 1 == b
+            {
+                last.1 = b;
+                continue;
             }
-            let data = self.fetch_block_from_remotes(block_idx)?;
-            Ok(Arc::new(data))
-        })
+            runs.push((b, b));
+        }
+
+        for (run_start, run_end) in runs {
+            let byte_start = run_start * BLOCK_SIZE;
+            let byte_end = ((run_end + 1) * BLOCK_SIZE).min(self.expected_len);
+            let total_len = byte_end.saturating_sub(byte_start);
+
+            if total_len == 0 {
+                continue;
+            }
+
+            match self.fetch_range_from_remotes(byte_start, total_len) {
+                Ok(fetched_bytes) => {
+                    let mut curr_offset = 0;
+                    for b in run_start..=run_end {
+                        let b_start = b * BLOCK_SIZE;
+                        let b_len = (BLOCK_SIZE).min(self.expected_len.saturating_sub(b_start)) as usize;
+                        let chunk = &fetched_bytes[curr_offset..curr_offset + b_len];
+                        curr_offset += b_len;
+
+                        let _ = self.block_cache.write_block(&self.filename, b, chunk);
+                        let arc_data = Arc::new(chunk.to_vec());
+                        result.insert(b, Arc::clone(&arc_data));
+                        guard.complete(b, Ok(arc_data));
+                    }
+                }
+                Err(err) => {
+                    for b in run_start..=run_end {
+                        guard.complete(b, Err(&err));
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        for follower in followers {
+            let data = follower.wait()?;
+            result.insert(follower.block_idx, data);
+        }
+
+        Ok(result)
+    }
+
+    /// Retrieves a single 1 MiB block from cache or fetches it from remotes.
+    pub fn get_or_fetch_block(&self, block_idx: u64) -> io::Result<Arc<Vec<u8>>> {
+        let mut map = self.fetch_blocks_batch(&[block_idx])?;
+        map.remove(&block_idx)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("block {} not found", block_idx)))
     }
 }
 
@@ -184,20 +258,32 @@ impl StorageReader for TieredStorageReader {
             ));
         }
 
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let start_block = offset / BLOCK_SIZE;
+        let end_block = (offset + buf.len() as u64 - 1) / BLOCK_SIZE;
+        let blocks_to_fetch: Vec<u64> = (start_block..=end_block).collect();
+        let blocks_data = self.fetch_blocks_batch(&blocks_to_fetch)?;
+
         let mut buf_offset = 0;
         let mut current_file_offset = offset;
         let mut remaining = buf.len();
 
-        while remaining > 0 {
-            let block_idx = current_file_offset / BLOCK_SIZE;
+        for b in start_block..=end_block {
+            let block_data = blocks_data.get(&b).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("missing block {} after batch fetch", b),
+                )
+            })?;
             let offset_in_block = (current_file_offset % BLOCK_SIZE) as usize;
-            let block_data = self.get_or_fetch_block(block_idx)?;
-
             let bytes_in_this_block = (block_data.len().saturating_sub(offset_in_block)).min(remaining);
             if bytes_in_this_block == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    format!("short block read at block index {}", block_idx),
+                    format!("short block read at block index {}", b),
                 ));
             }
 
@@ -351,5 +437,119 @@ mod tests {
         // Traffic must be distributed to BOTH stores, not all to one!
         assert!(reads_a > 0, "store_a must receive read traffic, got {}", reads_a);
         assert!(reads_b > 0, "store_b must receive read traffic, got {}", reads_b);
+    }
+
+    #[test]
+    fn test_tiered_reader_multi_block_batch_range_fetch() {
+        let cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
+        let mock_remote = Arc::new(MockRemoteStore::new());
+
+        let total_blocks = 5;
+        let mut payload = Vec::with_capacity((total_blocks * BLOCK_SIZE) as usize);
+        for b in 0..total_blocks {
+            payload.extend_from_slice(&vec![(b + 1) as u8; BLOCK_SIZE as usize]);
+        }
+        mock_remote
+            .put_object("000001.log", &mut &payload[..], payload.len() as u64, None)
+            .unwrap();
+
+        let counting_remote = Arc::new(CountingRemoteStore::new(mock_remote));
+        let remotes = vec![RemoteReadTarget::new("s3", counting_remote.clone(), 100)];
+        let reader = TieredStorageReader::new(1, "000001.log", payload.len() as u64, remotes, cache.clone());
+
+        // Read 3 MiB spanning blocks 1, 2, 3 in a single read_exact_at
+        let read_offset = BLOCK_SIZE;
+        let read_len = (3 * BLOCK_SIZE) as usize;
+        let mut buf = vec![0u8; read_len];
+        reader.read_exact_at(read_offset, &mut buf).unwrap();
+
+        // Verify data correctness
+        assert_eq!(&buf[0..BLOCK_SIZE as usize], &vec![2u8; BLOCK_SIZE as usize][..]);
+        assert_eq!(
+            &buf[BLOCK_SIZE as usize..2 * BLOCK_SIZE as usize],
+            &vec![3u8; BLOCK_SIZE as usize][..]
+        );
+        assert_eq!(
+            &buf[2 * BLOCK_SIZE as usize..3 * BLOCK_SIZE as usize],
+            &vec![4u8; BLOCK_SIZE as usize][..]
+        );
+
+        // Crucial assertion: Exactly 1 contiguous Range GET request was issued to the remote!
+        assert_eq!(
+            counting_remote.range_reads(),
+            1,
+            "Expected exactly 1 batched range read across 3 blocks, got {}",
+            counting_remote.range_reads()
+        );
+
+        // All 3 constituent blocks MUST now be in the local block cache!
+        assert!(cache.read_block("000001", 1).unwrap().is_some());
+        assert!(cache.read_block("000001", 2).unwrap().is_some());
+        assert!(cache.read_block("000001", 3).unwrap().is_some());
+
+        // Subsequent read of block 2 must be served directly from cache (0 new remote requests)
+        let mut slice = [0u8; 128];
+        reader.read_exact_at(2 * BLOCK_SIZE + 50, &mut slice).unwrap();
+        assert_eq!(slice, [3u8; 128]);
+        assert_eq!(counting_remote.range_reads(), 1);
+    }
+
+    #[test]
+    fn test_tiered_reader_with_concurrency_limiter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+        use std::time::Duration;
+
+        let cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
+        let mock_remote = Arc::new(MockRemoteStore::new());
+
+        let total_blocks = 10;
+        let payload = vec![0xABu8; (total_blocks * BLOCK_SIZE) as usize];
+        mock_remote
+            .put_object("000001.log", &mut &payload[..], payload.len() as u64, None)
+            .unwrap();
+
+        let max_permits = 2;
+        let target = RemoteReadTarget::new("s3", mock_remote, 100).with_concurrency_limit(max_permits);
+        let limiter = target.limiter.clone().unwrap();
+
+        let reader = Arc::new(TieredStorageReader::new(
+            1,
+            "000001.log",
+            payload.len() as u64,
+            vec![target],
+            cache,
+        ));
+
+        let active_max = Arc::new(AtomicUsize::new(0));
+        let num_threads = 8;
+        let mut handles = Vec::new();
+
+        for i in 0..num_threads {
+            let r = Arc::clone(&reader);
+            let l = Arc::clone(&limiter);
+            let a = Arc::clone(&active_max);
+            handles.push(thread::spawn(move || {
+                let cur = l.active_count();
+                a.fetch_max(cur, Ordering::SeqCst);
+
+                let offset = (i as u64) * BLOCK_SIZE;
+                let mut buf = [0u8; 256];
+                r.read_exact_at(offset, &mut buf).unwrap();
+                assert_eq!(buf, [0xABu8; 256]);
+                thread::sleep(Duration::from_millis(10));
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(limiter.active_count(), 0);
+        assert!(
+            active_max.load(Ordering::SeqCst) <= max_permits,
+            "Active requests exceeded concurrency limit: got {}",
+            active_max.load(Ordering::SeqCst)
+        );
     }
 }
