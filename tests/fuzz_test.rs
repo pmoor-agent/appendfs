@@ -1103,45 +1103,27 @@ fn test_differential_fuzzing_and_crash_recovery() {
 
         {
             let inner = fs_baseline.fs.inner.lock().unwrap();
-            assert!(
-                inner.dir_handles.is_empty(),
-                "seed {}: dir handle leak in baseline",
-                seed
-            );
+            assert!(inner.dir_handles.is_empty(), "seed {seed}: dir handle leak in baseline");
             assert!(
                 inner.file_handles.is_empty(),
-                "seed {}: file handle leak in baseline",
-                seed
+                "seed {seed}: file handle leak in baseline"
             );
             assert!(
                 inner.open_counts.is_empty(),
-                "seed {}: open_counts leak in baseline",
-                seed
+                "seed {seed}: open_counts leak in baseline"
             );
         }
         {
             let inner = fs_micro.fs.inner.lock().unwrap();
-            assert!(inner.dir_handles.is_empty(), "seed {}: dir handle leak in micro", seed);
-            assert!(
-                inner.file_handles.is_empty(),
-                "seed {}: file handle leak in micro",
-                seed
-            );
-            assert!(inner.open_counts.is_empty(), "seed {}: open_counts leak in micro", seed);
+            assert!(inner.dir_handles.is_empty(), "seed {seed}: dir handle leak in micro");
+            assert!(inner.file_handles.is_empty(), "seed {seed}: file handle leak in micro");
+            assert!(inner.open_counts.is_empty(), "seed {seed}: open_counts leak in micro");
         }
         {
             let inner = fs_remote.fs.inner.lock().unwrap();
-            assert!(inner.dir_handles.is_empty(), "seed {}: dir handle leak in remote", seed);
-            assert!(
-                inner.file_handles.is_empty(),
-                "seed {}: file handle leak in remote",
-                seed
-            );
-            assert!(
-                inner.open_counts.is_empty(),
-                "seed {}: open_counts leak in remote",
-                seed
-            );
+            assert!(inner.dir_handles.is_empty(), "seed {seed}: dir handle leak in remote");
+            assert!(inner.file_handles.is_empty(), "seed {seed}: file handle leak in remote");
+            assert!(inner.open_counts.is_empty(), "seed {seed}: open_counts leak in remote");
         }
 
         // The injection above is only worth anything if it actually fires. Without this,

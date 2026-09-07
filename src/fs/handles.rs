@@ -110,49 +110,25 @@ impl InMemoryFS {
         };
 
         // Clean up locks outside inner critical section
-        let (flock_canceled, flock_ready) = self.locks.release_flock(ino, fh);
-
-        let (range_canceled, range_ready) = if is_last_handle {
-            self.locks.release_range_locks(ino, fh)
+        self.locks.release_flock(ino, fh);
+        if is_last_handle {
+            self.locks.release_range_locks(ino, fh);
         } else {
-            let c = self.locks.cancel_range_lock_waiters(ino, fh);
-            (c, Vec::new())
-        };
-
-        for req in flock_canceled.into_iter().chain(range_canceled) {
-            req.reply_err(libc::EBADF);
-        }
-        for req in flock_ready.into_iter().chain(range_ready) {
-            req.reply_err(0);
+            self.locks.cancel_range_lock_waiters(ino, fh);
         }
         Ok(())
     }
 
     pub fn release_flock(&self, ino: u64, fh: u64) {
-        let (canceled, ready) = self.locks.release_flock(ino, fh);
-        for r in canceled {
-            r.reply_err(libc::EBADF);
-        }
-        for r in ready {
-            r.reply_err(0);
-        }
+        self.locks.release_flock(ino, fh);
     }
 
     pub fn cancel_range_lock_waiters(&self, ino: u64, fh: u64) {
-        let canceled = self.locks.cancel_range_lock_waiters(ino, fh);
-        for r in canceled {
-            r.reply_err(libc::EBADF);
-        }
+        self.locks.cancel_range_lock_waiters(ino, fh);
     }
 
     pub fn release_range_locks(&self, ino: u64, fh: u64) {
-        let (canceled, ready) = self.locks.release_range_locks(ino, fh);
-        for r in canceled {
-            r.reply_err(libc::EBADF);
-        }
-        for r in ready {
-            r.reply_err(0);
-        }
+        self.locks.release_range_locks(ino, fh);
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {

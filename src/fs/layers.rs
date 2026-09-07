@@ -250,7 +250,12 @@ impl<'a> InodeLayerStack<'a> {
     /// references to [`Arc<Vec<u8>>`] are cloned with zero byte-copying.
     ///
     /// If all requested bytes are covered by in-memory slices or holes, `has_cold_slices` will be false.
-    pub fn plan_read_file_data(&self, offset: u64, size: usize) -> Result<ReadPlan, i32> {
+    pub fn plan_read_file_data(
+        &self,
+        offset: u64,
+        size: usize,
+        log_cache: Option<&crate::log::LogFileCache>,
+    ) -> Result<ReadPlan, i32> {
         let attr = self.attr().ok_or(libc::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
             return Err(libc::EISDIR);
@@ -313,12 +318,23 @@ impl<'a> InodeLayerStack<'a> {
                         record_log_offset,
                         payload_offset,
                         length: _,
-                    } => ReadSliceSource::Disk {
-                        generation,
-                        record_log_offset,
-                        payload_offset,
-                        slice_inner_offset: inner_offset as u32,
-                    },
+                    } => {
+                        let cached = log_cache.and_then(|c| c.get_cached_record(generation, record_log_offset));
+                        if let Some(cached_data) = cached {
+                            let src_offset = payload_offset as usize + inner_offset;
+                            ReadSliceSource::Cache {
+                                data: cached_data,
+                                src_offset,
+                            }
+                        } else {
+                            ReadSliceSource::Disk {
+                                generation,
+                                record_log_offset,
+                                payload_offset,
+                                slice_inner_offset: inner_offset as u32,
+                            }
+                        }
+                    }
                 };
 
                 raw_slices.push(ReadSlice {
@@ -387,7 +403,7 @@ impl<'a> InodeLayerStack<'a> {
 
     /// Reads file data resolving extents across layers.
     pub fn read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<Vec<u8>, i32> {
-        let plan = self.plan_read_file_data(offset, size)?;
+        let plan = self.plan_read_file_data(offset, size, fs.log_cache.as_deref())?;
         fs.execute_read_plan_sync(plan)
     }
 }
@@ -402,6 +418,8 @@ pub enum ReadSliceSource {
         data: crate::log::extent::StagedBuffer,
         src_offset: usize,
     },
+    /// In-memory: reference to decrypted record cache hit.
+    Cache { data: Arc<Vec<u8>>, src_offset: usize },
     /// Cold disk or remote S3 extent.
     Disk {
         generation: u64,
@@ -435,6 +453,16 @@ impl PartialEq for ReadSliceSource {
                 let g2 = d2.read().unwrap();
                 *g1 == *g2
             }
+            (
+                Self::Cache {
+                    data: d1,
+                    src_offset: o1,
+                },
+                Self::Cache {
+                    data: d2,
+                    src_offset: o2,
+                },
+            ) => o1 == o2 && (Arc::ptr_eq(d1, d2) || d1 == d2),
             (
                 Self::Disk {
                     generation: g1,
@@ -530,20 +558,16 @@ pub fn execute_read_plan(
                 }
                 // Memory slice guard and StagedBuffer Arc are dropped at end of loop iteration!
             }
-            ReadSliceSource::Disk {
-                generation,
-                record_log_offset,
-                payload_offset,
-                slice_inner_offset,
-            } => {
-                cold_slices.push((
-                    slice.dst_offset,
-                    slice.len,
-                    generation,
-                    record_log_offset,
-                    payload_offset,
-                    slice_inner_offset,
-                ));
+            ReadSliceSource::Cache { data, src_offset } => {
+                let actual_len = std::cmp::min(slice.len, data.len().saturating_sub(src_offset));
+                if actual_len > 0 {
+                    dst_buf[slice.dst_offset..slice.dst_offset + actual_len]
+                        .copy_from_slice(&data[src_offset..src_offset + actual_len]);
+                }
+                // Cache data Arc is dropped at end of loop iteration!
+            }
+            ReadSliceSource::Disk { .. } => {
+                cold_slices.push(slice);
             }
         }
     }
@@ -553,17 +577,24 @@ pub fn execute_read_plan(
     // disk or remote S3 reads below take significant time.
     if !cold_slices.is_empty() {
         let cache = log_cache.ok_or(libc::EIO)?;
-        for (dst_offset, len, generation, record_log_offset, payload_offset, slice_inner_offset) in cold_slices {
-            match cache.read_extent_payload(
+        for slice in cold_slices {
+            if let ReadSliceSource::Disk {
                 generation,
                 record_log_offset,
                 payload_offset,
                 slice_inner_offset,
-                &mut dst_buf[dst_offset..dst_offset + len],
-                volume_key,
-            ) {
-                Ok(_) => {}
-                Err(_) => return Err(libc::EIO),
+            } = slice.source
+            {
+                cache
+                    .read_extent_payload(
+                        generation,
+                        record_log_offset,
+                        payload_offset,
+                        slice_inner_offset,
+                        &mut dst_buf[slice.dst_offset..slice.dst_offset + slice.len],
+                        volume_key,
+                    )
+                    .map_err(|_| libc::EIO)?;
             }
         }
     }
@@ -724,10 +755,11 @@ mod tests {
         let mut f_delta = FileDelta::default();
         f_delta.extents.insert(20, 20, SharedExtentState::new_zero(20));
         flushing_batch.insert(attr.ino, EntryDelta::Node(NodeDelta::File(f_delta)));
-        fs.inner.lock().unwrap().flushing.push_back(FlushBatch {
-            entries: flushing_batch,
-            arena: WriteArena::new(),
-        });
+        fs.inner
+            .lock()
+            .unwrap()
+            .flushing
+            .push_back(FlushBatch::new(flushing_batch, WriteArena::new()));
 
         // 3. Live layer: Staged extent at 30..50
         let mut live_delta = FileDelta::default();
@@ -782,5 +814,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_plan_read_file_data_decrypted_record_cache_hit() {
+        use crate::node::InodeMeta;
+        use crate::range_map::RangeMap;
+        use std::time::SystemTime;
+
+        let mut fs = InMemoryFS::new();
+        let storage = Arc::new(crate::storage::MemoryStorage::new());
+        fs.log_cache = Some(Arc::new(crate::log::LogFileCache::with_storage(storage)));
+
+        let attr = crate::operations::read_write::create_core(&fs, 1, "cached.bin", 0o644, 0, 1000, 1000).unwrap();
+
+        let shared_disk = SharedExtentState::new_disk(1, 1024, 0, 100);
+        let mut base_range = RangeMap::new();
+        base_range.insert(0, 100, shared_disk);
+        let mut base_map = HashMap::new();
+        base_map.insert(
+            attr.ino,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
+                kind: NodeKind::File {
+                    range_map: base_range,
+                    size: 100,
+                },
+            }),
+        );
+        fs.inner.lock().unwrap().base = base_map;
+        fs.inner.lock().unwrap().live.remove(&attr.ino);
+
+        let cached_bytes = Arc::new(vec![0xCC; 100]);
+        fs.log_cache
+            .as_ref()
+            .unwrap()
+            .insert_cached_record(1, 1024, Arc::clone(&cached_bytes));
+
+        let plan = fs.plan_read_file_data(attr.ino, 0, 100).unwrap();
+        assert_eq!(plan.total_len, 100);
+        assert!(!plan.has_cold_slices);
+        assert_eq!(plan.slices.len(), 1);
+        assert_eq!(plan.slices[0].dst_offset, 0);
+        assert_eq!(plan.slices[0].len, 100);
+        assert!(matches!(plan.slices[0].source, ReadSliceSource::Cache { .. }));
+
+        let buf = fs.execute_read_plan_sync(plan).unwrap();
+        assert_eq!(buf, vec![0xCC; 100]);
     }
 }

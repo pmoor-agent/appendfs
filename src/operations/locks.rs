@@ -296,44 +296,73 @@ impl LockManager {
         self.state.lock().unwrap().range_lock_waiter_count()
     }
 
-    pub fn wake_flock_waiters(&self, ino: u64) -> Vec<Request> {
-        let mut state = self.state.lock().unwrap();
-        let replies = state.wake_flock_waiters(ino);
-        self.cond.notify_all();
-        replies
+    pub fn wake_flock_waiters(&self, ino: u64) {
+        let replies = {
+            let mut state = self.state.lock().unwrap();
+            let r = state.wake_flock_waiters(ino);
+            self.cond.notify_all();
+            r
+        };
+        for req in replies {
+            req.reply_err(0);
+        }
     }
 
-    pub fn wake_range_lock_waiters(&self, ino: u64) -> Vec<Request> {
-        let mut state = self.state.lock().unwrap();
-        let replies = state.wake_range_lock_waiters(ino);
-        self.cond.notify_all();
-        replies
+    pub fn wake_range_lock_waiters(&self, ino: u64) {
+        let replies = {
+            let mut state = self.state.lock().unwrap();
+            let r = state.wake_range_lock_waiters(ino);
+            self.cond.notify_all();
+            r
+        };
+        for req in replies {
+            req.reply_err(0);
+        }
     }
 
-    pub fn release_flock(&self, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
-        let mut state = self.state.lock().unwrap();
-        let (canceled, ready) = state.release_flock(ino, fh);
-        self.cond.notify_all();
-        (canceled, ready)
+    pub fn release_flock(&self, ino: u64, fh: u64) {
+        let (canceled, ready) = {
+            let mut state = self.state.lock().unwrap();
+            let res = state.release_flock(ino, fh);
+            self.cond.notify_all();
+            res
+        };
+        for r in canceled {
+            r.reply_err(libc::EBADF);
+        }
+        for r in ready {
+            r.reply_err(0);
+        }
     }
 
-    pub fn cancel_range_lock_waiters(&self, ino: u64, fh: u64) -> Vec<Request> {
-        self.state.lock().unwrap().cancel_range_lock_waiters(ino, fh)
+    pub fn cancel_range_lock_waiters(&self, ino: u64, fh: u64) {
+        let canceled = {
+            let mut state = self.state.lock().unwrap();
+            state.cancel_range_lock_waiters(ino, fh)
+        };
+        for r in canceled {
+            r.reply_err(libc::EBADF);
+        }
     }
 
-    pub fn release_range_locks(&self, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
-        let mut state = self.state.lock().unwrap();
-        let (canceled, ready) = state.release_range_locks(ino, fh);
-        self.cond.notify_all();
-        (canceled, ready)
+    pub fn release_range_locks(&self, ino: u64, fh: u64) {
+        let (canceled, ready) = {
+            let mut state = self.state.lock().unwrap();
+            let res = state.release_range_locks(ino, fh);
+            self.cond.notify_all();
+            res
+        };
+        for r in canceled {
+            r.reply_err(libc::EBADF);
+        }
+        for r in ready {
+            r.reply_err(0);
+        }
     }
 }
 
 pub fn wake_flock_waiters(fs: &InMemoryFS, ino: u64) {
-    let replies = fs.locks.wake_flock_waiters(ino);
-    for req in replies {
-        req.reply_err(0);
-    }
+    fs.locks.wake_flock_waiters(ino);
 }
 
 pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
@@ -353,13 +382,7 @@ pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     let base_op = op & !libc::LOCK_NB;
 
     if base_op == libc::LOCK_UN {
-        let (canceled, ready) = fs.locks.release_flock(ino, fh);
-        for r in canceled {
-            r.reply_err(libc::EBADF);
-        }
-        for r in ready {
-            r.reply_err(0);
-        }
+        fs.locks.release_flock(ino, fh);
         req.reply_err(0);
         return;
     }
@@ -466,10 +489,7 @@ pub(crate) fn grant_range_lock(
 }
 
 pub fn wake_range_lock_waiters(fs: &InMemoryFS, ino: u64) {
-    let replies = fs.locks.wake_range_lock_waiters(ino);
-    for req in replies {
-        req.reply_err(0);
-    }
+    fs.locks.wake_range_lock_waiters(ino);
 }
 
 pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
@@ -679,13 +699,7 @@ pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32)
             }
         }
         libc::LOCK_UN => {
-            let (canceled, ready) = fs.locks.release_flock(ino, fh);
-            for r in canceled {
-                r.reply_err(libc::EBADF);
-            }
-            for r in ready {
-                r.reply_err(0);
-            }
+            fs.locks.release_flock(ino, fh);
             Ok(())
         }
         _ => Err(libc::EINVAL),

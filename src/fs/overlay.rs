@@ -416,7 +416,9 @@ impl InMemoryFS {
 
     pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
         let mut inner = self.inner.lock().unwrap();
-        let plan = inner.with_inode_layers(ino, |layers| layers.plan_read_file_data(offset, size))?;
+        let plan = inner.with_inode_layers(ino, |layers| {
+            layers.plan_read_file_data(offset, size, self.log_cache.as_deref())
+        })?;
 
         if self.track_atime && plan.total_len > 0 {
             let now = self.clock.now();

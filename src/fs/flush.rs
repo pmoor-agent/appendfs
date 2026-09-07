@@ -28,7 +28,7 @@ impl InMemoryFS {
             let entries = std::mem::take(&mut inner.live);
             let chunk_size = inner.live_arena.chunk_size;
             let arena = std::mem::replace(&mut inner.live_arena, WriteArena::with_chunk_size(chunk_size));
-            inner.flushing.push_back(FlushBatch { entries, arena });
+            inner.flushing.push_back(FlushBatch::new(entries, arena));
         }
     }
 
@@ -261,13 +261,10 @@ impl InMemoryFS {
         // Drain flushing batches from the front of the queue
         loop {
             let mut batch = {
-                let mut inner = self.inner.lock().unwrap();
-                match inner.flushing.front_mut() {
+                let inner = self.inner.lock().unwrap();
+                match inner.flushing.front() {
                     Some(b) => {
-                        if b.entries.is_empty() {
-                            let _ = inner.flushing.pop_front().unwrap();
-                            continue;
-                        }
+                        assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
                         b.clone()
                     }
                     None => break,
@@ -277,25 +274,21 @@ impl InMemoryFS {
             // Attempt to write and commit this batch
             self.synthesize_and_write_flushing_layer(&mut batch.entries, writer)?;
 
-            // On success: fold into base and pop from flushing queue
+            // On success: fold into base, assert front of queue is still batch, and pop
+            let batch_keys: Vec<u64> = batch.entries.keys().copied().collect();
+            self.fold_flushed_batch(batch);
             {
                 let mut inner = self.inner.lock().unwrap();
-                for (ino, entry) in batch.entries {
-                    match entry {
-                        EntryDelta::Tombstone => {
-                            inner.base.remove(&ino);
-                        }
-                        EntryDelta::Node(delta) => {
-                            if let Some(existing_arc) = inner.base.get(&ino).cloned() {
-                                let mut node_clone = (*existing_arc).clone();
-                                delta.apply_to_node(&mut node_clone);
-                                inner.base.insert(ino, Arc::new(node_clone));
-                            } else {
-                                inner.base.insert(ino, Arc::new(delta.to_node()));
-                            }
-                        }
-                    }
-                }
+                let front = inner.flushing.front().expect("flushing queue must not be empty");
+                assert_eq!(
+                    front.entries.len(),
+                    batch_keys.len(),
+                    "front of flushing queue must match committed batch length"
+                );
+                assert!(
+                    front.entries.keys().all(|k| batch_keys.contains(k)),
+                    "front of flushing queue must match committed batch entries"
+                );
                 let _ = inner.flushing.pop_front().unwrap();
             }
         }

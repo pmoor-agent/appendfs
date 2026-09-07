@@ -478,6 +478,18 @@ static void ll_init(void *userdata, struct fuse_conn_info *conn) {
     conn->max_write = 1024 * 1024;
     conn->max_readahead = 1024 * 1024;
     conn->time_gran = 1;
+    if (conn->capable & FUSE_CAP_ASYNC_READ) {
+      conn->want |= FUSE_CAP_ASYNC_READ;
+    }
+    if (conn->capable & FUSE_CAP_PARALLEL_DIROPS) {
+      conn->want |= FUSE_CAP_PARALLEL_DIROPS;
+    }
+    if (conn->capable & FUSE_CAP_POSIX_LOCKS) {
+      conn->want |= FUSE_CAP_POSIX_LOCKS;
+    }
+    if (conn->capable & FUSE_CAP_FLOCK_LOCKS) {
+      conn->want |= FUSE_CAP_FLOCK_LOCKS;
+    }
   }
   auto *ctx = static_cast<ShimContext *>(userdata);
   if (ctx && ctx->ops.init) {

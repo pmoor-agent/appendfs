@@ -34,59 +34,6 @@ pub enum ExtentState {
     Zero { length: u64 },
 }
 
-// std::sync::RwLock does not implement PartialEq or Eq. Because ExtentState::Staged
-// contains StagedBuffer (Arc<RwLock<Vec<u8>>>), PartialEq cannot be derived
-// automatically. This implementation performs a fast pointer comparison via Arc::ptr_eq,
-// falling back to comparing the staged slice byte contents.
-impl PartialEq for ExtentState {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                ExtentState::Staged {
-                    data: d1,
-                    payload_offset: p1,
-                    length: l1,
-                },
-                ExtentState::Staged {
-                    data: d2,
-                    payload_offset: p2,
-                    length: l2,
-                },
-            ) => {
-                if p1 != p2 || l1 != l2 {
-                    return false;
-                }
-                if Arc::ptr_eq(d1, d2) {
-                    return true;
-                }
-                let g1 = d1.read().unwrap();
-                let g2 = d2.read().unwrap();
-                let s1 = &g1[*p1 as usize..(*p1 + *l1) as usize];
-                let s2 = &g2[*p2 as usize..(*p2 + *l2) as usize];
-                s1 == s2
-            }
-            (
-                ExtentState::Disk {
-                    generation: g1,
-                    record_log_offset: r1,
-                    payload_offset: p1,
-                    length: l1,
-                },
-                ExtentState::Disk {
-                    generation: g2,
-                    record_log_offset: r2,
-                    payload_offset: p2,
-                    length: l2,
-                },
-            ) => g1 == g2 && r1 == r2 && p1 == p2 && l1 == l2,
-            (ExtentState::Zero { length: l1 }, ExtentState::Zero { length: l2 }) => l1 == l2,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for ExtentState {}
-
 impl ExtentState {
     pub fn length(&self) -> u64 {
         match self {
@@ -374,40 +321,62 @@ mod tests {
         let mut clone = state.clone();
 
         clone.trim_left(2);
-        assert_eq!(
-            clone.read_state(),
+        match clone.read_state() {
             ExtentState::Staged {
-                data: Arc::new(RwLock::new(vec![1, 2, 3, 4, 5])),
-                payload_offset: 2,
-                length: 3,
+                data,
+                payload_offset,
+                length,
+            } => {
+                assert_eq!(payload_offset, 2);
+                assert_eq!(length, 3);
+                assert_eq!(
+                    &data.read().unwrap()[payload_offset as usize..(payload_offset + length) as usize],
+                    &[3, 4, 5]
+                );
             }
-        );
-        assert_eq!(
-            state.read_state(),
+            _ => panic!("expected Staged"),
+        }
+        match state.read_state() {
             ExtentState::Staged {
-                data: Arc::new(RwLock::new(vec![1, 2, 3, 4, 5])),
-                payload_offset: 0,
-                length: 5,
+                data,
+                payload_offset,
+                length,
+            } => {
+                assert_eq!(payload_offset, 0);
+                assert_eq!(length, 5);
+                assert_eq!(&data.read().unwrap()[..], &[1, 2, 3, 4, 5]);
             }
-        );
+            _ => panic!("expected Staged"),
+        }
 
         clone.trim_right(2);
-        assert_eq!(
-            clone.read_state(),
+        match clone.read_state() {
             ExtentState::Staged {
-                data: Arc::new(RwLock::new(vec![1, 2, 3, 4, 5])),
-                payload_offset: 2,
-                length: 2,
+                data,
+                payload_offset,
+                length,
+            } => {
+                assert_eq!(payload_offset, 2);
+                assert_eq!(length, 2);
+                assert_eq!(
+                    &data.read().unwrap()[payload_offset as usize..(payload_offset + length) as usize],
+                    &[3, 4]
+                );
             }
-        );
-        assert_eq!(
-            state.read_state(),
+            _ => panic!("expected Staged"),
+        }
+        match state.read_state() {
             ExtentState::Staged {
-                data: Arc::new(RwLock::new(vec![1, 2, 3, 4, 5])),
-                payload_offset: 0,
-                length: 5,
+                data,
+                payload_offset,
+                length,
+            } => {
+                assert_eq!(payload_offset, 0);
+                assert_eq!(length, 5);
+                assert_eq!(&data.read().unwrap()[..], &[1, 2, 3, 4, 5]);
             }
-        );
+            _ => panic!("expected Staged"),
+        }
     }
 
     #[test]

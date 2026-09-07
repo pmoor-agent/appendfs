@@ -50,6 +50,13 @@ pub struct FlushBatch {
     pub arena: WriteArena,
 }
 
+impl FlushBatch {
+    pub fn new(entries: HashMap<u64, EntryDelta>, arena: WriteArena) -> Self {
+        assert!(!entries.is_empty(), "FlushBatch must contain at least one entry");
+        Self { entries, arena }
+    }
+}
+
 /// Consolidated mutable filesystem state protected by `InMemoryFS::inner`.
 pub struct FsInner {
     /// Resting consolidated state loaded from `.summary` at mount, folded forward over generations.
