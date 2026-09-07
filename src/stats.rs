@@ -197,6 +197,8 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 /// Formats a complete human-readable report of runtime filesystem statistics and health.
+// TODO(too-many-lines): extract this into smaller units.
+#[allow(clippy::too_many_lines)]
 pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     use std::sync::atomic::Ordering;
 

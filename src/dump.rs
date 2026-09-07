@@ -118,6 +118,8 @@ pub fn dump_log_reader(reader: &dyn StorageReader, verbosity: u8) -> io::Result<
     dump_log_reader_with_path(reader, None, verbosity, None)
 }
 
+// TODO(too-many-lines): extract this into smaller units.
+#[allow(clippy::too_many_lines)]
 pub fn dump_log_reader_with_path(
     reader: &dyn StorageReader,
     display_path: Option<&str>,
@@ -588,6 +590,8 @@ pub fn dump_summary_reader(reader: &SummaryReader, verbosity: u8) -> io::Result<
     dump_summary_reader_with_path(reader, None, verbosity)
 }
 
+// TODO(too-many-lines): extract this into smaller units.
+#[allow(clippy::too_many_lines)]
 pub fn dump_summary_reader_with_path(
     reader: &SummaryReader,
     display_path: Option<&str>,

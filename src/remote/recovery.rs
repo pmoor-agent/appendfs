@@ -121,6 +121,8 @@ fn fetch_and_verify_summary(
 /// If local storage has pruned older summaries and logs, uses the timeline manifest in the latest
 /// local summary file to identify the appropriate generation, downloads and verifies the historical
 /// checkpoint file, and fetches any missing `.log` files needed for log replay.
+// TODO(too-many-lines): extract this into smaller units.
+#[allow(clippy::too_many_lines)]
 pub fn prepare_remote_recovery_for_target(
     storage: &dyn Storage,
     target: RecoveryTarget,

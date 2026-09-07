@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::too_many_lines))]
 pub mod async_runtime;
 pub mod check;
 pub mod cli;

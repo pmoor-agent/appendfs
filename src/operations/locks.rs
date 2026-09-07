@@ -492,6 +492,8 @@ pub fn wake_range_lock_waiters(fs: &InMemoryFS, ino: u64) {
     fs.locks.wake_range_lock_waiters(ino);
 }
 
+// TODO(too-many-lines): extract this into smaller units.
+#[allow(clippy::too_many_lines)]
 pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
     log::trace!(
         "setlk(ino={}, fh={}, lock_owner={}, lock={:?}, sleep={})",

@@ -160,6 +160,8 @@ pub fn readlink(fs: &InMemoryFS, req: Request, ino: u64) {
     }
 }
 
+// TODO(too-many-lines): extract this into smaller units.
+#[allow(clippy::too_many_lines)]
 pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), i32> {
     if fs.is_read_only() {
         return Err(libc::EROFS);

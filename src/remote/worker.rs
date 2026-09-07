@@ -425,6 +425,8 @@ impl RemoteReplicationWorker {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // TODO(too-many-lines): extract this into smaller units.
+    #[allow(clippy::too_many_lines)]
     pub fn run_cycle_with_audit(
         fs: &InMemoryFS,
         registry: &Arc<RwLock<RemoteRegistry>>,
