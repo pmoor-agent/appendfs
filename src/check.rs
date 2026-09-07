@@ -244,7 +244,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
     // 0. Extract manifest and base snapshot
     let manifest = fs.manifest.read().unwrap().clone();
 
-    let base_map = fs.base.read().unwrap();
+    let base_map = fs.inner.lock().unwrap().base.clone();
     report.total_inodes = base_map.len();
 
     for (&_ino, node_arc) in base_map.iter() {
@@ -254,7 +254,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
             NodeKind::File { range_map, size, .. } => {
                 report.regular_files += 1;
                 report.total_extents += range_map.len();
-                report.total_data_bytes += *size;
+                report.total_data_bytes += size;
             }
             NodeKind::Symlink { .. } => report.symlinks += 1,
             NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
@@ -308,6 +308,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                         let mut seen_in_dir = HashSet::new();
 
                         for (name, child_ino) in entries {
+                            let child_ino = *child_ino;
                             // Validate entry name
                             if name.is_empty() {
                                 report.issues.push(IntegrityIssue::error(
@@ -341,7 +342,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                             }
 
                             // Check child existence
-                            let child_arc = match base_map.get(child_ino) {
+                            let child_arc = match base_map.get(&child_ino) {
                                 Some(a) => a,
                                 None => {
                                     report.issues.push(IntegrityIssue::error(
@@ -356,12 +357,12 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                 }
                             };
 
-                            *ref_counts.entry(*child_ino).or_default() += 1;
+                            *ref_counts.entry(child_ino).or_default() += 1;
 
                             let child_node = child_arc.as_ref();
                             match &child_node.kind {
                                 NodeKind::Directory { parent, .. } => {
-                                    if *child_ino == 1 {
+                                    if child_ino == 1 {
                                         report.issues.push(IntegrityIssue::error(
                                             "ROOT_IN_SUBDIR",
                                             Some(curr_dir_ino),
@@ -373,10 +374,10 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                         continue;
                                     }
 
-                                    if current_ancestors.contains(child_ino) {
+                                    if current_ancestors.contains(&child_ino) {
                                         report.issues.push(IntegrityIssue::error(
                                             "DIR_CYCLE",
-                                            Some(*child_ino),
+                                            Some(child_ino),
                                             format!(
                                                 "Directory cycle detected: inode {} appears in its own directory ancestry",
                                                 child_ino
@@ -388,7 +389,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                     if *parent != curr_dir_ino {
                                         report.issues.push(IntegrityIssue::error(
                                             "INVALID_PARENT",
-                                            Some(*child_ino),
+                                            Some(child_ino),
                                             format!(
                                                 "Directory inode {} has parent field {}, but is contained in directory {}",
                                                 child_ino, parent, curr_dir_ino
@@ -396,10 +397,10 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                         ));
                                     }
 
-                                    if reachable.contains(child_ino) {
+                                    if reachable.contains(&child_ino) {
                                         report.issues.push(IntegrityIssue::error(
                                             "MULTIPLE_DIR_HARDLINKS",
-                                            Some(*child_ino),
+                                            Some(child_ino),
                                             format!(
                                                 "Directory inode {} has multiple directory entries pointing to it",
                                                 child_ino
@@ -408,11 +409,11 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                     }
 
                                     *subdirs_count.entry(curr_dir_ino).or_default() += 1;
-                                    reachable.insert(*child_ino);
+                                    reachable.insert(child_ino);
 
                                     let mut next_ancestors = current_ancestors.clone();
-                                    next_ancestors.insert(*child_ino);
-                                    queue.push_back((*child_ino, next_ancestors));
+                                    next_ancestors.insert(child_ino);
+                                    queue.push_back((child_ino, next_ancestors));
                                 }
                                 NodeKind::File { .. }
                                 | NodeKind::Symlink { .. }
@@ -420,7 +421,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                 | NodeKind::CharDevice { .. }
                                 | NodeKind::BlockDevice { .. }
                                 | NodeKind::Socket => {
-                                    reachable.insert(*child_ino);
+                                    reachable.insert(child_ino);
                                 }
                             }
                         }
@@ -920,7 +921,7 @@ mod tests {
                 size: 0,
             },
         };
-        fs.base.write().unwrap().insert(orphan_ino, Arc::new(orphan_node));
+        fs.inner.lock().unwrap().base.insert(orphan_ino, Arc::new(orphan_node));
 
         let report = check_fs_integrity(&fs, None, false);
         assert!(!report.is_clean());
@@ -966,8 +967,8 @@ mod tests {
 
         // Corrupt nlink on test.txt in base (set nlink to 5 instead of 1)
         {
-            let mut base = fs.base.write().unwrap();
-            let node_arc = base.get_mut(&f.ino).unwrap();
+            let mut inner = fs.inner.lock().unwrap();
+            let node_arc = inner.base.get_mut(&f.ino).unwrap();
             let mut node = (**node_arc).clone();
             node.meta.nlink = 5;
             *node_arc = Arc::new(node);
@@ -999,7 +1000,7 @@ mod tests {
 
         // Inject file with extent beyond its size
         let mut rm = RangeMap::new();
-        rm.insert(100, 50, SharedExtentState::new_staged(Arc::new(vec![0; 50]), 0, 50));
+        rm.insert(100, 50, SharedExtentState::new_staged_buffer(vec![0; 50], 0, 50));
         let bad_file = Node {
             meta: InodeMeta::new(0o644, 1, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
             kind: NodeKind::File {
@@ -1007,11 +1008,11 @@ mod tests {
                 size: 120, // Extent ends at 150 > size 120!
             },
         };
-        fs.base.write().unwrap().insert(2, Arc::new(bad_file));
+        fs.inner.lock().unwrap().base.insert(2, Arc::new(bad_file));
         // Link to root
         {
-            let mut base = fs.base.write().unwrap();
-            let root_arc = base.get_mut(&1).unwrap();
+            let mut inner = fs.inner.lock().unwrap();
+            let root_arc = inner.base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
             if let NodeKind::Directory { entries, .. } = &mut root.kind {
                 entries.push(("bad.txt".to_string(), 2));
@@ -1060,10 +1061,10 @@ mod tests {
         };
 
         {
-            let mut base = fs.base.write().unwrap();
-            base.insert(2, Arc::new(dir_a));
-            base.insert(3, Arc::new(dir_b));
-            let root_arc = base.get_mut(&1).unwrap();
+            let mut inner = fs.inner.lock().unwrap();
+            inner.base.insert(2, Arc::new(dir_a));
+            inner.base.insert(3, Arc::new(dir_b));
+            let root_arc = inner.base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
             if let NodeKind::Directory { entries, .. } = &mut root.kind {
                 entries.push(("a".to_string(), 2));
@@ -1106,9 +1107,9 @@ mod tests {
         };
 
         {
-            let mut base = fs.base.write().unwrap();
-            base.insert(2, Arc::new(dir_wrong_parent));
-            let root_arc = base.get_mut(&1).unwrap();
+            let mut inner = fs.inner.lock().unwrap();
+            inner.base.insert(2, Arc::new(dir_wrong_parent));
+            let root_arc = inner.base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
             if let NodeKind::Directory { entries, .. } = &mut root.kind {
                 entries.push(("dangling".to_string(), 404));
@@ -1160,7 +1161,8 @@ mod tests {
 
         // 1. Initial check must be clean
         let record_offset = {
-            let base = fs.base.read().unwrap();
+            let inner = fs.inner.lock().unwrap();
+            let base = &inner.base;
             let node_arc = base.get(&f.ino).unwrap();
             let node = node_arc.as_ref();
             if let NodeKind::File { range_map, .. } = &node.kind {

@@ -182,7 +182,7 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
     fs.check_flush_capacity()?;
 
     let attr = {
-        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let mut inner = fs.inner.lock().unwrap();
         let now = fs.clock.now();
         log::trace!(
             "mkdir(parent={}, name={}, mode=0o{:o}, uid={}, gid={})",
@@ -197,12 +197,12 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
             return Err(libc::ENAMETOOLONG);
         }
 
-        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
 
-        if fs.lookup_child(parent, name).is_some() {
+        if fs.lookup_child_locked(&inner, parent, name).is_some() {
             return Err(libc::EEXIST);
         }
 
@@ -224,9 +224,9 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
             },
         });
 
-        fs.insert_new_node(new_ino, new_delta);
-        fs.add_dir_entry(parent, name, new_ino, now);
-        fs.update_attr_delta(
+        inner.insert_new_node(new_ino, new_delta);
+        inner.add_dir_entry(parent, name, new_ino, now);
+        inner.update_attr_delta(
             parent,
             AttrDelta {
                 nlink: Some(parent_attr.nlink + 1),
@@ -271,7 +271,7 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
     fs.check_flush_capacity()?;
 
     {
-        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let mut inner = fs.inner.lock().unwrap();
         let now = fs.clock.now();
         log::trace!("rmdir(parent={}, name={})", parent, name);
 
@@ -279,24 +279,24 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
             return Err(libc::ENAMETOOLONG);
         }
 
-        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
 
-        let child_ino = fs.lookup_child(parent, name).ok_or(libc::ENOENT)?;
-        let child_attr = fs.get_attr(child_ino).ok_or(libc::ENOENT)?;
+        let child_ino = fs.lookup_child_locked(&inner, parent, name).ok_or(libc::ENOENT)?;
+        let child_attr = fs.get_attr_locked(&inner, child_ino).ok_or(libc::ENOENT)?;
         if child_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
 
-        let entries = fs.list_directory(child_ino).ok_or(libc::ENOENT)?;
+        let entries = inner.list_directory(child_ino).ok_or(libc::ENOENT)?;
         if !entries.is_empty() {
             return Err(libc::ENOTEMPTY);
         }
 
-        fs.remove_dir_entry(parent, name, now);
-        fs.update_attr_delta(
+        inner.remove_dir_entry(parent, name, now);
+        inner.update_attr_delta(
             parent,
             AttrDelta {
                 nlink: Some(parent_attr.nlink.saturating_sub(1)),
@@ -304,7 +304,7 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
                 ..Default::default()
             },
         );
-        fs.tombstone(child_ino);
+        inner.tombstone(child_ino);
     }
 
     fs.notify_mutation(0);

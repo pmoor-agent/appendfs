@@ -18,7 +18,7 @@ pub fn mknod_core(
     fs.check_flush_capacity()?;
 
     let attr = {
-        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let mut inner = fs.inner.lock().unwrap();
         let now = fs.clock.now();
         log::trace!(
             "mknod(parent={}, name={}, mode=0o{:o}, rdev={}, uid={}, gid={})",
@@ -34,12 +34,12 @@ pub fn mknod_core(
             return Err(libc::ENAMETOOLONG);
         }
 
-        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
 
-        if fs.lookup_child(parent, name).is_some() {
+        if fs.lookup_child_locked(&inner, parent, name).is_some() {
             return Err(libc::EEXIST);
         }
 
@@ -91,8 +91,8 @@ pub fn mknod_core(
             ),
         };
 
-        fs.insert_new_node(new_ino, new_delta);
-        fs.add_dir_entry(parent, name, new_ino, now);
+        inner.insert_new_node(new_ino, new_delta);
+        inner.add_dir_entry(parent, name, new_ino, now);
 
         FileAttr {
             ino: new_ino,

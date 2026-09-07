@@ -1101,51 +1101,30 @@ fn test_differential_fuzzing_and_crash_recovery() {
             }
         }
 
-        assert!(
-            fs_baseline.fs.dir_handles.read().unwrap().is_empty(),
-            "seed {}: dir handle leak in baseline",
-            seed
-        );
-        assert!(
-            fs_baseline.fs.file_handles.read().unwrap().is_empty(),
-            "seed {}: file handle leak in baseline",
-            seed
-        );
-        assert!(
-            fs_baseline.fs.open_counts.read().unwrap().is_empty(),
-            "seed {}: open_counts leak in baseline",
-            seed
-        );
-        assert!(
-            fs_micro.fs.dir_handles.read().unwrap().is_empty(),
-            "seed {}: dir handle leak in micro",
-            seed
-        );
-        assert!(
-            fs_micro.fs.file_handles.read().unwrap().is_empty(),
-            "seed {}: file handle leak in micro",
-            seed
-        );
-        assert!(
-            fs_micro.fs.open_counts.read().unwrap().is_empty(),
-            "seed {}: open_counts leak in micro",
-            seed
-        );
-        assert!(
-            fs_remote.fs.dir_handles.read().unwrap().is_empty(),
-            "seed {}: dir handle leak in remote",
-            seed
-        );
-        assert!(
-            fs_remote.fs.file_handles.read().unwrap().is_empty(),
-            "seed {}: file handle leak in remote",
-            seed
-        );
-        assert!(
-            fs_remote.fs.open_counts.read().unwrap().is_empty(),
-            "seed {}: open_counts leak in remote",
-            seed
-        );
+        {
+            let inner = fs_baseline.fs.inner.lock().unwrap();
+            assert!(inner.dir_handles.is_empty(), "seed {seed}: dir handle leak in baseline");
+            assert!(
+                inner.file_handles.is_empty(),
+                "seed {seed}: file handle leak in baseline"
+            );
+            assert!(
+                inner.open_counts.is_empty(),
+                "seed {seed}: open_counts leak in baseline"
+            );
+        }
+        {
+            let inner = fs_micro.fs.inner.lock().unwrap();
+            assert!(inner.dir_handles.is_empty(), "seed {seed}: dir handle leak in micro");
+            assert!(inner.file_handles.is_empty(), "seed {seed}: file handle leak in micro");
+            assert!(inner.open_counts.is_empty(), "seed {seed}: open_counts leak in micro");
+        }
+        {
+            let inner = fs_remote.fs.inner.lock().unwrap();
+            assert!(inner.dir_handles.is_empty(), "seed {seed}: dir handle leak in remote");
+            assert!(inner.file_handles.is_empty(), "seed {seed}: file handle leak in remote");
+            assert!(inner.open_counts.is_empty(), "seed {seed}: open_counts leak in remote");
+        }
 
         // The injection above is only worth anything if it actually fires. Without this,
         // a future change to batching or thresholds could quietly stop producing failures

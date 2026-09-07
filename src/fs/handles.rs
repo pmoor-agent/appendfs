@@ -6,8 +6,8 @@
 //! paginated `readdir` is isolated from concurrent mutations.
 
 use super::{FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 
 impl InMemoryFS {
     // --- POSIX File Handle Tracking ---
@@ -16,13 +16,18 @@ impl InMemoryFS {
         if self.virtual_files.is_virtual_ino(ino) {
             let content = self.virtual_files.generate_content(ino, self).unwrap_or_default();
             let fh = (self.allocate_fh() & !super::VIRTUAL_FH_FLAG) | super::VIRTUAL_FH_FLAG;
-            self.virtual_handles.write().unwrap().insert(fh, content.into_bytes());
+            self.inner
+                .lock()
+                .unwrap()
+                .virtual_handles
+                .insert(fh, content.into_bytes());
             return fh;
         }
 
         let fh = self.allocate_fh();
-        self.file_handles.write().unwrap().insert(fh, FileHandle { ino, flags });
-        *self.open_counts.write().unwrap().entry(ino).or_insert(0) += 1;
+        let mut inner = self.inner.lock().unwrap();
+        inner.file_handles.insert(fh, FileHandle { ino, flags });
+        *inner.open_counts.entry(ino).or_insert(0) += 1;
         fh
     }
 
@@ -30,13 +35,13 @@ impl InMemoryFS {
         if (fh & super::VIRTUAL_FH_FLAG) != 0 {
             return None;
         }
-        self.file_handles.read().unwrap().get(&fh).copied()
+        self.inner.lock().unwrap().file_handles.get(&fh).copied()
     }
 
     pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
         if (fh & super::VIRTUAL_FH_FLAG) != 0 {
-            let handles = self.virtual_handles.read().unwrap();
-            let buf = handles.get(&fh).ok_or(libc::EBADF)?;
+            let inner = self.inner.lock().unwrap();
+            let buf = inner.virtual_handles.get(&fh).ok_or(libc::EBADF)?;
             let start = (offset as usize).min(buf.len());
             let end = (start + size).min(buf.len());
             let slice_len = end - start;
@@ -48,7 +53,7 @@ impl InMemoryFS {
                         dst_offset: 0,
                         len: slice_len,
                         source: ReadSliceSource::Memory {
-                            data: Arc::new(buf.clone()),
+                            data: Arc::new(RwLock::new(buf.clone())),
                             src_offset: start,
                         },
                     }]
@@ -67,40 +72,49 @@ impl InMemoryFS {
 
     pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
         let plan = self.plan_read_handle(ino, fh, offset, size)?;
-        self.execute_read_plan_sync(&plan)
+        self.execute_read_plan_sync(plan)
     }
 
     pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
-        if (fh & super::VIRTUAL_FH_FLAG) != 0 {
-            self.virtual_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;
-            return Ok(());
-        }
+        let is_last_handle = {
+            let mut inner = self.inner.lock().unwrap();
+            if (fh & super::VIRTUAL_FH_FLAG) != 0 {
+                inner.virtual_handles.remove(&fh).ok_or(libc::EBADF)?;
+                return Ok(());
+            }
 
-        let handle = self.file_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;
-        if handle.ino != ino {
-            return Err(libc::EBADF);
-        }
+            let handle = inner.file_handles.remove(&fh).ok_or(libc::EBADF)?;
+            if handle.ino != ino {
+                return Err(libc::EBADF);
+            }
 
-        // Clean up any BSD flock held by this handle
-        self.release_flock(ino, fh);
+            if let Some(count) = inner.open_counts.get_mut(&ino) {
+                *count = count.saturating_sub(1);
+            }
+            let is_last = if inner.open_counts.get(&ino) == Some(&0) {
+                inner.open_counts.remove(&ino);
+                true
+            } else {
+                false
+            };
 
-        let mut counts = self.open_counts.write().unwrap();
-        if let Some(count) = counts.get_mut(&ino) {
-            *count = count.saturating_sub(1);
-        }
-        if counts.get(&ino) == Some(&0) {
-            counts.remove(&ino);
-            // Clean up POSIX range locks if all handles on inode are closed
-            self.release_range_locks(ino, fh);
+            let remaining = inner.open_counts.get(&ino).copied().unwrap_or(0);
+            if remaining == 0
+                && let Some(attr) = inner.get_attr(ino)
+                && attr.nlink == 0
+            {
+                inner.tombstone(ino);
+            }
+
+            is_last
+        };
+
+        // Clean up locks outside inner critical section
+        self.locks.release_flock(ino, fh);
+        if is_last_handle {
+            self.locks.release_range_locks(ino, fh);
         } else {
-            self.cancel_range_lock_waiters(ino, fh);
-        }
-        let remaining = counts.get(&ino).copied().unwrap_or(0);
-        if remaining == 0
-            && let Some(attr) = self.get_attr(ino)
-            && attr.nlink == 0
-        {
-            self.tombstone(ino);
+            self.locks.cancel_range_lock_waiters(ino, fh);
         }
         Ok(())
     }
@@ -118,7 +132,7 @@ impl InMemoryFS {
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {
-        self.open_counts.read().unwrap().get(&ino).copied().unwrap_or(0)
+        self.inner.lock().unwrap().open_counts.get(&ino).copied().unwrap_or(0)
     }
 
     // --- Directory Handle Snapshot Management ---
@@ -129,16 +143,16 @@ impl InMemoryFS {
 
     pub fn open_dir_handle(&self, entries: Vec<(String, u64)>) -> u64 {
         let fh = self.allocate_fh();
-        self.dir_handles.write().unwrap().insert(fh, Arc::new(entries));
+        self.inner.lock().unwrap().dir_handles.insert(fh, Arc::new(entries));
         fh
     }
 
     pub fn get_dir_handle(&self, fh: u64) -> Option<Arc<Vec<(String, u64)>>> {
-        self.dir_handles.read().unwrap().get(&fh).cloned()
+        self.inner.lock().unwrap().dir_handles.get(&fh).cloned()
     }
 
     pub fn release_dir_handle(&self, fh: u64) -> Result<(), i32> {
-        self.dir_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;
+        self.inner.lock().unwrap().dir_handles.remove(&fh).ok_or(libc::EBADF)?;
         Ok(())
     }
 }

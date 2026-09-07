@@ -23,9 +23,8 @@ fn recovered_root_owner(dir: &std::path::Path) -> (u32, u32) {
     )
     .unwrap();
 
-    let base = fs.base.read().unwrap();
-    let root = base.get(&1).expect("root inode must survive recovery");
-    (root.meta.uid, root.meta.gid)
+    let attr = fs.get_attr(1).expect("root inode must survive recovery");
+    (attr.uid, attr.gid)
 }
 
 #[test]
@@ -80,13 +79,11 @@ fn test_root_owner_is_not_a_hardcoded_constant() {
         VolumeKey::plaintext_arc(),
     )
     .unwrap();
-    let base = fs.base.read().unwrap();
-    let root = base.get(&1).unwrap();
-
-    assert_eq!(root.meta.uid, pinned_uid, "explicit owner must reach the stored root");
-    assert_eq!(root.meta.gid, pinned_gid);
+    let attr = fs.get_attr(1).unwrap();
+    assert_eq!(attr.uid, pinned_uid, "explicit owner must reach the stored root");
+    assert_eq!(attr.gid, pinned_gid);
     assert_ne!(
-        root.meta.uid, uid,
+        attr.uid, uid,
         "the two volumes must differ, otherwise the owner is not actually plumbed through"
     );
 }

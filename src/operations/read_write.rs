@@ -51,7 +51,7 @@ pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, f
     // Fast path: small in-memory read (<= 128 KiB) with zero cold disk slices
     const MAX_INLINE_READ_BYTES: usize = 128 * 1024;
     if !plan.has_cold_slices && plan.total_len <= MAX_INLINE_READ_BYTES {
-        match fs.execute_read_plan_sync(&plan) {
+        match fs.execute_read_plan_sync(plan) {
             Ok(buf) => req.reply_buf(&buf),
             Err(e) => req.reply_err(e),
         }
@@ -117,42 +117,35 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
         return Err(libc::EINVAL);
     }
 
-    let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
-    if attr.file_type != FileType::RegularFile {
-        return Err(libc::EISDIR);
-    }
-
     let now = fs.clock.now();
     let file_offset = offset as u64;
     let write_len = buf.len() as u64;
 
-    let data = Arc::new(buf.to_vec());
-    let shared_state = SharedExtentState::new_staged(Arc::clone(&data), 0, buf.len() as u32);
-
     {
-        let mut live = fs.live.write().unwrap();
-        // The `get_attr` check above happened before this lock was taken, so the file may
-        // have been unlinked in between. If its tombstone has already been frozen out of
-        // `live`, inserting a delta here would resurrect the inode at the next fold.
-        if !live.contains_key(&ino) && !fs.exists_below_live(ino) {
+        let mut inner = fs.inner.lock().unwrap();
+        let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+        if attr.file_type != FileType::RegularFile {
+            return Err(libc::EISDIR);
+        }
+
+        if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
             return Err(libc::ENOENT);
         }
-        let entry = live
+
+        let slices = inner.live_arena.append(buf);
+
+        let entry = inner
+            .live
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
         if let EntryDelta::Node(NodeDelta::File(f)) = entry {
-            f.extents.insert(file_offset, write_len, shared_state.clone());
-            // `f.size` is only `Some` here if an earlier op in this same live batch
-            // already touched this file - otherwise this delta was just freshly
-            // inserted above, possibly because a flush froze the previous one out from
-            // under us in the window between the unlocked `get_attr` above and this
-            // lock. In that case `attr.size` (read before the lock) can be stale - e.g.
-            // a concurrent truncate that landed in that flush - so re-resolve the
-            // current size from below `live` instead of trusting it.
-            let current_size = f
-                .size
-                .or_else(|| fs.attr_below_live(ino).map(|a| a.size as u64))
-                .unwrap_or(attr.size as u64);
+            let mut cur_offset = file_offset;
+            for (chunk_data, payload_offset, slice_len) in slices {
+                let shared_state = SharedExtentState::new_staged(chunk_data, payload_offset, slice_len);
+                f.extents.insert(cur_offset, slice_len as u64, shared_state);
+                cur_offset += slice_len as u64;
+            }
+            let current_size = f.size.unwrap_or(attr.size as u64);
             f.size = Some(std::cmp::max(current_size, file_offset + write_len));
             f.attr_delta.mtime = Some(now);
             f.attr_delta.ctime = Some(now);
@@ -242,14 +235,15 @@ pub fn setattr_core(
     if (to_set & FUSE_SET_ATTR_SIZE) != 0 && attr.file_type == FileType::RegularFile {
         log::trace!("truncating file to {}", size);
         let new_size = size as u64;
-        let mut live = fs.live.write().unwrap();
+        let mut inner = fs.inner.lock().unwrap();
         // The `get_attr` check above happened before this lock was taken, so the file may
         // have been unlinked in between. If its tombstone has already been frozen out of
         // `live`, inserting a delta here would resurrect the inode at the next fold.
-        if !live.contains_key(&ino) && !fs.exists_below_live(ino) {
+        if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
             return Err(libc::ENOENT);
         }
-        let entry = live
+        let entry = inner
+            .live
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
         if let EntryDelta::Node(NodeDelta::File(f)) = entry {
@@ -311,14 +305,15 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
 
     let now = fs.clock.now();
     {
-        let mut live = fs.live.write().unwrap();
+        let mut inner = fs.inner.lock().unwrap();
         // As in `write_core`: `get_attr` ran before this lock, so the inode may have been
         // unlinked and its tombstone frozen out of `live` in between. Inserting a delta
         // then would resurrect it at the next fold.
-        if !live.contains_key(&ino) && !fs.exists_below_live(ino) {
+        if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
             return Err(libc::ENOENT);
         }
-        let entry = live
+        let entry = inner
+            .live
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
         if let EntryDelta::Node(NodeDelta::File(f)) = entry {
@@ -340,21 +335,14 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
 fn grow_size_to(fs: &InMemoryFS, ino: u64, new_size: u64) -> Result<(), i32> {
     let now = fs.clock.now();
     {
-        let mut live = fs.live.write().unwrap();
-        if !live.contains_key(&ino) && !fs.exists_below_live(ino) {
-            return Err(libc::ENOENT);
-        }
-        let entry = live
+        let mut inner = fs.inner.lock().unwrap();
+        let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+        let entry = inner
+            .live
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
         if let EntryDelta::Node(NodeDelta::File(f)) = entry {
-            // As in `write_core`: only trust `f.size` if this delta already touched the
-            // file, otherwise re-resolve from below `live`, since a flush may have frozen
-            // the previous delta out from under us.
-            let current = f
-                .size
-                .or_else(|| fs.attr_below_live(ino).map(|a| a.size as u64))
-                .unwrap_or(0);
+            let current = f.size.unwrap_or(attr.size as u64);
             if new_size > current {
                 f.size = Some(new_size);
                 f.attr_delta.mtime = Some(now);
@@ -479,7 +467,7 @@ pub fn create_core(
     fs.check_flush_capacity()?;
 
     let attr = {
-        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let mut inner = fs.inner.lock().unwrap();
         let now = fs.clock.now();
         log::trace!(
             "create(parent={}, name={}, mode=0o{:o}, flags=0x{:x}, uid={}, gid={})",
@@ -495,12 +483,12 @@ pub fn create_core(
             return Err(libc::ENAMETOOLONG);
         }
 
-        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
 
-        if fs.lookup_child(parent, name).is_some() {
+        if fs.lookup_child_locked(&inner, parent, name).is_some() {
             return Err(libc::EEXIST);
         }
 
@@ -521,8 +509,8 @@ pub fn create_core(
             },
         });
 
-        fs.insert_new_node(new_ino, new_delta);
-        fs.add_dir_entry(parent, name, new_ino, now);
+        inner.insert_new_node(new_ino, new_delta);
+        inner.add_dir_entry(parent, name, new_ino, now);
 
         FileAttr {
             ino: new_ino,

@@ -973,7 +973,7 @@ pub fn dump_summary_reader_with_path(
                                                 "Staged Memory Buffer [payload offset {}, len {}, data buf {}]",
                                                 payload_offset,
                                                 format_bytes(length as u64),
-                                                format_bytes(data.len() as u64)
+                                                format_bytes(data.read().map(|g| g.len() as u64).unwrap_or(0))
                                             )
                                         }
                                         ExtentState::Zero { length } => {
@@ -1330,10 +1330,10 @@ mod tests {
         });
 
         {
-            let mut base = fs.base.write().unwrap();
-            base.insert(1, root_node);
-            base.insert(2, dir_node);
-            base.insert(3, file_node);
+            let mut inner = fs.inner.lock().unwrap();
+            inner.base.insert(1, root_node);
+            inner.base.insert(2, dir_node);
+            inner.base.insert(3, file_node);
         }
 
         let snapshot = fs.snapshot_all();

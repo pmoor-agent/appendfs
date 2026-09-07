@@ -4,7 +4,7 @@
 //! into them. Reads go through [`InMemoryFS::with_layer_stack`], which takes all three
 //! layer locks in a safe order - see [`super::layers`] for why the order matters.
 
-use super::{InMemoryFS, InodeLayerStack, ReadPlan};
+use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, ReadPlan};
 use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SpecialDelta, SymlinkDelta};
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
@@ -12,20 +12,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-impl InMemoryFS {
+impl FsInner {
     // --- In-Memory Delta Layer Mutations ---
 
-    pub fn insert_new_node(&self, ino: u64, delta: NodeDelta) {
-        self.live.write().unwrap().insert(ino, EntryDelta::Node(delta));
+    pub fn insert_new_node(&mut self, ino: u64, delta: NodeDelta) {
+        self.live.insert(ino, EntryDelta::Node(delta));
     }
 
-    pub fn tombstone(&self, ino: u64) {
-        self.live.write().unwrap().insert(ino, EntryDelta::Tombstone);
+    pub fn tombstone(&mut self, ino: u64) {
+        self.live.insert(ino, EntryDelta::Tombstone);
     }
 
-    pub fn add_dir_entry(&self, parent: u64, name: &str, child_ino: u64, now: SystemTime) {
-        let mut live = self.live.write().unwrap();
-        let entry = live
+    pub fn add_dir_entry(&mut self, parent: u64, name: &str, child_ino: u64, now: SystemTime) {
+        let entry = self
+            .live
             .entry(parent)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::Directory(DirectoryDelta::default())));
         if let EntryDelta::Node(NodeDelta::Directory(d)) = entry {
@@ -36,9 +36,9 @@ impl InMemoryFS {
         }
     }
 
-    pub fn remove_dir_entry(&self, parent: u64, name: &str, now: SystemTime) {
-        let mut live = self.live.write().unwrap();
-        let entry = live
+    pub fn remove_dir_entry(&mut self, parent: u64, name: &str, now: SystemTime) {
+        let entry = self
+            .live
             .entry(parent)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::Directory(DirectoryDelta::default())));
         if let EntryDelta::Node(NodeDelta::Directory(d)) = entry {
@@ -49,9 +49,9 @@ impl InMemoryFS {
         }
     }
 
-    pub fn update_dir_parent(&self, ino: u64, new_parent: u64) {
-        let mut live = self.live.write().unwrap();
-        let entry = live
+    pub fn update_dir_parent(&mut self, ino: u64, new_parent: u64) {
+        let entry = self
+            .live
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::Directory(DirectoryDelta::default())));
         if let EntryDelta::Node(NodeDelta::Directory(d)) = entry {
@@ -63,9 +63,8 @@ impl InMemoryFS {
         self.with_inode_layers(ino, |layers| layers.parent_dir_inode())
     }
 
-    pub fn update_attr_delta(&self, ino: u64, delta: AttrDelta) {
-        let mut live = self.live.write().unwrap();
-        match live.get_mut(&ino) {
+    pub fn update_attr_delta(&mut self, ino: u64, delta: AttrDelta) {
+        match self.live.get_mut(&ino) {
             // Already deleted in this batch. The fallback below reconstructs a node delta
             // from the lower layers, which for a tombstoned inode would replace the
             // tombstone and bring the inode back from the dead - still carrying its old
@@ -83,7 +82,7 @@ impl InMemoryFS {
 
         match file_type {
             Some(FileType::Directory) => {
-                live.insert(
+                self.live.insert(
                     ino,
                     EntryDelta::Node(NodeDelta::Directory(DirectoryDelta {
                         parent: None,
@@ -94,7 +93,7 @@ impl InMemoryFS {
                 );
             }
             Some(FileType::RegularFile) => {
-                live.insert(
+                self.live.insert(
                     ino,
                     EntryDelta::Node(NodeDelta::File(FileDelta {
                         extents: RangeMap::new(),
@@ -104,7 +103,7 @@ impl InMemoryFS {
                 );
             }
             Some(FileType::Symlink) => {
-                live.insert(
+                self.live.insert(
                     ino,
                     EntryDelta::Node(NodeDelta::Symlink(SymlinkDelta {
                         target: None,
@@ -113,7 +112,7 @@ impl InMemoryFS {
                 );
             }
             Some(FileType::NamedPipe) => {
-                live.insert(
+                self.live.insert(
                     ino,
                     EntryDelta::Node(NodeDelta::Fifo(SpecialDelta {
                         rdev: 0,
@@ -122,7 +121,7 @@ impl InMemoryFS {
                 );
             }
             Some(FileType::CharDevice) => {
-                live.insert(
+                self.live.insert(
                     ino,
                     EntryDelta::Node(NodeDelta::CharDevice(SpecialDelta {
                         rdev: 0,
@@ -131,7 +130,7 @@ impl InMemoryFS {
                 );
             }
             Some(FileType::BlockDevice) => {
-                live.insert(
+                self.live.insert(
                     ino,
                     EntryDelta::Node(NodeDelta::BlockDevice(SpecialDelta {
                         rdev: 0,
@@ -140,7 +139,7 @@ impl InMemoryFS {
                 );
             }
             Some(FileType::Socket) => {
-                live.insert(
+                self.live.insert(
                     ino,
                     EntryDelta::Node(NodeDelta::Socket(SpecialDelta {
                         rdev: 0,
@@ -154,22 +153,15 @@ impl InMemoryFS {
 
     // --- Overlay Query & Resolution Methods ---
 
-    /// Acquires read locks across all three layers (`live`, `flushing`, `base`) atomically in
-    /// consistent safe order and invokes `f` with the combined `InodeLayerStack` for `ino`.
-    /// Zero-copy folding executes directly under the read locks.
     pub fn with_inode_layers<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
-        let live = self.live.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
-        let base = self.base.read().unwrap();
-
-        let base_entry = base.get(&ino);
-        let mut deltas = Vec::with_capacity(flushing.len() + 1);
-        for batch in flushing.iter() {
-            if let Some(entry) = batch.get(&ino) {
+        let base_entry = self.base.get(&ino);
+        let mut deltas = Vec::with_capacity(self.flushing.len() + 1);
+        for batch in self.flushing.iter() {
+            if let Some(entry) = batch.entries.get(&ino) {
                 deltas.push(entry);
             }
         }
-        if let Some(entry) = live.get(&ino) {
+        if let Some(entry) = self.live.get(&ino) {
             deltas.push(entry);
         }
 
@@ -182,16 +174,11 @@ impl InMemoryFS {
         f(stack)
     }
 
-    /// Acquires read locks across `flushing` and `base` layers (skipping `live`) for callers
-    /// that already hold `live.write()`.
     pub fn with_inode_layers_below_live<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
-        let flushing = self.flushing.read().unwrap();
-        let base = self.base.read().unwrap();
-
-        let base_entry = base.get(&ino);
-        let mut deltas = Vec::with_capacity(flushing.len());
-        for batch in flushing.iter() {
-            if let Some(entry) = batch.get(&ino) {
+        let base_entry = self.base.get(&ino);
+        let mut deltas = Vec::with_capacity(self.flushing.len());
+        for batch in self.flushing.iter() {
+            if let Some(entry) = batch.entries.get(&ino) {
                 deltas.push(entry);
             }
         }
@@ -205,40 +192,151 @@ impl InMemoryFS {
         f(stack)
     }
 
-    /// Executes `f` while holding read locks on all three layers (`live`, `flushing`, `base`).
-    pub fn with_layers<R>(
-        &self,
-        f: impl FnOnce(&HashMap<u64, EntryDelta>, &VecDeque<HashMap<u64, EntryDelta>>, &HashMap<u64, Arc<Node>>) -> R,
-    ) -> R {
-        let live = self.live.read().unwrap();
-        let flushing = self.flushing.read().unwrap();
-        let base = self.base.read().unwrap();
-        f(&live, &flushing, &base)
-    }
-
-    /// Validates whether an inode exists in the layers below `live` (flushing -> base).
     pub fn exists_below_live(&self, ino: u64) -> bool {
         self.with_inode_layers_below_live(ino, |layers| layers.exists())
     }
 
-    /// Resolves full `FileAttr` for an inode across `flushing` -> `base`, skipping `live`.
-    /// Used by mutators holding `live.write()`.
     pub fn attr_below_live(&self, ino: u64) -> Option<FileAttr> {
         self.with_inode_layers_below_live(ino, |layers| layers.attr())
     }
 
-    /// Resolves full `FileAttr` for an inode across `live` -> `flushing` -> `base`.
     pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
-        if self.virtual_files.is_virtual_ino(ino) {
-            // Dynamic virtual files report st_size = 0 (standard Linux procfs / sysfs convention),
-            // which prevents tools like `cat` from capping reads at an early stale size.
-            return Some(self.virtual_files.file_attr(ino, 0, self.clock.now()));
-        }
         self.with_inode_layers(ino, |layers| layers.attr())
     }
 
-    /// Resolves full `FileAttr`s for a slice of inode IDs across `live` -> `flushing` -> `base`
-    /// in a single atomic snapshot pass while holding all three layer read locks concurrently.
+    pub fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
+        self.with_inode_layers(parent, |layers| layers.lookup_child(name))
+    }
+
+    pub fn list_directory(&self, parent: u64) -> Option<Vec<(String, u64)>> {
+        self.with_inode_layers(parent, |layers| layers.list_directory())
+    }
+
+    pub fn read_link(&self, ino: u64) -> Option<String> {
+        self.with_inode_layers(ino, |layers| layers.read_link())
+    }
+
+    pub fn get_xattr(&self, ino: u64, name: &str) -> Option<Vec<u8>> {
+        self.with_inode_layers(ino, |layers| layers.get_xattr(name))
+    }
+
+    pub fn list_xattrs(&self, ino: u64) -> Option<Vec<String>> {
+        self.with_inode_layers(ino, |layers| layers.list_xattrs())
+    }
+
+    pub fn snapshot_all(&self) -> HashMap<u64, Arc<Node>> {
+        let mut result: HashMap<u64, Arc<Node>> = self.base.clone();
+
+        for batch in self.flushing.iter() {
+            for (ino, entry) in &batch.entries {
+                match entry {
+                    EntryDelta::Tombstone => {
+                        result.remove(ino);
+                    }
+                    EntryDelta::Node(delta) => {
+                        if let Some(existing_arc) = result.get(ino).cloned() {
+                            let mut node_clone = (*existing_arc).clone();
+                            delta.apply_to_node(&mut node_clone);
+                            result.insert(*ino, Arc::new(node_clone));
+                        } else {
+                            result.insert(*ino, Arc::new(delta.to_node()));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (ino, entry) in self.live.iter() {
+            match entry {
+                EntryDelta::Tombstone => {
+                    result.remove(ino);
+                }
+                EntryDelta::Node(delta) => {
+                    if let Some(existing_arc) = result.get(ino).cloned() {
+                        let mut node_clone = (*existing_arc).clone();
+                        delta.apply_to_node(&mut node_clone);
+                        result.insert(*ino, Arc::new(node_clone));
+                    } else {
+                        result.insert(*ino, Arc::new(delta.to_node()));
+                    }
+                }
+            }
+        }
+
+        result.retain(|_ino, arc| arc.meta.nlink > 0 || arc.is_dir());
+
+        result
+    }
+}
+
+impl InMemoryFS {
+    // --- In-Memory Delta Layer Mutations ---
+
+    pub fn insert_new_node(&self, ino: u64, delta: NodeDelta) {
+        self.inner.lock().unwrap().insert_new_node(ino, delta);
+    }
+
+    pub fn tombstone(&self, ino: u64) {
+        self.inner.lock().unwrap().tombstone(ino);
+    }
+
+    pub fn add_dir_entry(&self, parent: u64, name: &str, child_ino: u64, now: SystemTime) {
+        self.inner.lock().unwrap().add_dir_entry(parent, name, child_ino, now);
+    }
+
+    pub fn remove_dir_entry(&self, parent: u64, name: &str, now: SystemTime) {
+        self.inner.lock().unwrap().remove_dir_entry(parent, name, now);
+    }
+
+    pub fn update_dir_parent(&self, ino: u64, new_parent: u64) {
+        self.inner.lock().unwrap().update_dir_parent(ino, new_parent);
+    }
+
+    pub fn get_parent_dir_inode(&self, ino: u64) -> Option<u64> {
+        self.inner.lock().unwrap().get_parent_dir_inode(ino)
+    }
+
+    pub fn update_attr_delta(&self, ino: u64, delta: AttrDelta) {
+        self.inner.lock().unwrap().update_attr_delta(ino, delta);
+    }
+
+    // --- Overlay Query & Resolution Methods ---
+
+    pub fn with_inode_layers<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
+        self.inner.lock().unwrap().with_inode_layers(ino, f)
+    }
+
+    pub fn with_inode_layers_below_live<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
+        self.inner.lock().unwrap().with_inode_layers_below_live(ino, f)
+    }
+
+    pub fn with_layers<R>(
+        &self,
+        f: impl FnOnce(&HashMap<u64, EntryDelta>, &VecDeque<FlushBatch>, &HashMap<u64, Arc<Node>>) -> R,
+    ) -> R {
+        let inner = self.inner.lock().unwrap();
+        f(&inner.live, &inner.flushing, &inner.base)
+    }
+
+    pub fn exists_below_live(&self, ino: u64) -> bool {
+        self.inner.lock().unwrap().exists_below_live(ino)
+    }
+
+    pub fn attr_below_live(&self, ino: u64) -> Option<FileAttr> {
+        self.inner.lock().unwrap().attr_below_live(ino)
+    }
+
+    pub fn get_attr_locked(&self, inner: &FsInner, ino: u64) -> Option<FileAttr> {
+        if self.virtual_files.is_virtual_ino(ino) {
+            return Some(self.virtual_files.file_attr(ino, 0, self.clock.now()));
+        }
+        inner.get_attr(ino)
+    }
+
+    pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
+        self.get_attr_locked(&self.inner.lock().unwrap(), ino)
+    }
+
     pub fn get_attrs_batch(&self, inos: &[u64]) -> HashMap<u64, FileAttr> {
         let mut result = HashMap::with_capacity(inos.len());
         let mut regular_inos = Vec::with_capacity(inos.len());
@@ -255,66 +353,45 @@ impl InMemoryFS {
             return result;
         }
 
-        let regular_attrs = self.with_layers(|live, flushing, base| {
-            let mut res = HashMap::with_capacity(regular_inos.len());
-            for &ino in &regular_inos {
-                let base_entry = base.get(&ino);
-                let mut deltas = Vec::with_capacity(flushing.len() + 1);
-                for batch in flushing.iter() {
-                    if let Some(entry) = batch.get(&ino) {
-                        deltas.push(entry);
-                    }
-                }
-                if let Some(entry) = live.get(&ino) {
-                    deltas.push(entry);
-                }
-                let stack = InodeLayerStack {
-                    ino,
-                    base: base_entry,
-                    deltas,
-                };
-                if let Some(attr) = stack.attr() {
-                    res.insert(ino, attr);
-                }
+        let inner = self.inner.lock().unwrap();
+        for &ino in &regular_inos {
+            if let Some(attr) = inner.get_attr(ino) {
+                result.insert(ino, attr);
             }
-            res
-        });
+        }
 
-        result.extend(regular_attrs);
         result
     }
 
-    /// Looks up a child entry by `name` inside `parent` directory across layers.
-    pub fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
+    pub fn lookup_child_locked(&self, inner: &FsInner, parent: u64, name: &str) -> Option<u64> {
         if parent == 1
             && let Some(ino) = self.virtual_files.get_ino_by_name(name)
         {
             return Some(ino);
         }
-        self.with_inode_layers(parent, |layers| layers.lookup_child(name))
+        inner.lookup_child(parent, name)
     }
 
-    /// Lists all consolidated entries of directory `parent` across layers in alphabetical order.
+    pub fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
+        self.lookup_child_locked(&self.inner.lock().unwrap(), parent, name)
+    }
+
     pub fn list_directory(&self, parent: u64) -> Option<Vec<(String, u64)>> {
-        self.with_inode_layers(parent, |layers| layers.list_directory())
+        self.inner.lock().unwrap().list_directory(parent)
     }
 
-    /// Reads target of a symlink across layers.
     pub fn read_link(&self, ino: u64) -> Option<String> {
-        self.with_inode_layers(ino, |layers| layers.read_link())
+        self.inner.lock().unwrap().read_link(ino)
     }
 
-    /// Resolves an extended attribute value for an inode across live -> flushing -> base layers.
     pub fn get_xattr(&self, ino: u64, name: &str) -> Option<Vec<u8>> {
-        self.with_inode_layers(ino, |layers| layers.get_xattr(name))
+        self.inner.lock().unwrap().get_xattr(ino, name)
     }
 
-    /// Lists all extended attribute names for an inode across all layers in alphabetical order.
     pub fn list_xattrs(&self, ino: u64) -> Option<Vec<String>> {
-        self.with_inode_layers(ino, |layers| layers.list_xattrs())
+        self.inner.lock().unwrap().list_xattrs(ino)
     }
 
-    /// Stages a set/replace mutation for an extended attribute.
     pub fn set_xattr(&self, ino: u64, name: &str, value: Vec<u8>, now: SystemTime) {
         let mut xattrs = HashMap::new();
         xattrs.insert(name.to_string(), Some(value));
@@ -326,7 +403,6 @@ impl InMemoryFS {
         self.update_attr_delta(ino, delta);
     }
 
-    /// Stages a removal mutation for an extended attribute.
     pub fn remove_xattr(&self, ino: u64, name: &str, now: SystemTime) {
         let mut xattrs = HashMap::new();
         xattrs.insert(name.to_string(), None);
@@ -338,13 +414,15 @@ impl InMemoryFS {
         self.update_attr_delta(ino, delta);
     }
 
-    /// Plans file data read resolving extents across layers into a [`ReadPlan`].
     pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
-        let plan = self.with_inode_layers(ino, |layers| layers.plan_read_file_data(offset, size, self))?;
+        let mut inner = self.inner.lock().unwrap();
+        let plan = inner.with_inode_layers(ino, |layers| {
+            layers.plan_read_file_data(offset, size, self.log_cache.as_deref())
+        })?;
 
         if self.track_atime && plan.total_len > 0 {
             let now = self.clock.now();
-            self.update_attr_delta(
+            inner.update_attr_delta(
                 ino,
                 AttrDelta {
                     atime: Some(now),
@@ -356,57 +434,13 @@ impl InMemoryFS {
         Ok(plan)
     }
 
-    /// Reads file data at `[offset, offset + size)` resolving extents across layers.
     pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
         let plan = self.plan_read_file_data(ino, offset, size)?;
-        self.execute_read_plan_sync(&plan)
+        self.execute_read_plan_sync(plan)
     }
 
-    /// Merges all layers into a consolidated snapshot map atomically while holding all 3 layer guards.
     pub fn snapshot_all(&self) -> HashMap<u64, Arc<Node>> {
-        self.with_layers(|live, flushing, base| {
-            let mut result: HashMap<u64, Arc<Node>> = base.clone();
-
-            for flushing_map in flushing.iter() {
-                for (ino, entry) in flushing_map {
-                    match entry {
-                        EntryDelta::Tombstone => {
-                            result.remove(ino);
-                        }
-                        EntryDelta::Node(delta) => {
-                            if let Some(existing_arc) = result.get(ino).cloned() {
-                                let mut node_clone = (*existing_arc).clone();
-                                delta.apply_to_node(&mut node_clone);
-                                result.insert(*ino, Arc::new(node_clone));
-                            } else {
-                                result.insert(*ino, Arc::new(delta.to_node()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            for (ino, entry) in live.iter() {
-                match entry {
-                    EntryDelta::Tombstone => {
-                        result.remove(ino);
-                    }
-                    EntryDelta::Node(delta) => {
-                        if let Some(existing_arc) = result.get(ino).cloned() {
-                            let mut node_clone = (*existing_arc).clone();
-                            delta.apply_to_node(&mut node_clone);
-                            result.insert(*ino, Arc::new(node_clone));
-                        } else {
-                            result.insert(*ino, Arc::new(delta.to_node()));
-                        }
-                    }
-                }
-            }
-
-            result.retain(|_ino, arc| arc.meta.nlink > 0 || arc.is_dir());
-
-            result
-        })
+        self.inner.lock().unwrap().snapshot_all()
     }
 }
 
@@ -448,7 +482,7 @@ mod tests {
         // a writer that validated before taking the lock would insert a fresh delta and
         // resurrect the inode at the next fold - this predicate is what stops it.
         fs.begin_flush();
-        assert!(!fs.live.read().unwrap().contains_key(&attr.ino));
+        assert!(!fs.inner.lock().unwrap().live.contains_key(&attr.ino));
         assert!(
             !fs.exists_below_live(attr.ino),
             "a tombstone frozen out of live must still report the inode as gone"

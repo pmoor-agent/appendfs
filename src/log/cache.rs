@@ -172,13 +172,12 @@ impl LogFileCache {
 
     /// Returns the cached decrypted record payload for `(generation, record_log_offset)` if present in memory.
     pub fn get_cached_record(&self, generation: u64, record_log_offset: u64) -> Option<Arc<Vec<u8>>> {
-        let revision = self
-            .manifest
-            .as_ref()
-            .and_then(|m| m.read().ok())
-            .and_then(|m| m.get_by_generation(generation).map(|l| l.revision))
-            .unwrap_or(0);
-        self.decrypted_cache.get(generation, revision, record_log_offset)
+        self.decrypted_cache.get(generation, 0, record_log_offset)
+    }
+
+    /// Stores a decrypted record payload for `(generation, record_log_offset)` in the cache.
+    pub fn insert_cached_record(&self, generation: u64, record_log_offset: u64, payload: Arc<Vec<u8>>) {
+        self.decrypted_cache.insert(generation, 0, record_log_offset, payload);
     }
 
     /// Reads an extent payload slice directly from the in-memory decrypted record cache or decodes it from disk.

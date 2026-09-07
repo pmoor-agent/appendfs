@@ -28,7 +28,8 @@ impl VolumeStats {
     /// Collects volume statistics from an in-memory filesystem state.
     pub fn collect(fs: &InMemoryFS) -> Self {
         let manifest = fs.manifest.read().unwrap().clone();
-        let base = fs.base.read().unwrap();
+        let inner = fs.inner.lock().unwrap();
+        let base = &inner.base;
         let total_inodes = base.len();
 
         let mut directory_count = 0;
@@ -42,12 +43,13 @@ impl VolumeStats {
                 NodeKind::Directory { .. } => directory_count += 1,
                 NodeKind::File { size, .. } => {
                     file_count += 1;
-                    total_logical_bytes += *size;
+                    total_logical_bytes += size;
                 }
                 NodeKind::Symlink { .. } => symlink_count += 1,
                 NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
             }
         }
+        drop(inner);
 
         let generations = fs.calculate_generation_live_stats();
         let mut total_disk_bytes = 0;
@@ -219,15 +221,12 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     let next_ino = fs.next_inode.load(Ordering::SeqCst);
     let last_tx = fs.last_tx_id.load(Ordering::SeqCst);
 
-    let rec_time_str = {
-        let guard = fs.recovered_time.read().unwrap();
-        match *guard {
-            Some(t) => {
-                let elapsed = fs.clock.now().duration_since(t).unwrap_or_default().as_secs();
-                format!("{}s ago", elapsed)
-            }
-            None => "N/A (fresh session)".to_string(),
+    let rec_time_str = match fs.recovered_time() {
+        Some(t) => {
+            let elapsed = fs.clock.now().duration_since(t).unwrap_or_default().as_secs();
+            format!("{}s ago", elapsed)
         }
+        None => "N/A (fresh session)".to_string(),
     };
 
     out.push_str("=== appendfs Runtime Status ===\n\n");
@@ -271,7 +270,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
 
             for &ino in live
                 .keys()
-                .chain(flushing.iter().flat_map(|b| b.keys()))
+                .chain(flushing.iter().flat_map(|b| b.entries.keys()))
                 .chain(base.keys())
             {
                 if !seen.insert(ino) {
@@ -282,7 +281,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
                         crate::node::EntryDelta::Tombstone => None,
                         crate::node::EntryDelta::Node(d) => Some(d.file_type()),
                     }
-                } else if let Some(delta) = flushing.iter().rev().find_map(|b| b.get(&ino)) {
+                } else if let Some(delta) = flushing.iter().rev().find_map(|b| b.entries.get(&ino)) {
                     match delta {
                         crate::node::EntryDelta::Tombstone => None,
                         crate::node::EntryDelta::Node(d) => Some(d.file_type()),
@@ -418,10 +417,15 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push('\n');
 
     // 5. Handles & Locks
-    let file_handles_count = fs.file_handles.read().unwrap().len();
-    let dir_handles_count = fs.dir_handles.read().unwrap().len();
-    let virtual_handles_count = fs.virtual_handles.read().unwrap().len();
-    let open_inodes_count = fs.open_counts.read().unwrap().len();
+    let (file_handles_count, dir_handles_count, virtual_handles_count, open_inodes_count) = {
+        let inner = fs.inner.lock().unwrap();
+        (
+            inner.file_handles.len(),
+            inner.dir_handles.len(),
+            inner.virtual_handles.len(),
+            inner.open_counts.len(),
+        )
+    };
     let flock_count = fs.locks.flock_count();
     let range_lock_count = fs.locks.range_lock_count();
 
