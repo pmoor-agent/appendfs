@@ -17,7 +17,7 @@
 use appendfs::compat::{create_canonical_compat_volume, verify_compat_tree};
 use appendfs::operations::read_write::{create_core, open_core, read_core, release_core, write_core};
 use appendfs::storage::OsStorage;
-use appendfs::{InMemoryFS, LogWriter, RecoveryTarget, Storage, VolumeKey, recover_fs};
+use appendfs::{InMemoryFS, LogWriter, RecoveryTarget, Storage, SummaryReader, VolumeKey, recover_fs};
 
 fn read_test(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<u8> {
     let fh = open_core(fs, ino, libc::O_RDONLY as u32).expect("open file");
@@ -35,6 +35,29 @@ fn fixture_v1_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1")
 }
 
+fn fixture_v1_encrypted_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1_encrypted")
+}
+
+/// Resolves the volume key required to open `fixture_dir`, unlocking encrypted fixtures
+/// with the canonical test passphrase.
+pub fn resolve_fixture_volume_key(fixture_dir: &Path) -> Arc<VolumeKey> {
+    let storage = OsStorage::new(fixture_dir);
+    let summary_file = "000000.summary";
+    let volume_header = SummaryReader::read_volume_header(&storage, summary_file).expect("read fixture volume header");
+    if volume_header.cipher == appendfs::crypto::CipherSuite::None {
+        VolumeKey::plaintext_arc()
+    } else {
+        let master = appendfs::crypto::MasterKey::from_passphrase(
+            appendfs::compat::COMPAT_ENCRYPTED_PASSPHRASE,
+            &volume_header.kdf_salt,
+        )
+        .expect("derive master key from fixture passphrase");
+        let volume_key = volume_header.unlock(&master).expect("unlock encrypted fixture volume");
+        Arc::new(volume_key)
+    }
+}
+
 /// Tests recovery when the latest summary file is missing, forcing full log replay and
 /// reconstruction from the earliest summary and all subsequent log records.
 pub fn verify_recovery_with_latest_summary_missing(fixture_dir: &Path) {
@@ -48,12 +71,13 @@ pub fn verify_recovery_with_latest_summary_missing(fixture_dir: &Path) {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(temp_path));
     let clock: Arc<dyn appendfs::Clock> = Arc::new(appendfs::SystemClock);
+    let volume_key = resolve_fixture_volume_key(fixture_dir);
 
     let mut fs = recover_fs(
         storage.clone(),
         RecoveryTarget::Latest,
         clock.clone(),
-        VolumeKey::plaintext_arc(),
+        volume_key.clone(),
     )
     .expect("recovery from 000000.summary + 000001.log must succeed");
 
@@ -70,7 +94,7 @@ pub fn verify_recovery_with_latest_summary_missing(fixture_dir: &Path) {
             clock.as_ref(),
             appendfs::cli::DEFAULT_MAX_LOG_SIZE,
             start_tx,
-            VolumeKey::plaintext_arc(),
+            volume_key,
         )
         .unwrap(),
     );
@@ -100,12 +124,13 @@ pub fn verify_recovery_from_latest_summary_snapshot(fixture_dir: &Path) {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(temp_path));
     let clock: Arc<dyn appendfs::Clock> = Arc::new(appendfs::SystemClock);
+    let volume_key = resolve_fixture_volume_key(fixture_dir);
 
     let mut fs = recover_fs(
         storage.clone(),
         RecoveryTarget::Latest,
         clock.clone(),
-        VolumeKey::plaintext_arc(),
+        volume_key.clone(),
     )
     .expect("recovery from latest summary snapshot must succeed");
 
@@ -122,7 +147,7 @@ pub fn verify_recovery_from_latest_summary_snapshot(fixture_dir: &Path) {
             clock.as_ref(),
             appendfs::cli::DEFAULT_MAX_LOG_SIZE,
             start_tx,
-            VolumeKey::plaintext_arc(),
+            volume_key,
         )
         .unwrap(),
     );
@@ -146,6 +171,29 @@ fn test_v1_log_reconstruction_with_latest_summary_missing() {
 #[test]
 fn test_v1_recovery_from_latest_summary_snapshot() {
     verify_recovery_from_latest_summary_snapshot(&fixture_v1_dir());
+}
+
+#[test]
+fn test_v1_encrypted_deterministic_reproducibility() {
+    let temp = tempfile::tempdir().unwrap();
+    appendfs::compat::create_canonical_compat_volume_encrypted(
+        temp.path(),
+        appendfs::compat::COMPAT_ENCRYPTED_PASSPHRASE,
+    )
+    .expect("create canonical encrypted compat volume");
+
+    let fixture_dir = fixture_v1_encrypted_dir();
+    for name in &["000000.summary", "000001.log", "000001.summary"] {
+        let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
+        let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
+        assert_eq!(
+            actual_bytes,
+            expected_bytes,
+            "Generated encrypted file {} differs from checked-in fixture in {}",
+            name,
+            fixture_dir.display()
+        );
+    }
 }
 
 #[test]
@@ -205,10 +253,18 @@ pub fn verify_python_restore_script(fixture_dir: &Path) {
     let temp = tempfile::tempdir().unwrap();
     let dest_path = temp.path();
 
-    let status = std::process::Command::new("python3")
-        .arg(&script_path)
-        .arg(fixture_dir)
-        .arg(dest_path)
+    let storage = OsStorage::new(fixture_dir);
+    let is_encrypted = SummaryReader::read_volume_header(&storage, "000000.summary")
+        .map(|h| h.cipher != appendfs::crypto::CipherSuite::None)
+        .unwrap_or(false);
+
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script_path).arg(fixture_dir).arg(dest_path);
+    if is_encrypted {
+        cmd.arg("--passphrase")
+            .arg(appendfs::compat::COMPAT_ENCRYPTED_PASSPHRASE);
+    }
+    let status = cmd
         .status()
         .expect("failed to execute python3; python3 must be installed and in PATH");
 

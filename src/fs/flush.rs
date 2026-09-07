@@ -468,6 +468,15 @@ impl InMemoryFS {
 
     /// Exports a single-file summary snapshot of the current in-memory filesystem state to `storage`.
     pub fn export_summary(&self, storage: &dyn Storage) -> std::io::Result<String> {
+        self.export_summary_with_iv(storage, None)
+    }
+
+    /// Exports a single-file summary snapshot of the current in-memory filesystem state to `storage` with an optional explicit IV.
+    pub fn export_summary_with_iv(
+        &self,
+        storage: &dyn Storage,
+        explicit_iv: Option<[u8; 12]>,
+    ) -> std::io::Result<String> {
         self.sync_log()?;
         let snapshot = self.snapshot_all();
         let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
@@ -496,7 +505,8 @@ impl InMemoryFS {
             ));
         }
 
-        let result = crate::log::summary::export_summary(
+        let explicit_iv = explicit_iv.or(self.deterministic_summary_iv);
+        let result = crate::log::summary::export_summary_with_iv(
             &crate::log::summary::SummarySnapshot {
                 inodes: &snapshot,
                 manifest: &manifest,
@@ -508,6 +518,7 @@ impl InMemoryFS {
             },
             storage,
             &self.volume_key,
+            explicit_iv,
         );
 
         if result.is_ok() {
@@ -559,6 +570,10 @@ impl InMemoryFS {
     }
 
     pub fn sync_and_export_summary(&self) -> std::io::Result<Option<String>> {
+        self.sync_and_export_summary_with_iv(self.deterministic_summary_iv)
+    }
+
+    pub fn sync_and_export_summary_with_iv(&self, explicit_iv: Option<[u8; 12]>) -> std::io::Result<Option<String>> {
         self.sync_log()?;
         if let Some(ref writer) = self.log_writer {
             if !writer.is_open() {
@@ -566,7 +581,7 @@ impl InMemoryFS {
                 return Ok(None);
             }
             let storage = writer.storage();
-            match self.export_summary(storage.as_ref()) {
+            match self.export_summary_with_iv(storage.as_ref(), explicit_iv) {
                 Ok(filename) => {
                     self.notify_replication();
                     return Ok(Some(filename));

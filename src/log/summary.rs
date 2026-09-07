@@ -318,6 +318,16 @@ pub fn export_summary(
     storage: &dyn Storage,
     volume_key: &VolumeKey,
 ) -> io::Result<String> {
+    export_summary_with_iv(snapshot, storage, volume_key, None)
+}
+
+/// Exports a single-file summary snapshot to a `Storage` instance, optionally specifying an explicit IV.
+pub fn export_summary_with_iv(
+    snapshot: &SummarySnapshot<'_>,
+    storage: &dyn Storage,
+    volume_key: &VolumeKey,
+    explicit_iv: Option<[u8; 12]>,
+) -> io::Result<String> {
     let SummarySnapshot {
         inodes,
         manifest,
@@ -339,7 +349,7 @@ pub fn export_summary(
 
     let is_encrypted = volume_key.cipher().is_encrypted();
     let iv = if is_encrypted {
-        crate::crypto::generate_random_iv()
+        explicit_iv.unwrap_or_else(crate::crypto::generate_random_iv)
     } else {
         [0u8; 12]
     };
@@ -455,6 +465,19 @@ pub fn init_volume_with_clock_and_uids(
     uid: u32,
     gid: u32,
 ) -> io::Result<String> {
+    init_volume_with_clock_uids_and_iv(storage, volume_key, volume_header, clock, uid, gid, None)
+}
+
+/// Initializes a volume with an explicit root owner and optional explicit IV for generation 0 summary.
+pub fn init_volume_with_clock_uids_and_iv(
+    storage: Arc<dyn Storage>,
+    volume_key: &VolumeKey,
+    volume_header: crate::crypto::VolumeHeader,
+    clock: Arc<dyn crate::clock::Clock>,
+    uid: u32,
+    gid: u32,
+    explicit_iv: Option<[u8; 12]>,
+) -> io::Result<String> {
     let files = storage.list_files()?;
     for file in files {
         if file.ends_with(".summary") || file.ends_with(".log") {
@@ -472,7 +495,7 @@ pub fn init_volume_with_clock_and_uids(
         next_generation: 1,
     };
 
-    export_summary(
+    export_summary_with_iv(
         &SummarySnapshot {
             inodes: &snapshot,
             manifest: &manifest,
@@ -484,6 +507,7 @@ pub fn init_volume_with_clock_and_uids(
         },
         storage.as_ref(),
         volume_key,
+        explicit_iv,
     )
 }
 

@@ -284,7 +284,8 @@ class VolumeDecryptor:
         return data
 
 
-DATA_KEY_CONTEXT = "appendfs-volume-key"
+DATA_KEY_CONTEXT = "appendfs volume data key v1"
+KCV_KEY_CONTEXT = "appendfs key check value v1"
 
 
 def read_volume_header_from_summary(summary_path: Path) -> Tuple[bytes, bytes, bytes, bytes]:
@@ -308,7 +309,12 @@ def read_volume_header_from_summary(summary_path: Path) -> Tuple[bytes, bytes, b
 
 
 def derive_key_from_passphrase_or_file(
-    passphrase: Optional[str], key_file: Optional[str], salt: bytes
+    passphrase: Optional[str],
+    key_file: Optional[str],
+    salt: bytes,
+    volume_id: Optional[bytes] = None,
+    kcv_iv: Optional[bytes] = None,
+    kcv_tag: Optional[bytes] = None,
 ) -> bytes:
     """Derives the 32-byte data encryption key matching AppendFS's MasterKey and VolumeHeader."""
     if key_file and passphrase:
@@ -345,6 +351,15 @@ def derive_key_from_passphrase_or_file(
         )
     else:
         raise ValueError("Either --passphrase, --key-file, or both must be provided for encrypted volumes")
+
+    # Optional key-check value verification
+    if volume_id is not None and kcv_iv is not None and kcv_tag is not None:
+        kcv_key = blake3.blake3(master_key, derive_key_context=KCV_KEY_CONTEXT).digest()
+        kcv_cipher = ChaCha20Poly1305(kcv_key)
+        try:
+            kcv_cipher.decrypt(kcv_iv, kcv_tag, volume_id)
+        except Exception:
+            raise ValueError("Incorrect passphrase or key file: Key Check Value (KCV) verification failed")
 
     # Derivation matching derive_subkey(DATA_KEY_CONTEXT, &master.key)
     return blake3.blake3(master_key, derive_key_context=DATA_KEY_CONTEXT).digest()
@@ -663,6 +678,7 @@ def main():
     parser.add_argument("dest", type=Path, help="Target destination directory where files will be restored")
     parser.add_argument("--passphrase", type=str, help="Passphrase for encrypted volume")
     parser.add_argument("--key-file", type=str, help="Path to 32-byte hex key file for encrypted volume")
+    parser.add_argument("--salt", type=str, help="Hex-encoded 16-byte KDF salt (if no .summary file exists)")
     parser.add_argument("--no-verify", action="store_true", help="Skip BLAKE3 authentication checksum verification")
     parser.add_argument("-v", "--verbose", action="store_true", help="Display verbose log replay details")
     parser.add_argument("--dry-run", action="store_true", help="Parse and validate log files without writing to disk")
@@ -689,7 +705,9 @@ def main():
                 "The initial summary is required to obtain volume metadata and KDF salt."
             )
         volume_id, kdf_salt, kcv_iv, kcv_tag = read_volume_header_from_summary(summary_0)
-        key_bytes = derive_key_from_passphrase_or_file(args.passphrase, args.key_file, kdf_salt)
+        key_bytes = derive_key_from_passphrase_or_file(
+            args.passphrase, args.key_file, kdf_salt, volume_id, kcv_iv, kcv_tag
+        )
 
     decryptor = VolumeDecryptor(key_bytes=key_bytes, no_verify=args.no_verify)
     restorer = Restorer(dest_path, decryptor, verbose=args.verbose, dry_run=args.dry_run)
@@ -705,3 +723,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

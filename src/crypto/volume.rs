@@ -150,14 +150,26 @@ impl VolumeHeader {
         key_source: KeySource,
         compression: crate::compress::Compression,
     ) -> Result<(Self, VolumeKey), CryptoError> {
+        let volume_id = generate_random_16();
+        let kcv_iv = generate_random_iv();
+        Self::new_encrypted_with_params(master, volume_id, kdf_salt, kcv_iv, key_source, compression)
+    }
+
+    /// Creates an encrypted volume header with explicit parameters (e.g. for deterministic testing/fixtures).
+    pub fn new_encrypted_with_params(
+        master: &MasterKey,
+        volume_id: [u8; 16],
+        kdf_salt: [u8; 16],
+        kcv_iv: [u8; 12],
+        key_source: KeySource,
+        compression: crate::compress::Compression,
+    ) -> Result<(Self, VolumeKey), CryptoError> {
         if key_source == KeySource::None {
             return Err(CryptoError::IoError(
                 "an encrypted volume needs a key source other than None".into(),
             ));
         }
 
-        let volume_id = generate_random_16();
-        let kcv_iv = generate_random_iv();
         let kcv_tag = compute_kcv(&master.key, &volume_id, &kcv_iv)?;
 
         let header = Self {

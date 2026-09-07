@@ -32,6 +32,28 @@ pub const COMPAT_BASE_TIMESTAMP_SECS: u64 = 1_700_000_000;
 pub const COMPAT_UID: u32 = 1000;
 pub const COMPAT_GID: u32 = 1000;
 
+/// Fixed passphrase for canonical encrypted compatibility fixtures.
+pub const COMPAT_ENCRYPTED_PASSPHRASE: &str = "passphrase";
+
+/// Fixed 16-byte KDF salt for canonical encrypted compatibility fixtures.
+pub const COMPAT_ENCRYPTED_SALT: [u8; 16] = [
+    0x20, 0x26, 0x09, 0x07, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+];
+
+/// Fixed 16-byte volume ID for canonical encrypted compatibility fixtures.
+pub const COMPAT_ENCRYPTED_VOLUME_ID: [u8; 16] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+];
+
+/// Fixed 12-byte KCV IV for canonical encrypted compatibility fixtures.
+pub const COMPAT_ENCRYPTED_KCV_IV: [u8; 12] = [0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac];
+
+/// Fixed 12-byte IV for generation 0 summary snapshot in canonical encrypted compatibility fixtures.
+pub const COMPAT_SUMMARY_0_IV: [u8; 12] = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc];
+
+/// Fixed 12-byte IV for generation 1 summary snapshot in canonical encrypted compatibility fixtures.
+pub const COMPAT_SUMMARY_1_IV: [u8; 12] = [0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc];
+
 pub fn compat_time(offset_secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(COMPAT_BASE_TIMESTAMP_SECS + offset_secs)
 }
@@ -479,6 +501,85 @@ pub fn create_canonical_compat_volume(out_dir: &Path) -> io::Result<()> {
     // 4. Export final summary snapshot -> writes 000001.summary
     clock.set_offset(500);
     fs.sync_and_export_summary()?;
+
+    // Drop fs to flush writer and release file descriptors
+    drop(fs);
+
+    let _ = fs::remove_file(out_dir.join(".lock"));
+
+    Ok(())
+}
+
+/// Generates the canonical encrypted compatibility volume into `out_dir`, writing `000000.summary`,
+/// `000001.log`, and `000001.summary` encrypted with ChaCha20-Poly1305 and derived from `passphrase`.
+pub fn create_canonical_compat_volume_encrypted(out_dir: &Path, passphrase: &str) -> io::Result<()> {
+    fs::create_dir_all(out_dir)?;
+
+    // Clean existing files in out_dir so init_volume starts with a fresh empty volume
+    if let Ok(entries) = fs::read_dir(out_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(out_dir));
+    let clock = Arc::new(CompatClock::new());
+
+    let master_key = crate::crypto::MasterKey::from_passphrase(passphrase, &COMPAT_ENCRYPTED_SALT)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    let (volume_header, volume_key) = crate::crypto::VolumeHeader::new_encrypted_with_params(
+        &master_key,
+        COMPAT_ENCRYPTED_VOLUME_ID,
+        COMPAT_ENCRYPTED_SALT,
+        COMPAT_ENCRYPTED_KCV_IV,
+        crate::crypto::KeySource::Passphrase,
+        crate::compress::Compression::None,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    let volume_key_arc = Arc::new(volume_key);
+
+    // 1. Initialize volume -> writes 000000.summary with deterministic clock & explicit IV
+    crate::log::summary::init_volume_with_clock_uids_and_iv(
+        storage.clone(),
+        &volume_key_arc,
+        volume_header.clone(),
+        clock.clone(),
+        COMPAT_UID,
+        COMPAT_GID,
+        Some(COMPAT_SUMMARY_0_IV),
+    )?;
+
+    // 2. Open log writer for generation 1 with deterministic clock and volume encryption key
+    let writer = Arc::new(
+        LogWriter::create(
+            storage.clone(),
+            1,
+            clock.as_ref(),
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            volume_key_arc.clone(),
+        )
+        .map_err(io::Error::other)?,
+    );
+
+    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
+    fs.volume_header = volume_header;
+    fs.volume_key = volume_key_arc;
+    fs.deterministic_summary_iv = Some(COMPAT_SUMMARY_1_IV);
+    fs.log_writer = Some(writer);
+    fs.set_log_dir(out_dir);
+
+    // 3. Populate canonical tree across 3 flushes
+    populate_compat_tree(&fs, &clock).map_err(io::Error::from_raw_os_error)?;
+
+    // 4. Export final summary snapshot -> writes 000001.summary with explicit IV
+    clock.set_offset(500);
+    fs.sync_and_export_summary_with_iv(Some(COMPAT_SUMMARY_1_IV))?;
 
     // Drop fs to flush writer and release file descriptors
     drop(fs);
