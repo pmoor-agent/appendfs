@@ -190,5 +190,57 @@ fn test_all_fixture_versions() {
         println!("Running compatibility checks on fixture: {}", version_name);
         verify_recovery_with_latest_summary_missing(version_dir);
         verify_recovery_from_latest_summary_snapshot(version_dir);
+        verify_python_restore_script(version_dir);
     }
+}
+
+/// Verifies that the standalone Python restore script (scripts/restore.py) can successfully
+/// replay all log batches from the golden fixture and reconstruct identical file data.
+pub fn verify_python_restore_script(fixture_dir: &Path) {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
+    if !script_path.is_file() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let dest_path = temp.path();
+
+    let status = std::process::Command::new("python3")
+        .arg(&script_path)
+        .arg(fixture_dir)
+        .arg(dest_path)
+        .status();
+
+    let Ok(status) = status else {
+        println!("python3 not available, skipping python restore script verification");
+        return;
+    };
+
+    assert!(
+        status.success(),
+        "scripts/restore.py failed on {}",
+        fixture_dir.display()
+    );
+
+    // Verify key files restored by scripts/restore.py
+    let hello = fs::read(dest_path.join("hello.txt")).expect("read hello.txt");
+    assert_eq!(hello, b"Hello, AppendFS v1 compatibility world!\n");
+
+    let data_bin = fs::read(dest_path.join("dir_a/subdir_1/data.bin")).expect("read data.bin");
+    assert_eq!(data_bin, appendfs::compat::compat_data_bin());
+
+    let multi = fs::read(dest_path.join("dir_b/multi_extent.dat")).expect("read multi_extent.dat");
+    assert_eq!(multi, appendfs::compat::compat_multi_extent_full());
+
+    let sparse = fs::read(dest_path.join("sparse_file.bin")).expect("read sparse_file.bin");
+    assert_eq!(sparse.len(), 4196);
+    assert_eq!(&sparse[..4096], &[0u8; 4096]);
+    assert_eq!(&sparse[4096..], &[0xAA; 100]);
+
+    assert!(dest_path.join("dir_empty").is_dir());
+    assert!(dest_path.join("dir_a/subdir_1/deep").is_dir());
+    assert_eq!(
+        fs::read_link(dest_path.join("symlink_rel")).unwrap(),
+        Path::new("hello.txt")
+    );
 }
