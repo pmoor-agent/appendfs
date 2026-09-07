@@ -16,13 +16,18 @@ impl InMemoryFS {
         if self.virtual_files.is_virtual_ino(ino) {
             let content = self.virtual_files.generate_content(ino, self).unwrap_or_default();
             let fh = (self.allocate_fh() & !super::VIRTUAL_FH_FLAG) | super::VIRTUAL_FH_FLAG;
-            self.virtual_handles.write().unwrap().insert(fh, content.into_bytes());
+            self.inner
+                .lock()
+                .unwrap()
+                .virtual_handles
+                .insert(fh, content.into_bytes());
             return fh;
         }
 
         let fh = self.allocate_fh();
-        self.file_handles.write().unwrap().insert(fh, FileHandle { ino, flags });
-        *self.open_counts.write().unwrap().entry(ino).or_insert(0) += 1;
+        let mut inner = self.inner.lock().unwrap();
+        inner.file_handles.insert(fh, FileHandle { ino, flags });
+        *inner.open_counts.entry(ino).or_insert(0) += 1;
         fh
     }
 
@@ -30,13 +35,13 @@ impl InMemoryFS {
         if (fh & super::VIRTUAL_FH_FLAG) != 0 {
             return None;
         }
-        self.file_handles.read().unwrap().get(&fh).copied()
+        self.inner.lock().unwrap().file_handles.get(&fh).copied()
     }
 
     pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
         if (fh & super::VIRTUAL_FH_FLAG) != 0 {
-            let handles = self.virtual_handles.read().unwrap();
-            let buf = handles.get(&fh).ok_or(libc::EBADF)?;
+            let inner = self.inner.lock().unwrap();
+            let buf = inner.virtual_handles.get(&fh).ok_or(libc::EBADF)?;
             let start = (offset as usize).min(buf.len());
             let end = (start + size).min(buf.len());
             let slice_len = end - start;
@@ -48,7 +53,7 @@ impl InMemoryFS {
                         dst_offset: 0,
                         len: slice_len,
                         source: ReadSliceSource::Memory {
-                            data: Arc::new(buf.clone()),
+                            data: Arc::new(buf.clone()).into(),
                             src_offset: start,
                         },
                     }]
@@ -71,54 +76,101 @@ impl InMemoryFS {
     }
 
     pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
-        if (fh & super::VIRTUAL_FH_FLAG) != 0 {
-            self.virtual_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;
-            return Ok(());
-        }
+        let (canceled, ready) = {
+            let mut inner = self.inner.lock().unwrap();
+            if (fh & super::VIRTUAL_FH_FLAG) != 0 {
+                inner.virtual_handles.remove(&fh).ok_or(libc::EBADF)?;
+                return Ok(());
+            }
 
-        let handle = self.file_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;
-        if handle.ino != ino {
-            return Err(libc::EBADF);
-        }
+            let handle = inner.file_handles.remove(&fh).ok_or(libc::EBADF)?;
+            if handle.ino != ino {
+                return Err(libc::EBADF);
+            }
 
-        // Clean up any BSD flock held by this handle
-        self.release_flock(ino, fh);
+            // Clean up any BSD flock held by this handle
+            let (flock_canceled, flock_ready) = inner.locks.release_flock(ino, fh);
 
-        let mut counts = self.open_counts.write().unwrap();
-        if let Some(count) = counts.get_mut(&ino) {
-            *count = count.saturating_sub(1);
+            if let Some(count) = inner.open_counts.get_mut(&ino) {
+                *count = count.saturating_sub(1);
+            }
+            let (range_canceled, range_ready) = if inner.open_counts.get(&ino) == Some(&0) {
+                inner.open_counts.remove(&ino);
+                // Clean up POSIX range locks if all handles on inode are closed
+                inner.locks.release_range_locks(ino, fh)
+            } else {
+                let c = inner.locks.cancel_range_lock_waiters(ino, fh);
+                (c, Vec::new())
+            };
+
+            let remaining = inner.open_counts.get(&ino).copied().unwrap_or(0);
+            if remaining == 0
+                && let Some(attr) = inner.get_attr(ino)
+                && attr.nlink == 0
+            {
+                inner.tombstone(ino);
+            }
+
+            self.inner_cond.notify_all();
+
+            let mut all_canceled = flock_canceled;
+            all_canceled.extend(range_canceled);
+            let mut all_ready = flock_ready;
+            all_ready.extend(range_ready);
+            (all_canceled, all_ready)
+        };
+
+        for req in canceled {
+            req.reply_err(libc::EBADF);
         }
-        if counts.get(&ino) == Some(&0) {
-            counts.remove(&ino);
-            // Clean up POSIX range locks if all handles on inode are closed
-            self.release_range_locks(ino, fh);
-        } else {
-            self.cancel_range_lock_waiters(ino, fh);
-        }
-        let remaining = counts.get(&ino).copied().unwrap_or(0);
-        if remaining == 0
-            && let Some(attr) = self.get_attr(ino)
-            && attr.nlink == 0
-        {
-            self.tombstone(ino);
+        for req in ready {
+            req.reply_err(0);
         }
         Ok(())
     }
 
     pub fn release_flock(&self, ino: u64, fh: u64) {
-        self.locks.release_flock(ino, fh);
+        let (canceled, ready) = {
+            let mut inner = self.inner.lock().unwrap();
+            let res = inner.locks.release_flock(ino, fh);
+            self.inner_cond.notify_all();
+            res
+        };
+        for r in canceled {
+            r.reply_err(libc::EBADF);
+        }
+        for r in ready {
+            r.reply_err(0);
+        }
     }
 
     pub fn cancel_range_lock_waiters(&self, ino: u64, fh: u64) {
-        self.locks.cancel_range_lock_waiters(ino, fh);
+        let canceled = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.locks.cancel_range_lock_waiters(ino, fh)
+        };
+        for r in canceled {
+            r.reply_err(libc::EBADF);
+        }
     }
 
     pub fn release_range_locks(&self, ino: u64, fh: u64) {
-        self.locks.release_range_locks(ino, fh);
+        let (canceled, ready) = {
+            let mut inner = self.inner.lock().unwrap();
+            let res = inner.locks.release_range_locks(ino, fh);
+            self.inner_cond.notify_all();
+            res
+        };
+        for r in canceled {
+            r.reply_err(libc::EBADF);
+        }
+        for r in ready {
+            r.reply_err(0);
+        }
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {
-        self.open_counts.read().unwrap().get(&ino).copied().unwrap_or(0)
+        self.inner.lock().unwrap().open_counts.get(&ino).copied().unwrap_or(0)
     }
 
     // --- Directory Handle Snapshot Management ---
@@ -129,16 +181,16 @@ impl InMemoryFS {
 
     pub fn open_dir_handle(&self, entries: Vec<(String, u64)>) -> u64 {
         let fh = self.allocate_fh();
-        self.dir_handles.write().unwrap().insert(fh, Arc::new(entries));
+        self.inner.lock().unwrap().dir_handles.insert(fh, Arc::new(entries));
         fh
     }
 
     pub fn get_dir_handle(&self, fh: u64) -> Option<Arc<Vec<(String, u64)>>> {
-        self.dir_handles.read().unwrap().get(&fh).cloned()
+        self.inner.lock().unwrap().dir_handles.get(&fh).cloned()
     }
 
     pub fn release_dir_handle(&self, fh: u64) -> Result<(), i32> {
-        self.dir_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;
+        self.inner.lock().unwrap().dir_handles.remove(&fh).ok_or(libc::EBADF)?;
         Ok(())
     }
 }

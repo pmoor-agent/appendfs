@@ -1,4 +1,4 @@
-use crate::fs::{InMemoryFS, find_parent_inode};
+use crate::fs::InMemoryFS;
 use crate::node::{AttrDelta, NodeDelta, SymlinkDelta};
 use crate::shim::{FileAttr, FileType, Request};
 
@@ -9,7 +9,7 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
     fs.check_flush_capacity()?;
 
     {
-        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let mut inner = fs.inner.lock().unwrap();
         let now = fs.clock.now();
         log::trace!("unlink(parent={}, name={})", parent, name);
 
@@ -17,25 +17,25 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
             return Err(libc::ENAMETOOLONG);
         }
 
-        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
 
-        let child_ino = fs.lookup_child(parent, name).ok_or(libc::ENOENT)?;
+        let child_ino = fs.lookup_child_locked(&inner, parent, name).ok_or(libc::ENOENT)?;
         if fs.is_virtual_ino(child_ino) {
             return Err(libc::EPERM);
         }
-        let child_attr = fs.get_attr(child_ino).ok_or(libc::ENOENT)?;
+        let child_attr = fs.get_attr_locked(&inner, child_ino).ok_or(libc::ENOENT)?;
 
         if child_attr.file_type == FileType::Directory {
             return Err(libc::EISDIR);
         }
 
-        fs.remove_dir_entry(parent, name, now);
+        inner.remove_dir_entry(parent, name, now);
 
         let new_nlink = child_attr.nlink.saturating_sub(1);
-        fs.update_attr_delta(
+        inner.update_attr_delta(
             child_ino,
             AttrDelta {
                 nlink: Some(new_nlink),
@@ -44,8 +44,9 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
             },
         );
 
-        if new_nlink == 0 && fs.open_count(child_ino) == 0 {
-            fs.tombstone(child_ino);
+        let open_count = inner.open_counts.get(&child_ino).copied().unwrap_or(0);
+        if new_nlink == 0 && open_count == 0 {
+            inner.tombstone(child_ino);
         }
     }
 
@@ -75,7 +76,7 @@ pub fn symlink_core(
     fs.check_flush_capacity()?;
 
     let attr = {
-        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let mut inner = fs.inner.lock().unwrap();
         let now = fs.clock.now();
         log::trace!(
             "symlink(parent={}, name={}, link={}, uid={}, gid={})",
@@ -90,12 +91,12 @@ pub fn symlink_core(
             return Err(libc::ENAMETOOLONG);
         }
 
-        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
 
-        if fs.lookup_child(parent, name).is_some() {
+        if fs.lookup_child_locked(&inner, parent, name).is_some() {
             return Err(libc::EEXIST);
         }
 
@@ -115,8 +116,8 @@ pub fn symlink_core(
             },
         });
 
-        fs.insert_new_node(new_ino, new_delta);
-        fs.add_dir_entry(parent, name, new_ino, now);
+        inner.insert_new_node(new_ino, new_delta);
+        inner.add_dir_entry(parent, name, new_ino, now);
 
         FileAttr {
             ino: new_ino,
@@ -166,7 +167,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
     fs.check_flush_capacity()?;
 
     {
-        let _dir_guard = fs.dir_lock.lock().unwrap();
+        let mut inner = fs.inner.lock().unwrap();
         let now = fs.clock.now();
         log::trace!(
             "rename(parent={}, name={}, newparent={}, newname={})",
@@ -180,20 +181,20 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
             return Err(libc::ENAMETOOLONG);
         }
 
-        let parent_attr = fs.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
-        let newparent_attr = fs.get_attr(newparent).ok_or(libc::ENOENT)?;
+        let newparent_attr = inner.get_attr(newparent).ok_or(libc::ENOENT)?;
         if newparent_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
 
-        let source_ino = fs.lookup_child(parent, name).ok_or(libc::ENOENT)?;
+        let source_ino = fs.lookup_child_locked(&inner, parent, name).ok_or(libc::ENOENT)?;
         if fs.is_virtual_ino(source_ino) {
             return Err(libc::EPERM);
         }
-        let source_attr = fs.get_attr(source_ino).ok_or(libc::ENOENT)?;
+        let source_attr = fs.get_attr_locked(&inner, source_ino).ok_or(libc::ENOENT)?;
 
         if source_attr.file_type == FileType::Directory {
             let mut curr = newparent;
@@ -201,7 +202,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
                 if curr == source_ino {
                     return Err(libc::EINVAL);
                 }
-                if let Some(p) = find_parent_inode(fs, curr) {
+                if let Some(p) = inner.get_parent_dir_inode(curr) {
                     curr = p;
                 } else {
                     break;
@@ -216,7 +217,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
         let src_is_dir = source_attr.file_type == FileType::Directory;
 
         let mut dest_was_dir = false;
-        if let Some(dest_ino) = fs.lookup_child(newparent, newname) {
+        if let Some(dest_ino) = fs.lookup_child_locked(&inner, newparent, newname) {
             if fs.is_virtual_ino(dest_ino) {
                 return Err(libc::EPERM);
             }
@@ -229,7 +230,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
                 return Ok(());
             }
 
-            let dest_attr = fs.get_attr(dest_ino).ok_or(libc::ENOENT)?;
+            let dest_attr = fs.get_attr_locked(&inner, dest_ino).ok_or(libc::ENOENT)?;
             let dest_is_dir = dest_attr.file_type == FileType::Directory;
 
             if src_is_dir != dest_is_dir {
@@ -237,17 +238,17 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
             }
 
             if dest_is_dir {
-                let dest_entries = fs.list_directory(dest_ino).ok_or(libc::ENOENT)?;
+                let dest_entries = inner.list_directory(dest_ino).ok_or(libc::ENOENT)?;
                 if !dest_entries.is_empty() {
                     return Err(libc::ENOTEMPTY);
                 }
                 dest_was_dir = true;
-                fs.remove_dir_entry(newparent, newname, now);
-                fs.tombstone(dest_ino);
+                inner.remove_dir_entry(newparent, newname, now);
+                inner.tombstone(dest_ino);
             } else {
-                fs.remove_dir_entry(newparent, newname, now);
+                inner.remove_dir_entry(newparent, newname, now);
                 let new_dest_nlink = dest_attr.nlink.saturating_sub(1);
-                fs.update_attr_delta(
+                inner.update_attr_delta(
                     dest_ino,
                     AttrDelta {
                         nlink: Some(new_dest_nlink),
@@ -255,16 +256,17 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
                         ..Default::default()
                     },
                 );
-                if new_dest_nlink == 0 && fs.open_count(dest_ino) == 0 {
-                    fs.tombstone(dest_ino);
+                let open_count = inner.open_counts.get(&dest_ino).copied().unwrap_or(0);
+                if new_dest_nlink == 0 && open_count == 0 {
+                    inner.tombstone(dest_ino);
                 }
             }
         }
 
-        fs.remove_dir_entry(parent, name, now);
-        fs.add_dir_entry(newparent, newname, source_ino, now);
+        inner.remove_dir_entry(parent, name, now);
+        inner.add_dir_entry(newparent, newname, source_ino, now);
         if src_is_dir && parent != newparent {
-            fs.update_dir_parent(source_ino, newparent);
+            inner.update_dir_parent(source_ino, newparent);
         }
         if src_is_dir {
             // Two independent effects on subdirectory counts, composed rather than
@@ -288,7 +290,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
                 newparent_delta -= 1;
             }
             if parent_delta != 0 {
-                fs.update_attr_delta(
+                inner.update_attr_delta(
                     parent,
                     AttrDelta {
                         nlink: Some((parent_attr.nlink as i64 + parent_delta) as u32),
@@ -298,7 +300,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
                 );
             }
             if newparent_delta != 0 {
-                fs.update_attr_delta(
+                inner.update_attr_delta(
                     newparent,
                     AttrDelta {
                         nlink: Some((newparent_attr.nlink as i64 + newparent_delta) as u32),
@@ -328,8 +330,8 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
     }
     fs.check_flush_capacity()?;
 
-    {
-        let _dir_guard = fs.dir_lock.lock().unwrap();
+    let final_attr = {
+        let mut inner = fs.inner.lock().unwrap();
         let now = fs.clock.now();
         log::trace!("link(ino={}, newparent={}, newname={})", ino, newparent, newname);
 
@@ -337,7 +339,7 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
             return Err(libc::ENAMETOOLONG);
         }
 
-        let target_attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
+        let target_attr = fs.get_attr_locked(&inner, ino).ok_or(libc::ENOENT)?;
         if target_attr.file_type == FileType::Directory || fs.is_virtual_ino(ino) {
             return Err(libc::EPERM);
         }
@@ -345,17 +347,17 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
             return Err(libc::ENOENT);
         }
 
-        let newparent_attr = fs.get_attr(newparent).ok_or(libc::ENOENT)?;
+        let newparent_attr = inner.get_attr(newparent).ok_or(libc::ENOENT)?;
         if newparent_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
 
-        if fs.lookup_child(newparent, newname).is_some() {
+        if fs.lookup_child_locked(&inner, newparent, newname).is_some() {
             return Err(libc::EEXIST);
         }
 
         let new_nlink = target_attr.nlink + 1;
-        fs.update_attr_delta(
+        inner.update_attr_delta(
             ino,
             AttrDelta {
                 nlink: Some(new_nlink),
@@ -364,12 +366,16 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
             },
         );
 
-        fs.add_dir_entry(newparent, newname, ino, now);
-    }
+        inner.add_dir_entry(newparent, newname, ino, now);
+        let mut attr = target_attr;
+        attr.nlink = new_nlink;
+        attr.ctime = now;
+        attr
+    };
 
     fs.notify_mutation(0);
 
-    fs.get_attr(ino).ok_or(libc::ENOENT)
+    Ok(final_attr)
 }
 
 pub fn link(fs: &InMemoryFS, req: Request, ino: u64, newparent: u64, newname: &str) {

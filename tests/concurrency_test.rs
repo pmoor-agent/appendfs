@@ -751,29 +751,20 @@ fn run_concurrent_stress(seed: u64) {
     verify_tree_invariants(&fs, storage.as_ref(), seed);
     verify_log_replay_matches_live(&fs, storage.clone(), seed);
 
-    assert!(
-        fs.dir_handles.read().unwrap().is_empty(),
-        "seed {}: leaked dir handles",
-        seed
-    );
-    assert!(
-        fs.file_handles.read().unwrap().is_empty(),
-        "seed {}: leaked file handles",
-        seed
-    );
-    assert_eq!(fs.locks.flock_count(), 0, "seed {}: leaked flock entries", seed);
-    assert_eq!(
-        fs.locks.range_lock_count(),
-        0,
-        "seed {}: leaked range lock entries",
-        seed
-    );
-    assert!(fs.locks.is_empty(), "seed {}: leaked lock manager state", seed);
-    assert!(
-        fs.open_counts.read().unwrap().is_empty(),
-        "seed {}: leaked open_counts",
-        seed
-    );
+    {
+        let inner = fs.inner.lock().unwrap();
+        assert!(inner.dir_handles.is_empty(), "seed {}: leaked dir handles", seed);
+        assert!(inner.file_handles.is_empty(), "seed {}: leaked file handles", seed);
+        assert_eq!(inner.locks.flock_count(), 0, "seed {}: leaked flock entries", seed);
+        assert_eq!(
+            inner.locks.range_lock_count(),
+            0,
+            "seed {}: leaked range lock entries",
+            seed
+        );
+        assert!(inner.locks.is_empty(), "seed {}: leaked lock manager state", seed);
+        assert!(inner.open_counts.is_empty(), "seed {}: leaked open_counts", seed);
+    }
 }
 
 #[test]

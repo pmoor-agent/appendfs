@@ -7,11 +7,18 @@ use std::sync::{Arc, RwLock};
 /// This is a *resolved* view: `Staged` always means "only in memory right now" and
 /// `Disk` always means "durably flushed", regardless of how the value is actually
 /// stored internally. See `StoredExtent` for why that distinction matters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub type StagedBuffer = Arc<RwLock<Vec<u8>>>;
+
+/// Represents the physical location and state of an extent slice.
+///
+/// This is a *resolved* view: `Staged` always means "only in memory right now" and
+/// `Disk` always means "durably flushed", regardless of how the value is actually
+/// stored internally. See `StoredExtent` for why that distinction matters.
+#[derive(Debug, Clone)]
 pub enum ExtentState {
     /// Data is staged in memory, not yet flushed to disk.
     Staged {
-        data: Arc<Vec<u8>>,
+        data: StagedBuffer,
         payload_offset: u32,
         length: u32,
     },
@@ -23,20 +30,57 @@ pub enum ExtentState {
         length: u32,            // Length of slice
     },
     /// A hole: this range reads as zeros and occupies no space on disk.
-    ///
-    /// This is *not* the same as the range simply being absent from a file's extent map.
-    /// Absence means "this layer has no opinion", so a read falls through to the layer
-    /// below; `Zero` means "these bytes are zeros", masking whatever `base` holds. That
-    /// distinction is what makes hole punching work in a delta layer rather than silently
-    /// resurrecting the punched data at the next read. Folding into `base` may collapse
-    /// `Zero` back to absence, since nothing sits below `base` to mask.
-    ///
-    /// The length is `u64`, unlike the other variants: a hole has no backing payload to
-    /// index into, so the `u32` ceiling that bounds a real extent does not apply. That
-    /// matters because truncating a file emits a hole spanning everything it discarded,
-    /// which stays a single extent however large the file was.
     Zero { length: u64 },
 }
+
+impl PartialEq for ExtentState {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                ExtentState::Staged {
+                    data: d1,
+                    payload_offset: p1,
+                    length: l1,
+                },
+                ExtentState::Staged {
+                    data: d2,
+                    payload_offset: p2,
+                    length: l2,
+                },
+            ) => {
+                if p1 != p2 || l1 != l2 {
+                    return false;
+                }
+                if Arc::ptr_eq(d1, d2) {
+                    return true;
+                }
+                let g1 = d1.read().unwrap();
+                let g2 = d2.read().unwrap();
+                let s1 = &g1[*p1 as usize..(*p1 + *l1) as usize];
+                let s2 = &g2[*p2 as usize..(*p2 + *l2) as usize];
+                s1 == s2
+            }
+            (
+                ExtentState::Disk {
+                    generation: g1,
+                    record_log_offset: r1,
+                    payload_offset: p1,
+                    length: l1,
+                },
+                ExtentState::Disk {
+                    generation: g2,
+                    record_log_offset: r2,
+                    payload_offset: p2,
+                    length: l2,
+                },
+            ) => g1 == g2 && r1 == r2 && p1 == p2 && l1 == l2,
+            (ExtentState::Zero { length: l1 }, ExtentState::Zero { length: l2 }) => l1 == l2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ExtentState {}
 
 impl ExtentState {
     pub fn length(&self) -> u64 {
@@ -60,7 +104,7 @@ impl ExtentState {
 #[derive(Debug, Clone)]
 enum StoredExtent {
     Staged {
-        data: Arc<Vec<u8>>,
+        data: StagedBuffer,
         payload_offset: u32,
         length: u32,
     },
@@ -177,12 +221,16 @@ impl<'de> Deserialize<'de> for SharedExtentState {
 }
 
 impl SharedExtentState {
-    pub fn new_staged(data: Arc<Vec<u8>>, payload_offset: u32, length: u32) -> Self {
+    pub fn new_staged(data: StagedBuffer, payload_offset: u32, length: u32) -> Self {
         Self(Arc::new(RwLock::new(StoredExtent::Staged {
             data,
             payload_offset,
             length,
         })))
+    }
+
+    pub fn new_staged_buffer(bytes: Vec<u8>, payload_offset: u32, length: u32) -> Self {
+        Self::new_staged(Arc::new(RwLock::new(bytes)), payload_offset, length)
     }
 
     pub fn new_disk(generation: u64, record_log_offset: u64, payload_offset: u32, length: u32) -> Self {
@@ -317,14 +365,14 @@ mod tests {
 
     #[test]
     fn test_shared_extent_state_trimming() {
-        let state = SharedExtentState::new_staged(Arc::new(vec![1, 2, 3, 4, 5]), 0, 5);
+        let state = SharedExtentState::new_staged_buffer(vec![1, 2, 3, 4, 5], 0, 5);
         let mut clone = state.clone();
 
         clone.trim_left(2);
         assert_eq!(
             clone.read_state(),
             ExtentState::Staged {
-                data: Arc::new(vec![1, 2, 3, 4, 5]),
+                data: Arc::new(RwLock::new(vec![1, 2, 3, 4, 5])),
                 payload_offset: 2,
                 length: 3,
             }
@@ -332,7 +380,7 @@ mod tests {
         assert_eq!(
             state.read_state(),
             ExtentState::Staged {
-                data: Arc::new(vec![1, 2, 3, 4, 5]),
+                data: Arc::new(RwLock::new(vec![1, 2, 3, 4, 5])),
                 payload_offset: 0,
                 length: 5,
             }
@@ -342,7 +390,7 @@ mod tests {
         assert_eq!(
             clone.read_state(),
             ExtentState::Staged {
-                data: Arc::new(vec![1, 2, 3, 4, 5]),
+                data: Arc::new(RwLock::new(vec![1, 2, 3, 4, 5])),
                 payload_offset: 2,
                 length: 2,
             }
@@ -350,7 +398,7 @@ mod tests {
         assert_eq!(
             state.read_state(),
             ExtentState::Staged {
-                data: Arc::new(vec![1, 2, 3, 4, 5]),
+                data: Arc::new(RwLock::new(vec![1, 2, 3, 4, 5])),
                 payload_offset: 0,
                 length: 5,
             }
@@ -359,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_fork_is_independent_of_original_trimming() {
-        let state = SharedExtentState::new_staged(Arc::new(vec![0u8; 10]), 0, 10);
+        let state = SharedExtentState::new_staged_buffer(vec![0u8; 10], 0, 10);
         let mut forked = state.fork();
 
         // Trimming the fork must not affect the original, and vice versa.

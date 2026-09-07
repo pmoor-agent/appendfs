@@ -10,6 +10,7 @@
 //! - [`overlay`] - staging mutations into `live` and resolving reads across all layers.
 //! - [`flush`] - freezing `live`, synthesizing log records, and folding batches into `base`.
 
+pub mod arena;
 mod flush;
 mod handles;
 mod layers;
@@ -17,7 +18,8 @@ mod overlay;
 pub mod virtual_files;
 
 pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
-pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
+pub use arena::WriteArena;
+pub use layers::{InodeLayerStack, MemoryBuffer, ReadPlan, ReadSlice, ReadSliceSource};
 pub use virtual_files::{VIRTUAL_FH_FLAG, VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};
@@ -40,23 +42,46 @@ pub type DirSnapshot = Arc<Vec<(String, u64)>>;
 pub type FileHandleMap = HashMap<u64, FileHandle>;
 pub type DirectoryHandleMap = HashMap<u64, DirSnapshot>;
 
-pub struct InMemoryFS {
-    /// Resting consolidated state loaded from `.summary` at mount, folded forward over
-    /// generations.
-    pub base: RwLock<HashMap<u64, Arc<Node>>>,
+/// An immutable frozen batch of mutations being written to the log, holding its
+/// corresponding write arena chunk buffers.
+#[derive(Debug, Clone)]
+pub struct FlushBatch {
+    pub entries: HashMap<u64, EntryDelta>,
+    pub arena: WriteArena,
+}
+
+/// Consolidated mutable filesystem state protected by `InMemoryFS::inner`.
+pub struct FsInner {
+    /// Resting consolidated state loaded from `.summary` at mount, folded forward over generations.
+    pub base: HashMap<u64, Arc<Node>>,
     /// Ordered queue of immutable frozen snapshots waiting to be written/flushed to disk.
-    /// New batches are pushed to the back; flusher drains from the front.
-    pub flushing: RwLock<VecDeque<HashMap<u64, EntryDelta>>>,
+    pub flushing: VecDeque<FlushBatch>,
     /// Current generation's active mutable delta layer receiving live operations.
-    pub live: RwLock<HashMap<u64, EntryDelta>>,
+    pub live: HashMap<u64, EntryDelta>,
+    /// Active write arena staging extent payload allocations for `live`.
+    pub live_arena: WriteArena,
+    /// Recycled chunk buffer pool for re-use across flush generations.
+    pub arena_pool: Vec<Arc<RwLock<Vec<u8>>>>,
     /// Active open file handles keyed by allocated file handle ID (`fh`).
-    pub file_handles: RwLock<FileHandleMap>,
+    pub file_handles: FileHandleMap,
     /// Active open directory handle snapshots keyed by allocated file handle ID (`fh`).
-    pub dir_handles: RwLock<DirectoryHandleMap>,
+    pub dir_handles: DirectoryHandleMap,
+    /// Open descriptor reference count per inode for fast POSIX unlinking checks.
+    pub open_counts: HashMap<u64, u32>,
+    /// Active open virtual file handles holding frozen point-in-time snapshot strings.
+    pub virtual_handles: HashMap<u64, Vec<u8>>,
     /// Whole-file BSD flock and POSIX byte-range record lock manager.
     pub locks: LockManager,
-    /// Open descriptor reference count per inode for fast POSIX unlinking checks.
-    pub open_counts: RwLock<HashMap<u64, u32>>,
+    /// Timestamp of the latest recovered operation / summary snapshot (if recovered).
+    pub recovered_time: Option<SystemTime>,
+}
+
+pub struct InMemoryFS {
+    /// Consolidated critical section protecting all in-memory metadata, layer overlay,
+    /// file/dir handles, open counts, write arena buffers, and file locks.
+    pub inner: Mutex<FsInner>,
+    /// Condition variable for parking/waking in-process lock operations on `inner`.
+    pub inner_cond: Condvar,
     /// Atomic counter for allocating unique file and directory handle IDs (`fh`).
     pub next_fh: AtomicU64,
     /// Authoritative manifest of all active log generations and lineage.
@@ -83,10 +108,6 @@ pub struct InMemoryFS {
     pub track_atime: bool,
     /// When true, filesystem is mounted strictly read-only (EROFS).
     pub read_only: std::sync::atomic::AtomicBool,
-    /// Timestamp of the latest recovered operation / summary snapshot (if recovered).
-    pub recovered_time: RwLock<Option<SystemTime>>,
-    /// Serializes every directory-structure mutation (mkdir/create/symlink/unlink/rmdir/rename/link).
-    pub dir_lock: Mutex<()>,
     /// Active VolumeHeader holding unlocked Data Encryption Keys.
     pub volume_key: Arc<crate::crypto::VolumeKey>,
     /// Volume identity and key-check material, carried alongside the key it belongs to.
@@ -100,8 +121,6 @@ pub struct InMemoryFS {
     pub volume_header: crate::crypto::VolumeHeader,
     /// Dynamic virtual files registered in the filesystem root (`/`).
     pub(crate) virtual_files: Arc<virtual_files::VirtualFileRegistry>,
-    /// Active open virtual file handles holding frozen point-in-time snapshot strings.
-    pub(crate) virtual_handles: RwLock<HashMap<u64, Vec<u8>>>,
     /// Optional live RemoteRegistry instance for remote status reporting.
     pub remote_registry: RwLock<Option<Arc<RwLock<crate::remote::RemoteRegistry>>>>,
     /// Live telemetry counters and synchronization state across all remotes.
@@ -132,7 +151,7 @@ impl InMemoryFS {
     pub fn with_clock_and_uids(clock: Arc<dyn Clock>, uid: u32, gid: u32) -> Self {
         let fs = Self::with_clock(clock.clone());
         let now = clock.now();
-        if let Some(root) = fs.base.write().unwrap().get_mut(&1) {
+        if let Some(root) = fs.inner.lock().unwrap().base.get_mut(&1) {
             *root = Arc::new(Node::new_dir(1, 0o755, uid, gid, now));
         }
         fs
@@ -166,14 +185,23 @@ impl InMemoryFS {
 
         let virtual_files = Arc::new(virtual_files::VirtualFileRegistry::new());
 
-        let fs = Self {
-            base: RwLock::new(map),
-            flushing: RwLock::new(VecDeque::new()),
-            live: RwLock::new(HashMap::new()),
-            file_handles: RwLock::new(HashMap::new()),
-            dir_handles: RwLock::new(HashMap::new()),
+        let inner = FsInner {
+            base: map,
+            flushing: VecDeque::new(),
+            live: HashMap::new(),
+            live_arena: WriteArena::new(),
+            arena_pool: Vec::new(),
+            file_handles: HashMap::new(),
+            dir_handles: HashMap::new(),
+            open_counts: HashMap::new(),
+            virtual_handles: HashMap::new(),
             locks: LockManager::new(),
-            open_counts: RwLock::new(HashMap::new()),
+            recovered_time: None,
+        };
+
+        let fs = Self {
+            inner: Mutex::new(inner),
+            inner_cond: Condvar::new(),
             next_fh: AtomicU64::new(1),
             manifest,
             next_inode: AtomicU64::new(2),
@@ -192,12 +220,9 @@ impl InMemoryFS {
             flush_lock: Mutex::new(()),
             track_atime: true,
             read_only: std::sync::atomic::AtomicBool::new(false),
-            recovered_time: RwLock::new(None),
-            dir_lock: Mutex::new(()),
             volume_key,
             volume_header: crate::crypto::VolumeHeader::plaintext(),
             virtual_files,
-            virtual_handles: RwLock::new(HashMap::new()),
             remote_registry: RwLock::new(None),
             replication_telemetry: Arc::new(RwLock::new(crate::remote::worker::ReplicationTelemetry::new())),
             summary_interval_bytes: AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_BYTES),
@@ -314,11 +339,11 @@ impl InMemoryFS {
     }
 
     pub fn recovered_time(&self) -> Option<SystemTime> {
-        *self.recovered_time.read().unwrap()
+        self.inner.lock().unwrap().recovered_time
     }
 
     pub fn set_recovered_time(&self, time: Option<SystemTime>) {
-        *self.recovered_time.write().unwrap() = time;
+        self.inner.lock().unwrap().recovered_time = time;
     }
 
     pub fn set_storage(&mut self, storage: Arc<dyn Storage>) {

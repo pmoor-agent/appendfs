@@ -1207,9 +1207,10 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
             size: 256,
         },
     };
-    fs.base
-        .write()
+    fs.inner
+        .lock()
         .unwrap()
+        .base
         .insert(orphan_ino, std::sync::Arc::new(orphan_node));
 
     let corrupted_report = appendfs::check_fs_integrity(&fs, Some(log_path), true);
