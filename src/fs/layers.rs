@@ -526,130 +526,75 @@ pub fn execute_read_plan(
     if !cold_slices.is_empty() {
         let cache = log_cache.ok_or(libc::EIO)?;
 
-        if cold_slices.len() == 1 {
-            // Fast single-extent path: execute synchronously on current thread with zero overhead
-            let slice = &cold_slices[0];
-            match &slice.source {
-                ReadSliceSource::Disk {
-                    generation,
-                    record_log_offset,
-                    record_size,
-                    payload_offset,
-                    slice_inner_offset,
-                } => {
-                    cache
-                        .read_extent_payload(
-                            *generation,
-                            *record_log_offset,
-                            *record_size,
-                            *payload_offset,
-                            *slice_inner_offset,
-                            &mut dst_buf[slice.dst_offset..slice.dst_offset + slice.len],
-                            volume_key,
-                        )
-                        .map_err(|_| libc::EIO)?;
-                }
-                _ => panic!("expected Disk slice in cold_slices"),
-            }
-        } else {
-            // Multi-extent parallel path:
-            // 1. Sort slices by (generation, record_log_offset) so that slices referencing the same
-            // record land in the same worker chunk to maximize decrypted_cache hits.
-            cold_slices.sort_by_key(|s| match &s.source {
-                ReadSliceSource::Disk {
-                    generation,
-                    record_log_offset,
-                    ..
-                } => (*generation, *record_log_offset),
-                _ => (0, 0),
-            });
+        // Sort slices by (generation, record_log_offset) so that slices referencing the same
+        // record land in the same worker chunk to maximize decrypted_cache hits.
+        cold_slices.sort_by_key(|s| match &s.source {
+            ReadSliceSource::Disk {
+                generation,
+                record_log_offset,
+                ..
+            } => (*generation, *record_log_offset),
+            _ => (0, 0),
+        });
 
-            let num_workers = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(4)
-                .min(cold_slices.len())
-                .min(16);
+        let num_workers = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .min(cold_slices.len())
+            .clamp(1, 16);
 
-            if num_workers <= 1 {
-                for slice in &cold_slices {
-                    match &slice.source {
-                        ReadSliceSource::Disk {
-                            generation,
-                            record_log_offset,
-                            record_size,
-                            payload_offset,
-                            slice_inner_offset,
-                        } => {
-                            cache
-                                .read_extent_payload(
-                                    *generation,
-                                    *record_log_offset,
-                                    *record_size,
-                                    *payload_offset,
-                                    *slice_inner_offset,
-                                    &mut dst_buf[slice.dst_offset..slice.dst_offset + slice.len],
-                                    volume_key,
-                                )
-                                .map_err(|_| libc::EIO)?;
-                        }
-                        _ => panic!("expected Disk slice in cold_slices"),
-                    }
-                }
-            } else {
-                let chunk_size = cold_slices.len().div_ceil(num_workers);
-                let chunks: Vec<&[ReadSlice]> = cold_slices.chunks(chunk_size).collect();
+        let chunk_size = cold_slices.len().div_ceil(num_workers);
+        let chunks: Vec<&[ReadSlice]> = cold_slices.chunks(chunk_size).collect();
 
-                type ReadChunkResult = Vec<(usize, Vec<u8>)>;
-                let all_results = std::thread::scope(|s| -> Result<Vec<ReadChunkResult>, i32> {
-                    let mut handles = Vec::with_capacity(chunks.len());
+        type ReadChunkResult = Vec<(usize, Vec<u8>)>;
+        let all_results = std::thread::scope(|s| -> Result<Vec<ReadChunkResult>, i32> {
+            let mut handles = Vec::with_capacity(chunks.len());
 
-                    for chunk in chunks {
-                        let handle = s.spawn(move || -> Result<Vec<(usize, Vec<u8>)>, i32> {
-                            let mut chunk_res = Vec::with_capacity(chunk.len());
-                            for slice in chunk {
-                                match &slice.source {
-                                    ReadSliceSource::Disk {
-                                        generation,
-                                        record_log_offset,
-                                        record_size,
-                                        payload_offset,
-                                        slice_inner_offset,
-                                    } => {
-                                        let mut buf = vec![0u8; slice.len];
-                                        cache
-                                            .read_extent_payload(
-                                                *generation,
-                                                *record_log_offset,
-                                                *record_size,
-                                                *payload_offset,
-                                                *slice_inner_offset,
-                                                &mut buf,
-                                                volume_key,
-                                            )
-                                            .map_err(|_| libc::EIO)?;
-                                        chunk_res.push((slice.dst_offset, buf));
-                                    }
-                                    _ => panic!("expected Disk slice in cold_slices"),
-                                }
+            for chunk in chunks {
+                let handle = s.spawn(move || -> Result<Vec<(usize, Vec<u8>)>, i32> {
+                    let mut chunk_res = Vec::with_capacity(chunk.len());
+                    for slice in chunk {
+                        match &slice.source {
+                            ReadSliceSource::Disk {
+                                generation,
+                                record_log_offset,
+                                record_size,
+                                payload_offset,
+                                slice_inner_offset,
+                            } => {
+                                let mut buf = vec![0u8; slice.len];
+                                cache
+                                    .read_extent_payload(
+                                        *generation,
+                                        *record_log_offset,
+                                        *record_size,
+                                        *payload_offset,
+                                        *slice_inner_offset,
+                                        &mut buf,
+                                        volume_key,
+                                    )
+                                    .map_err(|_| libc::EIO)?;
+                                chunk_res.push((slice.dst_offset, buf));
                             }
-                            Ok(chunk_res)
-                        });
-                        handles.push(handle);
+                            _ => panic!("expected Disk slice in cold_slices"),
+                        }
                     }
+                    Ok(chunk_res)
+                });
+                handles.push(handle);
+            }
 
-                    let mut results = Vec::with_capacity(handles.len());
-                    for h in handles {
-                        let res = h.join().map_err(|_| libc::EIO)??;
-                        results.push(res);
-                    }
-                    Ok(results)
-                })?;
+            let mut results = Vec::with_capacity(handles.len());
+            for h in handles {
+                let res = h.join().map_err(|_| libc::EIO)??;
+                results.push(res);
+            }
+            Ok(results)
+        })?;
 
-                for chunk_res in all_results {
-                    for (dst_offset, buf) in chunk_res {
-                        dst_buf[dst_offset..dst_offset + buf.len()].copy_from_slice(&buf);
-                    }
-                }
+        for chunk_res in all_results {
+            for (dst_offset, buf) in chunk_res {
+                dst_buf[dst_offset..dst_offset + buf.len()].copy_from_slice(&buf);
             }
         }
     }
