@@ -1,3 +1,5 @@
 debug
 target
 **/*.rs.bk
+__pycache__/
+*.pyc

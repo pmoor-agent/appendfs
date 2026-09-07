@@ -243,6 +243,15 @@ def find_log_files(source_path: Path) -> List[Tuple[int, int, Path]]:
 
     result = [(gen, rev, path) for gen, (rev, path) in latest_rev_by_gen.items()]
     result.sort(key=lambda x: (x[0], x[1]))
+
+    # Verify that log generations are strictly continuous without gaps
+    for i in range(1, len(result)):
+        prev_gen = result[i - 1][0]
+        curr_gen = result[i][0]
+        if curr_gen != prev_gen + 1:
+            raise ValueError(
+                f"Missing log generation in '{source_path}': gap detected between generation {prev_gen} and {curr_gen}"
+            )
     return result
 
 
@@ -340,6 +349,9 @@ class Restorer:
         self.dir_entries: Dict[int, Dict[str, int]] = {1: {}}
         self.parent_map: Dict[int, Set[Tuple[int, str]]] = {}
         self.inode_types: Dict[int, str] = {1: "dir"}
+        self.expected_tx_id: Optional[int] = None
+        self.last_committed_tx_id: Optional[int] = None
+        self.tombstoned_inodes: Set[int] = set()
 
     def resolve_paths(self, ino: int) -> List[Path]:
         """Resolves all current filesystem paths associated with an inode."""
@@ -378,11 +390,39 @@ class Restorer:
                     # Truncated record at end of log due to crash mid-flush; discard
                     break
 
+                # 1. Check transaction ID monotonicity and continuity (gapless)
+                if self.expected_tx_id is not None:
+                    if tx != self.expected_tx_id:
+                        raise ValueError(
+                            f"Transaction ID gap/inversion in {log_path.name} @ offset 0x{rec_log_offset:x}: "
+                            f"expected tx_id {self.expected_tx_id}, got {tx}"
+                        )
+                    self.expected_tx_id += 1
+                else:
+                    self.expected_tx_id = tx + 1
+
+                # 2. Check for integrity errors: operations targeting deleted/tombstoned inodes
+                if ino in self.tombstoned_inodes:
+                    raise ValueError(
+                        f"Integrity violation in {log_path.name} @ offset 0x{rec_log_offset:x}: "
+                        f"record op={op} targets previously deleted/tombstoned inode {ino}"
+                    )
+
+                # 3. Check for data targeting non-file inodes
+                if op in (OP_DATA, OP_DATA_ZSTD):
+                    itype = self.inode_types.get(ino)
+                    if itype is not None and itype != "file":
+                        raise ValueError(
+                            f"Integrity violation in {log_path.name} @ offset 0x{rec_log_offset:x}: "
+                            f"data record targets non-file inode {ino} (type='{itype}')"
+                        )
+
                 try:
                     payload = self.decryptor.decode_record(gen, tx, op, ino, raw_payload, tag)
                 except Exception as e:
-                    print(f"Warning: Skipping unreadable record in {log_path.name} @ offset {rec_log_offset}: {e}", file=sys.stderr)
-                    continue
+                    raise ValueError(
+                        f"Failed to decode/decrypt record in {log_path.name} @ offset 0x{rec_log_offset:x}: {e}"
+                    ) from e
 
                 if op in (OP_DATA, OP_DATA_ZSTD):
                     batch_chunks[(ino, rec_log_offset)] = payload
@@ -393,15 +433,45 @@ class Restorer:
                         batch_deltas[ino] = delta
                         records_in_batch += 1
                     except Exception as e:
-                        print(f"Warning: Malformed InodeDelta for ino {ino} in {log_path.name}: {e}", file=sys.stderr)
+                        raise ValueError(
+                            f"Malformed InodeDelta for ino {ino} in {log_path.name} @ offset 0x{rec_log_offset:x}: {e}"
+                        ) from e
                 elif op == OP_FLUSH_COMMIT:
+                    if len(payload) < 16:
+                        raise ValueError(
+                            f"Malformed FlushCommit payload (len={len(payload)}) in {log_path.name} @ offset 0x{rec_log_offset:x}"
+                        )
+                    commit_secs, commit_nsecs, claimed_count = struct.unpack(">qII", payload[:16])
+                    if claimed_count != records_in_batch:
+                        raise ValueError(
+                            f"FlushCommit record count mismatch in {log_path.name} @ offset 0x{rec_log_offset:x}: "
+                            f"commit claimed {claimed_count} records but batch buffered {records_in_batch}"
+                        )
                     # Atomic commit point for the batch!
                     self._commit_batch(batch_chunks, batch_deltas)
+                    self.last_committed_tx_id = tx
                     batch_chunks.clear()
                     batch_deltas.clear()
                     records_in_batch = 0
+                else:
+                    raise ValueError(
+                        f"Unknown opcode {op} in {log_path.name} @ offset 0x{rec_log_offset:x}"
+                    )
 
-            # Any dangling uncommitted records at the end of the log are discarded automatically
+            # Any dangling uncommitted records at the end of the log are discarded
+            if records_in_batch > 0:
+                if self.verbose:
+                    print(
+                        f"[{log_path.name}] Discarding {records_in_batch} uncommitted trailing records at EOF",
+                        file=sys.stderr,
+                    )
+                batch_chunks.clear()
+                batch_deltas.clear()
+                records_in_batch = 0
+                if self.last_committed_tx_id is not None:
+                    self.expected_tx_id = self.last_committed_tx_id + 1
+                else:
+                    self.expected_tx_id = None
 
     def _commit_batch(self, batch_chunks: Dict[Tuple[int, int], bytes], batch_deltas: Dict[int, tuple]):
         if self.dry_run:
@@ -568,6 +638,7 @@ class Restorer:
                 self.inode_types.pop(ino, None)
                 self.dir_entries.pop(ino, None)
                 self.parent_map.pop(ino, None)
+                self.tombstoned_inodes.add(ino)
 
 
 def main():

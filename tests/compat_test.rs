@@ -244,3 +244,107 @@ pub fn verify_python_restore_script(fixture_dir: &Path) {
         Path::new("hello.txt")
     );
 }
+
+#[test]
+fn test_python_restore_integrity_checks() {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
+    if !script_path.is_file() {
+        return;
+    }
+
+    let py_code = r#"
+import sys, tempfile, struct
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+import restore
+
+# 1. Generation gap
+with tempfile.TemporaryDirectory() as tmpdir:
+    p = Path(tmpdir)
+    (p / '000001.log').touch()
+    (p / '000003.log').touch()
+    try:
+        restore.find_log_files(p)
+        assert False, "expected gap error"
+    except ValueError as e:
+        assert "gap detected" in str(e)
+
+# 2. tx_id gap/inversion
+v1_log = Path("tests/fixtures/v1/000001.log").read_bytes()
+op, tx, ino, plen, tag = struct.unpack(">BQQI16s", v1_log[32:69])
+rec2_start = 32 + 37 + plen
+op2, tx2, ino2, plen2, tag2 = struct.unpack(">BQQI16s", v1_log[rec2_start:rec2_start + 37])
+corrupted = bytearray(v1_log)
+corrupted[rec2_start + 1:rec2_start + 9] = struct.pack(">Q", tx2 + 5)
+with tempfile.TemporaryDirectory() as tmpdir:
+    p = Path(tmpdir)
+    (p / "000001.log").write_bytes(corrupted)
+    r = restore.Restorer(p / "out", restore.VolumeDecryptor(None))
+    try:
+        r.replay_log_file(p / "000001.log")
+        assert False, "expected tx gap error"
+    except ValueError as e:
+        assert "Transaction ID gap/inversion" in str(e)
+
+# 3. FlushCommit count mismatch
+corrupted = bytearray(v1_log)
+offset = 32
+while offset < len(v1_log):
+    op, tx, ino, plen, tag = struct.unpack(">BQQI16s", v1_log[offset:offset + 37])
+    if op == 4:
+        corrupted[offset + 37 + 12:offset + 37 + 16] = struct.pack(">I", 999)
+        break
+    offset += 37 + plen
+with tempfile.TemporaryDirectory() as tmpdir:
+    p = Path(tmpdir)
+    (p / "000001.log").write_bytes(corrupted)
+    r = restore.Restorer(p / "out", restore.VolumeDecryptor(None))
+    try:
+        r.replay_log_file(p / "000001.log")
+        assert False, "expected count mismatch error"
+    except ValueError as e:
+        assert "FlushCommit record count mismatch" in str(e)
+
+# 4. Write to tombstoned inode
+with tempfile.TemporaryDirectory() as tmpdir:
+    p = Path(tmpdir)
+    r = restore.Restorer(p / "out", restore.VolumeDecryptor(None))
+    r.tombstoned_inodes.add(42)
+    dummy = bytearray(struct.pack(">4sIQIqI", restore.FILE_MAGIC, 1, 1, 0, 0, 0))
+    dummy.extend(struct.pack(">BQQI16s", restore.OP_DATA, 1, 42, 4, b"\x00" * 16))
+    dummy.extend(b"test")
+    (p / "000001.log").write_bytes(dummy)
+    try:
+        r.replay_log_file(p / "000001.log")
+        assert False, "expected tombstone error"
+    except ValueError as e:
+        assert "previously deleted/tombstoned inode 42" in str(e)
+
+# 5. Data to non-file inode
+with tempfile.TemporaryDirectory() as tmpdir:
+    p = Path(tmpdir)
+    r = restore.Restorer(p / "out", restore.VolumeDecryptor(None))
+    dummy = bytearray(struct.pack(">4sIQIqI", restore.FILE_MAGIC, 1, 1, 0, 0, 0))
+    dummy.extend(struct.pack(">BQQI16s", restore.OP_DATA, 1, 1, 4, b"\x00" * 16))
+    dummy.extend(b"test")
+    (p / "000001.log").write_bytes(dummy)
+    try:
+        r.replay_log_file(p / "000001.log")
+        assert False, "expected non-file data error"
+    except ValueError as e:
+        assert "data record targets non-file inode 1" in str(e)
+"#;
+
+    let status = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(py_code)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status();
+
+    let Ok(status) = status else {
+        println!("python3 not available, skipping python restore integrity verification");
+        return;
+    };
+
+    assert!(status.success(), "scripts/restore.py integrity tests failed");
+}
