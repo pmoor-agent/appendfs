@@ -546,6 +546,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                 if let ExtentState::Disk {
                     generation,
                     record_log_offset,
+                    record_size: _,
                     payload_offset: _,
                     length: _,
                 } = entry.value.read_state()

@@ -316,6 +316,7 @@ impl<'a> InodeLayerStack<'a> {
                     ExtentState::Disk {
                         generation,
                         record_log_offset,
+                        record_size,
                         payload_offset,
                         length: _,
                     } => {
@@ -330,6 +331,7 @@ impl<'a> InodeLayerStack<'a> {
                             ReadSliceSource::Disk {
                                 generation,
                                 record_log_offset,
+                                record_size,
                                 payload_offset,
                                 slice_inner_offset: inner_offset as u32,
                             }
@@ -424,6 +426,7 @@ pub enum ReadSliceSource {
     Disk {
         generation: u64,
         record_log_offset: u64,
+        record_size: u32,
         payload_offset: u32,
         slice_inner_offset: u32,
     },
@@ -467,16 +470,18 @@ impl PartialEq for ReadSliceSource {
                 Self::Disk {
                     generation: g1,
                     record_log_offset: r1,
+                    record_size: rs1,
                     payload_offset: p1,
                     slice_inner_offset: s1,
                 },
                 Self::Disk {
                     generation: g2,
                     record_log_offset: r2,
+                    record_size: rs2,
                     payload_offset: p2,
                     slice_inner_offset: s2,
                 },
-            ) => g1 == g2 && r1 == r2 && p1 == p2 && s1 == s2,
+            ) => g1 == g2 && r1 == r2 && rs1 == rs2 && p1 == p2 && s1 == s2,
             _ => false,
         }
     }
@@ -582,6 +587,7 @@ pub fn execute_read_plan(
                 ReadSliceSource::Disk {
                     generation,
                     record_log_offset,
+                    record_size,
                     payload_offset,
                     slice_inner_offset,
                 } => {
@@ -589,6 +595,7 @@ pub fn execute_read_plan(
                         .read_extent_payload(
                             generation,
                             record_log_offset,
+                            record_size,
                             payload_offset,
                             slice_inner_offset,
                             &mut dst_buf[slice.dst_offset..slice.dst_offset + slice.len],
@@ -736,7 +743,7 @@ mod tests {
         let attr = crate::operations::read_write::create_core(&fs, 1, "layers.bin", 0o644, 0, 1000, 1000).unwrap();
 
         // 1. Base layer: Disk extent at 0..100
-        let shared_disk = SharedExtentState::new_disk(1, 1024, 0, 100);
+        let shared_disk = SharedExtentState::new_disk(1, 1024, 137, 0, 100);
         let mut base_range = RangeMap::new();
         base_range.insert(0, 100, shared_disk);
         let mut base_map = HashMap::new();
@@ -830,7 +837,7 @@ mod tests {
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "cached.bin", 0o644, 0, 1000, 1000).unwrap();
 
-        let shared_disk = SharedExtentState::new_disk(1, 1024, 0, 100);
+        let shared_disk = SharedExtentState::new_disk(1, 1024, 137, 0, 100);
         let mut base_range = RangeMap::new();
         base_range.insert(0, 100, shared_disk);
         let mut base_map = HashMap::new();

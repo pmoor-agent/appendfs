@@ -187,12 +187,18 @@ impl InMemoryFS {
                             let chunk_len = std::cmp::min(max_extent_size, data.len() - chunk_start);
                             let chunk = &data[chunk_start..chunk_start + chunk_len];
 
-                            let (_, generation, record_log_offset) = writer.append_record(OpCode::Data, ino, chunk)?;
+                            let (_, generation, record_log_offset, record_size) =
+                                writer.append_record(OpCode::Data, ino, chunk)?;
                             written_count += 1;
                             flushed_data_bytes += chunk_len as u64;
 
-                            let disk_extent =
-                                SharedExtentState::new_disk(generation, record_log_offset, 0, chunk_len as u32);
+                            let disk_extent = SharedExtentState::new_disk(
+                                generation,
+                                record_log_offset,
+                                record_size,
+                                0,
+                                chunk_len as u32,
+                            );
                             f.extents
                                 .insert(start_off + chunk_start as u64, chunk_len as u64, disk_extent);
 

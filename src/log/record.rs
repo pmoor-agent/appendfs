@@ -263,15 +263,17 @@ impl From<LogDirectoryDelta> for DirectoryDelta {
     }
 }
 
-/// Persisted on-disk descriptor for a single data extent in a delta record (24 bytes).
+/// Persisted on-disk descriptor for a single data extent in a delta record (28 bytes).
 ///
 /// A `record_log_offset` of 0 marks a hole rather than a reference into a `.log` file
-/// (since valid records start at offset >= 28 past FileHeader). `length` holds the extent
+/// (since valid records start at offset >= 28 past FileHeader). `record_size` holds the
+/// physical on-disk size (header + payload) of the record. `length` holds the extent
 /// or hole length in bytes (u64 allows holes > 32 bits).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogExtent {
     pub file_offset: u64,
     pub record_log_offset: u64,
+    pub record_size: u32,
     pub length: u64,
 }
 
@@ -293,16 +295,19 @@ impl From<&FileDelta> for LogFileDelta {
             let log_extent = match entry.value.read_state() {
                 ExtentState::Disk {
                     record_log_offset,
+                    record_size,
                     length,
                     ..
                 } => LogExtent {
                     file_offset: start,
                     record_log_offset,
+                    record_size,
                     length: length as u64,
                 },
                 ExtentState::Zero { length } => LogExtent {
                     file_offset: start,
                     record_log_offset: 0,
+                    record_size: 0,
                     length,
                 },
                 // The flush that emits this record converts staged extents to `Disk`
@@ -327,7 +332,7 @@ impl LogFileDelta {
             let state = if ext.record_log_offset == 0 {
                 SharedExtentState::new_zero(ext.length)
             } else {
-                SharedExtentState::new_disk(generation, ext.record_log_offset, 0, ext.length as u32)
+                SharedExtentState::new_disk(generation, ext.record_log_offset, ext.record_size, 0, ext.length as u32)
             };
             extents.insert(ext.file_offset, ext.length, state);
         }
