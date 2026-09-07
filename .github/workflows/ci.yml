@@ -53,10 +53,11 @@ jobs:
       - uses: actions/checkout@v7
       # `fuse3` is needed in addition to the -dev package: the integration tests mount a
       # real filesystem and call the fusermount3 binary to tear it down.
-      - name: Install FUSE build and runtime dependencies
+      - name: Install FUSE and Python test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config
+          sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config python3-pip python3-zstandard python3-cryptography
+          python3 -m pip install --break-system-packages blake3 argon2-cffi || python3 -m pip install blake3 argon2-cffi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Debug rather than release: overflow checks and debug assertions are active, and
