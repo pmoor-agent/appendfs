@@ -432,65 +432,8 @@ pub enum ReadSliceSource {
     },
 }
 
-impl PartialEq for ReadSliceSource {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Zero, Self::Zero) => true,
-            (
-                Self::Memory {
-                    data: d1,
-                    src_offset: o1,
-                },
-                Self::Memory {
-                    data: d2,
-                    src_offset: o2,
-                },
-            ) => {
-                if o1 != o2 {
-                    return false;
-                }
-                if Arc::ptr_eq(d1, d2) {
-                    return true;
-                }
-                let g1 = d1.read().unwrap();
-                let g2 = d2.read().unwrap();
-                *g1 == *g2
-            }
-            (
-                Self::Cache {
-                    data: d1,
-                    src_offset: o1,
-                },
-                Self::Cache {
-                    data: d2,
-                    src_offset: o2,
-                },
-            ) => o1 == o2 && (Arc::ptr_eq(d1, d2) || d1 == d2),
-            (
-                Self::Disk {
-                    generation: g1,
-                    record_log_offset: r1,
-                    record_size: rs1,
-                    payload_offset: p1,
-                    slice_inner_offset: s1,
-                },
-                Self::Disk {
-                    generation: g2,
-                    record_log_offset: r2,
-                    record_size: rs2,
-                    payload_offset: p2,
-                    slice_inner_offset: s2,
-                },
-            ) => g1 == g2 && r1 == r2 && rs1 == rs2 && p1 == p2 && s1 == s2,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for ReadSliceSource {}
-
 /// A contiguous segment of data within a read plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ReadSlice {
     pub dst_offset: usize,
     pub len: usize,
@@ -498,7 +441,7 @@ pub struct ReadSlice {
 }
 
 /// A complete recipe for fulfilling a read request across layer boundaries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ReadPlan {
     pub total_len: usize,
     pub has_cold_slices: bool,
@@ -684,7 +627,7 @@ mod tests {
 
         assert_eq!(plan.slices[1].dst_offset, 40);
         assert_eq!(plan.slices[1].len, 20);
-        assert_eq!(plan.slices[1].source, ReadSliceSource::Zero);
+        assert!(matches!(plan.slices[1].source, ReadSliceSource::Zero));
 
         assert_eq!(plan.slices[2].dst_offset, 60);
         assert_eq!(plan.slices[2].len, 40);
@@ -804,7 +747,7 @@ mod tests {
 
         assert_eq!(plan.slices[1].dst_offset, 20);
         assert_eq!(plan.slices[1].len, 10);
-        assert_eq!(plan.slices[1].source, ReadSliceSource::Zero);
+        assert!(matches!(plan.slices[1].source, ReadSliceSource::Zero));
 
         assert_eq!(plan.slices[2].dst_offset, 30);
         assert_eq!(plan.slices[2].len, 20);
