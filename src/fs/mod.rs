@@ -46,14 +46,15 @@ pub type DirectoryHandleMap = HashMap<u64, DirSnapshot>;
 /// corresponding write arena chunk buffers.
 #[derive(Debug, Clone)]
 pub struct FlushBatch {
+    pub id: u64,
     pub entries: HashMap<u64, EntryDelta>,
     pub arena: WriteArena,
 }
 
 impl FlushBatch {
-    pub fn new(entries: HashMap<u64, EntryDelta>, arena: WriteArena) -> Self {
+    pub fn new(id: u64, entries: HashMap<u64, EntryDelta>, arena: WriteArena) -> Self {
         assert!(!entries.is_empty(), "FlushBatch must contain at least one entry");
-        Self { entries, arena }
+        Self { id, entries, arena }
     }
 }
 
@@ -63,6 +64,8 @@ pub struct FsInner {
     pub base: HashMap<u64, Arc<Node>>,
     /// Ordered queue of immutable frozen snapshots waiting to be written/flushed to disk.
     pub flushing: VecDeque<FlushBatch>,
+    /// Monotonically increasing ID generator for flushing batches.
+    pub next_batch_id: u64,
     /// Current generation's active mutable delta layer receiving live operations.
     pub live: HashMap<u64, EntryDelta>,
     /// Active write arena staging extent payload allocations for `live`.
@@ -191,6 +194,7 @@ impl InMemoryFS {
         let inner = FsInner {
             base: map,
             flushing: VecDeque::new(),
+            next_batch_id: 1,
             live: HashMap::new(),
             live_arena: WriteArena::new(),
             file_handles: HashMap::new(),

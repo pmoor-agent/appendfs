@@ -258,7 +258,7 @@ pub fn recover_fs(
                 }
 
                 if !current_batch.is_empty() {
-                    fs_instance.fold_flushed_batch(FlushBatch::new(current_batch, WriteArena::new()));
+                    fs_instance.fold_flushed_batch(FlushBatch::new(0, current_batch, WriteArena::new()));
                 }
 
                 if target_cutoff_reached {

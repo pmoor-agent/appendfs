@@ -28,7 +28,9 @@ impl InMemoryFS {
             let entries = std::mem::take(&mut inner.live);
             let chunk_size = inner.live_arena.chunk_size;
             let arena = std::mem::replace(&mut inner.live_arena, WriteArena::with_chunk_size(chunk_size));
-            inner.flushing.push_back(FlushBatch::new(entries, arena));
+            let id = inner.next_batch_id;
+            inner.next_batch_id += 1;
+            inner.flushing.push_back(FlushBatch::new(id, entries, arena));
         }
     }
 
@@ -271,23 +273,19 @@ impl InMemoryFS {
                 }
             };
 
+            let batch_id = batch.id;
+
             // Attempt to write and commit this batch
             self.synthesize_and_write_flushing_layer(&mut batch.entries, writer)?;
 
             // On success: fold into base, assert front of queue is still batch, and pop
-            let batch_keys: Vec<u64> = batch.entries.keys().copied().collect();
             self.fold_flushed_batch(batch);
             {
                 let mut inner = self.inner.lock().unwrap();
                 let front = inner.flushing.front().expect("flushing queue must not be empty");
                 assert_eq!(
-                    front.entries.len(),
-                    batch_keys.len(),
-                    "front of flushing queue must match committed batch length"
-                );
-                assert!(
-                    front.entries.keys().all(|k| batch_keys.contains(k)),
-                    "front of flushing queue must match committed batch entries"
+                    front.id, batch_id,
+                    "front of flushing queue must match committed batch ID"
                 );
                 let _ = inner.flushing.pop_front().unwrap();
             }

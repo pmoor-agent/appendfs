@@ -578,23 +578,25 @@ pub fn execute_read_plan(
     if !cold_slices.is_empty() {
         let cache = log_cache.ok_or(libc::EIO)?;
         for slice in cold_slices {
-            if let ReadSliceSource::Disk {
-                generation,
-                record_log_offset,
-                payload_offset,
-                slice_inner_offset,
-            } = slice.source
-            {
-                cache
-                    .read_extent_payload(
-                        generation,
-                        record_log_offset,
-                        payload_offset,
-                        slice_inner_offset,
-                        &mut dst_buf[slice.dst_offset..slice.dst_offset + slice.len],
-                        volume_key,
-                    )
-                    .map_err(|_| libc::EIO)?;
+            match slice.source {
+                ReadSliceSource::Disk {
+                    generation,
+                    record_log_offset,
+                    payload_offset,
+                    slice_inner_offset,
+                } => {
+                    cache
+                        .read_extent_payload(
+                            generation,
+                            record_log_offset,
+                            payload_offset,
+                            slice_inner_offset,
+                            &mut dst_buf[slice.dst_offset..slice.dst_offset + slice.len],
+                            volume_key,
+                        )
+                        .map_err(|_| libc::EIO)?;
+                }
+                other => panic!("expected Disk slice in cold_slices, found {:?}", other),
             }
         }
     }
@@ -759,7 +761,7 @@ mod tests {
             .lock()
             .unwrap()
             .flushing
-            .push_back(FlushBatch::new(flushing_batch, WriteArena::new()));
+            .push_back(FlushBatch::new(1, flushing_batch, WriteArena::new()));
 
         // 3. Live layer: Staged extent at 30..50
         let mut live_delta = FileDelta::default();
