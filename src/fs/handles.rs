@@ -6,8 +6,8 @@
 //! paginated `readdir` is isolated from concurrent mutations.
 
 use super::{FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 
 impl InMemoryFS {
     // --- POSIX File Handle Tracking ---
@@ -53,7 +53,7 @@ impl InMemoryFS {
                         dst_offset: 0,
                         len: slice_len,
                         source: ReadSliceSource::Memory {
-                            data: Arc::new(buf.clone()).into(),
+                            data: Arc::new(RwLock::new(buf.clone())),
                             src_offset: start,
                         },
                     }]
@@ -72,11 +72,11 @@ impl InMemoryFS {
 
     pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
         let plan = self.plan_read_handle(ino, fh, offset, size)?;
-        self.execute_read_plan_sync(&plan)
+        self.execute_read_plan_sync(plan)
     }
 
     pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
-        let (canceled, ready) = {
+        let is_last_handle = {
             let mut inner = self.inner.lock().unwrap();
             if (fh & super::VIRTUAL_FH_FLAG) != 0 {
                 inner.virtual_handles.remove(&fh).ok_or(libc::EBADF)?;
@@ -88,19 +88,14 @@ impl InMemoryFS {
                 return Err(libc::EBADF);
             }
 
-            // Clean up any BSD flock held by this handle
-            let (flock_canceled, flock_ready) = inner.locks.release_flock(ino, fh);
-
             if let Some(count) = inner.open_counts.get_mut(&ino) {
                 *count = count.saturating_sub(1);
             }
-            let (range_canceled, range_ready) = if inner.open_counts.get(&ino) == Some(&0) {
+            let is_last = if inner.open_counts.get(&ino) == Some(&0) {
                 inner.open_counts.remove(&ino);
-                // Clean up POSIX range locks if all handles on inode are closed
-                inner.locks.release_range_locks(ino, fh)
+                true
             } else {
-                let c = inner.locks.cancel_range_lock_waiters(ino, fh);
-                (c, Vec::new())
+                false
             };
 
             let remaining = inner.open_counts.get(&ino).copied().unwrap_or(0);
@@ -111,31 +106,30 @@ impl InMemoryFS {
                 inner.tombstone(ino);
             }
 
-            self.inner_cond.notify_all();
-
-            let mut all_canceled = flock_canceled;
-            all_canceled.extend(range_canceled);
-            let mut all_ready = flock_ready;
-            all_ready.extend(range_ready);
-            (all_canceled, all_ready)
+            is_last
         };
 
-        for req in canceled {
+        // Clean up locks outside inner critical section
+        let (flock_canceled, flock_ready) = self.locks.release_flock(ino, fh);
+
+        let (range_canceled, range_ready) = if is_last_handle {
+            self.locks.release_range_locks(ino, fh)
+        } else {
+            let c = self.locks.cancel_range_lock_waiters(ino, fh);
+            (c, Vec::new())
+        };
+
+        for req in flock_canceled.into_iter().chain(range_canceled) {
             req.reply_err(libc::EBADF);
         }
-        for req in ready {
+        for req in flock_ready.into_iter().chain(range_ready) {
             req.reply_err(0);
         }
         Ok(())
     }
 
     pub fn release_flock(&self, ino: u64, fh: u64) {
-        let (canceled, ready) = {
-            let mut inner = self.inner.lock().unwrap();
-            let res = inner.locks.release_flock(ino, fh);
-            self.inner_cond.notify_all();
-            res
-        };
+        let (canceled, ready) = self.locks.release_flock(ino, fh);
         for r in canceled {
             r.reply_err(libc::EBADF);
         }
@@ -145,22 +139,14 @@ impl InMemoryFS {
     }
 
     pub fn cancel_range_lock_waiters(&self, ino: u64, fh: u64) {
-        let canceled = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.locks.cancel_range_lock_waiters(ino, fh)
-        };
+        let canceled = self.locks.cancel_range_lock_waiters(ino, fh);
         for r in canceled {
             r.reply_err(libc::EBADF);
         }
     }
 
     pub fn release_range_locks(&self, ino: u64, fh: u64) {
-        let (canceled, ready) = {
-            let mut inner = self.inner.lock().unwrap();
-            let res = inner.locks.release_range_locks(ino, fh);
-            self.inner_cond.notify_all();
-            res
-        };
+        let (canceled, ready) = self.locks.release_range_locks(ino, fh);
         for r in canceled {
             r.reply_err(libc::EBADF);
         }

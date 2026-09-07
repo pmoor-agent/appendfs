@@ -1,6 +1,7 @@
 use crate::fs::{FsInner, InMemoryFS};
 use crate::shim::{Request, ShimFlock};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Condvar, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlockState {
@@ -75,11 +76,9 @@ pub(crate) fn grant_flock(table: &mut HashMap<u64, FlockState>, ino: u64, fh: u6
     }
 }
 
-/// Encompasses in-memory locking data structures and parked waiter queues
-/// for both whole-file BSD flock and POSIX byte-range record locks.
-/// Externally synchronized by `FsInner`.
+/// Internal tables for whole-file BSD flock and POSIX byte-range record locks.
 #[derive(Default)]
-pub struct LockManager {
+pub struct LockManagerState {
     /// Active whole-file BSD flock locks keyed by inode number.
     pub flock_table: HashMap<u64, FlockState>,
     /// Pending parked FUSE BSD flock requests waiting on lock acquisition.
@@ -90,20 +89,7 @@ pub struct LockManager {
     pub range_lock_waiters: HashMap<u64, VecDeque<RangeLockWaiter>>,
 }
 
-impl std::fmt::Debug for LockManager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LockManager")
-            .field("flock_count", &self.flock_count())
-            .field("range_lock_count", &self.range_lock_count())
-            .finish()
-    }
-}
-
-impl LockManager {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+impl LockManagerState {
     pub fn is_empty(&self) -> bool {
         self.flock_table.is_empty()
             && self.range_lock_table.is_empty()
@@ -259,15 +245,92 @@ impl LockManager {
     }
 }
 
-pub fn wake_flock_waiters(fs: &InMemoryFS, ino: u64) {
-    let replies = {
-        let mut inner = fs.inner.lock().unwrap();
-        let replies = inner.locks.wake_flock_waiters(ino);
-        if !replies.is_empty() {
-            fs.inner_cond.notify_all();
+/// Encompasses in-memory locking data structures and parked waiter queues
+/// for both whole-file BSD flock and POSIX byte-range record locks.
+/// Manages its own internal mutex and condition variable independently of filesystem metadata.
+pub struct LockManager {
+    pub state: Mutex<LockManagerState>,
+    pub cond: Condvar,
+}
+
+impl Default for LockManager {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(LockManagerState::default()),
+            cond: Condvar::new(),
         }
+    }
+}
+
+impl std::fmt::Debug for LockManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockManager")
+            .field("flock_count", &self.flock_count())
+            .field("range_lock_count", &self.range_lock_count())
+            .finish()
+    }
+}
+
+impl LockManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.state.lock().unwrap().is_empty()
+    }
+
+    pub fn flock_count(&self) -> usize {
+        self.state.lock().unwrap().flock_count()
+    }
+
+    pub fn range_lock_count(&self) -> usize {
+        self.state.lock().unwrap().range_lock_count()
+    }
+
+    pub fn flock_waiter_count(&self) -> usize {
+        self.state.lock().unwrap().flock_waiter_count()
+    }
+
+    pub fn range_lock_waiter_count(&self) -> usize {
+        self.state.lock().unwrap().range_lock_waiter_count()
+    }
+
+    pub fn wake_flock_waiters(&self, ino: u64) -> Vec<Request> {
+        let mut state = self.state.lock().unwrap();
+        let replies = state.wake_flock_waiters(ino);
+        self.cond.notify_all();
         replies
-    };
+    }
+
+    pub fn wake_range_lock_waiters(&self, ino: u64) -> Vec<Request> {
+        let mut state = self.state.lock().unwrap();
+        let replies = state.wake_range_lock_waiters(ino);
+        self.cond.notify_all();
+        replies
+    }
+
+    pub fn release_flock(&self, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
+        let mut state = self.state.lock().unwrap();
+        let (canceled, ready) = state.release_flock(ino, fh);
+        self.cond.notify_all();
+        (canceled, ready)
+    }
+
+    pub fn cancel_range_lock_waiters(&self, ino: u64, fh: u64) -> Vec<Request> {
+        self.state.lock().unwrap().cancel_range_lock_waiters(ino, fh)
+    }
+
+    pub fn release_range_locks(&self, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
+        let mut state = self.state.lock().unwrap();
+        let (canceled, ready) = state.release_range_locks(ino, fh);
+        self.cond.notify_all();
+        (canceled, ready)
+    }
+}
+
+pub fn wake_flock_waiters(fs: &InMemoryFS, ino: u64) {
+    let replies = fs.locks.wake_flock_waiters(ino);
     for req in replies {
         req.reply_err(0);
     }
@@ -276,24 +339,21 @@ pub fn wake_flock_waiters(fs: &InMemoryFS, ino: u64) {
 pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
     log::trace!("flock(ino={}, fh={}, lock_owner={}, op={})", ino, fh, lock_owner, op);
 
-    let mut inner = fs.inner.lock().unwrap();
-    // 1. Verify file handle
-    match inner.file_handles.get(&fh) {
-        Some(h) if h.ino == ino => {}
-        _ => {
-            drop(inner);
-            req.reply_err(libc::EBADF);
-            return;
-        }
+    // 1. Verify file handle under brief inner lock
+    let valid = {
+        let inner = fs.inner.lock().unwrap();
+        matches!(inner.file_handles.get(&fh), Some(h) if h.ino == ino)
+    };
+    if !valid {
+        req.reply_err(libc::EBADF);
+        return;
     }
 
     let non_blocking = (op & libc::LOCK_NB) != 0;
     let base_op = op & !libc::LOCK_NB;
 
     if base_op == libc::LOCK_UN {
-        let (canceled, ready) = inner.locks.release_flock(ino, fh);
-        fs.inner_cond.notify_all();
-        drop(inner);
+        let (canceled, ready) = fs.locks.release_flock(ino, fh);
         for r in canceled {
             r.reply_err(libc::EBADF);
         }
@@ -305,39 +365,34 @@ pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     }
 
     if base_op != libc::LOCK_SH && base_op != libc::LOCK_EX {
-        drop(inner);
         req.reply_err(libc::EINVAL);
         return;
     }
 
-    let has_waiters = inner.locks.flock_waiters.get(&ino).is_some_and(|q| !q.is_empty());
+    let mut state = fs.locks.state.lock().unwrap();
+    let has_waiters = state.flock_waiters.get(&ino).is_some_and(|q| !q.is_empty());
 
-    if !has_waiters && can_grant_flock(&inner.locks.flock_table, ino, fh, base_op) {
-        grant_flock(&mut inner.locks.flock_table, ino, fh, base_op);
-        fs.inner_cond.notify_all();
-        drop(inner);
+    if !has_waiters && can_grant_flock(&state.flock_table, ino, fh, base_op) {
+        grant_flock(&mut state.flock_table, ino, fh, base_op);
+        fs.locks.cond.notify_all();
+        drop(state);
         req.reply_err(0);
         return;
     }
 
     if non_blocking {
-        drop(inner);
+        drop(state);
         req.reply_err(libc::EWOULDBLOCK);
         return;
     }
 
     // Blocking request with contention: park request in the waiter queue (0 threads used)
-    inner
-        .locks
-        .flock_waiters
-        .entry(ino)
-        .or_default()
-        .push_back(FlockWaiter {
-            req,
-            fh,
-            lock_owner,
-            op,
-        });
+    state.flock_waiters.entry(ino).or_default().push_back(FlockWaiter {
+        req,
+        fh,
+        lock_owner,
+        op,
+    });
 }
 
 pub fn getlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) {
@@ -411,14 +466,7 @@ pub(crate) fn grant_range_lock(
 }
 
 pub fn wake_range_lock_waiters(fs: &InMemoryFS, ino: u64) {
-    let replies = {
-        let mut inner = fs.inner.lock().unwrap();
-        let replies = inner.locks.wake_range_lock_waiters(ino);
-        if !replies.is_empty() {
-            fs.inner_cond.notify_all();
-        }
-        replies
-    };
+    let replies = fs.locks.wake_range_lock_waiters(ino);
     for req in replies {
         req.reply_err(0);
     }
@@ -434,63 +482,66 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
         sleep
     );
 
-    let mut inner = fs.inner.lock().unwrap();
-    match inner.file_handles.get(&fh) {
-        Some(h) if h.ino == ino => {}
-        _ => {
-            drop(inner);
-            req.reply_err(libc::EBADF);
-            return;
+    let (start, end) = {
+        let inner = fs.inner.lock().unwrap();
+        match inner.file_handles.get(&fh) {
+            Some(h) if h.ino == ino => {}
+            _ => {
+                req.reply_err(libc::EBADF);
+                return;
+            }
         }
-    }
-
-    let (start, end) = match normalize_range(&inner, ino, &lock) {
-        Ok(range) => range,
-        Err(err) => {
-            drop(inner);
-            req.reply_err(err);
-            return;
+        match normalize_range(&inner, ino, &lock) {
+            Ok(range) => range,
+            Err(err) => {
+                req.reply_err(err);
+                return;
+            }
         }
     };
 
     let req_type = lock.lock_type;
 
     if req_type == libc::F_UNLCK as i16 {
-        let ranges = inner.locks.range_lock_table.entry(ino).or_default();
-        let mut new_ranges = Vec::new();
-        for r in ranges.drain(..) {
-            if r.owner == lock_owner && ranges_overlap(start, end, r.start, r.end) {
-                if r.start < start {
-                    new_ranges.push(RangeLock {
-                        lock_type: r.lock_type,
-                        start: r.start,
-                        end: start,
-                        owner: r.owner,
-                        pid: r.pid,
-                    });
+        let mut state = fs.locks.state.lock().unwrap();
+        if let Some(ranges) = state.range_lock_table.get_mut(&ino) {
+            let mut new_ranges = Vec::new();
+            for r in ranges.drain(..) {
+                if r.owner == lock_owner && ranges_overlap(start, end, r.start, r.end) {
+                    if r.start < start {
+                        new_ranges.push(RangeLock {
+                            lock_type: r.lock_type,
+                            start: r.start,
+                            end: start,
+                            owner: r.owner,
+                            pid: r.pid,
+                        });
+                    }
+                    if r.end > end {
+                        new_ranges.push(RangeLock {
+                            lock_type: r.lock_type,
+                            start: end,
+                            end: r.end,
+                            owner: r.owner,
+                            pid: r.pid,
+                        });
+                    }
+                } else {
+                    new_ranges.push(r);
                 }
-                if r.end > end {
-                    new_ranges.push(RangeLock {
-                        lock_type: r.lock_type,
-                        start: end,
-                        end: r.end,
-                        owner: r.owner,
-                        pid: r.pid,
-                    });
-                }
+            }
+            if new_ranges.is_empty() {
+                state.range_lock_table.remove(&ino);
             } else {
-                new_ranges.push(r);
+                *ranges = new_ranges;
             }
         }
-        if new_ranges.is_empty() {
-            inner.locks.range_lock_table.remove(&ino);
-        } else {
-            *ranges = new_ranges;
-        }
 
-        let ready = inner.locks.wake_range_lock_waiters(ino);
-        fs.inner_cond.notify_all();
-        drop(inner);
+        let ready = state.wake_range_lock_waiters(ino);
+        if !ready.is_empty() {
+            fs.locks.cond.notify_all();
+        }
+        drop(state);
         for req in ready {
             req.reply_err(0);
         }
@@ -499,18 +550,18 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     }
 
     if req_type != libc::F_RDLCK as i16 && req_type != libc::F_WRLCK as i16 {
-        drop(inner);
         req.reply_err(libc::EINVAL);
         return;
     }
 
+    let mut state = fs.locks.state.lock().unwrap();
     let conflict = {
-        let ranges = inner.locks.range_lock_table.entry(ino).or_default();
+        let ranges = state.range_lock_table.entry(ino).or_default();
         check_range_conflict(ranges, lock_owner, start, end, req_type)
     };
 
     let mut waiter_conflict = false;
-    if let Some(queue) = inner.locks.range_lock_waiters.get(&ino) {
+    if let Some(queue) = state.range_lock_waiters.get(&ino) {
         for prior in queue {
             if prior.lock_owner != lock_owner
                 && ranges_overlap(start, end, prior.start, prior.end)
@@ -523,22 +574,21 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     }
 
     if !conflict && !waiter_conflict {
-        let ranges = inner.locks.range_lock_table.entry(ino).or_default();
+        let ranges = state.range_lock_table.entry(ino).or_default();
         grant_range_lock(ranges, lock_owner, start, end, req_type, lock.pid);
-        fs.inner_cond.notify_all();
-        drop(inner);
+        fs.locks.cond.notify_all();
+        drop(state);
         req.reply_err(0);
         return;
     }
 
     if !sleep {
-        drop(inner);
+        drop(state);
         req.reply_err(libc::EWOULDBLOCK);
         return;
     }
 
-    inner
-        .locks
+    state
         .range_lock_waiters
         .entry(ino)
         .or_default()
@@ -553,82 +603,83 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
 }
 
 pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32) -> Result<(), i32> {
-    let mut inner = fs.inner.lock().unwrap();
-    // 1. Verify file handle is valid and matches inode
-    match inner.file_handles.get(&fh) {
-        Some(h) if h.ino == ino => {}
-        _ => return Err(libc::EBADF),
+    let valid = {
+        let inner = fs.inner.lock().unwrap();
+        matches!(inner.file_handles.get(&fh), Some(h) if h.ino == ino)
+    };
+    if !valid {
+        return Err(libc::EBADF);
     }
 
-    // 2. Extract operation flags
     let non_blocking = (op & libc::LOCK_NB) != 0;
     let base_op = op & !libc::LOCK_NB;
 
     match base_op {
-        libc::LOCK_SH => loop {
-            match inner.locks.flock_table.get_mut(&ino) {
-                None => {
-                    let mut set = HashSet::new();
-                    set.insert(fh);
-                    inner.locks.flock_table.insert(ino, FlockState::Shared(set));
-                    fs.inner_cond.notify_all();
-                    return Ok(());
-                }
-                Some(FlockState::Shared(set)) => {
-                    set.insert(fh);
-                    return Ok(());
-                }
-                Some(FlockState::Exclusive(holder)) => {
-                    if *holder == fh {
-                        // Downgrade exclusive -> shared
+        libc::LOCK_SH => {
+            let mut state = fs.locks.state.lock().unwrap();
+            loop {
+                match state.flock_table.get_mut(&ino) {
+                    None => {
                         let mut set = HashSet::new();
                         set.insert(fh);
-                        inner.locks.flock_table.insert(ino, FlockState::Shared(set));
-                        fs.inner_cond.notify_all();
+                        state.flock_table.insert(ino, FlockState::Shared(set));
+                        fs.locks.cond.notify_all();
                         return Ok(());
-                    } else if non_blocking {
-                        return Err(libc::EWOULDBLOCK);
-                    } else {
-                        inner = fs.inner_cond.wait(inner).unwrap();
+                    }
+                    Some(FlockState::Shared(set)) => {
+                        set.insert(fh);
+                        return Ok(());
+                    }
+                    Some(FlockState::Exclusive(holder)) => {
+                        if *holder == fh {
+                            let mut set = HashSet::new();
+                            set.insert(fh);
+                            state.flock_table.insert(ino, FlockState::Shared(set));
+                            fs.locks.cond.notify_all();
+                            return Ok(());
+                        } else if non_blocking {
+                            return Err(libc::EWOULDBLOCK);
+                        } else {
+                            state = fs.locks.cond.wait(state).unwrap();
+                        }
                     }
                 }
             }
-        },
-        libc::LOCK_EX => loop {
-            match inner.locks.flock_table.get_mut(&ino) {
-                None => {
-                    inner.locks.flock_table.insert(ino, FlockState::Exclusive(fh));
-                    fs.inner_cond.notify_all();
-                    return Ok(());
-                }
-                Some(FlockState::Shared(set)) => {
-                    if set.len() == 1 && set.contains(&fh) {
-                        // Upgrade shared -> exclusive
-                        inner.locks.flock_table.insert(ino, FlockState::Exclusive(fh));
-                        fs.inner_cond.notify_all();
+        }
+        libc::LOCK_EX => {
+            let mut state = fs.locks.state.lock().unwrap();
+            loop {
+                match state.flock_table.get_mut(&ino) {
+                    None => {
+                        state.flock_table.insert(ino, FlockState::Exclusive(fh));
+                        fs.locks.cond.notify_all();
                         return Ok(());
-                    } else if non_blocking {
-                        return Err(libc::EWOULDBLOCK);
-                    } else {
-                        inner = fs.inner_cond.wait(inner).unwrap();
                     }
-                }
-                Some(FlockState::Exclusive(holder)) => {
-                    if *holder == fh {
-                        // Idempotent re-acquisition by same handle
-                        return Ok(());
-                    } else if non_blocking {
-                        return Err(libc::EWOULDBLOCK);
-                    } else {
-                        inner = fs.inner_cond.wait(inner).unwrap();
+                    Some(FlockState::Shared(set)) => {
+                        if set.len() == 1 && set.contains(&fh) {
+                            state.flock_table.insert(ino, FlockState::Exclusive(fh));
+                            fs.locks.cond.notify_all();
+                            return Ok(());
+                        } else if non_blocking {
+                            return Err(libc::EWOULDBLOCK);
+                        } else {
+                            state = fs.locks.cond.wait(state).unwrap();
+                        }
+                    }
+                    Some(FlockState::Exclusive(holder)) => {
+                        if *holder == fh {
+                            return Ok(());
+                        } else if non_blocking {
+                            return Err(libc::EWOULDBLOCK);
+                        } else {
+                            state = fs.locks.cond.wait(state).unwrap();
+                        }
                     }
                 }
             }
-        },
+        }
         libc::LOCK_UN => {
-            let (canceled, ready) = inner.locks.release_flock(ino, fh);
-            fs.inner_cond.notify_all();
-            drop(inner);
+            let (canceled, ready) = fs.locks.release_flock(ino, fh);
             for r in canceled {
                 r.reply_err(libc::EBADF);
             }
@@ -693,20 +744,23 @@ fn coalesce_ranges(ranges: &mut Vec<RangeLock>) {
 }
 
 pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<ShimFlock, i32> {
-    let inner = fs.inner.lock().unwrap();
-    let _handle = match inner.file_handles.get(&fh) {
-        Some(h) if h.ino == ino => *h,
-        _ => return Err(libc::EBADF),
+    let (start, end) = {
+        let inner = fs.inner.lock().unwrap();
+        match inner.file_handles.get(&fh) {
+            Some(h) if h.ino == ino => {}
+            _ => return Err(libc::EBADF),
+        }
+        normalize_range(&inner, ino, &lock)?
     };
 
-    let (start, end) = normalize_range(&inner, ino, &lock)?;
     let req_type = lock.lock_type;
 
     if req_type != libc::F_RDLCK as i16 && req_type != libc::F_WRLCK as i16 {
         return Err(libc::EINVAL);
     }
 
-    if let Some(ranges) = inner.locks.range_lock_table.get(&ino) {
+    let state = fs.locks.state.lock().unwrap();
+    if let Some(ranges) = state.range_lock_table.get(&ino) {
         for r in ranges {
             if ranges_overlap(start, end, r.start, r.end)
                 && r.owner != lock_owner
@@ -742,18 +796,21 @@ pub fn setlk_core(
     lock: ShimFlock,
     sleep: bool,
 ) -> Result<(), i32> {
-    let mut inner = fs.inner.lock().unwrap();
-    let _handle = match inner.file_handles.get(&fh) {
-        Some(h) if h.ino == ino => *h,
-        _ => return Err(libc::EBADF),
+    let (start, end) = {
+        let inner = fs.inner.lock().unwrap();
+        match inner.file_handles.get(&fh) {
+            Some(h) if h.ino == ino => {}
+            _ => return Err(libc::EBADF),
+        }
+        normalize_range(&inner, ino, &lock)?
     };
 
-    let (start, end) = normalize_range(&inner, ino, &lock)?;
     let req_type = lock.lock_type;
 
     if req_type == libc::F_RDLCK as i16 || req_type == libc::F_WRLCK as i16 {
+        let mut state = fs.locks.state.lock().unwrap();
         loop {
-            let ranges = inner.locks.range_lock_table.entry(ino).or_default();
+            let ranges = state.range_lock_table.entry(ino).or_default();
 
             // 1. Check for conflicts with other owners
             let mut conflict = false;
@@ -771,92 +828,56 @@ pub fn setlk_core(
                 if !sleep {
                     return Err(libc::EWOULDBLOCK);
                 } else {
-                    inner = fs.inner_cond.wait(inner).unwrap();
+                    state = fs.locks.cond.wait(state).unwrap();
                     continue;
                 }
             }
 
-            // 2. Remove/modify existing ranges belonging to THIS owner that overlap with [start, end)
-            let mut new_ranges = Vec::new();
-            for r in ranges.drain(..) {
-                if r.owner == lock_owner && ranges_overlap(start, end, r.start, r.end) {
-                    if r.start < start {
-                        new_ranges.push(RangeLock {
-                            lock_type: r.lock_type,
-                            start: r.start,
-                            end: start,
-                            owner: r.owner,
-                            pid: r.pid,
-                        });
-                    }
-                    if r.end > end {
-                        new_ranges.push(RangeLock {
-                            lock_type: r.lock_type,
-                            start: end,
-                            end: r.end,
-                            owner: r.owner,
-                            pid: r.pid,
-                        });
-                    }
-                } else {
-                    new_ranges.push(r);
-                }
-            }
-
-            // 3. Add new range lock
-            new_ranges.push(RangeLock {
-                lock_type: req_type,
-                start,
-                end,
-                owner: lock_owner,
-                pid: lock.pid,
-            });
-
-            // 4. Coalesce adjacent or overlapping ranges with same owner and lock_type
-            coalesce_ranges(&mut new_ranges);
-            let ranges_ref = inner.locks.range_lock_table.entry(ino).or_default();
-            *ranges_ref = new_ranges;
-
-            // 5. Notify any other waiting lock requests
-            fs.inner_cond.notify_all();
+            // 2. Grant lock
+            grant_range_lock(ranges, lock_owner, start, end, req_type, lock.pid);
+            fs.locks.cond.notify_all();
             return Ok(());
         }
     } else if req_type == libc::F_UNLCK as i16 {
-        let ranges = inner.locks.range_lock_table.entry(ino).or_default();
-        let mut new_ranges = Vec::new();
-        for r in ranges.drain(..) {
-            if r.owner == lock_owner && ranges_overlap(start, end, r.start, r.end) {
-                if r.start < start {
-                    new_ranges.push(RangeLock {
-                        lock_type: r.lock_type,
-                        start: r.start,
-                        end: start,
-                        owner: r.owner,
-                        pid: r.pid,
-                    });
+        let ready = {
+            let mut state = fs.locks.state.lock().unwrap();
+            if let Some(ranges) = state.range_lock_table.get_mut(&ino) {
+                let mut new_ranges = Vec::new();
+                for r in ranges.drain(..) {
+                    if r.owner == lock_owner && ranges_overlap(start, end, r.start, r.end) {
+                        if r.start < start {
+                            new_ranges.push(RangeLock {
+                                lock_type: r.lock_type,
+                                start: r.start,
+                                end: start,
+                                owner: r.owner,
+                                pid: r.pid,
+                            });
+                        }
+                        if r.end > end {
+                            new_ranges.push(RangeLock {
+                                lock_type: r.lock_type,
+                                start: end,
+                                end: r.end,
+                                owner: r.owner,
+                                pid: r.pid,
+                            });
+                        }
+                    } else {
+                        new_ranges.push(r);
+                    }
                 }
-                if r.end > end {
-                    new_ranges.push(RangeLock {
-                        lock_type: r.lock_type,
-                        start: end,
-                        end: r.end,
-                        owner: r.owner,
-                        pid: r.pid,
-                    });
+                if new_ranges.is_empty() {
+                    state.range_lock_table.remove(&ino);
+                } else {
+                    *ranges = new_ranges;
                 }
-            } else {
-                new_ranges.push(r);
             }
-        }
-        if new_ranges.is_empty() {
-            inner.locks.range_lock_table.remove(&ino);
-        } else {
-            *ranges = new_ranges;
-        }
 
-        let ready = inner.locks.wake_range_lock_waiters(ino);
-        fs.inner_cond.notify_all();
-        drop(inner);
+            let ready = state.wake_range_lock_waiters(ino);
+            fs.locks.cond.notify_all();
+            ready
+        };
         for req in ready {
             req.reply_err(0);
         }
@@ -919,8 +940,8 @@ mod tests {
         // 6. Release handle cleans up locks
         assert_eq!(fs.release_file_handle(fh1, ino), Ok(()));
         assert_eq!(fs.release_file_handle(fh2, ino), Ok(()));
-        assert_eq!(fs.inner.lock().unwrap().locks.flock_count(), 0);
-        assert!(fs.inner.lock().unwrap().locks.is_empty());
+        assert_eq!(fs.locks.flock_count(), 0);
+        assert!(fs.locks.is_empty());
     }
 
     #[test]
@@ -981,8 +1002,8 @@ mod tests {
         };
         assert_eq!(setlk_core(&fs, ino, fh1, owner1, unlock1, false), Ok(()));
 
-        let inner = fs.inner.lock().unwrap();
-        let ranges = inner.locks.range_lock_table.get(&ino).unwrap();
+        let state = fs.locks.state.lock().unwrap();
+        let ranges = state.range_lock_table.get(&ino).unwrap();
         let owner1_ranges: Vec<_> = ranges.iter().filter(|r| r.owner == owner1).collect();
         assert_eq!(owner1_ranges.len(), 2);
         assert_eq!((owner1_ranges[0].start, owner1_ranges[0].end), (0, 25));

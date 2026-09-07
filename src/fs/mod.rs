@@ -19,7 +19,7 @@ pub mod virtual_files;
 
 pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
 pub use arena::WriteArena;
-pub use layers::{InodeLayerStack, MemoryBuffer, ReadPlan, ReadSlice, ReadSliceSource};
+pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use virtual_files::{VIRTUAL_FH_FLAG, VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};
@@ -60,8 +60,6 @@ pub struct FsInner {
     pub live: HashMap<u64, EntryDelta>,
     /// Active write arena staging extent payload allocations for `live`.
     pub live_arena: WriteArena,
-    /// Recycled chunk buffer pool for re-use across flush generations.
-    pub arena_pool: Vec<Arc<RwLock<Vec<u8>>>>,
     /// Active open file handles keyed by allocated file handle ID (`fh`).
     pub file_handles: FileHandleMap,
     /// Active open directory handle snapshots keyed by allocated file handle ID (`fh`).
@@ -70,18 +68,16 @@ pub struct FsInner {
     pub open_counts: HashMap<u64, u32>,
     /// Active open virtual file handles holding frozen point-in-time snapshot strings.
     pub virtual_handles: HashMap<u64, Vec<u8>>,
-    /// Whole-file BSD flock and POSIX byte-range record lock manager.
-    pub locks: LockManager,
     /// Timestamp of the latest recovered operation / summary snapshot (if recovered).
     pub recovered_time: Option<SystemTime>,
 }
 
 pub struct InMemoryFS {
     /// Consolidated critical section protecting all in-memory metadata, layer overlay,
-    /// file/dir handles, open counts, write arena buffers, and file locks.
+    /// file/dir handles, open counts, and write arena buffers.
     pub inner: Mutex<FsInner>,
-    /// Condition variable for parking/waking in-process lock operations on `inner`.
-    pub inner_cond: Condvar,
+    /// Independent whole-file BSD flock and POSIX byte-range record lock manager.
+    pub locks: LockManager,
     /// Atomic counter for allocating unique file and directory handle IDs (`fh`).
     pub next_fh: AtomicU64,
     /// Authoritative manifest of all active log generations and lineage.
@@ -190,18 +186,16 @@ impl InMemoryFS {
             flushing: VecDeque::new(),
             live: HashMap::new(),
             live_arena: WriteArena::new(),
-            arena_pool: Vec::new(),
             file_handles: HashMap::new(),
             dir_handles: HashMap::new(),
             open_counts: HashMap::new(),
             virtual_handles: HashMap::new(),
-            locks: LockManager::new(),
             recovered_time: None,
         };
 
         let fs = Self {
             inner: Mutex::new(inner),
-            inner_cond: Condvar::new(),
+            locks: LockManager::new(),
             next_fh: AtomicU64::new(1),
             manifest,
             next_inode: AtomicU64::new(2),

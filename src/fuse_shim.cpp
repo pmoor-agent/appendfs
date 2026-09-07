@@ -476,6 +476,8 @@ static void ll_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name) {
 static void ll_init(void *userdata, struct fuse_conn_info *conn) {
   if (conn) {
     conn->max_write = 1024 * 1024;
+    conn->max_readahead = 1024 * 1024;
+    conn->time_gran = 1;
   }
   auto *ctx = static_cast<ShimContext *>(userdata);
   if (ctx && ctx->ops.init) {

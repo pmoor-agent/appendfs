@@ -2,11 +2,12 @@ use crate::range_map::RangeValue;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
-/// Represents the physical location and state of an extent slice.
+/// Thread-safe buffer reference for staged extent payloads.
 ///
-/// This is a *resolved* view: `Staged` always means "only in memory right now" and
-/// `Disk` always means "durably flushed", regardless of how the value is actually
-/// stored internally. See `StoredExtent` for why that distinction matters.
+/// An `RwLock` is used inside the `Arc` because multiple extents share references
+/// to the same 4 MiB `WriteArena` chunk while subsequent writes append to it.
+/// Interior mutability allows appending to the active chunk in place without
+/// reallocation or copying, while read plans hold shared read guards.
 pub type StagedBuffer = Arc<RwLock<Vec<u8>>>;
 
 /// Represents the physical location and state of an extent slice.
@@ -33,6 +34,10 @@ pub enum ExtentState {
     Zero { length: u64 },
 }
 
+// std::sync::RwLock does not implement PartialEq or Eq. Because ExtentState::Staged
+// contains StagedBuffer (Arc<RwLock<Vec<u8>>>), PartialEq cannot be derived
+// automatically. This implementation performs a fast pointer comparison via Arc::ptr_eq,
+// falling back to comparing the staged slice byte contents.
 impl PartialEq for ExtentState {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {

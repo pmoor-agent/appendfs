@@ -51,7 +51,7 @@ pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, f
     // Fast path: small in-memory read (<= 128 KiB) with zero cold disk slices
     const MAX_INLINE_READ_BYTES: usize = 128 * 1024;
     if !plan.has_cold_slices && plan.total_len <= MAX_INLINE_READ_BYTES {
-        match fs.execute_read_plan_sync(&plan) {
+        match fs.execute_read_plan_sync(plan) {
             Ok(buf) => req.reply_buf(&buf),
             Err(e) => req.reply_err(e),
         }
@@ -130,10 +130,7 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
             return Err(libc::ENOENT);
         }
 
-        let slices = {
-            let inner_mut = &mut *inner;
-            inner_mut.live_arena.append(buf, &mut inner_mut.arena_pool)
-        };
+        let slices = inner.live_arena.append(buf);
 
         let entry = inner
             .live

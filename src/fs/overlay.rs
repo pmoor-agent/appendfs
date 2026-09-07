@@ -416,7 +416,7 @@ impl InMemoryFS {
 
     pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
         let mut inner = self.inner.lock().unwrap();
-        let plan = inner.with_inode_layers(ino, |layers| layers.plan_read_file_data(offset, size, self))?;
+        let plan = inner.with_inode_layers(ino, |layers| layers.plan_read_file_data(offset, size))?;
 
         if self.track_atime && plan.total_len > 0 {
             let now = self.clock.now();
@@ -434,7 +434,7 @@ impl InMemoryFS {
 
     pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
         let plan = self.plan_read_file_data(ino, offset, size)?;
-        self.execute_read_plan_sync(&plan)
+        self.execute_read_plan_sync(plan)
     }
 
     pub fn snapshot_all(&self) -> HashMap<u64, Arc<Node>> {

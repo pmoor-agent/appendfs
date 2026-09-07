@@ -250,7 +250,7 @@ impl<'a> InodeLayerStack<'a> {
     /// references to [`Arc<Vec<u8>>`] are cloned with zero byte-copying.
     ///
     /// If all requested bytes are covered by in-memory slices or holes, `has_cold_slices` will be false.
-    pub fn plan_read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<ReadPlan, i32> {
+    pub fn plan_read_file_data(&self, offset: u64, size: usize) -> Result<ReadPlan, i32> {
         let attr = self.attr().ok_or(libc::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
             return Err(libc::EISDIR);
@@ -306,36 +306,19 @@ impl<'a> InodeLayerStack<'a> {
                         length: _,
                     } => {
                         let src_offset = payload_offset as usize + inner_offset;
-                        ReadSliceSource::Memory {
-                            data: data.into(),
-                            src_offset,
-                        }
+                        ReadSliceSource::Memory { data, src_offset }
                     }
                     ExtentState::Disk {
                         generation,
                         record_log_offset,
                         payload_offset,
                         length: _,
-                    } => {
-                        let cached = fs
-                            .log_cache
-                            .as_ref()
-                            .and_then(|c| c.get_cached_record(generation, record_log_offset));
-                        if let Some(cached_data) = cached {
-                            let src_offset = payload_offset as usize + inner_offset;
-                            ReadSliceSource::Memory {
-                                data: cached_data.into(),
-                                src_offset,
-                            }
-                        } else {
-                            ReadSliceSource::Disk {
-                                generation,
-                                record_log_offset,
-                                payload_offset,
-                                slice_inner_offset: inner_offset as u32,
-                            }
-                        }
-                    }
+                    } => ReadSliceSource::Disk {
+                        generation,
+                        record_log_offset,
+                        payload_offset,
+                        slice_inner_offset: inner_offset as u32,
+                    },
                 };
 
                 raw_slices.push(ReadSlice {
@@ -404,99 +387,21 @@ impl<'a> InodeLayerStack<'a> {
 
     /// Reads file data resolving extents across layers.
     pub fn read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<Vec<u8>, i32> {
-        let plan = self.plan_read_file_data(offset, size, fs)?;
-        fs.execute_read_plan_sync(&plan)
-    }
-}
-
-#[derive(Clone)]
-pub enum MemoryBuffer {
-    Immutable(Arc<Vec<u8>>),
-    Chunk(Arc<std::sync::RwLock<Vec<u8>>>),
-}
-
-impl Eq for MemoryBuffer {}
-
-impl From<Arc<Vec<u8>>> for MemoryBuffer {
-    fn from(v: Arc<Vec<u8>>) -> Self {
-        MemoryBuffer::Immutable(v)
-    }
-}
-
-impl From<Arc<std::sync::RwLock<Vec<u8>>>> for MemoryBuffer {
-    fn from(c: Arc<std::sync::RwLock<Vec<u8>>>) -> Self {
-        MemoryBuffer::Chunk(c)
-    }
-}
-
-impl std::fmt::Debug for MemoryBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MemoryBuffer::Immutable(v) => write!(f, "Immutable(len={})", v.len()),
-            MemoryBuffer::Chunk(c) => write!(f, "Chunk(len={})", c.read().map(|g| g.len()).unwrap_or(0)),
-        }
-    }
-}
-
-impl PartialEq for MemoryBuffer {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (MemoryBuffer::Immutable(a), MemoryBuffer::Immutable(b)) => a == b,
-            (MemoryBuffer::Chunk(a), MemoryBuffer::Chunk(b)) => {
-                if Arc::ptr_eq(a, b) {
-                    true
-                } else {
-                    let ga = a.read().unwrap();
-                    let gb = b.read().unwrap();
-                    *ga == *gb
-                }
-            }
-            (MemoryBuffer::Immutable(a), MemoryBuffer::Chunk(b)) => {
-                let gb = b.read().unwrap();
-                **a == *gb
-            }
-            (MemoryBuffer::Chunk(a), MemoryBuffer::Immutable(b)) => {
-                let ga = a.read().unwrap();
-                *ga == **b
-            }
-        }
-    }
-}
-
-impl MemoryBuffer {
-    pub fn len(&self) -> usize {
-        match self {
-            MemoryBuffer::Immutable(v) => v.len(),
-            MemoryBuffer::Chunk(c) => c.read().unwrap().len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn copy_slice(&self, src_offset: usize, dst: &mut [u8]) {
-        match self {
-            MemoryBuffer::Immutable(v) => {
-                let actual = dst.len().min(v.len().saturating_sub(src_offset));
-                dst[..actual].copy_from_slice(&v[src_offset..src_offset + actual]);
-            }
-            MemoryBuffer::Chunk(c) => {
-                let guard = c.read().unwrap();
-                let actual = dst.len().min(guard.len().saturating_sub(src_offset));
-                dst[..actual].copy_from_slice(&guard[src_offset..src_offset + actual]);
-            }
-        }
+        let plan = self.plan_read_file_data(offset, size)?;
+        fs.execute_read_plan_sync(plan)
     }
 }
 
 /// Source of data for a specific byte segment within a read plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ReadSliceSource {
     /// Zero-filled (hole, punch-hole, or truncated region).
     Zero,
-    /// In-memory: atomic pointer clone of backing buffer (~10 ns).
-    Memory { data: MemoryBuffer, src_offset: usize },
+    /// In-memory: reference to staged write buffer slice.
+    Memory {
+        data: crate::log::extent::StagedBuffer,
+        src_offset: usize,
+    },
     /// Cold disk or remote S3 extent.
     Disk {
         generation: u64,
@@ -505,6 +410,51 @@ pub enum ReadSliceSource {
         slice_inner_offset: u32,
     },
 }
+
+impl PartialEq for ReadSliceSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Zero, Self::Zero) => true,
+            (
+                Self::Memory {
+                    data: d1,
+                    src_offset: o1,
+                },
+                Self::Memory {
+                    data: d2,
+                    src_offset: o2,
+                },
+            ) => {
+                if o1 != o2 {
+                    return false;
+                }
+                if Arc::ptr_eq(d1, d2) {
+                    return true;
+                }
+                let g1 = d1.read().unwrap();
+                let g2 = d2.read().unwrap();
+                *g1 == *g2
+            }
+            (
+                Self::Disk {
+                    generation: g1,
+                    record_log_offset: r1,
+                    payload_offset: p1,
+                    slice_inner_offset: s1,
+                },
+                Self::Disk {
+                    generation: g2,
+                    record_log_offset: r2,
+                    payload_offset: p2,
+                    slice_inner_offset: s2,
+                },
+            ) => g1 == g2 && r1 == r2 && p1 == p2 && s1 == s2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ReadSliceSource {}
 
 /// A contiguous segment of data within a read plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,7 +484,7 @@ impl ReadPlan {
 
 impl InMemoryFS {
     /// Executes a [`ReadPlan`] synchronously, reading any cold disk extents via [`LogFileCache`].
-    pub fn execute_read_plan_sync(&self, plan: &ReadPlan) -> Result<Vec<u8>, i32> {
+    pub fn execute_read_plan_sync(&self, plan: ReadPlan) -> Result<Vec<u8>, i32> {
         execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key)
     }
 
@@ -548,89 +498,37 @@ impl InMemoryFS {
         log_cache: Option<Arc<crate::log::LogFileCache>>,
         volume_key: Arc<crate::crypto::VolumeKey>,
     ) -> Result<Vec<u8>, i32> {
-        tokio::task::spawn_blocking(move || {
-            let mut dst_buf = vec![0u8; plan.total_len];
-            let mut cold_slices = Vec::new();
-
-            // Phase 1: Pre-copy all in-memory slices into dst_buf
-            for slice in plan.slices {
-                match slice.source {
-                    ReadSliceSource::Zero => {}
-                    ReadSliceSource::Memory { data, src_offset } => {
-                        let actual_len = std::cmp::min(slice.len, data.len().saturating_sub(src_offset));
-                        if actual_len > 0 {
-                            data.copy_slice(
-                                src_offset,
-                                &mut dst_buf[slice.dst_offset..slice.dst_offset + actual_len],
-                            );
-                        }
-                    }
-                    ReadSliceSource::Disk {
-                        generation,
-                        record_log_offset,
-                        payload_offset,
-                        slice_inner_offset,
-                    } => {
-                        cold_slices.push((
-                            slice.dst_offset,
-                            slice.len,
-                            generation,
-                            record_log_offset,
-                            payload_offset,
-                            slice_inner_offset,
-                        ));
-                    }
-                }
-            }
-
-            // Phase 2: All memory slice descriptors are now dropped!
-            // Staged write buffers / arena chunks can be recycled immediately, even if
-            // disk or remote S3 reads below take significant time.
-            if !cold_slices.is_empty() {
-                let cache = log_cache.as_deref().ok_or(libc::EIO)?;
-                for (dst_offset, len, generation, record_log_offset, payload_offset, slice_inner_offset) in cold_slices
-                {
-                    match cache.read_extent_payload(
-                        generation,
-                        record_log_offset,
-                        payload_offset,
-                        slice_inner_offset,
-                        &mut dst_buf[dst_offset..dst_offset + len],
-                        &volume_key,
-                    ) {
-                        Ok(_) => {}
-                        Err(_) => return Err(libc::EIO),
-                    }
-                }
-            }
-
-            Ok(dst_buf)
-        })
-        .await
-        .map_err(|_| libc::EIO)?
+        tokio::task::spawn_blocking(move || execute_read_plan(plan, log_cache.as_deref(), &volume_key))
+            .await
+            .map_err(|_| libc::EIO)?
     }
 }
 
 /// Core execution helper for [`ReadPlan`] completely decoupled from [`InMemoryFS`].
+///
+/// Phase 1: Copies all in-memory slices into `dst_buf` and drops their backing buffers
+/// immediately, allowing staged buffers to be freed before any disk I/O.
+/// Phase 2: Resolves cold disk slices sequentially from cache or disk.
 pub fn execute_read_plan(
-    plan: &ReadPlan,
+    mut plan: ReadPlan,
     log_cache: Option<&crate::log::LogFileCache>,
     volume_key: &crate::crypto::VolumeKey,
 ) -> Result<Vec<u8>, i32> {
     let mut dst_buf = vec![0u8; plan.total_len];
     let mut cold_slices = Vec::new();
 
-    for slice in &plan.slices {
-        match &slice.source {
+    // Phase 1: Pre-copy all in-memory slices into dst_buf and drop memory buffers immediately
+    for slice in std::mem::take(&mut plan.slices) {
+        match slice.source {
             ReadSliceSource::Zero => {}
             ReadSliceSource::Memory { data, src_offset } => {
-                let actual_len = std::cmp::min(slice.len, data.len().saturating_sub(*src_offset));
+                let guard = data.read().unwrap();
+                let actual_len = std::cmp::min(slice.len, guard.len().saturating_sub(src_offset));
                 if actual_len > 0 {
-                    data.copy_slice(
-                        *src_offset,
-                        &mut dst_buf[slice.dst_offset..slice.dst_offset + actual_len],
-                    );
+                    dst_buf[slice.dst_offset..slice.dst_offset + actual_len]
+                        .copy_from_slice(&guard[src_offset..src_offset + actual_len]);
                 }
+                // Memory slice guard and StagedBuffer Arc are dropped at end of loop iteration!
             }
             ReadSliceSource::Disk {
                 generation,
@@ -641,15 +539,18 @@ pub fn execute_read_plan(
                 cold_slices.push((
                     slice.dst_offset,
                     slice.len,
-                    *generation,
-                    *record_log_offset,
-                    *payload_offset,
-                    *slice_inner_offset,
+                    generation,
+                    record_log_offset,
+                    payload_offset,
+                    slice_inner_offset,
                 ));
             }
         }
     }
 
+    // Phase 2: All memory slice descriptors are now dropped!
+    // Staged write buffers / arena chunks can be freed immediately, even if
+    // disk or remote S3 reads below take significant time.
     if !cold_slices.is_empty() {
         let cache = log_cache.ok_or(libc::EIO)?;
         for (dst_offset, len, generation, record_log_offset, payload_offset, slice_inner_offset) in cold_slices {
@@ -749,7 +650,7 @@ mod tests {
         assert_eq!(plan.slices[2].len, 40);
         assert!(matches!(plan.slices[2].source, ReadSliceSource::Memory { .. }));
 
-        let read_buf = fs.execute_read_plan_sync(&plan).unwrap();
+        let read_buf = fs.execute_read_plan_sync(plan).unwrap();
         assert_eq!(&read_buf[0..40], &[0xAA; 40]);
         assert_eq!(&read_buf[40..60], &[0x00; 20]);
         assert_eq!(&read_buf[60..100], &[0xAA; 40]);
@@ -764,7 +665,7 @@ mod tests {
         assert!(!plan.has_cold_slices);
         assert!(plan.slices.is_empty());
 
-        let res = fs.execute_read_plan_sync(&plan).unwrap();
+        let res = fs.execute_read_plan_sync(plan).unwrap();
         assert!(res.is_empty());
     }
 

@@ -60,7 +60,6 @@ impl InMemoryFS {
                 }
             }
         }
-        flushed.arena.recycle_into(&mut inner.arena_pool);
     }
 
     /// Writes pending data extents and serialized `LogEntryDelta` records for a frozen batch,
@@ -266,8 +265,7 @@ impl InMemoryFS {
                 match inner.flushing.front_mut() {
                     Some(b) => {
                         if b.entries.is_empty() {
-                            let popped = inner.flushing.pop_front().unwrap();
-                            popped.arena.recycle_into(&mut inner.arena_pool);
+                            let _ = inner.flushing.pop_front().unwrap();
                             continue;
                         }
                         b.clone()
@@ -298,8 +296,7 @@ impl InMemoryFS {
                         }
                     }
                 }
-                let popped = inner.flushing.pop_front().unwrap();
-                popped.arena.recycle_into(&mut inner.arena_pool);
+                let _ = inner.flushing.pop_front().unwrap();
             }
         }
 

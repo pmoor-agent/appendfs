@@ -75,9 +75,9 @@ impl WriteArena {
 
     /// Appends data into the arena, splitting across chunk boundaries if necessary.
     ///
-    /// If `pool` has recycled chunks available, they will be used before allocating new ones.
     /// Returns a list of `ArenaSlice` representing the allocated slices.
-    pub fn append(&mut self, data: &[u8], pool: &mut Vec<Arc<RwLock<Vec<u8>>>>) -> Vec<ArenaSlice> {
+    pub fn append(&mut self, data: &[u8]) -> Vec<ArenaSlice> {
+        assert!(data.len() < (1 << 31), "write payload length must be less than 2^31");
         let mut slices = Vec::new();
         let mut remaining_data = data;
 
@@ -85,21 +85,14 @@ impl WriteArena {
             let chunk = match self.chunks.last() {
                 Some(c) if c.remaining() > 0 => c.clone(),
                 _ => {
-                    let new_chunk = if let Some(pooled_buf) = pool.pop() {
-                        let cap = pooled_buf.read().unwrap().capacity();
-                        ArenaChunk {
-                            data: pooled_buf,
-                            capacity: cap,
-                        }
-                    } else {
-                        ArenaChunk::new(self.chunk_size.max(remaining_data.len()))
-                    };
+                    let new_chunk = ArenaChunk::new(self.chunk_size.max(remaining_data.len()));
                     self.chunks.push(new_chunk.clone());
                     new_chunk
                 }
             };
 
             let to_write = std::cmp::min(remaining_data.len(), chunk.remaining());
+            assert!(to_write > 0, "to_write must be greater than 0 to make progress");
             let offset = chunk.append(&remaining_data[..to_write]);
             slices.push((Arc::clone(&chunk.data), offset, to_write as u32));
             remaining_data = &remaining_data[to_write..];
@@ -107,23 +100,49 @@ impl WriteArena {
 
         slices
     }
+}
 
-    /// Recycles unused chunks (chunks with strong_count == 1) back into the pool.
-    pub fn recycle_into(self, pool: &mut Vec<Arc<RwLock<Vec<u8>>>>) {
-        for chunk in self.chunks {
-            // Only recycle if no in-flight readers still hold an Arc to this chunk
-            if Arc::strong_count(&chunk.data) == 1 {
-                let is_ok = match chunk.data.write() {
-                    Ok(mut guard) => {
-                        guard.clear();
-                        true
-                    }
-                    Err(_) => false,
-                };
-                if is_ok {
-                    pool.push(chunk.data);
-                }
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_arena_append_and_chunk_split() {
+        let mut arena = WriteArena::with_chunk_size(100);
+        let slices1 = arena.append(&[1u8; 60]);
+        assert_eq!(slices1.len(), 1);
+        assert_eq!(slices1[0].1, 0);
+        assert_eq!(slices1[0].2, 60);
+        assert_eq!(arena.chunks.len(), 1);
+
+        // Append 70 bytes: 40 fits in chunk 0, remaining 30 creates chunk 1
+        let slices2 = arena.append(&[2u8; 70]);
+        assert_eq!(slices2.len(), 2);
+        assert_eq!(slices2[0].1, 60);
+        assert_eq!(slices2[0].2, 40);
+        assert_eq!(slices2[1].1, 0);
+        assert_eq!(slices2[1].2, 30);
+        assert_eq!(arena.chunks.len(), 2);
+
+        // Verify content in chunk 0
+        let c0 = arena.chunks[0].data.read().unwrap();
+        assert_eq!(&c0[0..60], &[1u8; 60]);
+        assert_eq!(&c0[60..100], &[2u8; 40]);
+
+        // Verify content in chunk 1
+        let c1 = arena.chunks[1].data.read().unwrap();
+        assert_eq!(&c1[0..30], &[2u8; 30]);
+    }
+
+    #[test]
+    fn test_arena_large_single_write() {
+        let mut arena = WriteArena::with_chunk_size(100);
+        let large_data = vec![7u8; 350];
+        let slices = arena.append(&large_data);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].1, 0);
+        assert_eq!(slices[0].2, 350);
+        assert_eq!(arena.chunks.len(), 1);
+        assert!(arena.chunks[0].capacity >= 350);
     }
 }
