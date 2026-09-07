@@ -120,6 +120,8 @@ pub struct InMemoryFS {
     pub replication_notifier: Arc<(Mutex<bool>, Condvar)>,
     /// Tracks in-flight asynchronous operations (e.g. cold reads, async fsyncs) to ensure safe unmount without use-after-free.
     pub async_tracker: Arc<crate::async_runtime::AsyncTracker>,
+    /// Optional fixed IV for exported summary files (used for deterministic golden fixture generation and testing).
+    pub deterministic_summary_iv: Option<[u8; 12]>,
 }
 
 impl InMemoryFS {
@@ -209,6 +211,7 @@ impl InMemoryFS {
             last_summary_generation: AtomicU64::new(0),
             replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
             async_tracker: Arc::new(crate::async_runtime::AsyncTracker::new()),
+            deterministic_summary_iv: None,
         };
         fs.register_runtime_status();
         fs
