@@ -148,6 +148,14 @@ pub struct RemoteAddArgs {
     /// Force S3 path-style addressing (http://endpoint/bucket/key)
     #[arg(long = "path-style")]
     pub path_style: Option<bool>,
+
+    /// Upload incremental active log parts to this remote before generation seals (default: true)
+    #[arg(long = "upload-partial-logs", default_value = "true", action = clap::ArgAction::Set)]
+    pub upload_partial_logs: bool,
+
+    /// Disable uploading incremental active log parts to this remote (useful for write-only/append-only S3 targets)
+    #[arg(long = "no-upload-partial-logs", action = clap::ArgAction::SetTrue)]
+    pub no_upload_partial_logs: bool,
 }
 
 #[derive(Args, Debug, Clone)]

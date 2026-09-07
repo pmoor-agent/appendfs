@@ -40,6 +40,9 @@ pub struct RemoteTargetConfig {
     pub secret_access_key_env: Option<String>,
     pub credentials_file: Option<PathBuf>,
     pub force_path_style: Option<bool>,
+    /// Whether to upload incremental active log parts to this remote before generation seals (default: true).
+    #[serde(default = "default_upload_partial_logs")]
+    pub upload_partial_logs: bool,
 }
 
 fn default_region() -> String {
@@ -48,6 +51,10 @@ fn default_region() -> String {
 
 fn default_read_priority() -> u32 {
     100
+}
+
+fn default_upload_partial_logs() -> bool {
+    true
 }
 
 impl RemoteTargetConfig {
@@ -68,6 +75,7 @@ impl RemoteTargetConfig {
             secret_access_key_env: None,
             credentials_file: None,
             force_path_style: None,
+            upload_partial_logs: default_upload_partial_logs(),
         }
     }
 
@@ -88,6 +96,7 @@ impl RemoteTargetConfig {
             secret_access_key_env: None,
             credentials_file: None,
             force_path_style: None,
+            upload_partial_logs: default_upload_partial_logs(),
         }
     }
 
@@ -98,6 +107,11 @@ impl RemoteTargetConfig {
 
     pub fn with_max_concurrent_reads(mut self, max: usize) -> Self {
         self.max_concurrent_reads = if max > 0 { Some(max) } else { None };
+        self
+    }
+
+    pub fn with_upload_partial_logs(mut self, enabled: bool) -> Self {
+        self.upload_partial_logs = enabled;
         self
     }
 
@@ -241,6 +255,16 @@ impl Default for ReplicationPolicy {
     }
 }
 
+/// A remote store configured with its runtime parameters and operational flags.
+#[derive(Clone, Debug)]
+pub struct ConfiguredRemote {
+    pub name: String,
+    pub store: Arc<dyn RemoteStore>,
+    pub read_only: bool,
+    pub replicate_ancestors: bool,
+    pub upload_partial_logs: bool,
+}
+
 /// Registry managing all configured remotes and policies for a volume (`remotes.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteRegistry {
@@ -327,9 +351,9 @@ impl RemoteRegistry {
         self.store_overrides.insert(name.into(), store);
     }
 
-    /// Returns all configured stores as `(name, Arc<dyn RemoteStore>, is_read_only, replicate_ancestors)`,
+    /// Returns all configured stores as `ConfiguredRemote` records,
     /// ordered by `read_priority` ascending (lower numerical priority tried first), breaking ties by name.
-    pub fn build_all_stores(&self) -> Vec<(String, Arc<dyn RemoteStore>, bool, bool)> {
+    pub fn build_all_stores(&self) -> Vec<ConfiguredRemote> {
         let mut entries: Vec<_> = self
             .remotes
             .iter()
@@ -345,13 +369,20 @@ impl RemoteRegistry {
                     store,
                     cfg.read_only,
                     cfg.replicate_ancestors,
+                    cfg.upload_partial_logs,
                 )
             })
             .collect();
         entries.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
         entries
             .into_iter()
-            .map(|(_, name, store, ro, ra)| (name, store, ro, ra))
+            .map(|(_, name, store, ro, ra, upl)| ConfiguredRemote {
+                name,
+                store,
+                read_only: ro,
+                replicate_ancestors: ra,
+                upload_partial_logs: upl,
+            })
             .collect()
     }
 
@@ -431,5 +462,45 @@ mod tests {
         let stores = loaded.build_read_stores();
         let names: Vec<_> = stores.into_iter().map(|t| t.name).collect();
         assert_eq!(names, vec!["nas", "aws", "b2"]);
+
+        // Verify default upload_partial_logs is true for all remotes
+        for cfg in loaded.remotes.values() {
+            assert!(cfg.upload_partial_logs);
+        }
+    }
+
+    #[test]
+    fn test_upload_partial_logs_config_toggle_and_toml_omission() {
+        let toml_data = r#"
+[policy]
+min_synced_remotes = 1
+
+[remotes.s3]
+bucket = "backup-bucket"
+upload_partial_logs = false
+
+[remotes.nfs]
+path = "/mnt/nfs"
+upload_partial_logs = true
+
+[remotes.legacy]
+bucket = "legacy-bucket"
+"#;
+        let registry: RemoteRegistry = toml::from_str(toml_data).unwrap();
+        assert_eq!(registry.remotes.len(), 3);
+        assert!(!registry.remotes["s3"].upload_partial_logs);
+        assert!(registry.remotes["nfs"].upload_partial_logs);
+        assert!(
+            registry.remotes["legacy"].upload_partial_logs,
+            "omitted field should default to true"
+        );
+
+        let stores = registry.build_all_stores();
+        let s3_store = stores.iter().find(|r| r.name == "s3").unwrap();
+        assert!(!s3_store.upload_partial_logs);
+        let nfs_store = stores.iter().find(|r| r.name == "nfs").unwrap();
+        assert!(nfs_store.upload_partial_logs);
+        let leg_store = stores.iter().find(|r| r.name == "legacy").unwrap();
+        assert!(leg_store.upload_partial_logs);
     }
 }

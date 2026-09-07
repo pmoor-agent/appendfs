@@ -1,8 +1,20 @@
 use crate::log::SummaryReader;
-use crate::remote::RemoteStore;
 use crate::remote::config::{RemoteRegistry, RemoteTargetConfig};
+use crate::remote::{RemoteObject, RemoteStore};
 use crate::storage::{Storage, WriteMode};
 use std::io::{self, Write};
+
+struct StorageWriterAdapter<'a>(&'a mut Box<dyn crate::storage::StorageWriter>);
+
+impl<'a> Write for StorageWriterAdapter<'a> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.append(buf)?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.sync()
+    }
+}
 
 /// Bootstraps a local volume directory from an existing remote object store (`appendfs init --from-remote`).
 ///
@@ -47,16 +59,6 @@ pub fn bootstrap_from_remote(
     // 3. Download summary snapshot to tmp and verify
     {
         let mut writer = storage.open_writer(&tmp_summary_name, WriteMode::Overwrite)?;
-        struct StorageWriterAdapter<'a>(&'a mut Box<dyn crate::storage::StorageWriter>);
-        impl<'a> Write for StorageWriterAdapter<'a> {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.append(buf)?;
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                self.0.sync()
-            }
-        }
         let mut adapter = StorageWriterAdapter(&mut writer);
         remote.get_object(&summary_key, &mut adapter)?;
         writer.sync()?;
@@ -71,12 +73,44 @@ pub fn bootstrap_from_remote(
         remote_name
     );
 
-    // 4. Download any active intermediate parts for generation summary_gen + 1 (or summary_gen)
-    let next_gen = summary_gen + 1;
+    // 4. Download any active intermediate parts for generation summary_gen + 1,
+    // or the full sealed log if already consolidated on remote
+    restore_next_generation_log(remote, storage, &objects, summary_gen + 1)?;
+
+    // 5. Save remote configuration to remotes.toml in storage
+    let mut registry = RemoteRegistry::load_from_storage(storage)?;
+    registry.add_remote(remote_name, remote_cfg);
+    registry.save_to_storage(storage)?;
+
+    Ok(local_summary_name)
+}
+
+fn restore_next_generation_log(
+    remote: &dyn RemoteStore,
+    storage: &dyn Storage,
+    objects: &[RemoteObject],
+    next_gen: u64,
+) -> io::Result<()> {
+    let sealed_log_name = crate::log::log_filename(next_gen);
+    if let Some(sealed_obj) = objects.iter().find(|o| o.key == sealed_log_name) {
+        log::info!(
+            "Found sealed generation {} ({}, {} bytes) on remote; downloading...",
+            next_gen,
+            sealed_log_name,
+            sealed_obj.size
+        );
+        let mut log_writer = storage.open_writer(&sealed_log_name, WriteMode::Overwrite)?;
+        let mut adapter = StorageWriterAdapter(&mut log_writer);
+        remote.get_object(&sealed_log_name, &mut adapter)?;
+        log_writer.sync()?;
+        return Ok(());
+    }
+
     let part_prefix = format!("{:06}.part", next_gen);
     let mut part_objects: Vec<_> = objects
-        .into_iter()
+        .iter()
         .filter(|o| o.key.starts_with(&part_prefix) && o.key.ends_with(".log"))
+        .cloned()
         .collect();
 
     if !part_objects.is_empty() {
@@ -94,26 +128,11 @@ pub fn bootstrap_from_remote(
         log_writer.append(&header.to_bytes())?;
 
         for part in part_objects {
-            struct LogPartWriterAdapter<'a>(&'a mut Box<dyn crate::storage::StorageWriter>);
-            impl<'a> Write for LogPartWriterAdapter<'a> {
-                fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                    self.0.append(buf)?;
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> io::Result<()> {
-                    self.0.sync()
-                }
-            }
-            let mut adapter = LogPartWriterAdapter(&mut log_writer);
+            let mut adapter = StorageWriterAdapter(&mut log_writer);
             remote.get_object(&part.key, &mut adapter)?;
         }
         log_writer.sync()?;
     }
 
-    // 5. Save remote configuration to remotes.toml in storage
-    let mut registry = RemoteRegistry::load_from_storage(storage)?;
-    registry.add_remote(remote_name, remote_cfg);
-    registry.save_to_storage(storage)?;
-
-    Ok(local_summary_name)
+    Ok(())
 }

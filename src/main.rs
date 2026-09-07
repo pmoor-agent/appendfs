@@ -366,6 +366,7 @@ fn cmd_init(args: InitArgs) {
                 std::process::exit(1);
             }
         }
+<<<<<<< HEAD
     } else {
         let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
         // Compression is independent of encryption, so an unencrypted volume must
@@ -391,6 +392,39 @@ fn cmd_init(args: InitArgs) {
         }
     }
 }
+=======
+        Commands::Remote(subargs) => match subargs.command {
+            appendfs::cli::RemoteCommands::Add(add_args) => {
+                let storage = OsStorage::new(&add_args.log_dir);
+                let mut registry = load_remote_registry(&storage);
+                let mut cfg = if let Some(ref p) = add_args.path {
+                    appendfs::remote::RemoteTargetConfig::new_path(p)
+                } else if let Some(ref b) = add_args.bucket {
+                    appendfs::remote::RemoteTargetConfig::new(b)
+                } else {
+                    eprintln!("Error: Either --path or --bucket must be specified when adding a remote.");
+                    std::process::exit(1);
+                };
+                cfg.endpoint = add_args.endpoint;
+                cfg.region = add_args.region;
+                cfg.prefix = add_args.prefix;
+                cfg.read_only = add_args.read_only;
+                cfg.replicate_ancestors = add_args.replicate_ancestors;
+                if let Some(prio) = add_args.read_priority {
+                    cfg.read_priority = prio;
+                }
+                cfg.access_key_id = add_args.access_key_id;
+                cfg.secret_access_key = add_args.secret_access_key;
+                cfg.access_key_id_env = add_args.access_key_id_env;
+                cfg.secret_access_key_env = add_args.secret_access_key_env;
+                cfg.credentials_file = add_args.credentials_file;
+                cfg.force_path_style = add_args.path_style;
+                if add_args.no_upload_partial_logs {
+                    cfg.upload_partial_logs = false;
+                } else {
+                    cfg.upload_partial_logs = add_args.upload_partial_logs;
+                }
+>>>>>>> 8664d36 (feat(remote): add per-remote upload_partial_logs setting)
 
 fn cmd_mount(args: MountArgs) {
     let log_dir = &args.log_dir;
@@ -777,6 +811,11 @@ fn cmd_remote_add(add_args: RemoteAddArgs) {
     cfg.secret_access_key_env = add_args.secret_access_key_env;
     cfg.credentials_file = add_args.credentials_file;
     cfg.force_path_style = add_args.path_style;
+    if add_args.no_upload_partial_logs {
+        cfg.upload_partial_logs = false;
+    } else {
+        cfg.upload_partial_logs = add_args.upload_partial_logs;
+    }
 
     registry.add_remote(&add_args.name, cfg);
     if let Err(e) = registry.save_to_storage(&storage) {
@@ -817,20 +856,22 @@ fn cmd_remote_list(list_args: RemoteListArgs) {
         for (name, cfg) in sorted_remotes {
             if let Some(ref p) = cfg.path {
                 println!(
-                    "  - {}: type='local/nfs', path='{}', priority={}, mode='{}'",
+                    "  - {}: type='local/nfs', path='{}', priority={}, mode='{}', partial_logs={}",
                     name,
                     p.display(),
                     cfg.read_priority,
                     if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
+                    if cfg.upload_partial_logs { "Enabled" } else { "Disabled" },
                 );
             } else {
                 println!(
-                    "  - {}: type='s3', bucket='{}', priority={}, region='{}', mode='{}', endpoint={:?}, prefix='{}'",
+                    "  - {}: type='s3', bucket='{}', priority={}, region='{}', mode='{}', partial_logs={}, endpoint={:?}, prefix='{}'",
                     name,
                     cfg.bucket.as_deref().unwrap_or(""),
                     cfg.read_priority,
                     cfg.region,
                     if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
+                    if cfg.upload_partial_logs { "Enabled" } else { "Disabled" },
                     cfg.endpoint,
                     cfg.prefix
                 );

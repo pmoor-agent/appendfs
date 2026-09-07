@@ -135,3 +135,69 @@ fn test_cli_init_plaintext_generates_random_volume_id() {
     let key_stderr = String::from_utf8_lossy(&key_stats.stderr);
     assert!(key_stderr.contains("Volume is not encrypted; --key-file does not apply to it"));
 }
+
+#[test]
+fn test_cli_remote_add_and_list_upload_partial_logs() {
+    let temp_dir = TempDir::new().unwrap();
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .arg("init")
+        .arg(temp_dir.path())
+        .output()
+        .expect("failed to run appendfs init");
+    assert!(init_out.status.success());
+
+    // 1. Add NFS remote (default upload_partial_logs = true)
+    let nfs_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remote",
+            "add",
+            temp_dir.path().to_str().unwrap(),
+            "nfs",
+            "--path",
+            "/mnt/nfs_backup",
+        ])
+        .output()
+        .expect("failed to run remote add nfs");
+    assert!(
+        nfs_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&nfs_out.stderr)
+    );
+
+    // 2. Add S3 remote with --no-upload-partial-logs
+    let s3_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remote",
+            "add",
+            temp_dir.path().to_str().unwrap(),
+            "s3_backup",
+            "--bucket",
+            "my-appendfs-bucket",
+            "--no-upload-partial-logs",
+        ])
+        .output()
+        .expect("failed to run remote add s3_backup");
+    assert!(
+        s3_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&s3_out.stderr)
+    );
+
+    // 3. Verify `remote list` output shows partial_logs status
+    let list_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["remote", "list", temp_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run remote list");
+    assert!(list_out.status.success());
+    let stdout = String::from_utf8_lossy(&list_out.stdout);
+    assert!(stdout.contains("nfs: type='local/nfs'"));
+    assert!(stdout.contains("partial_logs=Enabled"));
+    assert!(stdout.contains("s3_backup: type='s3'"));
+    assert!(stdout.contains("partial_logs=Disabled"));
+
+    // 4. Verify remotes.toml was written correctly
+    let storage = appendfs::storage::OsStorage::new(temp_dir.path());
+    let registry = appendfs::remote::RemoteRegistry::load_from_storage(&storage).unwrap();
+    assert!(registry.remotes["nfs"].upload_partial_logs);
+    assert!(!registry.remotes["s3_backup"].upload_partial_logs);
+}
