@@ -3,6 +3,7 @@
 #include <fuse3/fuse_lowlevel.h>
 #include <fuse3/fuse_opt.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -144,6 +145,7 @@ struct RustLowlevelOps {
 struct ShimContext {
   RustLowlevelOps ops;
   void *userdata;
+  std::atomic<bool> destroyed;
 };
 
 static std::mutex global_mount_lock;
@@ -484,7 +486,10 @@ static void ll_init(void *userdata, struct fuse_conn_info *conn) {
 static void ll_destroy(void *userdata) {
   auto *ctx = static_cast<ShimContext *>(userdata);
   if (ctx && ctx->ops.destroy) {
-    ctx->ops.destroy(ctx->userdata);
+    bool expected = false;
+    if (ctx->destroyed.compare_exchange_strong(expected, true)) {
+      ctx->ops.destroy(ctx->userdata);
+    }
   }
 }
 
@@ -506,6 +511,7 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
     memset(&ctx.ops, 0, sizeof(ctx.ops));
   }
   ctx.userdata = userdata;
+  ctx.destroyed.store(false);
 
   if (fuse_parse_cmdline(&args, &opts) != 0) {
     goto err_out1;
@@ -583,6 +589,10 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   fuse_daemonize(opts.foreground);
 
   ret = fuse_session_loop(se);
+
+  // Drain in-flight asynchronous operations and clean up filesystem state
+  // before unmounting and destroying the FUSE session.
+  ll_destroy(&ctx);
 
   fuse_session_unmount(se);
 err_out2:

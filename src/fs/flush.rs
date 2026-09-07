@@ -375,15 +375,15 @@ impl InMemoryFS {
         }
     }
 
-    /// Cleanly stops background services upon FUSE unmount.
+    /// Cleanly stops background services and drains in-flight async operations upon FUSE unmount.
     pub fn destroy(&self) {
-        if self.is_read_only() {
-            return;
+        if !self.is_read_only() {
+            let mut flusher = self.flusher.lock().unwrap();
+            if let Some(mut f) = flusher.take() {
+                f.stop();
+            }
         }
-        let mut flusher = self.flusher.lock().unwrap();
-        if let Some(mut f) = flusher.take() {
-            f.stop();
-        }
+        self.drain_async_ops();
     }
 
     pub fn sync_log(&self) -> std::io::Result<()> {
@@ -1890,5 +1890,55 @@ mod tests {
                 panic!("Expected file node");
             }
         }
+    }
+
+    #[test]
+    fn test_in_memory_fs_destroy_drains_async_ops() {
+        let fs = Arc::new(InMemoryFS::new());
+        assert_eq!(fs.in_flight_async_ops(), 0);
+
+        let guard = fs.begin_async_op();
+        assert_eq!(fs.in_flight_async_ops(), 1);
+
+        let fs_clone = Arc::clone(&fs);
+        let destroyed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let destroyed_clone = Arc::clone(&destroyed);
+
+        let handle = std::thread::spawn(move || {
+            fs_clone.destroy();
+            destroyed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!destroyed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(fs.in_flight_async_ops(), 1);
+
+        drop(guard);
+        handle.join().unwrap();
+        assert!(destroyed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(fs.in_flight_async_ops(), 0);
+    }
+
+    #[test]
+    fn test_in_memory_fs_destroy_drains_read_only() {
+        let fs = Arc::new(InMemoryFS::new());
+        fs.set_read_only(true);
+        let guard = fs.begin_async_op();
+
+        let fs_clone = Arc::clone(&fs);
+        let destroyed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let destroyed_clone = Arc::clone(&destroyed);
+
+        let handle = std::thread::spawn(move || {
+            fs_clone.destroy();
+            destroyed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!destroyed.load(std::sync::atomic::Ordering::SeqCst));
+
+        drop(guard);
+        handle.join().unwrap();
+        assert!(destroyed.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

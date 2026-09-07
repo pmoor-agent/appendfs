@@ -3450,3 +3450,68 @@ fn test_fuse_async_fsync_and_singlethread_loop() {
 
     mount.unmount();
 }
+
+#[test]
+fn test_unmount_drains_in_flight_async_operations() {
+    let mut mount = TestMount::new_rw();
+    let mount_path = mount.path().to_path_buf();
+
+    // Prepare a large cold file on disk (512 KiB)
+    let cold_file = mount_path.join("cold_file.bin");
+    let initial_data = vec![0xABu8; 512 * 1024];
+    fs::write(&cold_file, &initial_data).unwrap();
+
+    // Flush and remount so it becomes cold disk extents
+    mount.remount_rw();
+    let remount_path = mount.path().to_path_buf();
+    let cold_file = remount_path.join("cold_file.bin");
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut threads = Vec::new();
+
+    // Spawn 4 concurrent readers requesting > 128 KiB chunks (triggers async offload on cold extents)
+    for _ in 0..4 {
+        let p = cold_file.clone();
+        let stop_clone = Arc::clone(&stop);
+        threads.push(thread::spawn(move || {
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                // Read 512 KiB
+                let _ = fs::read(&p);
+            }
+        }));
+    }
+
+    // Spawn 2 concurrent fsync / fsyncdir workers (triggers async fsync offload)
+    for i in 0..2 {
+        let p = remount_path.join(format!("fsync_work_{}.bin", i));
+        let stop_clone = Arc::clone(&stop);
+        threads.push(thread::spawn(move || {
+            let chunk = vec![0xCDu8; 8192];
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&p) {
+                    let _ = f.write_all(&chunk);
+                    let _ = f.sync_all();
+                }
+            }
+        }));
+    }
+
+    // Allow workers to run and establish continuous in-flight async operations
+    thread::sleep(Duration::from_millis(150));
+
+    // Signal workers to stop initiating new iterations so files close,
+    // then immediately unmount while in-flight operations drain.
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    mount.unmount();
+    for t in threads {
+        let _ = t.join();
+    }
+
+    // Ensure volume remounts cleanly and data is intact
+    mount.remount_rw();
+    let recovered_path = mount.path().to_path_buf();
+    let read_back = fs::read(recovered_path.join("cold_file.bin")).unwrap();
+    assert_eq!(read_back, initial_data);
+
+    mount.unmount();
+}
