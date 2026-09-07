@@ -1821,6 +1821,7 @@ fn test_summary_export_is_deterministic() {
             fs.fs.next_inode.load(std::sync::atomic::Ordering::SeqCst),
             std::sync::atomic::Ordering::SeqCst,
         );
+        replayed.volume_header = fs.fs.volume_header.clone();
         let regenerated_file = replayed
             .export_summary(replay_storage.as_ref())
             .expect("export_summary failed on the replayed instance");

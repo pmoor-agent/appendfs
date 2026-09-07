@@ -107,11 +107,31 @@ pub struct VolumeHeader {
 
 impl VolumeHeader {
     /// An unencrypted volume: no key, no check value, zero overhead.
+    /// Generates a random 16-byte volume ID.
     pub fn plaintext() -> Self {
         Self {
             cipher: CipherSuite::None,
             key_source: KeySource::None,
             compression: crate::compress::Compression::None,
+            volume_id: generate_random_16(),
+            kdf_salt: [0u8; 16],
+            kcv_iv: [0u8; 12],
+            kcv_tag: [0u8; 16],
+        }
+    }
+
+    /// Creates an unencrypted volume header with an all-zero volume ID for deterministic tests.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn plaintext_for_tests() -> Self {
+        Self::deterministic_plaintext(crate::compress::Compression::None)
+    }
+
+    /// Internal helper for creating deterministic unencrypted headers (all-zero volume ID).
+    pub(crate) fn deterministic_plaintext(compression: crate::compress::Compression) -> Self {
+        Self {
+            cipher: CipherSuite::None,
+            key_source: KeySource::None,
+            compression,
             volume_id: [0u8; 16],
             kdf_salt: [0u8; 16],
             kcv_iv: [0u8; 12],
@@ -248,7 +268,7 @@ impl VolumeKey {
         Self::plaintext_with_volume_id([0u8; 16])
     }
 
-    fn plaintext_with_volume_id(volume_id: [u8; 16]) -> Self {
+    pub fn plaintext_with_volume_id(volume_id: [u8; 16]) -> Self {
         Self {
             volume_id,
             cipher: CipherSuite::None,
@@ -483,5 +503,17 @@ mod tests {
             reopened.decrypt_summary(&iv, b"other header", &ct).unwrap_err(),
             CryptoError::AuthFailed
         );
+    }
+
+    #[test]
+    fn test_plaintext_volume_header_random_id() {
+        let h1 = VolumeHeader::plaintext();
+        let h2 = VolumeHeader::plaintext();
+        assert_ne!(h1.volume_id, [0u8; 16]);
+        assert_ne!(h2.volume_id, [0u8; 16]);
+        assert_ne!(h1.volume_id, h2.volume_id);
+
+        let h_zero = VolumeHeader::plaintext_for_tests();
+        assert_eq!(h_zero.volume_id, [0u8; 16]);
     }
 }
