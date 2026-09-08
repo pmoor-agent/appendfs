@@ -3133,6 +3133,220 @@ fn test_periodic_summary_generation_by_bytes() {
 }
 
 #[test]
+fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
+    use std::sync::atomic::Ordering;
+
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let key = Arc::new(appendfs::crypto::VolumeKey::plaintext());
+
+    appendfs::init_volume(
+        storage.clone(),
+        key.as_ref(),
+        appendfs::crypto::VolumeHeader::plaintext(),
+    )
+    .unwrap();
+
+    // 1. Session 1: configure max_log_size = 1500 bytes.
+    // Write 1000 bytes in gen 1, export 000001.summary.
+    // Then write 1000 bytes in gen 2 and 1000 bytes in gen 3 without exporting a summary.
+    {
+        let mut fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            Arc::new(appendfs::clock::SystemClock),
+            key.clone(),
+        )
+        .unwrap();
+
+        let writer = Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), 1, 1500, 0, key.clone()).unwrap());
+        fs.log_writer = Some(writer);
+
+        let a1 = appendfs::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a1.ino, &vec![1u8; 1000], 0).unwrap();
+        fs.flush_log().unwrap();
+
+        // Export summary for gen 1
+        fs.export_summary(storage.as_ref()).unwrap();
+        assert!(storage.exists("000001.summary"));
+
+        // Gen 2: write 1000 bytes in f2.bin, causing roll to gen 2
+        let a2 = appendfs::operations::read_write::create_core(&fs, 1, "f2.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a2.ino, &vec![2u8; 1000], 0).unwrap();
+        fs.flush_log().unwrap();
+
+        // Gen 3: write 1000 bytes in f3.bin, causing roll to gen 3
+        let a3 = appendfs::operations::read_write::create_core(&fs, 1, "f3.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a3.ino, &vec![3u8; 1000], 0).unwrap();
+        // Drop fs and writer to release lock, then remove 000003.summary (emitted on clean drop) to simulate crash
+        drop(fs);
+    }
+    if storage.exists("000003.summary") {
+        storage.remove_file("000003.summary").unwrap();
+    }
+
+    // At this point:
+    // 000001.summary exists.
+    // 000002.log has 1000 bytes of data.
+    // 000003.log has 1000 bytes of data.
+    // Neither 000002.summary nor 000003.summary exists.
+    assert!(storage.exists("000001.summary"));
+    assert!(!storage.exists("000002.summary"));
+    assert!(!storage.exists("000003.summary"));
+
+    // 2. Recover filesystem
+    let mut recovered_fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::clock::SystemClock),
+        key.clone(),
+    )
+    .unwrap();
+
+    // Verify last_summary_generation is 1
+    assert_eq!(recovered_fs.last_summary_generation.load(Ordering::SeqCst), 1);
+    // Verify generations_since_last_summary is 2 (gens 2 and 3 replayed)
+    assert_eq!(
+        recovered_fs.generations_since_last_summary.load(Ordering::SeqCst),
+        2,
+        "generations_since_last_summary must be restored from replayed logs"
+    );
+    // Verify bytes_since_last_summary is 2000 (1000 bytes in gen 2 + 1000 bytes in gen 3)
+    assert_eq!(
+        recovered_fs.bytes_since_last_summary.load(Ordering::SeqCst),
+        2000,
+        "bytes_since_last_summary must be restored from replayed data"
+    );
+
+    // 3. Mount RW for Session 2 on generation 4 with summary_interval_bytes = 2500
+    // Because 2000 bytes were already recovered from logs, writing 1000 bytes in gen 4
+    // will push bytes_since to 3000 >= 2500, triggering an early summary on gen 4's roll!
+    let next_gen = recovered_fs.manifest.read().unwrap().next_generation;
+    assert_eq!(next_gen, 4);
+
+    let start_tx = recovered_fs.last_tx_id.load(Ordering::SeqCst) + 1;
+    let writer2 =
+        Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), next_gen, 1500, start_tx, key.clone()).unwrap());
+    recovered_fs.log_writer = Some(writer2);
+    recovered_fs.set_summary_intervals(2500, 0);
+
+    // Write file4 in gen 4 (1000 bytes). Gen 4 is opened and committed.
+    let a4 = appendfs::operations::read_write::create_core(&recovered_fs, 1, "f4.bin", 0o644, 0, 1000, 1000).unwrap();
+    appendfs::operations::read_write::write_core(&recovered_fs, a4.ino, &vec![4u8; 1000], 0).unwrap();
+    recovered_fs.flush_log().unwrap();
+
+    // Now write file5 in gen 5 (1000 bytes), which forces gen 4 to roll (1000 + 1000 > 1500).
+    // On gen 4 roll:
+    // bytes_since was 2000 (recovered) + 1000 (gen 4) = 3000 >= 2500!
+    // 000004.summary MUST be emitted!
+    let a5 = appendfs::operations::read_write::create_core(&recovered_fs, 1, "f5.bin", 0o644, 0, 1000, 1000).unwrap();
+    appendfs::operations::read_write::write_core(&recovered_fs, a5.ino, &vec![5u8; 1000], 0).unwrap();
+    recovered_fs.flush_log().unwrap();
+
+    assert!(
+        storage.exists("000004.summary"),
+        "000004.summary must be emitted because recovered bytes (2000) + gen 4 (1000) = 3000 >= 2500"
+    );
+    assert_eq!(recovered_fs.last_summary_generation.load(Ordering::SeqCst), 4);
+    assert_eq!(recovered_fs.bytes_since_last_summary.load(Ordering::SeqCst), 1000); // 1000 from f5.bin in gen 5
+    drop(recovered_fs);
+}
+
+#[test]
+fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
+    use std::sync::atomic::Ordering;
+
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let key = Arc::new(appendfs::crypto::VolumeKey::plaintext());
+
+    appendfs::init_volume(
+        storage.clone(),
+        key.as_ref(),
+        appendfs::crypto::VolumeHeader::plaintext(),
+    )
+    .unwrap();
+
+    // 1. Session 1: export 000001.summary, then roll to gen 2 and gen 3.
+    {
+        let mut fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            Arc::new(appendfs::clock::SystemClock),
+            key.clone(),
+        )
+        .unwrap();
+
+        let writer = Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), 1, 1500, 0, key.clone()).unwrap());
+        fs.log_writer = Some(writer);
+
+        let a1 = appendfs::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a1.ino, &vec![1u8; 1000], 0).unwrap();
+        fs.flush_log().unwrap();
+
+        fs.export_summary(storage.as_ref()).unwrap();
+        assert!(storage.exists("000001.summary"));
+
+        // Gen 2
+        let a2 = appendfs::operations::read_write::create_core(&fs, 1, "f2.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a2.ino, &vec![2u8; 1000], 0).unwrap();
+        fs.flush_log().unwrap();
+
+        // Gen 3
+        let a3 = appendfs::operations::read_write::create_core(&fs, 1, "f3.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a3.ino, &vec![3u8; 1000], 0).unwrap();
+
+        drop(fs);
+    }
+    if storage.exists("000003.summary") {
+        storage.remove_file("000003.summary").unwrap();
+    }
+
+    // 2. Recover filesystem
+    let mut recovered_fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::clock::SystemClock),
+        key.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(recovered_fs.last_summary_generation.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        recovered_fs.generations_since_last_summary.load(Ordering::SeqCst),
+        2,
+        "generations_since_last_summary must be 2 (gens 2 and 3 replayed)"
+    );
+
+    // 3. Mount Session 2 with summary_interval_generations = 3 (and 0 byte trigger)
+    let next_gen = recovered_fs.manifest.read().unwrap().next_generation;
+    assert_eq!(next_gen, 4);
+
+    let start_tx = recovered_fs.last_tx_id.load(Ordering::SeqCst) + 1;
+    let writer2 =
+        Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), next_gen, 1500, start_tx, key.clone()).unwrap());
+    recovered_fs.log_writer = Some(writer2);
+    recovered_fs.set_summary_intervals(0, 3);
+
+    // Write file4 in gen 4
+    let a4 = appendfs::operations::read_write::create_core(&recovered_fs, 1, "f4.bin", 0o644, 0, 1000, 1000).unwrap();
+    appendfs::operations::read_write::write_core(&recovered_fs, a4.ino, &vec![4u8; 1000], 0).unwrap();
+    recovered_fs.flush_log().unwrap();
+
+    // Write file5 in gen 5 (rolls gen 4). gens_since becomes 2 (recovered) + 1 (gen 4) = 3 >= 3!
+    let a5 = appendfs::operations::read_write::create_core(&recovered_fs, 1, "f5.bin", 0o644, 0, 1000, 1000).unwrap();
+    appendfs::operations::read_write::write_core(&recovered_fs, a5.ino, &vec![5u8; 1000], 0).unwrap();
+    recovered_fs.flush_log().unwrap();
+
+    assert!(
+        storage.exists("000004.summary"),
+        "000004.summary must be emitted because recovered gens (2) + gen 4 (1) = 3 >= 3"
+    );
+    assert_eq!(recovered_fs.last_summary_generation.load(Ordering::SeqCst), 4);
+    assert_eq!(recovered_fs.generations_since_last_summary.load(Ordering::SeqCst), 0);
+
+    drop(recovered_fs);
+}
+
+#[test]
 fn test_fuse_async_read_concurrency() {
     use std::io::{Read, Seek, SeekFrom};
 
