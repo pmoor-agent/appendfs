@@ -7,7 +7,6 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-    fs.check_flush_capacity()?;
 
     fs.with_inner(OpTag::Unlink, |inner| {
         let now = fs.clock.now();
@@ -71,7 +70,6 @@ pub fn symlink_core(
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-    fs.check_flush_capacity()?;
 
     fs.with_inner(OpTag::Symlink, |inner| {
         let now = fs.clock.now();
@@ -160,7 +158,6 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-    fs.check_flush_capacity()?;
 
     fs.with_inner(OpTag::Rename, |inner| {
         let now = fs.clock.now();
@@ -321,7 +318,6 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-    fs.check_flush_capacity()?;
 
     fs.with_inner(OpTag::Link, |inner| {
         let now = fs.clock.now();

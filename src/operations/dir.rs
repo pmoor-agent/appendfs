@@ -180,7 +180,6 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-    fs.check_flush_capacity()?;
 
     fs.with_inner(OpTag::Mkdir, |inner| {
         let now = fs.clock.now();
@@ -265,7 +264,6 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-    fs.check_flush_capacity()?;
 
     fs.with_inner(OpTag::Rmdir, |inner| {
         let now = fs.clock.now();
