@@ -20,7 +20,7 @@ pub mod virtual_files;
 pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
 pub use arena::WriteArena;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
-pub use virtual_files::{VIRTUAL_FH_FLAG, VIRTUAL_INO_BASE, VirtualFileRegistry};
+pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};
 use crate::log::{BackgroundFlusher, LogFileCache, LogManifest, LogWriter};
@@ -32,34 +32,46 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::SystemTime;
 
+pub type DirSnapshot = Arc<Vec<(String, u64)>>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FileHandleKind {
+pub enum HandleKind {
     Regular,
     Virtual(Arc<Vec<u8>>),
+    Directory(DirSnapshot),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileHandle {
+pub struct Handle {
     pub ino: u64,
     pub flags: u32,
-    pub kind: FileHandleKind,
+    pub kind: HandleKind,
 }
 
-impl FileHandle {
+impl Handle {
     #[inline]
     pub fn is_regular(&self) -> bool {
-        matches!(self.kind, FileHandleKind::Regular)
+        matches!(self.kind, HandleKind::Regular)
     }
 
     #[inline]
     pub fn is_virtual(&self) -> bool {
-        matches!(self.kind, FileHandleKind::Virtual(_))
+        matches!(self.kind, HandleKind::Virtual(_))
+    }
+
+    #[inline]
+    pub fn is_dir(&self) -> bool {
+        matches!(self.kind, HandleKind::Directory(_))
     }
 }
 
-pub type DirSnapshot = Arc<Vec<(String, u64)>>;
-pub type FileHandleMap = HashMap<u64, FileHandle>;
-pub type DirectoryHandleMap = HashMap<u64, DirSnapshot>;
+pub type HandleMap = HashMap<u64, Handle>;
+
+// Backward compatibility type aliases
+pub type FileHandle = Handle;
+pub type FileHandleKind = HandleKind;
+pub type FileHandleMap = HandleMap;
+pub type DirectoryHandleMap = HandleMap;
 
 /// An immutable frozen batch of mutations being written to the log, holding its
 /// corresponding write arena chunk buffers.
@@ -89,14 +101,24 @@ pub struct FsInner {
     pub live: HashMap<u64, EntryDelta>,
     /// Active write arena staging extent payload allocations for `live`.
     pub live_arena: WriteArena,
-    /// Active open file handles (both regular and virtual) keyed by allocated file handle ID (`fh`).
-    pub file_handles: FileHandleMap,
-    /// Active open directory handle snapshots keyed by allocated file handle ID (`fh`).
-    pub dir_handles: DirectoryHandleMap,
+    /// Active open handles (regular files, virtual files, and directories) keyed by allocated handle ID (`fh`).
+    pub handles: HandleMap,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
     pub open_counts: HashMap<u64, u32>,
     /// Timestamp of the latest recovered operation / summary snapshot (if recovered).
     pub recovered_time: Option<SystemTime>,
+}
+
+impl FsInner {
+    #[inline]
+    pub fn file_handles_count(&self) -> usize {
+        self.handles.values().filter(|h| !h.is_dir()).count()
+    }
+
+    #[inline]
+    pub fn dir_handles_count(&self) -> usize {
+        self.handles.values().filter(|h| h.is_dir()).count()
+    }
 }
 
 pub struct InMemoryFS {
@@ -218,8 +240,7 @@ impl InMemoryFS {
             next_batch_id: 1,
             live: HashMap::new(),
             live_arena: WriteArena::new(),
-            file_handles: HashMap::new(),
-            dir_handles: HashMap::new(),
+            handles: HashMap::new(),
             open_counts: HashMap::new(),
             recovered_time: None,
         };

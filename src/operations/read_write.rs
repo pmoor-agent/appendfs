@@ -104,7 +104,7 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
 pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
     log::trace!("open(ino={}, flags=0x{:x})", ino, flags);
     match open_core(fs, ino, flags) {
-        Ok(fh) => req.reply_open(fh),
+        Ok(fh) => req.reply_open(fh, fs.is_virtual_ino(ino)),
         Err(e) => req.reply_err(e),
     }
 }

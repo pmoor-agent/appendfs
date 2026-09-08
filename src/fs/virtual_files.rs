@@ -10,10 +10,6 @@ use std::time::SystemTime;
 /// from on-disk persisted inodes.
 pub const VIRTUAL_INO_BASE: u64 = 0xFFFF_FFFF_0000_0001;
 
-/// High bit flag for virtual file handles.
-/// Bit 63 is set so virtual handles are completely isolated from regular file handles.
-pub const VIRTUAL_FH_FLAG: u64 = 1 << 63;
-
 /// Dynamic content generator for a virtual file.
 pub type VirtualFileGenerator = Arc<dyn Fn(&InMemoryFS) -> String + Send + Sync>;
 
@@ -157,11 +153,11 @@ mod tests {
 
         // 1. Open first handle: freezes counter = 0
         let fh1 = fs.open_file_handle(v_ino, 0);
-        assert_ne!(fh1 & VIRTUAL_FH_FLAG, 0, "fh1 must have high bit flag set");
+        assert!(fh1 > 0);
 
         // 2. Open second handle: freezes counter = 1
         let fh2 = fs.open_file_handle(v_ino, 0);
-        assert_ne!(fh2 & VIRTUAL_FH_FLAG, 0, "fh2 must have high bit flag set");
+        assert!(fh2 > 0);
         assert_ne!(fh1, fh2, "Handles must be distinct");
 
         // 3. Reading fh1 and fh2 via read_core yields their frozen snapshots

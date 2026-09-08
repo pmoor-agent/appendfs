@@ -422,8 +422,8 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     let (file_handles_count, dir_handles_count, open_inodes_count) = {
         let inner = fs.inner.lock().unwrap();
         (
-            inner.file_handles.len(),
-            inner.dir_handles.len(),
+            inner.file_handles_count(),
+            inner.dir_handles_count(),
             inner.open_counts.len(),
         )
     };
@@ -536,7 +536,7 @@ mod tests {
         // Verify reading .status virtual file via handle
         let v_ino = fs.lookup_child(1, ".status").expect(".status must exist");
         let fh = fs.open_file_handle(v_ino, 0);
-        assert_ne!(fh & crate::fs::VIRTUAL_FH_FLAG, 0);
+        assert!(fh > 0);
         let content = fs.read_handle(v_ino, fh, 0, 1024).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert!(s.contains("=== appendfs Runtime Status ==="));

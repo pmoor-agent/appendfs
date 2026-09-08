@@ -371,7 +371,7 @@ pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     // 1. Verify file handle under brief inner lock
     let valid = {
         let inner = fs.inner.lock().unwrap();
-        matches!(inner.file_handles.get(&fh), Some(h) if h.ino == ino && h.is_regular())
+        matches!(inner.handles.get(&fh), Some(h) if h.ino == ino && h.is_regular())
     };
     if !valid {
         req.reply_err(libc::EBADF);
@@ -506,7 +506,7 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
 
     let (start, end) = {
         let inner = fs.inner.lock().unwrap();
-        match inner.file_handles.get(&fh) {
+        match inner.handles.get(&fh) {
             Some(h) if h.ino == ino && h.is_regular() => {}
             _ => {
                 req.reply_err(libc::EBADF);
@@ -627,7 +627,7 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
 pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32) -> Result<(), i32> {
     let valid = {
         let inner = fs.inner.lock().unwrap();
-        matches!(inner.file_handles.get(&fh), Some(h) if h.ino == ino && h.is_regular())
+        matches!(inner.handles.get(&fh), Some(h) if h.ino == ino && h.is_regular())
     };
     if !valid {
         return Err(libc::EBADF);
@@ -762,7 +762,7 @@ fn coalesce_ranges(ranges: &mut Vec<RangeLock>) {
 pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<ShimFlock, i32> {
     let (start, end) = {
         let inner = fs.inner.lock().unwrap();
-        match inner.file_handles.get(&fh) {
+        match inner.handles.get(&fh) {
             Some(h) if h.ino == ino && h.is_regular() => {}
             _ => return Err(libc::EBADF),
         }
@@ -814,7 +814,7 @@ pub fn setlk_core(
 ) -> Result<(), i32> {
     let (start, end) = {
         let inner = fs.inner.lock().unwrap();
-        match inner.file_handles.get(&fh) {
+        match inner.handles.get(&fh) {
             Some(h) if h.ino == ino && h.is_regular() => {}
             _ => return Err(libc::EBADF),
         }

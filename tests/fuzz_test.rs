@@ -1103,11 +1103,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
 
         {
             let inner = fs_baseline.fs.inner.lock().unwrap();
-            assert!(inner.dir_handles.is_empty(), "seed {seed}: dir handle leak in baseline");
-            assert!(
-                inner.file_handles.is_empty(),
-                "seed {seed}: file handle leak in baseline"
-            );
+            assert!(inner.handles.is_empty(), "seed {seed}: handle leak in baseline");
             assert!(
                 inner.open_counts.is_empty(),
                 "seed {seed}: open_counts leak in baseline"
@@ -1115,14 +1111,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
         }
         {
             let inner = fs_micro.fs.inner.lock().unwrap();
-            assert!(inner.dir_handles.is_empty(), "seed {seed}: dir handle leak in micro");
-            assert!(inner.file_handles.is_empty(), "seed {seed}: file handle leak in micro");
+            assert!(inner.handles.is_empty(), "seed {seed}: handle leak in micro");
             assert!(inner.open_counts.is_empty(), "seed {seed}: open_counts leak in micro");
         }
         {
             let inner = fs_remote.fs.inner.lock().unwrap();
-            assert!(inner.dir_handles.is_empty(), "seed {seed}: dir handle leak in remote");
-            assert!(inner.file_handles.is_empty(), "seed {seed}: file handle leak in remote");
+            assert!(inner.handles.is_empty(), "seed {seed}: handle leak in remote");
             assert!(inner.open_counts.is_empty(), "seed {seed}: open_counts leak in remote");
         }
 

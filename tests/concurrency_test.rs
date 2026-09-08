@@ -753,8 +753,7 @@ fn run_concurrent_stress(seed: u64) {
 
     {
         let inner = fs.inner.lock().unwrap();
-        assert!(inner.dir_handles.is_empty(), "seed {}: leaked dir handles", seed);
-        assert!(inner.file_handles.is_empty(), "seed {}: leaked file handles", seed);
+        assert!(inner.handles.is_empty(), "seed {}: leaked handles", seed);
         assert!(inner.open_counts.is_empty(), "seed {}: leaked open_counts", seed);
     }
     assert_eq!(fs.locks.flock_count(), 0, "seed {}: leaked flock entries", seed);

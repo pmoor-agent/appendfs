@@ -5,42 +5,47 @@
 //! Directory handles hold an immutable snapshot of the listing taken at `opendir`, so a
 //! paginated `readdir` is isolated from concurrent mutations.
 
-use super::{FileHandle, FileHandleKind, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
+use super::{DirSnapshot, Handle, HandleKind, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 impl InMemoryFS {
-    // --- POSIX File Handle Tracking ---
+    // --- POSIX File & Directory Handle Tracking ---
 
     pub fn open_file_handle(&self, ino: u64, flags: u32) -> u64 {
         let is_virtual = self.virtual_files.is_virtual_ino(ino);
-        let (fh, kind) = if is_virtual {
+        let kind = if is_virtual {
             let content = self.virtual_files.generate_content(ino, self).unwrap_or_default();
-            let fh = (self.allocate_fh() & !super::VIRTUAL_FH_FLAG) | super::VIRTUAL_FH_FLAG;
-            (fh, FileHandleKind::Virtual(Arc::new(content.into_bytes())))
+            HandleKind::Virtual(Arc::new(content.into_bytes()))
         } else {
-            (self.allocate_fh(), FileHandleKind::Regular)
+            HandleKind::Regular
         };
 
+        let fh = self.allocate_fh();
         let mut inner = self.inner.lock().unwrap();
-        inner.file_handles.insert(fh, FileHandle { ino, flags, kind });
+        inner.handles.insert(fh, Handle { ino, flags, kind });
         if !is_virtual {
             *inner.open_counts.entry(ino).or_insert(0) += 1;
         }
         fh
     }
 
-    pub fn get_file_handle(&self, fh: u64) -> Option<FileHandle> {
-        self.inner.lock().unwrap().file_handles.get(&fh).cloned()
+    pub fn get_handle(&self, fh: u64) -> Option<Handle> {
+        self.inner.lock().unwrap().handles.get(&fh).cloned()
+    }
+
+    pub fn get_file_handle(&self, fh: u64) -> Option<Handle> {
+        let h = self.inner.lock().unwrap().handles.get(&fh).cloned()?;
+        if h.is_dir() { None } else { Some(h) }
     }
 
     pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
-        let handle = self.get_file_handle(fh).ok_or(libc::EBADF)?;
+        let handle = self.get_handle(fh).ok_or(libc::EBADF)?;
         if handle.ino != ino {
             return Err(libc::EBADF);
         }
         match handle.kind {
-            FileHandleKind::Virtual(buf) => {
+            HandleKind::Virtual(buf) => {
                 let start = (offset as usize).min(buf.len());
                 let end = (start + size).min(buf.len());
                 let slice_len = end - start;
@@ -61,7 +66,8 @@ impl InMemoryFS {
                     },
                 })
             }
-            FileHandleKind::Regular => self.plan_read_file_data(ino, offset, size),
+            HandleKind::Regular => self.plan_read_file_data(ino, offset, size),
+            HandleKind::Directory(_) => Err(libc::EISDIR),
         }
     }
 
@@ -73,8 +79,8 @@ impl InMemoryFS {
     pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
         let is_last_handle = {
             let mut inner = self.inner.lock().unwrap();
-            let handle = match inner.file_handles.get(&fh) {
-                Some(h) if h.ino == ino => inner.file_handles.remove(&fh).unwrap(),
+            let handle = match inner.handles.get(&fh) {
+                Some(h) if h.ino == ino && !h.is_dir() => inner.handles.remove(&fh).unwrap(),
                 _ => return Err(libc::EBADF),
             };
 
@@ -135,19 +141,38 @@ impl InMemoryFS {
         self.next_fh.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub fn open_dir_handle(&self, entries: Vec<(String, u64)>) -> u64 {
+    pub fn open_dir_handle(&self, ino: u64, flags: u32, entries: Vec<(String, u64)>) -> u64 {
         let fh = self.allocate_fh();
-        self.inner.lock().unwrap().dir_handles.insert(fh, Arc::new(entries));
+        self.inner.lock().unwrap().handles.insert(
+            fh,
+            Handle {
+                ino,
+                flags,
+                kind: HandleKind::Directory(Arc::new(entries)),
+            },
+        );
         fh
     }
 
-    pub fn get_dir_handle(&self, fh: u64) -> Option<Arc<Vec<(String, u64)>>> {
-        self.inner.lock().unwrap().dir_handles.get(&fh).cloned()
+    pub fn get_dir_handle(&self, fh: u64) -> Option<DirSnapshot> {
+        match self.inner.lock().unwrap().handles.get(&fh) {
+            Some(h) => match &h.kind {
+                HandleKind::Directory(entries) => Some(Arc::clone(entries)),
+                _ => None,
+            },
+            None => None,
+        }
     }
 
     pub fn release_dir_handle(&self, fh: u64) -> Result<(), i32> {
-        self.inner.lock().unwrap().dir_handles.remove(&fh).ok_or(libc::EBADF)?;
-        Ok(())
+        let mut inner = self.inner.lock().unwrap();
+        match inner.handles.get(&fh) {
+            Some(h) if h.is_dir() => {
+                inner.handles.remove(&fh);
+                Ok(())
+            }
+            _ => Err(libc::EBADF),
+        }
     }
 }
 
@@ -254,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unified_file_handle_map_regular_and_virtual() {
+    fn test_unified_handle_map_regular_virtual_and_directory() {
         let fs = InMemoryFS::new();
         let attr = crate::operations::read_write::create_core(&fs, 1, "data.bin", 0o644, 0, 1000, 1000).unwrap();
         let reg_ino = attr.ino;
@@ -262,17 +287,26 @@ mod tests {
 
         let fh_reg = fs.open_file_handle(reg_ino, libc::O_RDWR as u32);
         let fh_virt = fs.open_file_handle(v_ino, libc::O_RDONLY as u32);
+        let fh_dir = crate::operations::dir::opendir_core(&fs, 1, 0).expect("opendir must succeed");
 
         assert_ne!(fh_reg, fh_virt);
-        assert_eq!(fh_reg & crate::fs::VIRTUAL_FH_FLAG, 0);
-        assert_ne!(fh_virt & crate::fs::VIRTUAL_FH_FLAG, 0);
+        assert_ne!(fh_reg, fh_dir);
+        assert_ne!(fh_virt, fh_dir);
 
-        // Both handles exist in the unified map
+        // All handles use regular sequential IDs
+        assert!(fh_reg > 0);
+        assert!(fh_virt > 0);
+        assert!(fh_dir > 0);
+
+        // All 3 handles exist in the unified map
         {
             let inner = fs.inner.lock().unwrap();
-            assert_eq!(inner.file_handles.len(), 2);
-            assert!(inner.file_handles.contains_key(&fh_reg));
-            assert!(inner.file_handles.contains_key(&fh_virt));
+            assert_eq!(inner.handles.len(), 3);
+            assert_eq!(inner.file_handles_count(), 2);
+            assert_eq!(inner.dir_handles_count(), 1);
+            assert!(inner.handles.contains_key(&fh_reg));
+            assert!(inner.handles.contains_key(&fh_virt));
+            assert!(inner.handles.contains_key(&fh_dir));
         }
 
         // Check get_file_handle properties
@@ -280,11 +314,32 @@ mod tests {
         assert_eq!(h_reg.ino, reg_ino);
         assert!(h_reg.is_regular());
         assert!(!h_reg.is_virtual());
+        assert!(!h_reg.is_dir());
 
         let h_virt = fs.get_file_handle(fh_virt).expect("Virtual handle must exist");
         assert_eq!(h_virt.ino, v_ino);
         assert!(!h_virt.is_regular());
         assert!(h_virt.is_virtual());
+        assert!(!h_virt.is_dir());
+
+        // Directory handle is not returned by get_file_handle
+        assert!(fs.get_file_handle(fh_dir).is_none());
+
+        // Directory handle is returned by get_dir_handle
+        let dir_snap = fs.get_dir_handle(fh_dir).expect("Directory snapshot must exist");
+        assert!(!dir_snap.is_empty());
+        assert!(fs.get_dir_handle(fh_reg).is_none());
+        assert!(fs.get_dir_handle(fh_virt).is_none());
+
+        // Reading directory handle via plan_read_handle fails with EISDIR
+        assert_eq!(fs.plan_read_handle(1, fh_dir, 0, 100).unwrap_err(), libc::EISDIR);
+
+        // Releasing dir handle via release_file_handle fails with EBADF
+        assert_eq!(fs.release_file_handle(fh_dir, 1), Err(libc::EBADF));
+
+        // Releasing file handle via release_dir_handle fails with EBADF
+        assert_eq!(fs.release_dir_handle(fh_reg), Err(libc::EBADF));
+        assert_eq!(fs.release_dir_handle(fh_virt), Err(libc::EBADF));
 
         // Inode mismatch on release must fail with EBADF for both
         assert_eq!(fs.release_file_handle(fh_virt, reg_ino), Err(libc::EBADF));
@@ -295,6 +350,11 @@ mod tests {
         assert!(fs.get_file_handle(fh_virt).is_none());
         assert_eq!(fs.release_file_handle(fh_virt, v_ino), Err(libc::EBADF));
 
+        // Release directory handle
+        assert_eq!(fs.release_dir_handle(fh_dir), Ok(()));
+        assert!(fs.get_dir_handle(fh_dir).is_none());
+        assert_eq!(fs.release_dir_handle(fh_dir), Err(libc::EBADF));
+
         // Regular handle is still present and functional
         assert!(fs.get_file_handle(fh_reg).is_some());
         assert_eq!(fs.release_file_handle(fh_reg, reg_ino), Ok(()));
@@ -303,7 +363,7 @@ mod tests {
         // Unified map is now empty
         {
             let inner = fs.inner.lock().unwrap();
-            assert!(inner.file_handles.is_empty());
+            assert!(inner.handles.is_empty());
         }
     }
 }
