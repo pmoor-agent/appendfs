@@ -5,9 +5,7 @@
 //! Directory handles hold an immutable snapshot of the listing taken at `opendir`, so a
 //! paginated `readdir` is isolated from concurrent mutations.
 
-use super::{
-    DirHandle, DirSnapshot, Handle, HandleKind, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource, VirtualHandle,
-};
+use super::{DirHandle, Handle, HandleKind, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -32,78 +30,41 @@ impl InMemoryFS {
         fh
     }
 
-    pub fn get_handle(&self, fh: u64) -> Option<Handle> {
-        self.inner.lock().unwrap().handles.get(&fh).cloned()
-    }
-
-    pub fn get_file_handle(&self, fh: u64) -> Option<Handle> {
-        let h = self.inner.lock().unwrap().handles.get(&fh).cloned()?;
-        if h.is_dir() { None } else { Some(h) }
-    }
-
-    /// Validates and extracts a directory handle for the given inode and handle ID.
-    ///
-    /// Returns:
-    /// - `Err(libc::EBADF)` if the handle does not exist or was opened for a different inode.
-    /// - `Err(libc::ENOTDIR)` if the handle refers to a regular or virtual file.
-    pub fn extract_dir_handle(&self, ino: u64, fh: u64) -> Result<DirHandle, i32> {
-        let handle = self.get_handle(fh).ok_or(libc::EBADF)?;
-        if handle.ino != ino {
-            return Err(libc::EBADF);
-        }
-        match handle.kind {
-            HandleKind::Directory(entries) => Ok(DirHandle {
-                ino: handle.ino,
-                flags: handle.flags,
-                entries,
-            }),
-            _ => Err(libc::ENOTDIR),
-        }
-    }
-
     /// Validates and extracts an open file handle (either regular or virtual) for the given inode and handle ID.
     ///
     /// Returns:
     /// - `Err(libc::EBADF)` if the handle does not exist or was opened for a different inode.
     /// - `Err(libc::EISDIR)` if the handle refers to a directory.
     pub fn extract_file_handle(&self, ino: u64, fh: u64) -> Result<Handle, i32> {
-        let handle = self.get_handle(fh).ok_or(libc::EBADF)?;
+        let inner = self.inner.lock().unwrap();
+        let handle = inner.handles.get(&fh).ok_or(libc::EBADF)?;
         if handle.ino != ino {
             return Err(libc::EBADF);
         }
         if handle.is_dir() {
             return Err(libc::EISDIR);
         }
-        Ok(handle)
+        Ok(handle.clone())
     }
 
-    /// Validates and extracts an open regular file handle for the given inode and handle ID.
+    /// Validates and extracts a directory handle for the given inode and handle ID.
     ///
     /// Returns:
-    /// - `Err(libc::EBADF)` if the handle does not exist, was opened for a different inode, or is a virtual file.
-    /// - `Err(libc::EISDIR)` if the handle refers to a directory.
-    pub fn extract_regular_handle(&self, ino: u64, fh: u64) -> Result<Handle, i32> {
-        let handle = self.extract_file_handle(ino, fh)?;
-        if !handle.is_regular() {
+    /// - `Err(libc::EBADF)` if the handle does not exist or was opened for a different inode.
+    /// - `Err(libc::ENOTDIR)` if the handle refers to a file.
+    pub fn extract_dir_handle(&self, ino: u64, fh: u64) -> Result<DirHandle, i32> {
+        let inner = self.inner.lock().unwrap();
+        let handle = inner.handles.get(&fh).ok_or(libc::EBADF)?;
+        if handle.ino != ino {
             return Err(libc::EBADF);
         }
-        Ok(handle)
-    }
-
-    /// Validates and extracts an open virtual file handle for the given inode and handle ID.
-    ///
-    /// Returns:
-    /// - `Err(libc::EBADF)` if the handle does not exist, was opened for a different inode, or is a regular file.
-    /// - `Err(libc::EISDIR)` if the handle refers to a directory.
-    pub fn extract_virtual_handle(&self, ino: u64, fh: u64) -> Result<VirtualHandle, i32> {
-        let handle = self.extract_file_handle(ino, fh)?;
-        match handle.kind {
-            HandleKind::Virtual(data) => Ok(VirtualHandle {
+        match &handle.kind {
+            HandleKind::Directory(entries) => Ok(DirHandle {
                 ino: handle.ino,
                 flags: handle.flags,
-                data,
+                entries: Arc::clone(entries),
             }),
-            _ => Err(libc::EBADF),
+            _ => Err(libc::ENOTDIR),
         }
     }
 
@@ -149,26 +110,23 @@ impl InMemoryFS {
                 _ => return Err(libc::EBADF),
             };
 
-            if handle.is_virtual() {
-                return Ok(());
-            }
+            let is_last = !inner.handles.values().any(|h| h.ino == ino);
 
-            if let Some(count) = inner.open_counts.get_mut(&ino) {
-                *count = count.saturating_sub(1);
-            }
-            let is_last = if inner.open_counts.get(&ino) == Some(&0) {
-                inner.open_counts.remove(&ino);
-                true
-            } else {
-                false
-            };
+            if !handle.is_virtual() {
+                if let Some(count) = inner.open_counts.get_mut(&ino) {
+                    *count = count.saturating_sub(1);
+                }
+                if inner.open_counts.get(&ino) == Some(&0) {
+                    inner.open_counts.remove(&ino);
+                }
 
-            let remaining = inner.open_counts.get(&ino).copied().unwrap_or(0);
-            if remaining == 0
-                && let Some(attr) = inner.get_attr(ino)
-                && attr.nlink == 0
-            {
-                inner.tombstone(ino);
+                let remaining = inner.open_counts.get(&ino).copied().unwrap_or(0);
+                if remaining == 0
+                    && let Some(attr) = inner.get_attr(ino)
+                    && attr.nlink == 0
+                {
+                    inner.tombstone(ino);
+                }
             }
 
             is_last
@@ -219,16 +177,6 @@ impl InMemoryFS {
         fh
     }
 
-    pub fn get_dir_handle(&self, fh: u64) -> Option<DirSnapshot> {
-        match self.inner.lock().unwrap().handles.get(&fh) {
-            Some(h) => match &h.kind {
-                HandleKind::Directory(entries) => Some(Arc::clone(entries)),
-                _ => None,
-            },
-            None => None,
-        }
-    }
-
     pub fn release_dir_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
         let mut inner = self.inner.lock().unwrap();
         match inner.handles.get(&fh) {
@@ -258,7 +206,10 @@ mod tests {
         let fh1 = crate::operations::dir::opendir_core(&fs, 1, 0).expect("opendir_core must succeed on directory");
         assert!(fh1 > 0);
 
-        let snap1 = fs.get_dir_handle(fh1).expect("Handle snapshot must exist");
+        let snap1 = fs
+            .extract_dir_handle(1, fh1)
+            .expect("Handle snapshot must exist")
+            .entries;
         assert_eq!(snap1.len(), 3);
         assert_eq!(snap1[0].0, ".status");
         assert_eq!(snap1[1].0, "alpha.txt");
@@ -269,7 +220,10 @@ mod tests {
         fs.remove_dir_entry(1, "alpha.txt", now);
 
         // 4. fh1 MUST retain its original snapshot (.status, alpha, bravo)
-        let snap1_recheck = fs.get_dir_handle(fh1).expect("Handle snapshot must still exist");
+        let snap1_recheck = fs
+            .extract_dir_handle(1, fh1)
+            .expect("Handle snapshot must still exist")
+            .entries;
         assert_eq!(snap1_recheck.len(), 3);
         assert_eq!(snap1_recheck[0].0, ".status");
         assert_eq!(snap1_recheck[1].0, "alpha.txt");
@@ -278,7 +232,10 @@ mod tests {
         // 5. A new directory handle on root gets the new snapshot (.status, bravo, charlie)
         let fh2 = crate::operations::dir::opendir_core(&fs, 1, 0).expect("opendir_core must succeed on directory");
         assert_ne!(fh1, fh2);
-        let snap2 = fs.get_dir_handle(fh2).expect("Second handle snapshot must exist");
+        let snap2 = fs
+            .extract_dir_handle(1, fh2)
+            .expect("Second handle snapshot must exist")
+            .entries;
         assert_eq!(snap2.len(), 3);
         assert_eq!(snap2[0].0, ".status");
         assert_eq!(snap2[1].0, "bravo.txt");
@@ -287,13 +244,13 @@ mod tests {
         // 6. Release fh1
         assert_eq!(fs.release_dir_handle(fh1, 999), Err(libc::EBADF));
         assert_eq!(fs.release_dir_handle(fh1, 1), Ok(()));
-        assert!(fs.get_dir_handle(fh1).is_none());
-        assert!(fs.get_dir_handle(fh2).is_some());
+        assert_eq!(fs.extract_dir_handle(1, fh1), Err(libc::EBADF));
+        assert!(fs.extract_dir_handle(1, fh2).is_ok());
         assert_eq!(fs.release_dir_handle(fh1, 1), Err(libc::EBADF));
 
         // 7. Release fh2
         assert_eq!(fs.release_dir_handle(fh2, 1), Ok(()));
-        assert!(fs.get_dir_handle(fh2).is_none());
+        assert_eq!(fs.extract_dir_handle(1, fh2), Err(libc::EBADF));
 
         // 8. opendir_core on a non-directory returns ENOTDIR
         let alpha_ino = snap1[0].1;
@@ -316,8 +273,8 @@ mod tests {
         let fh2 = fs.open_file_handle(ino, libc::O_WRONLY as u32);
         assert_ne!(fh1, fh2);
         assert_eq!(fs.open_count(ino), 2);
-        assert_eq!(fs.get_file_handle(fh1).unwrap().ino, ino);
-        assert_eq!(fs.get_file_handle(fh2).unwrap().ino, ino);
+        assert_eq!(fs.extract_file_handle(ino, fh1).unwrap().ino, ino);
+        assert_eq!(fs.extract_file_handle(ino, fh2).unwrap().ino, ino);
 
         // 3. Unlink the file while handles are still open
         crate::operations::links::unlink_core(&fs, 1, "test.txt").unwrap();
@@ -328,15 +285,15 @@ mod tests {
 
         // 4. Release first handle
         assert_eq!(fs.release_file_handle(fh1, ino), Ok(()));
-        assert!(fs.get_file_handle(fh1).is_none());
-        assert!(fs.get_file_handle(fh2).is_some());
+        assert_eq!(fs.extract_file_handle(ino, fh1), Err(libc::EBADF));
+        assert!(fs.extract_file_handle(ino, fh2).is_ok());
         assert_eq!(fs.open_count(ino), 1);
         assert!(fs.get_attr(ino).is_some());
         assert_eq!(fs.release_file_handle(fh1, ino), Err(libc::EBADF));
 
         // 5. Release second handle -> count drops to 0, inode gets tombstoned
         assert_eq!(fs.release_file_handle(fh2, ino), Ok(()));
-        assert!(fs.get_file_handle(fh2).is_none());
+        assert_eq!(fs.extract_file_handle(ino, fh2), Err(libc::EBADF));
         assert_eq!(fs.open_count(ino), 0);
         assert!(
             fs.get_attr(ino).is_none(),
@@ -368,34 +325,35 @@ mod tests {
         {
             let inner = fs.inner.lock().unwrap();
             assert_eq!(inner.handles.len(), 3);
-            assert_eq!(inner.file_handles_count(), 2);
-            assert_eq!(inner.dir_handles_count(), 1);
+            assert_eq!(inner.handle_counts(), (1, 1, 1));
             assert!(inner.handles.contains_key(&fh_reg));
             assert!(inner.handles.contains_key(&fh_virt));
             assert!(inner.handles.contains_key(&fh_dir));
         }
 
-        // Check get_file_handle properties
-        let h_reg = fs.get_file_handle(fh_reg).expect("Regular handle must exist");
+        // --- extract_file_handle validation ---
+        let h_reg = fs
+            .extract_file_handle(reg_ino, fh_reg)
+            .expect("Regular handle must exist");
         assert_eq!(h_reg.ino, reg_ino);
         assert!(h_reg.is_regular());
         assert!(!h_reg.is_virtual());
         assert!(!h_reg.is_dir());
 
-        let h_virt = fs.get_file_handle(fh_virt).expect("Virtual handle must exist");
+        let h_virt = fs
+            .extract_file_handle(v_ino, fh_virt)
+            .expect("Virtual handle must exist");
         assert_eq!(h_virt.ino, v_ino);
         assert!(!h_virt.is_regular());
         assert!(h_virt.is_virtual());
         assert!(!h_virt.is_dir());
 
-        // Directory handle is not returned by get_file_handle
-        assert!(fs.get_file_handle(fh_dir).is_none());
-
-        // Directory handle is returned by get_dir_handle
-        let dir_snap = fs.get_dir_handle(fh_dir).expect("Directory snapshot must exist");
-        assert!(!dir_snap.is_empty());
-        assert!(fs.get_dir_handle(fh_reg).is_none());
-        assert!(fs.get_dir_handle(fh_virt).is_none());
+        // Directory handle fails extract_file_handle with EISDIR
+        assert_eq!(fs.extract_file_handle(1, fh_dir).unwrap_err(), libc::EISDIR);
+        // Inode mismatch fails with EBADF
+        assert_eq!(fs.extract_file_handle(999, fh_reg).unwrap_err(), libc::EBADF);
+        // Unknown handle ID fails with EBADF
+        assert_eq!(fs.extract_file_handle(reg_ino, 99999).unwrap_err(), libc::EBADF);
 
         // --- extract_dir_handle validation ---
         let dir_h = fs
@@ -404,43 +362,25 @@ mod tests {
         assert_eq!(dir_h.ino, 1);
         assert!(!dir_h.entries.is_empty());
         assert_eq!(fs.extract_dir_handle(999, fh_dir).unwrap_err(), libc::EBADF);
+        // File handles fail extract_dir_handle with ENOTDIR
         assert_eq!(fs.extract_dir_handle(reg_ino, fh_reg).unwrap_err(), libc::ENOTDIR);
         assert_eq!(fs.extract_dir_handle(v_ino, fh_virt).unwrap_err(), libc::ENOTDIR);
         assert_eq!(fs.extract_dir_handle(1, 99999).unwrap_err(), libc::EBADF);
 
-        // --- extract_file_handle validation ---
-        let file_h_reg = fs
-            .extract_file_handle(reg_ino, fh_reg)
-            .expect("extract_file_handle must succeed on regular");
-        assert!(file_h_reg.is_regular());
-        let file_h_virt = fs
-            .extract_file_handle(v_ino, fh_virt)
-            .expect("extract_file_handle must succeed on virtual");
-        assert!(file_h_virt.is_virtual());
-        assert_eq!(fs.extract_file_handle(1, fh_dir).unwrap_err(), libc::EISDIR);
-        assert_eq!(fs.extract_file_handle(999, fh_reg).unwrap_err(), libc::EBADF);
-        assert_eq!(fs.extract_file_handle(reg_ino, 99999).unwrap_err(), libc::EBADF);
-
-        // --- extract_regular_handle validation ---
-        let reg_h = fs
-            .extract_regular_handle(reg_ino, fh_reg)
-            .expect("extract_regular_handle must succeed");
-        assert_eq!(reg_h.ino, reg_ino);
-        assert_eq!(fs.extract_regular_handle(v_ino, fh_virt).unwrap_err(), libc::EBADF);
-        assert_eq!(fs.extract_regular_handle(1, fh_dir).unwrap_err(), libc::EISDIR);
-        assert_eq!(fs.extract_regular_handle(999, fh_reg).unwrap_err(), libc::EBADF);
-        assert_eq!(fs.extract_regular_handle(reg_ino, 99999).unwrap_err(), libc::EBADF);
-
-        // --- extract_virtual_handle validation ---
-        let virt_h = fs
-            .extract_virtual_handle(v_ino, fh_virt)
-            .expect("extract_virtual_handle must succeed");
-        assert_eq!(virt_h.ino, v_ino);
-        assert!(!virt_h.data.is_empty());
-        assert_eq!(fs.extract_virtual_handle(reg_ino, fh_reg).unwrap_err(), libc::EBADF);
-        assert_eq!(fs.extract_virtual_handle(1, fh_dir).unwrap_err(), libc::EISDIR);
-        assert_eq!(fs.extract_virtual_handle(999, fh_virt).unwrap_err(), libc::EBADF);
-        assert_eq!(fs.extract_virtual_handle(v_ino, 99999).unwrap_err(), libc::EBADF);
+        // --- flock on virtual file handles is supported ---
+        assert_eq!(
+            crate::operations::locks::flock_core(&fs, v_ino, fh_virt, 1001, libc::LOCK_SH),
+            Ok(())
+        );
+        assert_eq!(
+            crate::operations::locks::flock_core(&fs, v_ino, fh_virt, 1001, libc::LOCK_UN),
+            Ok(())
+        );
+        // Locking a directory handle fails with EISDIR
+        assert_eq!(
+            crate::operations::locks::flock_core(&fs, 1, fh_dir, 1001, libc::LOCK_SH),
+            Err(libc::EISDIR)
+        );
 
         // Reading directory handle via plan_read_handle fails with EISDIR
         assert_eq!(fs.plan_read_handle(1, fh_dir, 0, 100).unwrap_err(), libc::EISDIR);
@@ -459,18 +399,18 @@ mod tests {
 
         // Releasing virtual handle with correct inode succeeds
         assert_eq!(fs.release_file_handle(fh_virt, v_ino), Ok(()));
-        assert!(fs.get_file_handle(fh_virt).is_none());
+        assert_eq!(fs.extract_file_handle(v_ino, fh_virt), Err(libc::EBADF));
         assert_eq!(fs.release_file_handle(fh_virt, v_ino), Err(libc::EBADF));
 
         // Release directory handle
         assert_eq!(fs.release_dir_handle(fh_dir, 1), Ok(()));
-        assert!(fs.get_dir_handle(fh_dir).is_none());
+        assert_eq!(fs.extract_dir_handle(1, fh_dir), Err(libc::EBADF));
         assert_eq!(fs.release_dir_handle(fh_dir, 1), Err(libc::EBADF));
 
         // Regular handle is still present and functional
-        assert!(fs.get_file_handle(fh_reg).is_some());
+        assert!(fs.extract_file_handle(reg_ino, fh_reg).is_ok());
         assert_eq!(fs.release_file_handle(fh_reg, reg_ino), Ok(()));
-        assert!(fs.get_file_handle(fh_reg).is_none());
+        assert_eq!(fs.extract_file_handle(reg_ino, fh_reg), Err(libc::EBADF));
 
         // Unified map is now empty
         {

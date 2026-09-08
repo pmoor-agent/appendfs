@@ -165,8 +165,15 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
 
 pub fn write(fs: &InMemoryFS, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64) {
     log::trace!("write(ino={}, len={}, offset={}, fh={})", ino, buf.len(), offset, fh);
-    if let Err(e) = fs.extract_regular_handle(ino, fh) {
-        req.reply_err(e);
+    let handle = match fs.extract_file_handle(ino, fh) {
+        Ok(h) => h,
+        Err(e) => {
+            req.reply_err(e);
+            return;
+        }
+    };
+    if !handle.is_regular() {
+        req.reply_err(libc::EBADF);
         return;
     }
     match write_core(fs, ino, buf, offset) {
@@ -545,18 +552,24 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
 
 pub fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
     if fh != 0 {
-        fs.extract_regular_handle(ino, fh)?;
+        let handle = fs.extract_file_handle(ino, fh)?;
+        if !handle.is_regular() {
+            return Err(libc::EBADF);
+        }
     }
     fs.sync_log().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
 }
 
 pub fn fsync(fs: &Arc<InMemoryFS>, req: Request, ino: u64, datasync: bool, fh: u64) {
     log::trace!("fsync(ino={}, datasync={}, fh={})", ino, datasync, fh);
-    if fh != 0
-        && let Err(e) = fs.extract_regular_handle(ino, fh)
-    {
-        req.reply_err(e);
-        return;
+    if fh != 0 {
+        match fs.extract_file_handle(ino, fh) {
+            Ok(h) if h.is_regular() => {}
+            _ => {
+                req.reply_err(libc::EBADF);
+                return;
+            }
+        }
     }
     if fs.log_writer.is_none() {
         req.reply_err(0);

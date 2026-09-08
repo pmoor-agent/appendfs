@@ -55,13 +55,6 @@ pub struct DirHandle {
     pub entries: DirSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VirtualHandle {
-    pub ino: u64,
-    pub flags: u32,
-    pub data: Arc<Vec<u8>>,
-}
-
 impl Handle {
     #[inline]
     pub fn is_regular(&self) -> bool {
@@ -80,12 +73,6 @@ impl Handle {
 }
 
 pub type HandleMap = HashMap<u64, Handle>;
-
-// Backward compatibility type aliases
-pub type FileHandle = Handle;
-pub type FileHandleKind = HandleKind;
-pub type FileHandleMap = HandleMap;
-pub type DirectoryHandleMap = HandleMap;
 
 /// An immutable frozen batch of mutations being written to the log, holding its
 /// corresponding write arena chunk buffers.
@@ -125,13 +112,18 @@ pub struct FsInner {
 
 impl FsInner {
     #[inline]
-    pub fn file_handles_count(&self) -> usize {
-        self.handles.values().filter(|h| !h.is_dir()).count()
-    }
-
-    #[inline]
-    pub fn dir_handles_count(&self) -> usize {
-        self.handles.values().filter(|h| h.is_dir()).count()
+    pub fn handle_counts(&self) -> (usize, usize, usize) {
+        let mut regular = 0;
+        let mut virtual_count = 0;
+        let mut dir = 0;
+        for h in self.handles.values() {
+            match &h.kind {
+                HandleKind::Regular => regular += 1,
+                HandleKind::Virtual(_) => virtual_count += 1,
+                HandleKind::Directory(_) => dir += 1,
+            }
+        }
+        (regular, virtual_count, dir)
     }
 }
 

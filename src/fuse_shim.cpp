@@ -677,7 +677,7 @@ int shim_reply_buf(shim_req_t req, const char *buf, size_t size) {
   return fuse_reply_buf(static_cast<fuse_req_t>(req), buf, size);
 }
 
-int shim_reply_open(shim_req_t req, uint64_t fh, int direct_io) {
+int shim_reply_open(shim_req_t req, uint64_t fh, bool direct_io) {
   struct fuse_file_info fi = {};
   fi.fh = fh;
   if (direct_io) {

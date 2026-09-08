@@ -141,7 +141,7 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
             8 => {
                 // Exercise opendir snapshotting & releasedir concurrently with active mutations
                 if let Ok(fh) = opendir_core(&fs, dir_a, 0) {
-                    let _ = fs.get_dir_handle(fh);
+                    let _ = fs.extract_dir_handle(dir_a, fh);
                     let _ = releasedir_core(&fs, dir_a, fh);
                 }
             }

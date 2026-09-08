@@ -426,11 +426,31 @@ fn test_differential_fuzzing_and_crash_recovery() {
                     assert_eq!(res1.is_ok(), res5.is_ok());
 
                     if let (Ok(fh1), Ok(fh2), Ok(fh3), Ok(fh4), Ok(fh5)) = (res1, res2, res3, res4, res5) {
-                        let snap1 = fs_baseline.fs.get_dir_handle(fh1).expect("baseline dir handle");
-                        let snap2 = fs_micro.fs.get_dir_handle(fh2).expect("micro dir handle");
-                        let snap3 = fs_remount.fs.get_dir_handle(fh3).expect("remount dir handle");
-                        let snap4 = fs_crash.fs.get_dir_handle(fh4).expect("crash dir handle");
-                        let snap5 = fs_remote.fs.get_dir_handle(fh5).expect("remote dir handle");
+                        let snap1 = fs_baseline
+                            .fs
+                            .extract_dir_handle(ino, fh1)
+                            .expect("baseline dir handle")
+                            .entries;
+                        let snap2 = fs_micro
+                            .fs
+                            .extract_dir_handle(ino, fh2)
+                            .expect("micro dir handle")
+                            .entries;
+                        let snap3 = fs_remount
+                            .fs
+                            .extract_dir_handle(ino, fh3)
+                            .expect("remount dir handle")
+                            .entries;
+                        let snap4 = fs_crash
+                            .fs
+                            .extract_dir_handle(ino, fh4)
+                            .expect("crash dir handle")
+                            .entries;
+                        let snap5 = fs_remote
+                            .fs
+                            .extract_dir_handle(ino, fh5)
+                            .expect("remote dir handle")
+                            .entries;
                         let snap5_filtered: Vec<(String, u64)> =
                             snap5.iter().filter(|(name, _)| name != ".remotes").cloned().collect();
 
@@ -460,11 +480,31 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let idx = prng.gen_range(0, open_dir_handles.len() - 1);
                         let h = open_dir_handles.remove(idx);
 
-                        let snap1 = fs_baseline.fs.get_dir_handle(h.fh1).expect("baseline handle");
-                        let snap2 = fs_micro.fs.get_dir_handle(h.fh2).expect("micro handle");
-                        let snap3 = fs_remount.fs.get_dir_handle(h.fh3).expect("remount handle");
-                        let snap4 = fs_crash.fs.get_dir_handle(h.fh4).expect("crash handle");
-                        let snap5 = fs_remote.fs.get_dir_handle(h.fh5).expect("remote handle");
+                        let snap1 = fs_baseline
+                            .fs
+                            .extract_dir_handle(h.ino, h.fh1)
+                            .expect("baseline handle")
+                            .entries;
+                        let snap2 = fs_micro
+                            .fs
+                            .extract_dir_handle(h.ino, h.fh2)
+                            .expect("micro handle")
+                            .entries;
+                        let snap3 = fs_remount
+                            .fs
+                            .extract_dir_handle(h.ino, h.fh3)
+                            .expect("remount handle")
+                            .entries;
+                        let snap4 = fs_crash
+                            .fs
+                            .extract_dir_handle(h.ino, h.fh4)
+                            .expect("crash handle")
+                            .entries;
+                        let snap5 = fs_remote
+                            .fs
+                            .extract_dir_handle(h.ino, h.fh5)
+                            .expect("remote handle")
+                            .entries;
                         let snap5_filtered: Vec<(String, u64)> =
                             snap5.iter().filter(|(name, _)| name != ".remotes").cloned().collect();
 
@@ -679,7 +719,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 // Drain open handles before remounting so all instances start recovery
                 // cleanly without in-flight userspace descriptors
                 for h in open_dir_handles.drain(..) {
-                    let snap1 = fs_baseline.fs.get_dir_handle(h.fh1).expect("baseline handle");
+                    let snap1 = fs_baseline
+                        .fs
+                        .extract_dir_handle(h.ino, h.fh1)
+                        .expect("baseline handle")
+                        .entries;
                     assert_eq!(
                         &*snap1, &h.expected_snapshot,
                         "Snapshot isolation violated before checkpoint"

@@ -130,7 +130,7 @@ int shim_reply_err(shim_req_t req, int err);
 int shim_reply_attr(shim_req_t req, const shim_file_attr *attr, double attr_timeout);
 int shim_reply_entry(shim_req_t req, const shim_file_attr *attr, double attr_timeout, double entry_timeout);
 int shim_reply_buf(shim_req_t req, const char *buf, size_t size);
-int shim_reply_open(shim_req_t req, uint64_t fh, int direct_io);
+int shim_reply_open(shim_req_t req, uint64_t fh, bool direct_io);
 int shim_reply_write(shim_req_t req, size_t count);
 int shim_reply_create(shim_req_t req, const shim_file_attr *attr, double attr_timeout, double entry_timeout,
                       uint64_t fh);
