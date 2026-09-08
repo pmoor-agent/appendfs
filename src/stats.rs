@@ -429,22 +429,18 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push('\n');
 
     // 5. Handles & Locks
-    let (file_handles_count, dir_handles_count, virtual_handles_count, open_inodes_count) = {
+    let (file_handles_count, virt_handles_count, dir_handles_count, open_inodes_count) = {
         let inner = fs.inner.lock().unwrap();
-        (
-            inner.file_handles.len(),
-            inner.dir_handles.len(),
-            inner.virtual_handles.len(),
-            inner.open_counts.len(),
-        )
+        let (reg, virt, dir) = inner.handle_counts();
+        (reg, virt, dir, inner.open_counts.len())
     };
     let flock_count = fs.locks.flock_count();
     let range_lock_count = fs.locks.range_lock_count();
 
     out.push_str("[Handles & Locks]\n");
     out.push_str(&format!("  Open File Handles:  {}\n", file_handles_count));
+    out.push_str(&format!("  Open Virt Handles:  {}\n", virt_handles_count));
     out.push_str(&format!("  Open Dir Handles:   {}\n", dir_handles_count));
-    out.push_str(&format!("  Open Virtual FHs:   {}\n", virtual_handles_count));
     out.push_str(&format!("  Open Inodes:        {}\n", open_inodes_count));
     out.push_str(&format!("  Active File Locks:  {}\n", flock_count));
     out.push_str(&format!("  Active Range Locks: {}\n", range_lock_count));
@@ -541,6 +537,7 @@ mod tests {
 
         assert!(status.contains("[Handles & Locks]"));
         assert!(status.contains("Open File Handles:  0"));
+        assert!(status.contains("Open Virt Handles:  0"));
         assert!(status.contains("Open Dir Handles:   0"));
         assert!(status.contains("Active File Locks:  0"));
         assert!(status.contains("Active Range Locks: 0"));
@@ -548,11 +545,20 @@ mod tests {
         // Verify reading .status virtual file via handle
         let v_ino = fs.lookup_child(1, ".status").expect(".status must exist");
         let fh = fs.open_file_handle(v_ino, 0);
-        assert_ne!(fh & crate::fs::VIRTUAL_FH_FLAG, 0);
-        let content = fs.read_handle(v_ino, fh, 0, 1024).unwrap();
+        assert!(fh > 0);
+        // While open, runtime status query reports 1 open virt handle and 1 open inode
+        let open_status = format_runtime_status(&fs);
+        assert!(open_status.contains("Open Virt Handles:  1"));
+        assert!(open_status.contains("Open Inodes:        1"));
+        // The handle itself holds the snapshot taken at open time (before fh was recorded)
+        let content = fs.read_handle(v_ino, fh, 0, 4096).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert!(s.contains("=== appendfs Runtime Status ==="));
+        assert!(s.contains("Open Virt Handles:  0"));
         fs.release_file_handle(fh, v_ino).unwrap();
+        let closed_status = format_runtime_status(&fs);
+        assert!(closed_status.contains("Open Virt Handles:  0"));
+        assert!(closed_status.contains("Open Inodes:        0"));
     }
 
     #[test]
@@ -615,6 +621,7 @@ mod tests {
         assert!(status.contains("Live Staged Inodes: 5")); // root, f1, f2, sub, link
         assert!(status.contains("Staged Data:        23 B"));
         assert!(status.contains("Open File Handles:  2"));
+        assert!(status.contains("Open Virt Handles:  0"));
         assert!(status.contains("Open Dir Handles:   1"));
         assert!(status.contains("Active File Locks:  1"));
         assert!(status.contains("Active Range Locks: 1"));

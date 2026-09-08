@@ -112,30 +112,30 @@ pub fn iter_dir_entries<'a>(
     dot.into_iter().chain(dotdot).chain(rest)
 }
 
-pub fn opendir_core(fs: &InMemoryFS, ino: u64, _flags: u32) -> Result<u64, i32> {
+pub fn opendir_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
     let entries = list_dir_core(fs, ino)?;
-    Ok(fs.open_dir_handle(entries))
+    Ok(fs.open_dir_handle(ino, flags, entries))
 }
 
 pub fn opendir(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
     log::trace!("opendir(ino={}, flags=0x{:x})", ino, flags);
     match opendir_core(fs, ino, flags) {
-        Ok(fh) => req.reply_open(fh),
+        Ok(fh) => req.reply_open(fh, false),
         Err(e) => req.reply_err(e),
     }
 }
 
 pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
     log::trace!("readdir(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
-    let entries = match fs.get_dir_handle(fh) {
-        Some(entries) => entries,
-        None => {
-            req.reply_err(libc::EBADF);
+    let dir = match fs.extract_dir_handle(ino, fh) {
+        Ok(dir) => dir,
+        Err(e) => {
+            req.reply_err(e);
             return;
         }
     };
 
-    let items: Vec<DirItem> = iter_dir_entries(fs, ino, &entries, offset).collect();
+    let items: Vec<DirItem> = iter_dir_entries(fs, ino, &dir.entries, offset).collect();
     let inos: Vec<u64> = items.iter().map(|item| item.ino).collect();
     let attrs = fs.get_attrs_batch(&inos);
 
@@ -152,15 +152,15 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
 
 pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
     log::trace!("readdirplus(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
-    let entries = match fs.get_dir_handle(fh) {
-        Some(entries) => entries,
-        None => {
-            req.reply_err(libc::EBADF);
+    let dir = match fs.extract_dir_handle(ino, fh) {
+        Ok(dir) => dir,
+        Err(e) => {
+            req.reply_err(e);
             return;
         }
     };
 
-    let items: Vec<DirItem> = iter_dir_entries(fs, ino, &entries, offset).collect();
+    let items: Vec<DirItem> = iter_dir_entries(fs, ino, &dir.entries, offset).collect();
     let inos: Vec<u64> = items.iter().map(|item| item.ino).collect();
     let attrs = fs.get_attrs_batch(&inos);
 
@@ -319,8 +319,8 @@ pub fn rmdir(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
     }
 }
 
-pub fn releasedir_core(fs: &InMemoryFS, _ino: u64, fh: u64) -> Result<(), i32> {
-    fs.release_dir_handle(fh)
+pub fn releasedir_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
+    fs.release_dir_handle(fh, ino)
 }
 
 pub fn releasedir(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {

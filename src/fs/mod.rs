@@ -20,7 +20,7 @@ pub mod virtual_files;
 pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
 pub use arena::WriteArena;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
-pub use virtual_files::{VIRTUAL_FH_FLAG, VIRTUAL_INO_BASE, VirtualFileRegistry};
+pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};
 use crate::log::{BackgroundFlusher, LogFileCache, LogManifest, LogWriter};
@@ -32,15 +32,112 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::SystemTime;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileHandle {
+pub type DirSnapshot = Arc<Vec<(String, u64)>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirHandle {
     pub ino: u64,
     pub flags: u32,
+    pub entries: DirSnapshot,
 }
 
-pub type DirSnapshot = Arc<Vec<(String, u64)>>;
-pub type FileHandleMap = HashMap<u64, FileHandle>;
-pub type DirectoryHandleMap = HashMap<u64, DirSnapshot>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileHandle {
+    Regular { ino: u64, flags: u32 },
+    Virtual { ino: u64, flags: u32, data: Arc<Vec<u8>> },
+}
+
+impl FileHandle {
+    #[inline]
+    pub fn ino(&self) -> u64 {
+        match self {
+            FileHandle::Regular { ino, .. } | FileHandle::Virtual { ino, .. } => *ino,
+        }
+    }
+
+    #[inline]
+    pub fn flags(&self) -> u32 {
+        match self {
+            FileHandle::Regular { flags, .. } | FileHandle::Virtual { flags, .. } => *flags,
+        }
+    }
+
+    #[inline]
+    pub fn is_regular(&self) -> bool {
+        matches!(self, FileHandle::Regular { .. })
+    }
+
+    #[inline]
+    pub fn is_virtual(&self) -> bool {
+        matches!(self, FileHandle::Virtual { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handle {
+    File(FileHandle),
+    Directory(DirHandle),
+}
+
+impl Handle {
+    #[inline]
+    pub fn ino(&self) -> u64 {
+        match self {
+            Handle::File(f) => f.ino(),
+            Handle::Directory(d) => d.ino,
+        }
+    }
+
+    #[inline]
+    pub fn flags(&self) -> u32 {
+        match self {
+            Handle::File(f) => f.flags(),
+            Handle::Directory(d) => d.flags,
+        }
+    }
+
+    #[inline]
+    pub fn is_file(&self) -> bool {
+        matches!(self, Handle::File(_))
+    }
+
+    #[inline]
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Handle::Directory(_))
+    }
+
+    #[inline]
+    pub fn as_file(&self) -> Option<&FileHandle> {
+        match self {
+            Handle::File(f) => Some(f),
+            Handle::Directory(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_dir(&self) -> Option<&DirHandle> {
+        match self {
+            Handle::Directory(d) => Some(d),
+            Handle::File(_) => None,
+        }
+    }
+}
+
+impl From<FileHandle> for Handle {
+    #[inline]
+    fn from(f: FileHandle) -> Self {
+        Handle::File(f)
+    }
+}
+
+impl From<DirHandle> for Handle {
+    #[inline]
+    fn from(d: DirHandle) -> Self {
+        Handle::Directory(d)
+    }
+}
+
+pub type HandleMap = HashMap<u64, Handle>;
 
 /// An immutable frozen batch of mutations being written to the log, holding its
 /// corresponding write arena chunk buffers and batch statistics.
@@ -78,14 +175,10 @@ pub struct FsInner {
     pub live: HashMap<u64, EntryDelta>,
     /// Active write arena staging extent payload allocations for `live`.
     pub live_arena: WriteArena,
-    /// Active open file handles keyed by allocated file handle ID (`fh`).
-    pub file_handles: FileHandleMap,
-    /// Active open directory handle snapshots keyed by allocated file handle ID (`fh`).
-    pub dir_handles: DirectoryHandleMap,
+    /// Active open handles (regular files, virtual files, and directories) keyed by allocated handle ID (`fh`).
+    pub handles: HandleMap,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
     pub open_counts: HashMap<u64, u32>,
-    /// Active open virtual file handles holding frozen point-in-time snapshot strings.
-    pub virtual_handles: HashMap<u64, Arc<Vec<u8>>>,
     /// Timestamp of the latest recovered operation / summary snapshot (if recovered).
     pub recovered_time: Option<SystemTime>,
 
@@ -133,6 +226,23 @@ impl FsInner {
         } else {
             false
         }
+    }
+}
+
+impl FsInner {
+    #[inline]
+    pub fn handle_counts(&self) -> (usize, usize, usize) {
+        let mut regular = 0;
+        let mut virtual_count = 0;
+        let mut dir = 0;
+        for h in self.handles.values() {
+            match h {
+                Handle::File(FileHandle::Regular { .. }) => regular += 1,
+                Handle::File(FileHandle::Virtual { .. }) => virtual_count += 1,
+                Handle::Directory(_) => dir += 1,
+            }
+        }
+        (regular, virtual_count, dir)
     }
 }
 
@@ -253,10 +363,8 @@ impl InMemoryFS {
             next_batch_id: 1,
             live: HashMap::new(),
             live_arena: WriteArena::new(),
-            file_handles: HashMap::new(),
-            dir_handles: HashMap::new(),
+            handles: HashMap::new(),
             open_counts: HashMap::new(),
-            virtual_handles: HashMap::new(),
             recovered_time: None,
             staged_bytes: 0,
             staged_ops: 0,

@@ -368,13 +368,9 @@ pub fn wake_flock_waiters(fs: &InMemoryFS, ino: u64) {
 pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
     log::trace!("flock(ino={}, fh={}, lock_owner={}, op={})", ino, fh, lock_owner, op);
 
-    // 1. Verify file handle under brief inner lock
-    let valid = {
-        let inner = fs.inner.lock().unwrap();
-        matches!(inner.file_handles.get(&fh), Some(h) if h.ino == ino)
-    };
-    if !valid {
-        req.reply_err(libc::EBADF);
+    // 1. Verify file handle
+    if let Err(err) = fs.extract_file_handle(ino, fh) {
+        req.reply_err(err);
         return;
     }
 
@@ -504,15 +500,13 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
         sleep
     );
 
+    if let Err(err) = fs.extract_file_handle(ino, fh) {
+        req.reply_err(err);
+        return;
+    }
+
     let (start, end) = {
         let inner = fs.inner.lock().unwrap();
-        match inner.file_handles.get(&fh) {
-            Some(h) if h.ino == ino => {}
-            _ => {
-                req.reply_err(libc::EBADF);
-                return;
-            }
-        }
         match normalize_range(&inner, ino, &lock) {
             Ok(range) => range,
             Err(err) => {
@@ -625,13 +619,7 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
 }
 
 pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32) -> Result<(), i32> {
-    let valid = {
-        let inner = fs.inner.lock().unwrap();
-        matches!(inner.file_handles.get(&fh), Some(h) if h.ino == ino)
-    };
-    if !valid {
-        return Err(libc::EBADF);
-    }
+    fs.extract_file_handle(ino, fh)?;
 
     let non_blocking = (op & libc::LOCK_NB) != 0;
     let base_op = op & !libc::LOCK_NB;
@@ -760,12 +748,9 @@ fn coalesce_ranges(ranges: &mut Vec<RangeLock>) {
 }
 
 pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<ShimFlock, i32> {
+    fs.extract_file_handle(ino, fh)?;
     let (start, end) = {
         let inner = fs.inner.lock().unwrap();
-        match inner.file_handles.get(&fh) {
-            Some(h) if h.ino == ino => {}
-            _ => return Err(libc::EBADF),
-        }
         normalize_range(&inner, ino, &lock)?
     };
 
@@ -812,12 +797,9 @@ pub fn setlk_core(
     lock: ShimFlock,
     sleep: bool,
 ) -> Result<(), i32> {
+    fs.extract_file_handle(ino, fh)?;
     let (start, end) = {
         let inner = fs.inner.lock().unwrap();
-        match inner.file_handles.get(&fh) {
-            Some(h) if h.ino == ino => {}
-            _ => return Err(libc::EBADF),
-        }
         normalize_range(&inner, ino, &lock)?
     };
 

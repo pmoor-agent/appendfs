@@ -191,7 +191,7 @@ unsafe extern "C" {
     fn shim_reply_entry(req: shim_req_t, attr: *const ShimFileAttr, attr_timeout: f64, entry_timeout: f64) -> c_int;
     fn shim_reply_attr(req: shim_req_t, attr: *const ShimFileAttr, attr_timeout: f64) -> c_int;
     fn shim_reply_buf(req: shim_req_t, buf: *const u8, size: usize) -> c_int;
-    fn shim_reply_open(req: shim_req_t, fh: u64) -> c_int;
+    fn shim_reply_open(req: shim_req_t, fh: u64, direct_io: bool) -> c_int;
     fn shim_reply_write(req: shim_req_t, count: usize) -> c_int;
     fn shim_reply_create(
         req: shim_req_t,
@@ -291,9 +291,9 @@ impl Request {
         }
     }
 
-    pub fn reply_open(self, fh: u64) {
+    pub fn reply_open(self, fh: u64, direct_io: bool) {
         unsafe {
-            shim_reply_open(self.req, fh);
+            shim_reply_open(self.req, fh, direct_io);
         }
     }
 

@@ -781,7 +781,7 @@ mod tests {
 
         let status_ino = crate::fs::VIRTUAL_INO_BASE;
         let fh = fs.open_file_handle(status_ino, libc::O_RDONLY as u32);
-        assert_ne!(fh & crate::fs::VIRTUAL_FH_FLAG, 0);
+        assert!(fh > 0);
 
         let plan = fs.plan_read_handle(status_ino, fh, 0, 50).unwrap();
         assert_eq!(plan.total_len, 50);

@@ -11,9 +11,6 @@
 #include <mutex>
 #include <sys/stat.h>
 
-// High bit flag indicating dynamic synthesized virtual file handles (bit 63)
-constexpr uint64_t VIRTUAL_FH_FLAG = 1ULL << 63;
-
 typedef void *shim_req_t;
 
 struct shim_file_attr {
@@ -680,10 +677,10 @@ int shim_reply_buf(shim_req_t req, const char *buf, size_t size) {
   return fuse_reply_buf(static_cast<fuse_req_t>(req), buf, size);
 }
 
-int shim_reply_open(shim_req_t req, uint64_t fh) {
+int shim_reply_open(shim_req_t req, uint64_t fh, bool direct_io) {
   struct fuse_file_info fi = {};
   fi.fh = fh;
-  if ((fh & VIRTUAL_FH_FLAG) != 0) {
+  if (direct_io) {
     fi.direct_io = 1;
   }
   return fuse_reply_open(static_cast<fuse_req_t>(req), &fi);

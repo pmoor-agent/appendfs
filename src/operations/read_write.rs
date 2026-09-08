@@ -104,7 +104,7 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
 pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
     log::trace!("open(ino={}, flags=0x{:x})", ino, flags);
     match open_core(fs, ino, flags) {
-        Ok(fh) => req.reply_open(fh),
+        Ok(fh) => req.reply_open(fh, fs.is_virtual_ino(ino)),
         Err(e) => req.reply_err(e),
     }
 }
@@ -166,14 +166,14 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
 
 pub fn write(fs: &InMemoryFS, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64) {
     log::trace!("write(ino={}, len={}, offset={}, fh={})", ino, buf.len(), offset, fh);
-    let handle = match fs.get_file_handle(fh) {
-        Some(h) => h,
-        None => {
-            req.reply_err(libc::EBADF);
+    let handle = match fs.extract_file_handle(ino, fh) {
+        Ok(h) => h,
+        Err(e) => {
+            req.reply_err(e);
             return;
         }
     };
-    if handle.ino != ino {
+    if !handle.is_regular() {
         req.reply_err(libc::EBADF);
         return;
     }
@@ -553,9 +553,9 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
 
 pub fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
     if fh != 0 {
-        match fs.get_file_handle(fh) {
-            Some(h) if h.ino == ino => {}
-            _ => return Err(libc::EBADF),
+        let handle = fs.extract_file_handle(ino, fh)?;
+        if !handle.is_regular() {
+            return Err(libc::EBADF);
         }
     }
     fs.sync_log().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
@@ -564,8 +564,8 @@ pub fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
 pub fn fsync(fs: &Arc<InMemoryFS>, req: Request, ino: u64, datasync: bool, fh: u64) {
     log::trace!("fsync(ino={}, datasync={}, fh={})", ino, datasync, fh);
     if fh != 0 {
-        match fs.get_file_handle(fh) {
-            Some(h) if h.ino == ino => {}
+        match fs.extract_file_handle(ino, fh) {
+            Ok(h) if h.is_regular() => {}
             _ => {
                 req.reply_err(libc::EBADF);
                 return;
