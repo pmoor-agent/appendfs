@@ -250,6 +250,8 @@ impl<'a> InodeLayerStack<'a> {
     /// references to [`Arc<Vec<u8>>`] are cloned with zero byte-copying.
     ///
     /// If all requested bytes are covered by in-memory slices or holes, `has_cold_slices` will be false.
+    // TODO(too-many-lines): extract this into smaller units.
+    #[allow(clippy::too_many_lines)]
     pub fn plan_read_file_data(
         &self,
         offset: u64,

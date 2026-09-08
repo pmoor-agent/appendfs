@@ -68,6 +68,8 @@ impl InMemoryFS {
     /// followed by the `FlushCommit` trailer that makes the batch replayable.
     ///
     /// On any write error the entire batch is rolled back to its starting offset.
+    // TODO(too-many-lines): extract this into smaller units.
+    #[allow(clippy::too_many_lines)]
     fn synthesize_and_write_flushing_layer(
         &self,
         frozen: &mut HashMap<u64, EntryDelta>,

@@ -27,6 +27,8 @@ pub enum RecoveryTarget {
 
 /// Rebuilds complete in-memory filesystem state from summary files and `.log` files in `storage`
 /// up to the specified `target` boundary, using `clock` for timestamp context.
+// TODO(too-many-lines): extract this into smaller units.
+#[allow(clippy::too_many_lines)]
 pub fn recover_fs(
     storage: Arc<dyn crate::storage::Storage>,
     target: RecoveryTarget,

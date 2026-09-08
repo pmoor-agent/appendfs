@@ -1,0 +1,4 @@
+# Functions above this are flagged by clippy::too_many_lines (denied in src/).
+# Existing offenders carry an explicit #[allow] so the debt is greppable rather than
+# invisible; the intent is to burn that list down, not to raise this number.
+too-many-lines-threshold = 100

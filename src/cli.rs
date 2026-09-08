@@ -64,8 +64,6 @@ pub enum Commands {
     Check(CheckArgs),
     /// Alias for check (filesystem consistency check)
     Fsck(CheckArgs),
-    /// Show a volume's encryption state and identity (no key required)
-    Key(KeyArgs),
     /// Manage remote S3-compatible replication targets
     Remote(RemoteSubcommandArgs),
 }
@@ -164,16 +162,6 @@ pub struct RemoteRmArgs {
 #[derive(Args, Debug, Clone)]
 pub struct RemoteListArgs {
     /// Volume log directory containing remotes.toml
-    pub log_dir: PathBuf,
-}
-
-/// Arguments for `key`, which reports a volume's encryption state.
-///
-/// Whether a volume is encrypted is fixed at `init` and cannot be changed afterwards, so
-/// there is nothing here to toggle - only to inspect.
-#[derive(Args, Debug)]
-pub struct KeyArgs {
-    /// Volume log directory
     pub log_dir: PathBuf,
 }
 

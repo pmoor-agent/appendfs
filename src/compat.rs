@@ -113,6 +113,8 @@ pub fn compat_multi_extent_full() -> Vec<u8> {
 }
 
 /// Populates the canonical compatibility filesystem tree on `fs` across 3 distinct flush cycles.
+// TODO(too-many-lines): extract this into smaller units.
+#[allow(clippy::too_many_lines)]
 pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), i32> {
     // --- BATCH 1: Initial directories, partial file write, and initial xattr ---
     clock.set_offset(10);
@@ -611,6 +613,8 @@ fn read_compat_file(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<
 /// Asserts that `fs` exactly matches the canonical compatibility specification.
 /// Validates directory hierarchy, file contents, sparse holes, symlinks, special files,
 /// permissions (`mode`), ownership (`uid`/`gid`), timestamps (`mtime`/`atime`), and xattrs.
+// TODO(too-many-lines): extract this into smaller units.
+#[allow(clippy::too_many_lines)]
 pub fn verify_compat_tree(fs: &InMemoryFS) {
     // 1. Root directory (Inode 1)
     let root_attr = fs.get_attr(1).expect("root directory must exist");

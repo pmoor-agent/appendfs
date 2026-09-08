@@ -606,6 +606,8 @@ impl SummaryReader {
     }
 
     /// Opens a `.summary` file from a `Storage` instance.
+    // TODO(too-many-lines): extract this into smaller units.
+    #[allow(clippy::too_many_lines)]
     pub fn open(storage: &dyn Storage, filename: &str, volume_key: Arc<VolumeKey>) -> io::Result<Self> {
         let reader = storage.open_reader(filename)?;
         let file_len = reader.len()?;

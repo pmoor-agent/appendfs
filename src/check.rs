@@ -95,6 +95,8 @@ impl IntegrityReport {
     }
 
     /// Formats the report as a clean, human-readable terminal output.
+    // TODO(too-many-lines): extract this into smaller units.
+    #[allow(clippy::too_many_lines)]
     pub fn format_report(&self, log_dir: Option<&Path>, verbose: bool) -> String {
         let mut out = String::new();
         out.push_str("=================================================================\n");
@@ -238,6 +240,8 @@ impl IntegrityReport {
 }
 
 /// Runs a read-only filesystem integrity check on the provided `InMemoryFS`.
+// TODO(too-many-lines): extract this into smaller units.
+#[allow(clippy::too_many_lines)]
 pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: bool) -> IntegrityReport {
     let mut report = IntegrityReport::default();
 
