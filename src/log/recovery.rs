@@ -147,6 +147,8 @@ pub fn recover_fs(
     let mut max_inode = fs_instance.next_inode.load(Ordering::SeqCst).saturating_sub(1);
 
     let mut target_cutoff_reached = false;
+    let mut total_recovered_data_bytes = 0u64;
+    let mut max_replayed_generation = min_log_gen;
 
     // 3. Replay log files with generation > min_log_gen
     for (gen_num, filename) in log_files {
@@ -159,6 +161,8 @@ pub fn recover_fs(
         {
             break;
         }
+
+        max_replayed_generation = max_replayed_generation.max(gen_num);
 
         let mut pending: Vec<LogRecord> = Vec::new();
         let mut committed_records_count = 0u32;
@@ -305,10 +309,20 @@ pub fn recover_fs(
             }
         }
 
+        total_recovered_data_bytes += log_data_bytes;
+
         if target_cutoff_reached {
             break;
         }
     }
+
+    let gens_since_summary = max_replayed_generation.saturating_sub(min_log_gen);
+    fs_instance
+        .generations_since_last_summary
+        .store(gens_since_summary, Ordering::SeqCst);
+    fs_instance
+        .bytes_since_last_summary
+        .store(total_recovered_data_bytes, Ordering::SeqCst);
 
     if max_inode >= fs_instance.next_inode.load(Ordering::SeqCst) {
         fs_instance.next_inode.store(max_inode + 1, Ordering::SeqCst);
