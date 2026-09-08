@@ -6,8 +6,8 @@
 //! paginated `readdir` is isolated from concurrent mutations.
 
 use super::{FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, RwLock};
 
 impl InMemoryFS {
     // --- POSIX File Handle Tracking ---
@@ -20,7 +20,7 @@ impl InMemoryFS {
                 .lock()
                 .unwrap()
                 .virtual_handles
-                .insert(fh, content.into_bytes());
+                .insert(fh, Arc::new(content.into_bytes()));
             return fh;
         }
 
@@ -41,7 +41,7 @@ impl InMemoryFS {
     pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
         if (fh & super::VIRTUAL_FH_FLAG) != 0 {
             let inner = self.inner.lock().unwrap();
-            let buf = inner.virtual_handles.get(&fh).ok_or(libc::EBADF)?;
+            let buf = inner.virtual_handles.get(&fh).cloned().ok_or(libc::EBADF)?;
             let start = (offset as usize).min(buf.len());
             let end = (start + size).min(buf.len());
             let slice_len = end - start;
@@ -52,8 +52,8 @@ impl InMemoryFS {
                     vec![ReadSlice {
                         dst_offset: 0,
                         len: slice_len,
-                        source: ReadSliceSource::Memory {
-                            data: Arc::new(RwLock::new(buf.clone())),
+                        source: ReadSliceSource::Cache {
+                            data: buf,
                             src_offset: start,
                         },
                     }]

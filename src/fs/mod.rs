@@ -77,7 +77,7 @@ pub struct FsInner {
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
     pub open_counts: HashMap<u64, u32>,
     /// Active open virtual file handles holding frozen point-in-time snapshot strings.
-    pub virtual_handles: HashMap<u64, Vec<u8>>,
+    pub virtual_handles: HashMap<u64, Arc<Vec<u8>>>,
     /// Timestamp of the latest recovered operation / summary snapshot (if recovered).
     pub recovered_time: Option<SystemTime>,
 }
