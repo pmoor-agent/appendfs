@@ -369,8 +369,7 @@ pub struct InMemoryFS {
     /// Largest payload written as a single data record. Bounds how much must be read and
     /// decrypted to serve a read of any byte within it - see `DEFAULT_MAX_EXTENT_SIZE`.
     pub max_extent_size: usize,
-    /// Maximum frozen batches allowed to queue up before mutations are refused. See
-    /// `check_flush_capacity`.
+    /// Maximum frozen batches allowed to queue up before auto-freezing is bounded.
     pub max_flush_queue_depth: usize,
     pub flush_interval: AtomicU64,
     pub(crate) flusher: Mutex<Option<BackgroundFlusher>>,

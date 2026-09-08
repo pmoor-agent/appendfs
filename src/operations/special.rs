@@ -16,7 +16,6 @@ pub fn mknod_core(
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-    fs.check_flush_capacity()?;
 
     fs.with_inner(OpTag::Mknod, |inner| {
         let now = fs.clock.now();
