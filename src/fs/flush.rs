@@ -34,8 +34,8 @@ impl InMemoryFS {
     pub fn pop_flushing_batch(&self) -> Option<FlushBatch> {
         let mut inner = self.inner.lock().unwrap();
         let batch = inner.flushing.pop_front()?;
-        inner.flushing_bytes = inner.flushing_bytes.saturating_sub(batch.bytes);
-        inner.flushing_ops = inner.flushing_ops.saturating_sub(batch.ops);
+        inner.flushing_bytes -= batch.bytes;
+        inner.flushing_ops -= batch.ops;
         Some(batch)
     }
 
@@ -292,8 +292,8 @@ impl InMemoryFS {
                     "front of flushing queue must match committed batch ID"
                 );
                 let popped = inner.flushing.pop_front().unwrap();
-                inner.flushing_bytes = inner.flushing_bytes.saturating_sub(popped.bytes);
-                inner.flushing_ops = inner.flushing_ops.saturating_sub(popped.ops);
+                inner.flushing_bytes -= popped.bytes;
+                inner.flushing_ops -= popped.ops;
             }
         }
 
