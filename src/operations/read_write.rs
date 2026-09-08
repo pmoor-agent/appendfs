@@ -48,6 +48,12 @@ pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, f
         }
     };
 
+    // Zero-copy fast path: single in-memory/cache slice or empty/zero read
+    if plan.is_single_borrowable_slice() {
+        plan.execute_single_slice(|buf| req.reply_buf(buf));
+        return;
+    }
+
     // Fast path: small in-memory read (<= 128 KiB) with zero cold disk slices
     const MAX_INLINE_READ_BYTES: usize = 128 * 1024;
     if !plan.has_cold_slices && plan.total_len <= MAX_INLINE_READ_BYTES {

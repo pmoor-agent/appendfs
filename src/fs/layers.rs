@@ -450,12 +450,63 @@ pub struct ReadPlan {
     pub slices: Vec<ReadSlice>,
 }
 
+static STATIC_ZEROES: [u8; 128 * 1024] = [0u8; 128 * 1024];
+
 impl ReadPlan {
     pub fn empty() -> Self {
         Self {
             total_len: 0,
             has_cold_slices: false,
             slices: Vec::new(),
+        }
+    }
+
+    /// Returns true if the plan can be answered directly by borrowing a single slice
+    /// with zero allocations and zero copies.
+    pub fn is_single_borrowable_slice(&self) -> bool {
+        if self.total_len == 0 || self.slices.is_empty() {
+            return true;
+        }
+        if self.slices.len() != 1 || self.has_cold_slices {
+            return false;
+        }
+        match &self.slices[0].source {
+            ReadSliceSource::Zero => self.total_len <= STATIC_ZEROES.len(),
+            ReadSliceSource::Memory { .. } | ReadSliceSource::Cache { .. } => true,
+            ReadSliceSource::Disk { .. } => false,
+        }
+    }
+
+    /// Executes the read plan by invoking `f` with a borrowed slice directly
+    /// from memory, cache, or static zeroes with ZERO intermediate allocations and ZERO copies.
+    ///
+    /// # Panics
+    /// Panics if `self.is_single_borrowable_slice()` is false.
+    pub fn execute_single_slice<F: FnOnce(&[u8])>(&self, f: F) {
+        if self.total_len == 0 || self.slices.is_empty() {
+            f(&[]);
+            return;
+        }
+        assert_eq!(self.slices.len(), 1, "expected exactly 1 slice in execute_single_slice");
+        let slice = &self.slices[0];
+        match &slice.source {
+            ReadSliceSource::Zero => {
+                assert!(
+                    self.total_len <= STATIC_ZEROES.len(),
+                    "zero slice exceeds static buffer"
+                );
+                f(&STATIC_ZEROES[..self.total_len]);
+            }
+            ReadSliceSource::Memory { data, src_offset } => {
+                let guard = data.read().unwrap();
+                let actual_len = std::cmp::min(slice.len, guard.len().saturating_sub(*src_offset));
+                f(&guard[*src_offset..*src_offset + actual_len]);
+            }
+            ReadSliceSource::Cache { data, src_offset } => {
+                let actual_len = std::cmp::min(slice.len, data.len().saturating_sub(*src_offset));
+                f(&data[*src_offset..*src_offset + actual_len]);
+            }
+            ReadSliceSource::Disk { .. } => panic!("disk slice cannot be borrowed directly"),
         }
     }
 }
@@ -486,12 +537,16 @@ impl InMemoryFS {
 ///
 /// Phase 1: Copies all in-memory slices into `dst_buf` and drops their backing buffers
 /// immediately, allowing staged buffers to be freed before any disk I/O.
-/// Phase 2: Resolves cold disk slices sequentially from cache or disk.
+/// Phase 2: Resolves cold disk slices from cache or disk directly into `dst_buf`.
 pub fn execute_read_plan(
     mut plan: ReadPlan,
     log_cache: Option<&crate::log::LogFileCache>,
     volume_key: &crate::crypto::VolumeKey,
 ) -> Result<Vec<u8>, i32> {
+    if plan.total_len == 0 || plan.slices.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut dst_buf = vec![0u8; plan.total_len];
     let mut cold_slices = Vec::new();
 
@@ -527,81 +582,98 @@ pub fn execute_read_plan(
     // disk or remote S3 reads below take significant time.
     if !cold_slices.is_empty() {
         let cache = log_cache.ok_or(libc::EIO)?;
-
-        // Sort slices by (generation, record_log_offset) so that slices referencing the same
-        // record land in the same worker chunk to maximize decrypted_cache hits.
-        cold_slices.sort_by_key(|s| match &s.source {
-            ReadSliceSource::Disk {
-                generation,
-                record_log_offset,
-                ..
-            } => (*generation, *record_log_offset),
-            _ => (0, 0),
-        });
-
-        let num_workers = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4)
-            .min(cold_slices.len())
-            .clamp(1, 16);
-
-        let chunk_size = cold_slices.len().div_ceil(num_workers);
-        let chunks: Vec<&[ReadSlice]> = cold_slices.chunks(chunk_size).collect();
-
-        type ReadChunkResult = Vec<(usize, Vec<u8>)>;
-        let all_results = std::thread::scope(|s| -> Result<Vec<ReadChunkResult>, i32> {
-            let mut handles = Vec::with_capacity(chunks.len());
-
-            for chunk in chunks {
-                let handle = s.spawn(move || -> Result<Vec<(usize, Vec<u8>)>, i32> {
-                    let mut chunk_res = Vec::with_capacity(chunk.len());
-                    for slice in chunk {
-                        match &slice.source {
-                            ReadSliceSource::Disk {
-                                generation,
-                                record_log_offset,
-                                record_size,
-                                payload_offset,
-                                slice_inner_offset,
-                            } => {
-                                let mut buf = vec![0u8; slice.len];
-                                cache
-                                    .read_extent_payload(
-                                        *generation,
-                                        *record_log_offset,
-                                        *record_size,
-                                        *payload_offset,
-                                        *slice_inner_offset,
-                                        &mut buf,
-                                        volume_key,
-                                    )
-                                    .map_err(|_| libc::EIO)?;
-                                chunk_res.push((slice.dst_offset, buf));
-                            }
-                            _ => panic!("expected Disk slice in cold_slices"),
-                        }
-                    }
-                    Ok(chunk_res)
-                });
-                handles.push(handle);
-            }
-
-            let mut results = Vec::with_capacity(handles.len());
-            for h in handles {
-                let res = h.join().map_err(|_| libc::EIO)??;
-                results.push(res);
-            }
-            Ok(results)
-        })?;
-
-        for chunk_res in all_results {
-            for (dst_offset, buf) in chunk_res {
-                dst_buf[dst_offset..dst_offset + buf.len()].copy_from_slice(&buf);
-            }
-        }
+        execute_cold_slices(cold_slices, &mut dst_buf, cache, volume_key)?;
     }
 
     Ok(dst_buf)
+}
+
+fn execute_cold_slices(
+    cold_slices: Vec<ReadSlice>,
+    dst_buf: &mut [u8],
+    cache: &crate::log::LogFileCache,
+    volume_key: &crate::crypto::VolumeKey,
+) -> Result<(), i32> {
+    if cold_slices.is_empty() {
+        return Ok(());
+    }
+
+    struct ColdJob<'a> {
+        slice: ReadSlice,
+        target: &'a mut [u8],
+    }
+
+    let mut jobs = Vec::with_capacity(cold_slices.len());
+    let mut remainder = dst_buf;
+    let mut current_offset = 0;
+
+    for slice in cold_slices {
+        let (skip, tail) = remainder.split_at_mut(slice.dst_offset - current_offset);
+        let _ = skip;
+        let (target, next_remainder) = tail.split_at_mut(slice.len);
+        current_offset = slice.dst_offset + slice.len;
+        remainder = next_remainder;
+        jobs.push(ColdJob { slice, target });
+    }
+
+    // Sort jobs by (generation, record_log_offset) so that slices referencing the same
+    // record land in the same worker chunk to maximize decrypted_cache hits.
+    jobs.sort_by_key(|job| match &job.slice.source {
+        ReadSliceSource::Disk {
+            generation,
+            record_log_offset,
+            ..
+        } => (*generation, *record_log_offset),
+        _ => (0, 0),
+    });
+
+    let num_workers = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(jobs.len())
+        .clamp(1, 16);
+
+    let chunk_size = jobs.len().div_ceil(num_workers);
+
+    std::thread::scope(|s| -> Result<(), i32> {
+        let mut handles = Vec::with_capacity(num_workers);
+
+        for chunk in jobs.chunks_mut(chunk_size) {
+            let handle = s.spawn(move || -> Result<(), i32> {
+                for job in chunk {
+                    match &job.slice.source {
+                        ReadSliceSource::Disk {
+                            generation,
+                            record_log_offset,
+                            record_size,
+                            payload_offset,
+                            slice_inner_offset,
+                        } => {
+                            cache
+                                .read_extent_payload(
+                                    *generation,
+                                    *record_log_offset,
+                                    *record_size,
+                                    *payload_offset,
+                                    *slice_inner_offset,
+                                    &mut *job.target,
+                                    volume_key,
+                                )
+                                .map_err(|_| libc::EIO)?;
+                        }
+                        _ => panic!("expected Disk slice in cold_slices"),
+                    }
+                }
+                Ok(())
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().map_err(|_| libc::EIO)??;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -715,7 +787,7 @@ mod tests {
         assert_eq!(plan.total_len, 50);
         assert!(!plan.has_cold_slices);
         assert_eq!(plan.slices.len(), 1);
-        assert!(matches!(plan.slices[0].source, ReadSliceSource::Memory { .. }));
+        assert!(matches!(plan.slices[0].source, ReadSliceSource::Cache { .. }));
 
         let buf = fs.read_handle(status_ino, fh, 0, 50).unwrap();
         assert_eq!(buf.len(), 50);
@@ -946,5 +1018,144 @@ mod tests {
         assert_eq!(&async_buf[200..400], &data2[..]);
         assert_eq!(&async_buf[400..600], &data3[..]);
         assert_eq!(&async_buf[600..800], &data4[..]);
+    }
+
+    #[test]
+    fn test_read_plan_execute_single_slice_zero_copy() {
+        // 1. Empty plan
+        let empty_plan = ReadPlan::empty();
+        assert!(empty_plan.is_single_borrowable_slice());
+        let mut called = false;
+        empty_plan.execute_single_slice(|slice| {
+            assert!(slice.is_empty());
+            called = true;
+        });
+        assert!(called);
+
+        // 2. Zero plan
+        let zero_plan = ReadPlan {
+            total_len: 1024,
+            has_cold_slices: false,
+            slices: vec![ReadSlice {
+                dst_offset: 0,
+                len: 1024,
+                source: ReadSliceSource::Zero,
+            }],
+        };
+        assert!(zero_plan.is_single_borrowable_slice());
+        called = false;
+        zero_plan.execute_single_slice(|slice| {
+            assert_eq!(slice.len(), 1024);
+            assert!(slice.iter().all(|&b| b == 0));
+            called = true;
+        });
+        assert!(called);
+
+        // 3. Staged memory slice
+        let staged_data = vec![0xABu8; 512];
+        let memory_plan = ReadPlan {
+            total_len: 256,
+            has_cold_slices: false,
+            slices: vec![ReadSlice {
+                dst_offset: 0,
+                len: 256,
+                source: ReadSliceSource::Memory {
+                    data: Arc::new(std::sync::RwLock::new(staged_data)),
+                    src_offset: 20,
+                },
+            }],
+        };
+        assert!(memory_plan.is_single_borrowable_slice());
+        called = false;
+        memory_plan.execute_single_slice(|slice| {
+            assert_eq!(slice.len(), 256);
+            assert!(slice.iter().all(|&b| b == 0xAB));
+            called = true;
+        });
+        assert!(called);
+
+        // 4. Cache hit slice
+        let cache_data = Arc::new(vec![0xCDu8; 128]);
+        let cache_plan = ReadPlan {
+            total_len: 64,
+            has_cold_slices: false,
+            slices: vec![ReadSlice {
+                dst_offset: 0,
+                len: 64,
+                source: ReadSliceSource::Cache {
+                    data: cache_data,
+                    src_offset: 16,
+                },
+            }],
+        };
+        assert!(cache_plan.is_single_borrowable_slice());
+        called = false;
+        cache_plan.execute_single_slice(|slice| {
+            assert_eq!(slice.len(), 64);
+            assert!(slice.iter().all(|&b| b == 0xCD));
+            called = true;
+        });
+        assert!(called);
+
+        // 5. Multi-slice plan is not single borrowable
+        let multi_plan = ReadPlan {
+            total_len: 200,
+            has_cold_slices: false,
+            slices: vec![
+                ReadSlice {
+                    dst_offset: 0,
+                    len: 100,
+                    source: ReadSliceSource::Zero,
+                },
+                ReadSlice {
+                    dst_offset: 100,
+                    len: 100,
+                    source: ReadSliceSource::Zero,
+                },
+            ],
+        };
+        assert!(!multi_plan.is_single_borrowable_slice());
+    }
+
+    #[test]
+    fn test_execute_read_plan_single_cold_slice_direct() {
+        use crate::crypto::{VolumeHeader, VolumeKey};
+        use crate::log::RecoveryTarget;
+        use crate::storage::MemoryStorage;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = Arc::new(crate::clock::SystemClock);
+        let key = Arc::new(VolumeKey::plaintext());
+        crate::log::init_volume(storage.clone(), &key, VolumeHeader::plaintext()).unwrap();
+        let mut fs =
+            crate::log::recover_fs(storage.clone(), RecoveryTarget::Latest, clock.clone(), key.clone()).unwrap();
+
+        let writer = Arc::new(
+            crate::log::LogWriter::create(
+                storage.clone(),
+                1,
+                clock.as_ref(),
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                key.clone(),
+            )
+            .unwrap(),
+        );
+        fs.attach_log_writer(writer);
+
+        let attr = crate::operations::read_write::create_core(&fs, 1, "single_cold.bin", 0o644, 0, 1000, 1000).unwrap();
+        let payload = vec![0xEFu8; 1024];
+        crate::operations::read_write::write_core(&fs, attr.ino, &payload, 0).unwrap();
+        fs.flush_log().unwrap();
+
+        // Evict from decrypted cache to force single cold disk direct read
+        fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
+
+        let plan = fs.plan_read_file_data(attr.ino, 0, 1024).unwrap();
+        assert_eq!(plan.slices.len(), 1);
+        assert!(plan.has_cold_slices);
+
+        let res = fs.execute_read_plan_sync(plan).unwrap();
+        assert_eq!(res, payload);
     }
 }
