@@ -48,6 +48,20 @@ pub struct Handle {
     pub kind: HandleKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirHandle {
+    pub ino: u64,
+    pub flags: u32,
+    pub entries: DirSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualHandle {
+    pub ino: u64,
+    pub flags: u32,
+    pub data: Arc<Vec<u8>>,
+}
+
 impl Handle {
     #[inline]
     pub fn is_regular(&self) -> bool {
