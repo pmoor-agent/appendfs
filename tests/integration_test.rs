@@ -1127,16 +1127,13 @@ fn test_background_flusher_in_mount_session() {
         .unwrap();
 
     // Staged ops should be 2 initially
-    assert_eq!(fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(fs.staged_ops(), 2);
 
     // Wait up to 5 seconds for the background flusher to flush staged ops
     assert!(
-        wait_until(
-            || fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst) == 0,
-            std::time::Duration::from_secs(5)
-        ),
+        wait_until(|| fs.staged_ops() == 0, std::time::Duration::from_secs(5)),
         "Staged ops ({}) must be flushed to 0 by the background flusher",
-        fs.staged_ops.load(std::sync::atomic::Ordering::SeqCst)
+        fs.staged_ops()
     );
     let manifest = fs.manifest.read().unwrap();
     assert!(!manifest.logs.is_empty());

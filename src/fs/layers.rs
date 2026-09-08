@@ -833,7 +833,7 @@ mod tests {
             .lock()
             .unwrap()
             .flushing
-            .push_back(FlushBatch::new(1, flushing_batch, WriteArena::new()));
+            .push_back(FlushBatch::new(1, flushing_batch, WriteArena::new(), 0, 0));
 
         // 3. Live layer: Staged extent at 30..50
         let mut live_delta = FileDelta::default();
