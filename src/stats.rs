@@ -326,9 +326,16 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push('\n');
 
     // 3. Flush Layer Stats
-    let staged_bytes = fs.staged_bytes.load(Ordering::SeqCst);
+    let (staged_bytes, staged_ops, flushing_bytes, flushing_ops) = {
+        let inner = fs.inner.lock().unwrap();
+        (
+            inner.staged_bytes,
+            inner.staged_ops,
+            inner.flushing_bytes,
+            inner.flushing_ops,
+        )
+    };
     let max_buffer_size = fs.max_buffer_size;
-    let staged_ops = fs.staged_ops.load(Ordering::SeqCst);
     let max_staged_ops = fs.max_staged_ops;
     let max_extent_size = fs.max_extent_size;
     let max_flush_queue_depth = fs.max_flush_queue_depth;
@@ -354,8 +361,11 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     ));
     out.push_str(&format!("  Staged Operations:  {} / {}\n", staged_ops, max_staged_ops));
     out.push_str(&format!(
-        "  Flushing Queue:     {} / {} batches\n",
-        flushing_batches, max_flush_queue_depth
+        "  Flushing Queue:     {} / {} batches ({} data, {} ops)\n",
+        flushing_batches,
+        max_flush_queue_depth,
+        format_bytes(flushing_bytes as u64),
+        flushing_ops
     ));
     out.push_str(&format!(
         "  Max Extent Size:    {}\n",

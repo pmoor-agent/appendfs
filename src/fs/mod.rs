@@ -28,7 +28,7 @@ use crate::node::{EntryDelta, Node};
 use crate::storage::Storage;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::SystemTime;
 
@@ -43,18 +43,26 @@ pub type FileHandleMap = HashMap<u64, FileHandle>;
 pub type DirectoryHandleMap = HashMap<u64, DirSnapshot>;
 
 /// An immutable frozen batch of mutations being written to the log, holding its
-/// corresponding write arena chunk buffers.
+/// corresponding write arena chunk buffers and batch statistics.
 #[derive(Debug, Clone)]
 pub struct FlushBatch {
     pub id: u64,
     pub entries: HashMap<u64, EntryDelta>,
     pub arena: WriteArena,
+    pub bytes: usize,
+    pub ops: usize,
 }
 
 impl FlushBatch {
-    pub fn new(id: u64, entries: HashMap<u64, EntryDelta>, arena: WriteArena) -> Self {
+    pub fn new(id: u64, entries: HashMap<u64, EntryDelta>, arena: WriteArena, bytes: usize, ops: usize) -> Self {
         assert!(!entries.is_empty(), "FlushBatch must contain at least one entry");
-        Self { id, entries, arena }
+        Self {
+            id,
+            entries,
+            arena,
+            bytes,
+            ops,
+        }
     }
 }
 
@@ -80,6 +88,52 @@ pub struct FsInner {
     pub virtual_handles: HashMap<u64, Arc<Vec<u8>>>,
     /// Timestamp of the latest recovered operation / summary snapshot (if recovered).
     pub recovered_time: Option<SystemTime>,
+
+    /// Dirty write data bytes currently staged in `live` / `live_arena`.
+    pub staged_bytes: usize,
+    /// Mutating operations currently staged in `live`.
+    pub staged_ops: usize,
+    /// Total data bytes across all frozen batches in `flushing`.
+    pub flushing_bytes: usize,
+    /// Total mutating operations across all frozen batches in `flushing`.
+    pub flushing_ops: usize,
+}
+
+impl FsInner {
+    /// Records a mutation of `additional_bytes` and increments staged operation count by 1.
+    /// If thresholds are reached, freezes the active `live` layer into `flushing` immediately.
+    /// Returns true if a batch was frozen into `flushing`, false otherwise.
+    pub fn record_mutation(&mut self, additional_bytes: usize, max_buffer_size: usize, max_staged_ops: usize) -> bool {
+        self.staged_bytes += additional_bytes;
+        self.staged_ops += 1;
+        if self.staged_bytes >= max_buffer_size || self.staged_ops >= max_staged_ops {
+            self.freeze_live()
+        } else {
+            false
+        }
+    }
+
+    /// Freezes `live` into the `flushing` queue and transfers staged byte/op counts.
+    /// Returns true if a batch was frozen, false if `live` was empty.
+    pub fn freeze_live(&mut self) -> bool {
+        if !self.live.is_empty() {
+            let entries = std::mem::take(&mut self.live);
+            let chunk_size = self.live_arena.chunk_size;
+            let arena = std::mem::replace(&mut self.live_arena, WriteArena::with_chunk_size(chunk_size));
+            let bytes = self.staged_bytes;
+            let ops = self.staged_ops;
+            self.staged_bytes = 0;
+            self.staged_ops = 0;
+            self.flushing_bytes += bytes;
+            self.flushing_ops += ops;
+            let id = self.next_batch_id;
+            self.next_batch_id += 1;
+            self.flushing.push_back(FlushBatch::new(id, entries, arena, bytes, ops));
+            true
+        } else {
+            false
+        }
+    }
 }
 
 pub struct InMemoryFS {
@@ -97,9 +151,7 @@ pub struct InMemoryFS {
     pub clock: Arc<dyn Clock>,
     pub log_writer: Option<Arc<LogWriter>>,
     pub log_cache: Option<Arc<LogFileCache>>,
-    pub staged_bytes: AtomicUsize,
     pub max_buffer_size: usize,
-    pub staged_ops: AtomicUsize,
     pub max_staged_ops: usize,
     /// Largest payload written as a single data record. Bounds how much must be read and
     /// decrypted to serve a read of any byte within it - see `DEFAULT_MAX_EXTENT_SIZE`.
@@ -206,6 +258,10 @@ impl InMemoryFS {
             open_counts: HashMap::new(),
             virtual_handles: HashMap::new(),
             recovered_time: None,
+            staged_bytes: 0,
+            staged_ops: 0,
+            flushing_bytes: 0,
+            flushing_ops: 0,
         };
 
         let fs = Self {
@@ -218,9 +274,7 @@ impl InMemoryFS {
             clock,
             log_writer,
             log_cache,
-            staged_bytes: AtomicUsize::new(0),
             max_buffer_size: 128 * 1024 * 1024,
-            staged_ops: AtomicUsize::new(0),
             max_staged_ops: crate::cli::DEFAULT_MAX_BUFFER_OPS,
             max_extent_size: crate::cli::DEFAULT_MAX_EXTENT_SIZE,
             max_flush_queue_depth: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_DEPTH,
@@ -245,6 +299,38 @@ impl InMemoryFS {
         };
         fs.register_runtime_status();
         fs
+    }
+
+    /// Number of dirty bytes currently staged in the active `live` layer.
+    pub fn staged_bytes(&self) -> usize {
+        self.inner.lock().unwrap().staged_bytes
+    }
+
+    /// Number of mutating operations currently staged in the active `live` layer.
+    pub fn staged_ops(&self) -> usize {
+        self.inner.lock().unwrap().staged_ops
+    }
+
+    /// Total data bytes across all frozen batches waiting in `flushing`.
+    pub fn flushing_bytes(&self) -> usize {
+        self.inner.lock().unwrap().flushing_bytes
+    }
+
+    /// Total operations across all frozen batches waiting in `flushing`.
+    pub fn flushing_ops(&self) -> usize {
+        self.inner.lock().unwrap().flushing_ops
+    }
+
+    /// Total dirty bytes currently in memory (staged in `live` + queued in `flushing`).
+    pub fn total_dirty_bytes(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.staged_bytes + inner.flushing_bytes
+    }
+
+    /// Total dirty operations currently in memory (staged in `live` + queued in `flushing`).
+    pub fn total_dirty_ops(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.staged_ops + inner.flushing_ops
     }
 
     /// Attaches an active `LogWriter` to the filesystem instance, registering its active generation in the manifest.

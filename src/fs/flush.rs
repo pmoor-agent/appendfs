@@ -5,7 +5,7 @@
 //! trailing `FlushCommit` confirming atomic persistence. Recovery replays `LogEntryDelta`
 //! records directly onto `base`, guaranteeing identical state transitions across crash recovery.
 
-use super::{FlushBatch, InMemoryFS, WriteArena};
+use super::{FlushBatch, InMemoryFS};
 use crate::log::{
     BackgroundFlusher, ExtentState, GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE,
     SharedExtentState,
@@ -22,16 +22,8 @@ impl InMemoryFS {
     // --- Flush & Fold Pipelines ---
 
     /// Freezes `live` into the `flushing` queue.
-    pub fn begin_flush(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        if !inner.live.is_empty() {
-            let entries = std::mem::take(&mut inner.live);
-            let chunk_size = inner.live_arena.chunk_size;
-            let arena = std::mem::replace(&mut inner.live_arena, WriteArena::with_chunk_size(chunk_size));
-            let id = inner.next_batch_id;
-            inner.next_batch_id += 1;
-            inner.flushing.push_back(FlushBatch::new(id, entries, arena));
-        }
+    pub fn begin_flush(&self) -> bool {
+        self.inner.lock().unwrap().freeze_live()
     }
 
     pub fn current_flushing(&self) -> VecDeque<FlushBatch> {
@@ -40,7 +32,11 @@ impl InMemoryFS {
 
     /// Pops the front batch from the flushing queue, if any.
     pub fn pop_flushing_batch(&self) -> Option<FlushBatch> {
-        self.inner.lock().unwrap().flushing.pop_front()
+        let mut inner = self.inner.lock().unwrap();
+        let batch = inner.flushing.pop_front()?;
+        inner.flushing_bytes -= batch.bytes;
+        inner.flushing_ops -= batch.ops;
+        Some(batch)
     }
 
     /// Merges a flushed batch into `base`.
@@ -295,12 +291,12 @@ impl InMemoryFS {
                     front.id, batch_id,
                     "front of flushing queue must match committed batch ID"
                 );
-                let _ = inner.flushing.pop_front().unwrap();
+                let popped = inner.flushing.pop_front().unwrap();
+                inner.flushing_bytes -= popped.bytes;
+                inner.flushing_ops -= popped.ops;
             }
         }
 
-        self.staged_bytes.store(0, Ordering::Relaxed);
-        self.staged_ops.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -359,24 +355,20 @@ impl InMemoryFS {
         }
     }
 
+    /// Wakes up the background periodic flusher or flushes inline if thresholds were reached.
+    pub fn notify_flush_trigger(&self, should_trigger: bool) {
+        if should_trigger && !self.trigger_flusher() {
+            let _ = self.flush_log();
+        }
+    }
+
     /// Increments mutation counters (ops & bytes) and triggers an automatic flush if thresholds are reached.
     pub fn notify_mutation(&self, additional_bytes: usize) {
-        let staged_b = if additional_bytes > 0 {
-            self.staged_bytes.fetch_add(additional_bytes, Ordering::Relaxed) + additional_bytes
-        } else {
-            self.staged_bytes.load(Ordering::Relaxed)
+        let should_trigger = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.record_mutation(additional_bytes, self.max_buffer_size, self.max_staged_ops)
         };
-        let staged_o = self.staged_ops.fetch_add(1, Ordering::Relaxed) + 1;
-
-        if staged_b >= self.max_buffer_size || staged_o >= self.max_staged_ops {
-            // In-memory freeze of active live delta into flushing queue (< 1 µs)
-            self.begin_flush();
-            // Signal background flusher thread to drain to disk asynchronously; if none present, flush inline
-            if !self.trigger_flusher() {
-                // In standalone / unmounted test environments without background flusher thread, flush inline
-                let _ = self.flush_log();
-            }
-        }
+        self.notify_flush_trigger(should_trigger);
     }
 
     /// Initializes background services (e.g. periodic flusher) upon FUSE mount.
@@ -1349,14 +1341,14 @@ mod tests {
             let name = format!("file_{}.txt", i);
             crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
         }
-        assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 4);
+        assert_eq!(fs.staged_ops(), 4);
         assert_eq!(fs.manifest.read().unwrap().logs[0].record_count, 0);
 
         // 5th operation reaches threshold and triggers automatic flush!
         crate::operations::read_write::create_core(&fs, 1, "file_4.txt", 0o644, 0, 1000, 1000).unwrap();
 
         // Staged ops reset to 0 after automatic flush
-        assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 0);
+        assert_eq!(fs.staged_ops(), 0);
         assert_eq!(fs.manifest.read().unwrap().logs[0].record_count, 7); // 5 files + 1 root dir + 1 FlushCommit
     }
 
@@ -1979,5 +1971,80 @@ mod tests {
         drop(guard);
         handle.join().unwrap();
         assert!(destroyed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_staged_accounting_reset_on_begin_flush_prevents_spurious_batches() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        // Threshold: 100 bytes or 10 ops
+        fs.max_buffer_size = 100;
+        fs.max_staged_ops = 10;
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
+
+        // 1. Write 100 bytes to hit max_buffer_size threshold
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 100], 0).unwrap();
+
+        // Automatic threshold triggered begin_flush()!
+        // In unmounted environment without background flusher, notify_mutation flushes inline,
+        // so queue depth is 0 and staged counters are 0.
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.staged_ops(), 0);
+
+        // Now simulate active background flusher with queued batch:
+        // Populate live with 60 bytes
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xBB; 60], 100).unwrap();
+        assert_eq!(fs.staged_bytes(), 60);
+        assert_eq!(fs.staged_ops(), 1);
+
+        // Freeze batch into queue manually (simulating begin_flush when flusher starts or when threshold hit)
+        fs.begin_flush();
+        assert_eq!(fs.flush_queue_depth(), 1);
+        // Counters must be reset to 0 upon freezing into flushing queue, and moved to flushing counters
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.staged_ops(), 0);
+        assert_eq!(fs.flushing_bytes(), 60);
+        assert_eq!(fs.flushing_ops(), 1);
+
+        // Subsequent write arriving while batch 1 is in flushing queue
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xCC; 20], 160).unwrap();
+        // Should NOT trigger another begin_flush()! Queue depth must remain 1
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.staged_bytes(), 20);
+        assert_eq!(fs.staged_ops(), 1);
+        assert_eq!(fs.flushing_bytes(), 60);
+        assert_eq!(fs.flushing_ops(), 1);
+
+        // Another small write
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xDD; 20], 180).unwrap();
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.staged_bytes(), 40);
+        assert_eq!(fs.staged_ops(), 2);
+        assert_eq!(fs.flushing_bytes(), 60);
+        assert_eq!(fs.flushing_ops(), 1);
+
+        // Now drain flushing batches
+        while let Some(batch) = fs.pop_flushing_batch() {
+            fs.fold_flushed_batch(batch);
+        }
+
+        // Live staged data is preserved and flushing counters are drained to 0
+        assert_eq!(fs.staged_bytes(), 40);
+        assert_eq!(fs.staged_ops(), 2);
+        assert_eq!(fs.flushing_bytes(), 0);
+        assert_eq!(fs.flushing_ops(), 0);
     }
 }

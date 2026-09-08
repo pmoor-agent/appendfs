@@ -127,7 +127,7 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
     let file_offset = offset as u64;
     let write_len = buf.len() as u64;
 
-    {
+    let should_trigger = {
         let mut inner = fs.inner.lock().unwrap();
         let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
@@ -156,9 +156,10 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
             f.attr_delta.mtime = Some(now);
             f.attr_delta.ctime = Some(now);
         }
-    }
+        inner.record_mutation(write_len as usize, fs.max_buffer_size, fs.max_staged_ops)
+    };
 
-    fs.notify_mutation(write_len as usize);
+    fs.notify_flush_trigger(should_trigger);
 
     Ok(buf.len())
 }
