@@ -101,23 +101,16 @@ fn test_cli_init_plaintext_generates_random_volume_id() {
     assert_ne!(id2, "00000000000000000000000000000000");
     assert_ne!(id1, id2);
 
-    // Verify `appendfs key` on plaintext volume also displays the random volume ID
-    let key_output = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .arg("key")
-        .arg(temp_dir1.path())
-        .output()
-        .expect("failed to run appendfs key");
-    assert!(key_output.status.success());
-    let key_stdout = String::from_utf8_lossy(&key_output.stdout);
-    assert!(key_stdout.contains(&format!("Volume ID:     {}", id1)));
-
-    // Verify `appendfs stats` succeeds on initialized plaintext volume
+    // `stats` reports volume identity as well as statistics, so the volume ID is visible
+    // without a separate command.
     let stats_output = Command::new(env!("CARGO_BIN_EXE_appendfs"))
         .arg("stats")
         .arg(temp_dir1.path())
         .output()
         .expect("failed to run appendfs stats");
     assert!(stats_output.status.success());
+    let stats_stdout = String::from_utf8_lossy(&stats_output.stdout);
+    assert!(stats_stdout.contains(&format!("Volume ID:     {}", id1)));
 
     // Verify passing --passphrase to stats on plaintext volume fails cleanly
     let pass_stats = Command::new(env!("CARGO_BIN_EXE_appendfs"))

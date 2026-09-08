@@ -1,6 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::too_many_lines))]
 use appendfs::cli::{
-    CheckArgs, Cli, Commands, DumpArgs, InitArgs, KeyArgs, MountArgs, MountRoArgs, RemoteAddArgs, RemoteCommands,
+    CheckArgs, Cli, Commands, DumpArgs, InitArgs, MountArgs, MountRoArgs, RemoteAddArgs, RemoteCommands,
     RemoteListArgs, RemoteRmArgs, RemoteSubcommandArgs, StatsArgs,
 };
 use appendfs::clock::SystemClock;
@@ -263,7 +263,6 @@ fn main() {
         Commands::Dump(args) => cmd_dump(args),
         Commands::Check(args) | Commands::Fsck(args) => cmd_check(args),
         Commands::Remote(subargs) => cmd_remote(subargs),
-        Commands::Key(args) => cmd_key(args),
     }
 }
 
@@ -600,6 +599,18 @@ fn cmd_mount_ro(args: MountRoArgs) {
 }
 
 fn cmd_stats(args: StatsArgs) {
+    let VolumeHeaderInfo { header, .. } = match read_volume_header_info(&args.log_dir) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Printed before unlocking is attempted, so the credential a volume wants is visible
+    // even when opening it fails - or before the passphrase prompt appears.
+    print_volume_identity(&args.log_dir, &header);
+
     let OpenVolumeFS { fs, .. } = match open_volume_fs(
         &args.log_dir,
         args.key_file.as_deref(),
@@ -609,6 +620,7 @@ fn cmd_stats(args: StatsArgs) {
         Ok(res) => res,
         Err(e) => {
             eprintln!("Error: {}", e);
+            print_credential_help(&header);
             std::process::exit(1);
         }
     };
@@ -827,39 +839,38 @@ fn cmd_remote_list(list_args: RemoteListArgs) {
     }
 }
 
-fn cmd_key(args: KeyArgs) {
-    let log_dir = &args.log_dir;
-    let VolumeHeaderInfo { header, .. } = match read_volume_header_info(log_dir) {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    println!("=== Volume Encryption ===");
+/// Prints a volume's identity: what it is and what unlocks it. Needs no credentials,
+/// because the header sits in plaintext ahead of the encrypted summary body.
+fn print_volume_identity(log_dir: &Path, header: &VolumeHeader) {
+    println!("=== Volume ===");
     println!("Volume:        {}", log_dir.display());
     println!("Cipher Suite:  {}", header.cipher);
     println!("Compression:   {}", header.compression);
     println!("Volume ID:     {}", hex_string(&header.volume_id));
-
     if header.cipher.is_encrypted() {
         println!("Unlocked by:   {}", header.key_source);
-        println!();
+    }
+    println!();
+}
+
+/// Explains the credential situation. Only printed when the volume could not be opened,
+/// which is exactly when someone needs to know what to supply.
+fn print_credential_help(header: &VolumeHeader) {
+    if header.cipher.is_encrypted() {
+        eprintln!();
+        eprintln!("Credentials are supplied per invocation and are not stored here.");
+        eprintln!("Back them up: losing them loses the volume, and changing them means");
+        eprintln!("re-encrypting into a fresh volume.");
         if header.compression.is_enabled() {
-            println!("Compressed records reveal roughly how compressible their contents");
-            println!("were, which encryption alone does not. Sizes leak; contents do not.");
-            println!();
+            eprintln!();
+            eprintln!("Compressed records reveal roughly how compressible their contents");
+            eprintln!("were, which encryption alone does not. Sizes leak; contents do not.");
         }
-        println!("Credentials are supplied at mount time and are not stored here.");
-        println!("Back them up: losing them loses the volume, and changing them means");
-        println!("re-encrypting into a fresh volume.");
     } else {
-        println!();
-        println!("Volume is unencrypted, and cannot be encrypted in place.");
-        println!("Encryption is chosen at init time - 'appendfs init --key-file <file>'");
-        println!("and/or '--passphrase' - and fixed for the life of the volume. To");
-        println!("encrypt this data, init a new encrypted volume and copy it across.");
+        eprintln!();
+        eprintln!("Volume is unencrypted, and cannot be encrypted in place.");
+        eprintln!("Encryption is chosen at init time - 'appendfs init --key-file <file>'");
+        eprintln!("and/or '--passphrase' - and fixed for the life of the volume.");
     }
 }
 
