@@ -777,6 +777,15 @@ fn cmd_remote_add(add_args: RemoteAddArgs) {
     cfg.secret_access_key_env = add_args.secret_access_key_env;
     cfg.credentials_file = add_args.credentials_file;
     cfg.force_path_style = add_args.path_style;
+    if add_args.no_upload_partial_logs && add_args.upload_partial_logs.is_some() {
+        eprintln!("Error: Cannot specify both --upload-partial-logs and --no-upload-partial-logs.");
+        std::process::exit(1);
+    }
+    if add_args.no_upload_partial_logs {
+        cfg.upload_partial_logs = false;
+    } else if let Some(upl) = add_args.upload_partial_logs {
+        cfg.upload_partial_logs = upl;
+    }
 
     registry.add_remote(&add_args.name, cfg);
     if let Err(e) = registry.save_to_storage(&storage) {
@@ -817,20 +826,22 @@ fn cmd_remote_list(list_args: RemoteListArgs) {
         for (name, cfg) in sorted_remotes {
             if let Some(ref p) = cfg.path {
                 println!(
-                    "  - {}: type='local/nfs', path='{}', priority={}, mode='{}'",
+                    "  - {}: type='local/nfs', path='{}', priority={}, mode='{}', partial_logs={}",
                     name,
                     p.display(),
                     cfg.read_priority,
                     if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
+                    if cfg.upload_partial_logs { "Enabled" } else { "Disabled" },
                 );
             } else {
                 println!(
-                    "  - {}: type='s3', bucket='{}', priority={}, region='{}', mode='{}', endpoint={:?}, prefix='{}'",
+                    "  - {}: type='s3', bucket='{}', priority={}, region='{}', mode='{}', partial_logs={}, endpoint={:?}, prefix='{}'",
                     name,
                     cfg.bucket.as_deref().unwrap_or(""),
                     cfg.read_priority,
                     cfg.region,
                     if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
+                    if cfg.upload_partial_logs { "Enabled" } else { "Disabled" },
                     cfg.endpoint,
                     cfg.prefix
                 );

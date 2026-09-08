@@ -312,11 +312,13 @@ fn test_read_only_remote_and_cloud_forking() {
     let stores = registry.build_all_stores();
     assert_eq!(stores.len(), 2);
 
-    let (_, _, up_ro, _) = stores.iter().find(|(name, _, _, _)| name == "upstream").unwrap();
-    assert!(*up_ro, "Upstream remote must be marked read-only");
+    let up = stores.iter().find(|r| r.name == "upstream").unwrap();
+    assert!(up.read_only, "Upstream remote must be marked read-only");
+    assert!(up.upload_partial_logs);
 
-    let (_, _, down_ro, _) = stores.iter().find(|(name, _, _, _)| name == "downstream").unwrap();
-    assert!(!*down_ro, "Downstream remote must be writable");
+    let down = stores.iter().find(|r| r.name == "downstream").unwrap();
+    assert!(!down.read_only, "Downstream remote must be writable");
+    assert!(down.upload_partial_logs);
 }
 
 #[test]
@@ -1818,4 +1820,168 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         "Pruning quorum check used 1 list_objects request"
     );
     assert_eq!(failing_counting.heads(), 0, "No head_object calls were issued");
+}
+
+#[test]
+fn test_per_remote_upload_partial_logs_behavior() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    let nfs_mock = Arc::new(MockRemoteStore::new());
+    let s3_raw = Arc::new(MockRemoteStore::new());
+    let s3_counting = Arc::new(CountingRemoteStore::new(s3_raw.clone()));
+
+    // Setup registry: nfs has upload_partial_logs = true, s3 has upload_partial_logs = false
+    let mut registry = RemoteRegistry::new();
+    registry.policy.active_sync_interval_secs = 0; // trigger on every tick
+    registry.policy.min_synced_remotes = 1;
+
+    let nfs_cfg = RemoteTargetConfig::new_path("/mnt/nfs/appendfs");
+    assert!(
+        nfs_cfg.upload_partial_logs,
+        "new_path must default upload_partial_logs to true"
+    );
+    registry.add_remote("nfs", nfs_cfg);
+    registry.set_store_override("nfs", nfs_mock.clone());
+
+    let s3_cfg = RemoteTargetConfig::new("my-s3-bucket").with_upload_partial_logs(false);
+    assert!(!s3_cfg.upload_partial_logs);
+    registry.add_remote("s3", s3_cfg.clone());
+    registry.set_store_override("s3", s3_counting.clone());
+
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+    let fs_arc = Arc::new(fs);
+    fs_arc.set_remote_registry(registry_arc.clone());
+
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+
+    // 1. Write first chunk of active data
+    let file1_attr = create_core(&fs_arc, 1, "active_doc.txt", 0o644, 0, 1000, 1000).unwrap();
+    let ino = file1_attr.ino;
+    write_core(&fs_arc, ino, b"Chunk 0: real-time mutations for NFS only!", 0).unwrap();
+    fs_arc.sync_log().unwrap();
+
+    // Run replication cycle
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+
+    // NFS must have part0000, S3 must NOT have part0000
+    assert!(
+        nfs_mock.head_object("000001.part0000.log").unwrap().is_some(),
+        "NFS must receive active part0000"
+    );
+    assert!(
+        s3_counting.head_object("000001.part0000.log").unwrap().is_none(),
+        "S3 with upload_partial_logs=false must NOT receive active part0000"
+    );
+
+    // Telemetry check
+    {
+        let telem = fs_arc.replication_telemetry.read().unwrap();
+        assert_eq!(telem.remotes["nfs"].active_part, Some((1, 0)));
+        assert!(telem.remotes.get("s3").is_none_or(|t| t.active_part.is_none()));
+    }
+
+    // 2. Write second chunk of active data
+    write_core(&fs_arc, ino, b"Chunk 1: more mutations appended!", 100).unwrap();
+    fs_arc.sync_log().unwrap();
+
+    last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+
+    assert!(
+        nfs_mock.head_object("000001.part0001.log").unwrap().is_some(),
+        "NFS must receive active part0001"
+    );
+    assert!(
+        s3_counting.head_object("000001.part0001.log").unwrap().is_none(),
+        "S3 must NOT receive active part0001"
+    );
+
+    // 3. Roll generation: seals gen 1 into gen 2 and exports summary
+    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
+    {
+        let mut manifest = fs_arc.manifest.write().unwrap();
+        manifest.set_generation_md5(next_gen - 1, sealed_md5);
+        manifest.record_roll(next_gen, clock.now(), 24);
+    }
+    fs_arc.export_summary(storage.as_ref()).unwrap();
+
+    // Run cycle after seal
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+
+    // Both remotes must have sealed 000001.log
+    assert!(
+        nfs_mock.head_object("000001.log").unwrap().is_some(),
+        "NFS must receive sealed 000001.log"
+    );
+    assert!(
+        s3_counting.head_object("000001.log").unwrap().is_some(),
+        "S3 must receive sealed 000001.log"
+    );
+
+    // NFS parts were cleaned up
+    assert!(
+        nfs_mock.list_objects("000001.part").unwrap().is_empty(),
+        "NFS transient parts must be cleaned up on seal"
+    );
+
+    // CRUCIAL: S3 received ZERO delete_object calls!
+    assert_eq!(
+        s3_counting.deletes(),
+        0,
+        "S3 remote with upload_partial_logs=false must never issue delete_object calls"
+    );
+
+    // Check .remotes virtual file status output
+    let status = appendfs::remote::worker::format_remotes_status(&fs_arc);
+    assert!(status.contains("[Remote: nfs]"));
+    assert!(status.contains("Partial Logs:       Enabled"));
+    assert!(status.contains("[Remote: s3]"));
+    assert!(status.contains("Partial Logs:       Disabled"));
+
+    // 4. Disaster recovery / bootstrap from S3 (which has no parts)
+    let fresh_storage = Arc::new(MemoryStorage::new());
+    let recovered_summary =
+        appendfs::remote::bootstrap_from_remote(s3_raw.as_ref(), fresh_storage.as_ref(), "s3", s3_cfg).unwrap();
+    assert!(fresh_storage.exists(&recovered_summary));
+    assert!(fresh_storage.exists("remotes.toml"));
+
+    let fresh_fs = appendfs::recover_fs(fresh_storage, appendfs::RecoveryTarget::Latest, clock, volume_key).unwrap();
+    let base = fresh_fs.inner.lock().unwrap().base.clone();
+    assert!(base.len() >= 2); // root + active_doc.txt
 }

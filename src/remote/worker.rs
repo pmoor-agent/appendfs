@@ -1,5 +1,5 @@
 use crate::fs::InMemoryFS;
-use crate::remote::config::RemoteRegistry;
+use crate::remote::config::{ConfiguredRemote, RemoteRegistry};
 use crate::remote::{RemoteObject, RemoteStore};
 use crate::storage::Storage;
 use std::collections::HashMap;
@@ -215,6 +215,14 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
         out.push_str(&format!(
             "  Mode:               {}\n",
             if config.read_only { "Read-Only" } else { "Read-Write" }
+        ));
+        out.push_str(&format!(
+            "  Partial Logs:       {}\n",
+            if config.upload_partial_logs {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
         ));
 
         let telem = telemetry_guard.remotes.get(name);
@@ -496,28 +504,28 @@ impl RemoteReplicationWorker {
             let expected_len = log_entry.total_bytes;
             let expected_md5 = log_entry.md5.as_ref();
 
-            for (remote_name, remote, read_only, _) in &stores {
-                if *read_only {
+            for r in &stores {
+                if r.read_only {
                     continue;
                 }
 
                 // If not in a full audit cycle, skip if this remote already confirmed this generation
                 if !is_audit
                     && confirmed_generations
-                        .get(remote_name)
+                        .get(&r.name)
                         .is_some_and(|set| set.contains(&gen_num))
                 {
                     continue;
                 }
 
-                let remote_head = match remote.head_object(filename) {
+                let remote_head = match r.store.head_object(filename) {
                     Ok(h) => h,
                     Err(e) => {
-                        log::warn!("head_object {} on remote '{}' failed: {}", filename, remote_name, e);
+                        log::warn!("head_object {} on remote '{}' failed: {}", filename, r.name, e);
                         fs.replication_telemetry
                             .write()
                             .unwrap()
-                            .record_error(remote_name, &e.to_string());
+                            .record_error(&r.name, &e.to_string());
                         continue;
                     }
                 };
@@ -534,42 +542,37 @@ impl RemoteReplicationWorker {
                             "Replicating sealed {} ({} bytes) to remote '{}'...",
                             filename,
                             expected_len,
-                            remote_name
+                            r.name
                         );
-                        match upload_storage_file(storage.as_ref(), remote.as_ref(), filename, expected_md5) {
+                        match upload_storage_file(storage.as_ref(), r.store.as_ref(), filename, expected_md5) {
                             Ok(()) => upload_succeeded = true,
                             Err(e) => {
-                                log::warn!(
-                                    "upload_storage_file {} to remote '{}' failed: {}",
-                                    filename,
-                                    remote_name,
-                                    e
-                                );
+                                log::warn!("upload_storage_file {} to remote '{}' failed: {}", filename, r.name, e);
                                 fs.replication_telemetry
                                     .write()
                                     .unwrap()
-                                    .record_error(remote_name, &e.to_string());
+                                    .record_error(&r.name, &e.to_string());
                             }
                         }
                     } else {
                         // Cross-copy from another remote holding this generation
-                        for (src_name, src_remote, _, _) in &stores {
-                            if src_name == remote_name {
+                        for src in &stores {
+                            if src.name == r.name {
                                 continue;
                             }
-                            if let Ok(Some(src_obj)) = src_remote.head_object(filename)
+                            if let Ok(Some(src_obj)) = src.store.head_object(filename)
                                 && src_obj.size == expected_len
                             {
                                 log::info!(
                                     "Cross-copying {} ({} bytes) from remote '{}' to remote '{}'...",
                                     filename,
                                     expected_len,
-                                    src_name,
-                                    remote_name
+                                    src.name,
+                                    r.name
                                 );
                                 match cross_copy_file(
-                                    src_remote.as_ref(),
-                                    remote.as_ref(),
+                                    src.store.as_ref(),
+                                    r.store.as_ref(),
                                     filename,
                                     expected_len,
                                     expected_md5,
@@ -582,8 +585,8 @@ impl RemoteReplicationWorker {
                                         log::warn!(
                                             "cross_copy_file {} from '{}' to '{}' failed: {}",
                                             filename,
-                                            src_name,
-                                            remote_name,
+                                            src.name,
+                                            r.name,
                                             e
                                         );
                                     }
@@ -596,25 +599,29 @@ impl RemoteReplicationWorker {
                 }
 
                 let verified_on_remote = upload_succeeded
-                    || remote
+                    || r.store
                         .head_object(filename)
                         .is_ok_and(|h| h.is_some_and(|o| o.size == expected_len));
                 if verified_on_remote {
-                    // Clean up any obsolete transient parts on this remote once consolidated log is verified
-                    let parts = remote.list_objects(&format!("{:06}.part", gen_num)).unwrap_or_default();
-                    for part in parts {
-                        let _ = remote.delete_object(&part.key);
+                    // Clean up any obsolete transient parts on this remote once consolidated log is verified,
+                    // but ONLY if partial logs were enabled for this remote (avoiding unnecessary DELETE calls
+                    // for append-only / write-only remotes).
+                    if r.upload_partial_logs {
+                        let parts = r
+                            .store
+                            .list_objects(&format!("{:06}.part", gen_num))
+                            .unwrap_or_default();
+                        for part in parts {
+                            let _ = r.store.delete_object(&part.key);
+                        }
                     }
 
-                    confirmed_generations
-                        .entry(remote_name.clone())
-                        .or_default()
-                        .insert(gen_num);
+                    confirmed_generations.entry(r.name.clone()).or_default().insert(gen_num);
 
                     fs.replication_telemetry
                         .write()
                         .unwrap()
-                        .record_synced_gen(remote_name, gen_num, now);
+                        .record_synced_gen(&r.name, gen_num, now);
                 }
             }
         }
@@ -628,8 +635,8 @@ impl RemoteReplicationWorker {
             .collect();
         // Also check if any remotes have summary files not in local storage (during full audit)
         if is_audit {
-            for (_, remote, _, _) in &stores {
-                if let Ok(objs) = remote.list_objects("") {
+            for r in &stores {
+                if let Ok(objs) = r.store.list_objects("") {
                     for obj in objs {
                         if obj.key.ends_with(".summary") {
                             summary_files.insert(obj.key);
@@ -647,33 +654,28 @@ impl RemoteReplicationWorker {
                 0
             };
 
-            for (remote_name, remote, read_only, _) in &stores {
-                if *read_only {
+            for r in &stores {
+                if r.read_only {
                     continue;
                 }
 
                 // If not in a full audit cycle, skip if this remote already confirmed this summary
                 if !is_audit
                     && confirmed_summaries
-                        .get(remote_name)
+                        .get(&r.name)
                         .is_some_and(|set| set.contains(sum_file))
                 {
                     continue;
                 }
 
-                let head = match remote.head_object(sum_file) {
+                let head = match r.store.head_object(sum_file) {
                     Ok(h) => h,
                     Err(e) => {
-                        log::warn!(
-                            "head_object summary {} on remote '{}' failed: {}",
-                            sum_file,
-                            remote_name,
-                            e
-                        );
+                        log::warn!("head_object summary {} on remote '{}' failed: {}", sum_file, r.name, e);
                         fs.replication_telemetry
                             .write()
                             .unwrap()
-                            .record_error(remote_name, &e.to_string());
+                            .record_error(&r.name, &e.to_string());
                         continue;
                     }
                 };
@@ -686,34 +688,34 @@ impl RemoteReplicationWorker {
                 let mut sync_succeeded = false;
                 if needs_sync {
                     if local_exists {
-                        log::info!("Syncing summary {} to remote '{}'...", sum_file, remote_name);
-                        match upload_storage_file(storage.as_ref(), remote.as_ref(), sum_file, None) {
+                        log::info!("Syncing summary {} to remote '{}'...", sum_file, r.name);
+                        match upload_storage_file(storage.as_ref(), r.store.as_ref(), sum_file, None) {
                             Ok(()) => sync_succeeded = true,
                             Err(e) => {
-                                log::warn!("upload summary {} to '{}' failed: {}", sum_file, remote_name, e);
+                                log::warn!("upload summary {} to '{}' failed: {}", sum_file, r.name, e);
                                 fs.replication_telemetry
                                     .write()
                                     .unwrap()
-                                    .record_error(remote_name, &e.to_string());
+                                    .record_error(&r.name, &e.to_string());
                             }
                         }
                     } else {
                         // Find a peer remote that has this summary
-                        for (src_name, src_remote, _, _) in &stores {
-                            if src_name == remote_name {
+                        for src in &stores {
+                            if src.name == r.name {
                                 continue;
                             }
-                            if let Ok(Some(src_head)) = src_remote.head_object(sum_file) {
+                            if let Ok(Some(src_head)) = src.store.head_object(sum_file) {
                                 log::info!(
                                     "Cross-copying summary {} ({} bytes) from remote '{}' to '{}'...",
                                     sum_file,
                                     src_head.size,
-                                    src_name,
-                                    remote_name
+                                    src.name,
+                                    r.name
                                 );
                                 match cross_copy_file(
-                                    src_remote.as_ref(),
-                                    remote.as_ref(),
+                                    src.store.as_ref(),
+                                    r.store.as_ref(),
                                     sum_file,
                                     src_head.size,
                                     None,
@@ -734,12 +736,12 @@ impl RemoteReplicationWorker {
                 }
 
                 if sync_succeeded
-                    || remote
+                    || r.store
                         .head_object(sum_file)
                         .is_ok_and(|h| h.is_some_and(|o| if local_exists { o.size == local_len } else { true }))
                 {
                     confirmed_summaries
-                        .entry(remote_name.clone())
+                        .entry(r.name.clone())
                         .or_default()
                         .insert(sum_file.clone());
                 }
@@ -757,50 +759,57 @@ impl RemoteReplicationWorker {
                 let part_len = active_offset - *last_offset;
                 let part_filename = format!("{:06}.part{:04}.log", active_gen, *part_idx);
 
-                // Read slice from local active log
-                let active_filename = crate::log::log_filename(active_gen);
-                if let Ok(reader) = storage.open_reader(&active_filename) {
-                    let mut part_bytes = vec![0u8; part_len as usize];
-                    if reader.read_exact_at(*last_offset, &mut part_bytes).is_ok() {
-                        let part_md5: [u8; 16] = *md5::compute(&part_bytes);
-                        let mut any_part_success = false;
-                        for (remote_name, remote, read_only, _) in &stores {
-                            if *read_only {
-                                continue;
-                            }
-                            log::info!(
-                                "Uploading active incremental part {} ({} bytes) to remote '{}'...",
-                                part_filename,
-                                part_len,
-                                remote_name
-                            );
-                            match remote.put_object(&part_filename, &mut &part_bytes[..], part_len, Some(&part_md5)) {
-                                Ok(()) => {
-                                    any_part_success = true;
-                                    fs.replication_telemetry.write().unwrap().record_active_part(
-                                        remote_name,
-                                        active_gen,
-                                        *part_idx,
-                                        now,
-                                    );
+                let wants_parts = stores.iter().any(|r| !r.read_only && r.upload_partial_logs);
+
+                if wants_parts {
+                    // Read slice from local active log
+                    let active_filename = crate::log::log_filename(active_gen);
+                    if let Ok(reader) = storage.open_reader(&active_filename) {
+                        let mut part_bytes = vec![0u8; part_len as usize];
+                        if reader.read_exact_at(*last_offset, &mut part_bytes).is_ok() {
+                            let part_md5: [u8; 16] = *md5::compute(&part_bytes);
+                            let mut any_part_success = false;
+                            for r in &stores {
+                                if r.read_only || !r.upload_partial_logs {
+                                    continue;
                                 }
-                                Err(e) => {
-                                    log::warn!(
-                                        "put_object active part {} to '{}' failed: {}",
-                                        part_filename,
-                                        remote_name,
-                                        e
-                                    );
-                                    fs.replication_telemetry
-                                        .write()
-                                        .unwrap()
-                                        .record_error(remote_name, &e.to_string());
+                                log::info!(
+                                    "Uploading active incremental part {} ({} bytes) to remote '{}'...",
+                                    part_filename,
+                                    part_len,
+                                    r.name
+                                );
+                                match r.store.put_object(
+                                    &part_filename,
+                                    &mut &part_bytes[..],
+                                    part_len,
+                                    Some(&part_md5),
+                                ) {
+                                    Ok(()) => {
+                                        any_part_success = true;
+                                        fs.replication_telemetry
+                                            .write()
+                                            .unwrap()
+                                            .record_active_part(&r.name, active_gen, *part_idx, now);
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "put_object active part {} to '{}' failed: {}",
+                                            part_filename,
+                                            r.name,
+                                            e
+                                        );
+                                        fs.replication_telemetry
+                                            .write()
+                                            .unwrap()
+                                            .record_error(&r.name, &e.to_string());
+                                    }
                                 }
                             }
-                        }
-                        if any_part_success {
-                            *last_offset = active_offset;
-                            *part_idx += 1;
+                            if any_part_success {
+                                *last_offset = active_offset;
+                                *part_idx += 1;
+                            }
                         }
                     }
                 }
@@ -820,7 +829,7 @@ impl RemoteReplicationWorker {
         manifest: &crate::log::LogManifest,
         active_gen: u64,
         policy: &crate::remote::config::ReplicationPolicy,
-        stores: &[(String, Arc<dyn RemoteStore>, bool, bool)],
+        stores: &[ConfiguredRemote],
     ) {
         let now = fs.clock.now();
         let retention_dur = policy
@@ -869,8 +878,8 @@ impl RemoteReplicationWorker {
         // Batch-list remote objects across each remote store to compare sizes and ETags (MD5)
         // in O(1) listing requests rather than issuing individual head_object requests per log.
         let mut store_listings: Vec<Option<HashMap<String, RemoteObject>>> = Vec::with_capacity(stores.len());
-        for (remote_name, remote, _, _) in stores {
-            match remote.list_objects("") {
+        for r in stores {
+            match r.store.list_objects("") {
                 Ok(objs) => {
                     let map: HashMap<String, RemoteObject> = objs.into_iter().map(|o| (o.key.clone(), o)).collect();
                     store_listings.push(Some(map));
@@ -878,7 +887,7 @@ impl RemoteReplicationWorker {
                 Err(e) => {
                     log::warn!(
                         "list_objects failed on remote '{}' during pruning: {}. Remote will be skipped for this pruning cycle",
-                        remote_name,
+                        r.name,
                         e
                     );
                     store_listings.push(None);

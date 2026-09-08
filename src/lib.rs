@@ -41,10 +41,11 @@ pub use log::{
 pub use node::{InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta};
 pub use range_map::{RangeEntry, RangeMap, RangeValue};
 pub use remote::{
-    BatchLeaderGuard, BlockCache, ConcurrencyLimiter, ConcurrencyPermit, DEFAULT_DECRYPTED_CACHE_SIZE,
-    DecryptedRecordCache, FollowerBlock, MemoryBlockCache, OnDiskBlockCache, RemoteObject, RemoteReadCoalescer,
-    RemoteReadTarget, RemoteRegistry, RemoteReplicationWorker, RemoteStore, RemoteTargetConfig, ReplicationPolicy,
-    S3RemoteStore, TieredCache, TieredStorageReader, prepare_remote_recovery_for_target,
+    BatchLeaderGuard, BlockCache, ConcurrencyLimiter, ConcurrencyPermit, ConfiguredRemote,
+    DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, FollowerBlock, MemoryBlockCache, OnDiskBlockCache,
+    RemoteObject, RemoteReadCoalescer, RemoteReadTarget, RemoteRegistry, RemoteReplicationWorker, RemoteStore,
+    RemoteTargetConfig, ReplicationPolicy, S3RemoteStore, TieredCache, TieredStorageReader,
+    prepare_remote_recovery_for_target,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use remote::{CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, MockRemoteStore, RemoteStoreMetrics};
