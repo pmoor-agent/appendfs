@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::too_many_lines))]
 use appendfs::cli::{
-    CheckArgs, Cli, Commands, DumpArgs, InitArgs, KeyArgs, MountArgs, MountRoArgs, RemoteSubcommandArgs, StatsArgs,
+    CheckArgs, Cli, Commands, DumpArgs, InitArgs, KeyArgs, MountArgs, MountRoArgs, RemoteAddArgs, RemoteCommands,
+    RemoteListArgs, RemoteRmArgs, RemoteSubcommandArgs, StatsArgs,
 };
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{
@@ -733,88 +734,94 @@ fn cmd_check(args: CheckArgs) {
 
 fn cmd_remote(subargs: RemoteSubcommandArgs) {
     match subargs.command {
-        appendfs::cli::RemoteCommands::Add(add_args) => {
-            let storage = OsStorage::new(&add_args.log_dir);
-            let mut registry = load_remote_registry(&storage);
-            let mut cfg = if let Some(ref p) = add_args.path {
-                appendfs::remote::RemoteTargetConfig::new_path(p)
-            } else if let Some(ref b) = add_args.bucket {
-                appendfs::remote::RemoteTargetConfig::new(b)
-            } else {
-                eprintln!("Error: Either --path or --bucket must be specified when adding a remote.");
-                std::process::exit(1);
-            };
-            cfg.endpoint = add_args.endpoint;
-            cfg.region = add_args.region;
-            cfg.prefix = add_args.prefix;
-            cfg.read_only = add_args.read_only;
-            cfg.replicate_ancestors = add_args.replicate_ancestors;
-            if let Some(prio) = add_args.read_priority {
-                cfg.read_priority = prio;
-            }
-            cfg.access_key_id = add_args.access_key_id;
-            cfg.secret_access_key = add_args.secret_access_key;
-            cfg.access_key_id_env = add_args.access_key_id_env;
-            cfg.secret_access_key_env = add_args.secret_access_key_env;
-            cfg.credentials_file = add_args.credentials_file;
-            cfg.force_path_style = add_args.path_style;
+        RemoteCommands::Add(add_args) => cmd_remote_add(add_args),
+        RemoteCommands::Rm(rm_args) => cmd_remote_rm(rm_args),
+        RemoteCommands::List(list_args) => cmd_remote_list(list_args),
+    }
+}
 
-            registry.add_remote(&add_args.name, cfg);
-            if let Err(e) = registry.save_to_storage(&storage) {
-                eprintln!("Failed to save remotes.toml in '{}': {}", add_args.log_dir.display(), e);
-                std::process::exit(1);
-            }
-            println!(
-                "Successfully added remote '{}' in '{}'",
-                add_args.name,
-                add_args.log_dir.display()
-            );
+fn cmd_remote_add(add_args: RemoteAddArgs) {
+    let storage = OsStorage::new(&add_args.log_dir);
+    let mut registry = load_remote_registry(&storage);
+    let mut cfg = if let Some(ref p) = add_args.path {
+        appendfs::remote::RemoteTargetConfig::new_path(p)
+    } else if let Some(ref b) = add_args.bucket {
+        appendfs::remote::RemoteTargetConfig::new(b)
+    } else {
+        eprintln!("Error: Either --path or --bucket must be specified when adding a remote.");
+        std::process::exit(1);
+    };
+    cfg.endpoint = add_args.endpoint;
+    cfg.region = add_args.region;
+    cfg.prefix = add_args.prefix;
+    cfg.read_only = add_args.read_only;
+    cfg.replicate_ancestors = add_args.replicate_ancestors;
+    if let Some(prio) = add_args.read_priority {
+        cfg.read_priority = prio;
+    }
+    cfg.access_key_id = add_args.access_key_id;
+    cfg.secret_access_key = add_args.secret_access_key;
+    cfg.access_key_id_env = add_args.access_key_id_env;
+    cfg.secret_access_key_env = add_args.secret_access_key_env;
+    cfg.credentials_file = add_args.credentials_file;
+    cfg.force_path_style = add_args.path_style;
+
+    registry.add_remote(&add_args.name, cfg);
+    if let Err(e) = registry.save_to_storage(&storage) {
+        eprintln!("Failed to save remotes.toml in '{}': {}", add_args.log_dir.display(), e);
+        std::process::exit(1);
+    }
+    println!(
+        "Successfully added remote '{}' in '{}'",
+        add_args.name,
+        add_args.log_dir.display()
+    );
+}
+
+fn cmd_remote_rm(rm_args: RemoteRmArgs) {
+    let storage = OsStorage::new(&rm_args.log_dir);
+    let mut registry = load_remote_registry(&storage);
+    if registry.remove_remote(&rm_args.name) {
+        if let Err(e) = registry.save_to_storage(&storage) {
+            eprintln!("Failed to save remotes.toml in '{}': {}", rm_args.log_dir.display(), e);
+            std::process::exit(1);
         }
-        appendfs::cli::RemoteCommands::Rm(rm_args) => {
-            let storage = OsStorage::new(&rm_args.log_dir);
-            let mut registry = load_remote_registry(&storage);
-            if registry.remove_remote(&rm_args.name) {
-                if let Err(e) = registry.save_to_storage(&storage) {
-                    eprintln!("Failed to save remotes.toml in '{}': {}", rm_args.log_dir.display(), e);
-                    std::process::exit(1);
-                }
-                println!("Removed remote '{}' from '{}'", rm_args.name, rm_args.log_dir.display());
+        println!("Removed remote '{}' from '{}'", rm_args.name, rm_args.log_dir.display());
+    } else {
+        eprintln!("Error: Remote '{}' was not configured.", rm_args.name);
+        std::process::exit(1);
+    }
+}
+
+fn cmd_remote_list(list_args: RemoteListArgs) {
+    let storage = OsStorage::new(&list_args.log_dir);
+    let registry = load_remote_registry(&storage);
+    if registry.remotes.is_empty() {
+        println!("No remotes configured in '{}'.", list_args.log_dir.display());
+    } else {
+        println!("Configured remotes in '{}':", list_args.log_dir.display());
+        let mut sorted_remotes: Vec<_> = registry.remotes.iter().collect();
+        sorted_remotes.sort_by_key(|(name, cfg)| (cfg.read_priority, (*name).clone()));
+        for (name, cfg) in sorted_remotes {
+            if let Some(ref p) = cfg.path {
+                println!(
+                    "  - {}: type='local/nfs', path='{}', priority={}, mode='{}'",
+                    name,
+                    p.display(),
+                    cfg.read_priority,
+                    if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
+                );
             } else {
-                eprintln!("Error: Remote '{}' was not configured.", rm_args.name);
-                std::process::exit(1);
-            }
-        }
-        appendfs::cli::RemoteCommands::List(list_args) => {
-            let storage = OsStorage::new(&list_args.log_dir);
-            let registry = load_remote_registry(&storage);
-            if registry.remotes.is_empty() {
-                println!("No remotes configured in '{}'.", list_args.log_dir.display());
-            } else {
-                println!("Configured remotes in '{}':", list_args.log_dir.display());
-                let mut sorted_remotes: Vec<_> = registry.remotes.iter().collect();
-                sorted_remotes.sort_by_key(|(name, cfg)| (cfg.read_priority, (*name).clone()));
-                for (name, cfg) in sorted_remotes {
-                    if let Some(ref p) = cfg.path {
-                        println!(
-                            "  - {}: type='local/nfs', path='{}', priority={}, mode='{}'",
-                            name,
-                            p.display(),
-                            cfg.read_priority,
-                            if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
-                        );
-                    } else {
-                        println!(
-                            "  - {}: type='s3', bucket='{}', priority={}, region='{}', mode='{}', endpoint={:?}, prefix='{}'",
-                            name,
-                            cfg.bucket.as_deref().unwrap_or(""),
-                            cfg.read_priority,
-                            cfg.region,
-                            if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
-                            cfg.endpoint,
-                            cfg.prefix
-                        );
-                    }
-                }
+                println!(
+                    "  - {}: type='s3', bucket='{}', priority={}, region='{}', mode='{}', endpoint={:?}, prefix='{}'",
+                    name,
+                    cfg.bucket.as_deref().unwrap_or(""),
+                    cfg.read_priority,
+                    cfg.region,
+                    if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
+                    cfg.endpoint,
+                    cfg.prefix
+                );
             }
         }
     }
