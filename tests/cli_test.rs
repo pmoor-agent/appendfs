@@ -200,4 +200,26 @@ fn test_cli_remote_add_and_list_upload_partial_logs() {
     let registry = appendfs::remote::RemoteRegistry::load_from_storage(&storage).unwrap();
     assert!(registry.remotes["nfs"].upload_partial_logs);
     assert!(!registry.remotes["s3_backup"].upload_partial_logs);
+
+    // 5. Verify passing both --upload-partial-logs and --no-upload-partial-logs fails
+    let conflict_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remote",
+            "add",
+            temp_dir.path().to_str().unwrap(),
+            "invalid_remote",
+            "--bucket",
+            "my-bucket",
+            "--upload-partial-logs",
+            "--no-upload-partial-logs",
+        ])
+        .output()
+        .expect("failed to run remote add with conflicting flags");
+    assert!(!conflict_out.status.success());
+    let stderr = String::from_utf8_lossy(&conflict_out.stderr);
+    assert!(
+        stderr.contains("cannot be used with") || stderr.contains("Cannot specify both"),
+        "expected conflict error, got: {}",
+        stderr
+    );
 }

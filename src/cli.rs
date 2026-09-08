@@ -150,11 +150,16 @@ pub struct RemoteAddArgs {
     pub path_style: Option<bool>,
 
     /// Upload incremental active log parts to this remote before generation seals (default: true)
-    #[arg(long = "upload-partial-logs", default_value = "true", action = clap::ArgAction::Set)]
-    pub upload_partial_logs: bool,
+    #[arg(
+        long = "upload-partial-logs",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        conflicts_with = "no_upload_partial_logs"
+    )]
+    pub upload_partial_logs: Option<bool>,
 
     /// Disable uploading incremental active log parts to this remote (useful for write-only/append-only S3 targets)
-    #[arg(long = "no-upload-partial-logs", action = clap::ArgAction::SetTrue)]
+    #[arg(long = "no-upload-partial-logs", conflicts_with = "upload_partial_logs")]
     pub no_upload_partial_logs: bool,
 }
 
