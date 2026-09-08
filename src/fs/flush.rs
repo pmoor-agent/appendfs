@@ -31,6 +31,8 @@ impl InMemoryFS {
             let id = inner.next_batch_id;
             inner.next_batch_id += 1;
             inner.flushing.push_back(FlushBatch::new(id, entries, arena));
+            self.staged_bytes.store(0, Ordering::SeqCst);
+            self.staged_ops.store(0, Ordering::SeqCst);
         }
     }
 
@@ -299,8 +301,6 @@ impl InMemoryFS {
             }
         }
 
-        self.staged_bytes.store(0, Ordering::Relaxed);
-        self.staged_ops.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -362,11 +362,11 @@ impl InMemoryFS {
     /// Increments mutation counters (ops & bytes) and triggers an automatic flush if thresholds are reached.
     pub fn notify_mutation(&self, additional_bytes: usize) {
         let staged_b = if additional_bytes > 0 {
-            self.staged_bytes.fetch_add(additional_bytes, Ordering::Relaxed) + additional_bytes
+            self.staged_bytes.fetch_add(additional_bytes, Ordering::SeqCst) + additional_bytes
         } else {
-            self.staged_bytes.load(Ordering::Relaxed)
+            self.staged_bytes.load(Ordering::SeqCst)
         };
-        let staged_o = self.staged_ops.fetch_add(1, Ordering::Relaxed) + 1;
+        let staged_o = self.staged_ops.fetch_add(1, Ordering::SeqCst) + 1;
 
         if staged_b >= self.max_buffer_size || staged_o >= self.max_staged_ops {
             // In-memory freeze of active live delta into flushing queue (< 1 µs)
@@ -1979,5 +1979,72 @@ mod tests {
         drop(guard);
         handle.join().unwrap();
         assert!(destroyed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_staged_accounting_reset_on_begin_flush_prevents_spurious_batches() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        // Threshold: 100 bytes or 10 ops
+        fs.max_buffer_size = 100;
+        fs.max_staged_ops = 10;
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
+
+        // 1. Write 100 bytes to hit max_buffer_size threshold
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 100], 0).unwrap();
+
+        // Automatic threshold triggered begin_flush()!
+        // In unmounted environment without background flusher, notify_mutation flushes inline,
+        // so queue depth is 0 and staged counters are 0.
+        assert_eq!(fs.staged_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 0);
+
+        // Now simulate active background flusher with queued batch:
+        // Populate live with 60 bytes
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xBB; 60], 100).unwrap();
+        assert_eq!(fs.staged_bytes.load(Ordering::SeqCst), 60);
+        assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 1);
+
+        // Freeze batch into queue manually (simulating begin_flush when flusher starts or when threshold hit)
+        fs.begin_flush();
+        assert_eq!(fs.flush_queue_depth(), 1);
+        // Counters must be reset to 0 upon freezing into flushing queue
+        assert_eq!(fs.staged_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 0);
+
+        // Subsequent write arriving while batch 1 is in flushing queue
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xCC; 20], 160).unwrap();
+        // Should NOT trigger another begin_flush()! Queue depth must remain 1
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.staged_bytes.load(Ordering::SeqCst), 20);
+        assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 1);
+
+        // Another small write
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xDD; 20], 180).unwrap();
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.staged_bytes.load(Ordering::SeqCst), 40);
+        assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 2);
+
+        // Now drain flushing batches
+        while let Some(batch) = fs.pop_flushing_batch() {
+            fs.fold_flushed_batch(batch);
+        }
+
+        // Live staged data is preserved
+        assert_eq!(fs.staged_bytes.load(Ordering::SeqCst), 40);
+        assert_eq!(fs.staged_ops.load(Ordering::SeqCst), 2);
     }
 }
