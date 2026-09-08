@@ -5,14 +5,15 @@
 //! trailing `FlushCommit` confirming atomic persistence. Recovery replays `LogEntryDelta`
 //! records directly onto `base`, guaranteeing identical state transitions across crash recovery.
 
-use super::{FlushBatch, InMemoryFS};
+use super::{FlushBatch, FsInner, InMemoryFS};
 use crate::log::{
     BackgroundFlusher, ExtentState, GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE,
     SharedExtentState,
 };
 use crate::node::{EntryDelta, NodeDelta, NodeKind};
 use crate::storage::Storage;
-use std::collections::{HashMap, VecDeque};
+use crate::sync::OpTag;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -21,18 +22,20 @@ use std::time::Duration;
 impl InMemoryFS {
     // --- Flush & Fold Pipelines ---
 
-    /// Freezes `live` into the `flushing` queue.
+    /// Freezes `live` into the `flushing` queue if queue depth is below `max_flush_queue_depth`.
     pub fn begin_flush(&self) -> bool {
-        self.inner.lock().unwrap().freeze_live()
+        let mut inner = self.inner.lock_tag(OpTag::Flush).unwrap();
+        self.begin_flush_locked(&mut inner)
     }
 
-    pub fn current_flushing(&self) -> VecDeque<FlushBatch> {
-        self.inner.lock().unwrap().flushing.clone()
+    /// Freezes `live` into the `flushing` queue with the inner lock already held.
+    pub fn begin_flush_locked(&self, inner: &mut FsInner) -> bool {
+        inner.freeze_live(self.max_flush_queue_depth)
     }
 
     /// Pops the front batch from the flushing queue, if any.
     pub fn pop_flushing_batch(&self) -> Option<FlushBatch> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_tag(OpTag::Flush).unwrap();
         let batch = inner.flushing.pop_front()?;
         inner.flushing_bytes -= batch.bytes;
         inner.flushing_ops -= batch.ops;
@@ -41,23 +44,13 @@ impl InMemoryFS {
 
     /// Merges a flushed batch into `base`.
     pub fn fold_flushed_batch(&self, flushed: FlushBatch) {
-        let mut inner = self.inner.lock().unwrap();
-        for (ino, entry) in flushed.entries {
-            match entry {
-                EntryDelta::Tombstone => {
-                    inner.base.remove(&ino);
-                }
-                EntryDelta::Node(delta) => {
-                    if let Some(existing_arc) = inner.base.get(&ino).cloned() {
-                        let mut node_clone = (*existing_arc).clone();
-                        delta.apply_to_node(&mut node_clone);
-                        inner.base.insert(ino, Arc::new(node_clone));
-                    } else {
-                        inner.base.insert(ino, Arc::new(delta.to_node()));
-                    }
-                }
-            }
-        }
+        let mut inner = self.inner.lock_tag(OpTag::Fold).unwrap();
+        self.fold_flushed_batch_locked(&mut inner, flushed);
+    }
+
+    /// Merges a flushed batch into `base` with the inner lock already held.
+    pub fn fold_flushed_batch_locked(&self, inner: &mut FsInner, flushed: FlushBatch) {
+        inner.fold_flushed_batch(flushed);
     }
 
     /// Writes pending data extents and serialized `LogEntryDelta` records for a frozen batch,
@@ -256,18 +249,20 @@ impl InMemoryFS {
         let Some(ref writer) = self.log_writer else {
             return Ok(());
         };
+        self.begin_flush();
         self.flush_log_locked(writer)
     }
 
     /// Internal flush implementation called while holding `flush_lock`.
     fn flush_log_locked(&self, writer: &LogWriter) -> std::io::Result<()> {
-        // Freeze any active live mutations into the flushing queue
-        self.begin_flush();
-
-        // Drain flushing batches from the front of the queue
+        // Drain flushing batches from the queue, freezing active live mutations if room allows
+        // and staged mutation thresholds are reached.
         loop {
             let mut batch = {
-                let inner = self.inner.lock().unwrap();
+                let mut inner = self.inner.lock_tag(OpTag::Flush).unwrap();
+                if inner.staged_bytes >= self.max_buffer_size || inner.staged_ops >= self.max_staged_ops {
+                    self.begin_flush_locked(&mut inner);
+                }
                 match inner.flushing.front() {
                     Some(b) => {
                         assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
@@ -283,9 +278,9 @@ impl InMemoryFS {
             self.synthesize_and_write_flushing_layer(&mut batch.entries, writer)?;
 
             // On success: fold into base, assert front of queue is still batch, and pop
-            self.fold_flushed_batch(batch);
             {
-                let mut inner = self.inner.lock().unwrap();
+                let mut inner = self.inner.lock_tag(OpTag::Fold).unwrap();
+                self.fold_flushed_batch_locked(&mut inner, batch);
                 let front = inner.flushing.front().expect("flushing queue must not be empty");
                 assert_eq!(
                     front.id, batch_id,
@@ -308,6 +303,7 @@ impl InMemoryFS {
         };
 
         // Drain pending batches first so the current generation is cleanly flushed
+        self.begin_flush();
         self.flush_log_locked(writer)?;
 
         if let Some((next_gen, sealed_md5)) = writer.force_roll(&*self.clock)? {
@@ -326,7 +322,7 @@ impl InMemoryFS {
 
     /// Number of frozen batches currently waiting to be written to the log.
     pub fn flush_queue_depth(&self) -> usize {
-        self.inner.lock().unwrap().flushing.len()
+        self.inner.lock_tag(OpTag::Flush).unwrap().flushing.len()
     }
 
     /// Admission control for mutating operations, called before any state is changed.
@@ -360,15 +356,6 @@ impl InMemoryFS {
         if should_trigger && !self.trigger_flusher() {
             let _ = self.flush_log();
         }
-    }
-
-    /// Increments mutation counters (ops & bytes) and triggers an automatic flush if thresholds are reached.
-    pub fn notify_mutation(&self, additional_bytes: usize) {
-        let should_trigger = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.record_mutation(additional_bytes, self.max_buffer_size, self.max_staged_ops)
-        };
-        self.notify_flush_trigger(should_trigger);
     }
 
     /// Initializes background services (e.g. periodic flusher) upon FUSE mount.
@@ -1999,7 +1986,7 @@ mod tests {
         crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 100], 0).unwrap();
 
         // Automatic threshold triggered begin_flush()!
-        // In unmounted environment without background flusher, notify_mutation flushes inline,
+        // In unmounted environment without background flusher, threshold trigger flushes inline,
         // so queue depth is 0 and staged counters are 0.
         assert_eq!(fs.staged_bytes(), 0);
         assert_eq!(fs.staged_ops(), 0);
@@ -2046,5 +2033,120 @@ mod tests {
         assert_eq!(fs.staged_ops(), 2);
         assert_eq!(fs.flushing_bytes(), 0);
         assert_eq!(fs.flushing_ops(), 0);
+    }
+
+    #[test]
+    fn test_freeze_live_bounded_by_max_flush_queue_depth() {
+        let mut fs = InMemoryFS::new();
+        fs.max_flush_queue_depth = 2;
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "bounded.bin", 0o644, 0, 1000, 1000).unwrap();
+
+        // Populate batch 1
+        crate::operations::read_write::write_core(&fs, file.ino, &[0x11; 30], 0).unwrap();
+        assert!(fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 1);
+
+        // Populate batch 2
+        crate::operations::read_write::write_core(&fs, file.ino, &[0x22; 40], 30).unwrap();
+        assert!(fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 2);
+
+        // Queue is now full (len == max_flush_queue_depth == 2).
+        // Populate live with batch 3 candidates
+        crate::operations::read_write::write_core(&fs, file.ino, &[0x33; 50], 70).unwrap();
+        assert_eq!(fs.staged_bytes(), 50);
+        assert_eq!(fs.staged_ops(), 1);
+
+        // begin_flush must be a no-op that returns false and leaves live and staged accounting untouched
+        assert!(!fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.staged_bytes(), 50);
+        assert_eq!(fs.staged_ops(), 1);
+
+        // Verify data in live is intact and readable across layers
+        let read = fs.read_file_data(file.ino, 0, 120).unwrap();
+        assert_eq!(&read[0..30], &[0x11; 30]);
+        assert_eq!(&read[30..70], &[0x22; 40]);
+        assert_eq!(&read[70..120], &[0x33; 50]);
+
+        // Pop one batch from flushing queue to make room
+        let popped = fs.pop_flushing_batch().unwrap();
+        fs.fold_flushed_batch(popped);
+        assert_eq!(fs.flush_queue_depth(), 1);
+
+        // Now begin_flush should succeed in freezing the accumulated live mutations
+        assert!(fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.staged_ops(), 0);
+
+        // Drain remaining batches
+        while let Some(batch) = fs.pop_flushing_batch() {
+            fs.fold_flushed_batch(batch);
+        }
+        assert_eq!(fs.flush_queue_depth(), 0);
+        let read_final = fs.read_file_data(file.ino, 0, 120).unwrap();
+        assert_eq!(&read_final[0..30], &[0x11; 30]);
+        assert_eq!(&read_final[30..70], &[0x22; 40]);
+        assert_eq!(&read_final[70..120], &[0x33; 50]);
+    }
+
+    #[test]
+    fn test_flush_log_dedicated_fold_tag_and_threshold_drain() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer.clone()));
+        fs.max_buffer_size = 100;
+        fs.max_staged_ops = 10;
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 50], 0).unwrap();
+
+        // Perform flush
+        fs.flush_log().unwrap();
+
+        // Verify OpTag::Fold metric was recorded
+        let stats = fs.inner.op_stats();
+        let fold_stat = stats.iter().find(|s| s.tag == OpTag::Fold).unwrap();
+        assert!(
+            fold_stat.count >= 1,
+            "OpTag::Fold must be recorded when folding batches into base"
+        );
+
+        // Populate live with 20 bytes (below threshold of 100 bytes / 10 ops)
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xBB; 20], 50).unwrap();
+        assert_eq!(fs.staged_bytes(), 20);
+        assert_eq!(fs.staged_ops(), 1);
+
+        // Direct call to flush_log_locked: should NOT freeze live because thresholds are not met
+        fs.flush_log_locked(&writer).unwrap();
+        assert_eq!(fs.staged_bytes(), 20, "Mutations below threshold should remain in live");
+        assert_eq!(fs.staged_ops(), 1);
+        assert_eq!(fs.flush_queue_depth(), 0);
+
+        // Record mutations exceeding max_buffer_size directly on inner
+        {
+            let mut inner = fs.inner.lock().unwrap();
+            inner.record_mutation(90); // 20 + 90 = 110 >= 100
+        }
+        assert_eq!(fs.staged_bytes(), 110);
+        assert_eq!(fs.flush_queue_depth(), 0);
+
+        // flush_log_locked will detect the threshold is met, freeze it via begin_flush_locked, and drain it
+        fs.flush_log_locked(&writer).unwrap();
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.flush_queue_depth(), 0);
     }
 }

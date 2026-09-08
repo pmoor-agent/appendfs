@@ -1,6 +1,7 @@
 use crate::fs::{InMemoryFS, find_parent_inode};
 use crate::node::{AttrDelta, DirectoryDelta, NodeDelta};
 use crate::shim::{self, FileAttr, FileType, Request};
+use crate::sync::OpTag;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -181,8 +182,7 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
     }
     fs.check_flush_capacity()?;
 
-    let attr = {
-        let mut inner = fs.inner.lock().unwrap();
+    fs.with_inner(OpTag::Mkdir, |inner| {
         let now = fs.clock.now();
         log::trace!(
             "mkdir(parent={}, name={}, mode=0o{:o}, uid={}, gid={})",
@@ -202,7 +202,7 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
             return Err(libc::ENOTDIR);
         }
 
-        if fs.lookup_child_locked(&inner, parent, name).is_some() {
+        if fs.lookup_child_locked(inner, parent, name).is_some() {
             return Err(libc::EEXIST);
         }
 
@@ -234,8 +234,9 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
                 ..Default::default()
             },
         );
+        inner.record_mutation(name.len());
 
-        FileAttr {
+        Ok(FileAttr {
             ino: new_ino,
             file_type: FileType::Directory,
             perm: mode & 0o7777,
@@ -247,12 +248,8 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
             atime: now,
             mtime: now,
             ctime: now,
-        }
-    };
-
-    fs.notify_mutation(0);
-
-    Ok(attr)
+        })
+    })
 }
 
 pub fn mkdir(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32) {
@@ -270,8 +267,7 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
     }
     fs.check_flush_capacity()?;
 
-    {
-        let mut inner = fs.inner.lock().unwrap();
+    fs.with_inner(OpTag::Rmdir, |inner| {
         let now = fs.clock.now();
         log::trace!("rmdir(parent={}, name={})", parent, name);
 
@@ -284,8 +280,8 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
             return Err(libc::ENOTDIR);
         }
 
-        let child_ino = fs.lookup_child_locked(&inner, parent, name).ok_or(libc::ENOENT)?;
-        let child_attr = fs.get_attr_locked(&inner, child_ino).ok_or(libc::ENOENT)?;
+        let child_ino = fs.lookup_child_locked(inner, parent, name).ok_or(libc::ENOENT)?;
+        let child_attr = fs.get_attr_locked(inner, child_ino).ok_or(libc::ENOENT)?;
         if child_attr.file_type != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
@@ -305,11 +301,9 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
             },
         );
         inner.tombstone(child_ino);
-    }
-
-    fs.notify_mutation(0);
-
-    Ok(())
+        inner.record_mutation(name.len());
+        Ok(())
+    })
 }
 
 pub fn rmdir(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {

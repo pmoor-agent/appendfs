@@ -6,6 +6,7 @@
 //! paginated `readdir` is isolated from concurrent mutations.
 
 use super::{DirHandle, FileHandle, Handle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
+use crate::sync::OpTag;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -26,9 +27,10 @@ impl InMemoryFS {
         };
 
         let fh = self.allocate_fh();
-        let mut inner = self.inner.lock().unwrap();
-        inner.handles.insert(fh, Handle::File(file_handle));
-        *inner.open_counts.entry(ino).or_insert(0) += 1;
+        self.with_inner(OpTag::Handle, |inner| {
+            inner.handles.insert(fh, Handle::File(file_handle));
+            *inner.open_counts.entry(ino).or_insert(0) += 1;
+        });
         fh
     }
 
@@ -38,15 +40,16 @@ impl InMemoryFS {
     /// - `Err(libc::EBADF)` if the handle does not exist or was opened for a different inode.
     /// - `Err(libc::EISDIR)` if the handle refers to a directory.
     pub fn extract_file_handle(&self, ino: u64, fh: u64) -> Result<FileHandle, i32> {
-        let inner = self.inner.lock().unwrap();
-        let handle = inner.handles.get(&fh).ok_or(libc::EBADF)?;
-        if handle.ino() != ino {
-            return Err(libc::EBADF);
-        }
-        match handle {
-            Handle::File(f) => Ok(f.clone()),
-            Handle::Directory(_) => Err(libc::EISDIR),
-        }
+        self.with_inner(OpTag::Handle, |inner| {
+            let handle = inner.handles.get(&fh).ok_or(libc::EBADF)?;
+            if handle.ino() != ino {
+                return Err(libc::EBADF);
+            }
+            match handle {
+                Handle::File(f) => Ok(f.clone()),
+                Handle::Directory(_) => Err(libc::EISDIR),
+            }
+        })
     }
 
     /// Validates and extracts a directory handle for the given inode and handle ID.
@@ -55,15 +58,16 @@ impl InMemoryFS {
     /// - `Err(libc::EBADF)` if the handle does not exist or was opened for a different inode.
     /// - `Err(libc::ENOTDIR)` if the handle refers to a file.
     pub fn extract_dir_handle(&self, ino: u64, fh: u64) -> Result<DirHandle, i32> {
-        let inner = self.inner.lock().unwrap();
-        let handle = inner.handles.get(&fh).ok_or(libc::EBADF)?;
-        if handle.ino() != ino {
-            return Err(libc::EBADF);
-        }
-        match handle {
-            Handle::Directory(d) => Ok(d.clone()),
-            Handle::File(_) => Err(libc::ENOTDIR),
-        }
+        self.with_inner(OpTag::Handle, |inner| {
+            let handle = inner.handles.get(&fh).ok_or(libc::EBADF)?;
+            if handle.ino() != ino {
+                return Err(libc::EBADF);
+            }
+            match handle {
+                Handle::Directory(d) => Ok(d.clone()),
+                Handle::File(_) => Err(libc::ENOTDIR),
+            }
+        })
     }
 
     pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
@@ -100,8 +104,7 @@ impl InMemoryFS {
     }
 
     pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
-        let is_last_handle = {
-            let mut inner = self.inner.lock().unwrap();
+        let is_last_handle = self.with_inner(OpTag::Handle, |inner| {
             match inner.handles.get(&fh) {
                 Some(h) if h.ino() == ino && !h.is_dir() => {
                     inner.handles.remove(&fh);
@@ -125,8 +128,8 @@ impl InMemoryFS {
                 0
             };
 
-            remaining == 0
-        };
+            Ok(remaining == 0)
+        })?;
 
         // Clean up locks outside inner critical section
         self.locks.release_flock(ino, fh);
@@ -151,7 +154,7 @@ impl InMemoryFS {
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {
-        self.inner.lock().unwrap().open_counts.get(&ino).copied().unwrap_or(0)
+        self.with_inner(OpTag::Handle, |inner| inner.open_counts.get(&ino).copied().unwrap_or(0))
     }
 
     // --- Directory Handle Snapshot Management ---
@@ -162,26 +165,27 @@ impl InMemoryFS {
 
     pub fn open_dir_handle(&self, ino: u64, flags: u32, entries: Vec<(String, u64)>) -> u64 {
         let fh = self.allocate_fh();
-        self.inner.lock().unwrap().handles.insert(
-            fh,
-            Handle::Directory(DirHandle {
-                ino,
-                flags,
-                entries: Arc::new(entries),
-            }),
-        );
+        self.with_inner(OpTag::Handle, |inner| {
+            inner.handles.insert(
+                fh,
+                Handle::Directory(DirHandle {
+                    ino,
+                    flags,
+                    entries: Arc::new(entries),
+                }),
+            );
+        });
         fh
     }
 
     pub fn release_dir_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
-        let mut inner = self.inner.lock().unwrap();
-        match inner.handles.get(&fh) {
+        self.with_inner(OpTag::Handle, |inner| match inner.handles.get(&fh) {
             Some(h) if h.ino() == ino && h.is_dir() => {
                 inner.handles.remove(&fh);
                 Ok(())
             }
             _ => Err(libc::EBADF),
-        }
+        })
     }
 }
 

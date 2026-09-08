@@ -196,6 +196,20 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Formats a duration into a human-readable string (ns, µs, ms, s).
+pub fn format_duration(d: std::time::Duration) -> String {
+    let nanos = d.as_nanos();
+    if nanos < 1_000 {
+        format!("{} ns", nanos)
+    } else if nanos < 1_000_000 {
+        format!("{:.2} µs", nanos as f64 / 1_000.0)
+    } else if nanos < 1_000_000_000 {
+        format!("{:.2} ms", nanos as f64 / 1_000_000.0)
+    } else {
+        format!("{:.2} s", d.as_secs_f64())
+    }
+}
+
 /// Formats a complete human-readable report of runtime filesystem statistics and health.
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
@@ -436,6 +450,14 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     };
     let flock_count = fs.locks.flock_count();
     let range_lock_count = fs.locks.range_lock_count();
+    let mutex_lock_count = fs.inner.lock_count();
+    let mutex_busy_time = fs.inner.busy_time();
+    let mutex_wait_time = fs.inner.wait_time();
+    let avg_hold = if mutex_lock_count > 0 {
+        mutex_busy_time / (mutex_lock_count as u32)
+    } else {
+        std::time::Duration::ZERO
+    };
 
     out.push_str("[Handles & Locks]\n");
     out.push_str(&format!("  Open File Handles:  {}\n", file_handles_count));
@@ -444,6 +466,39 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push_str(&format!("  Open Inodes:        {}\n", open_inodes_count));
     out.push_str(&format!("  Active File Locks:  {}\n", flock_count));
     out.push_str(&format!("  Active Range Locks: {}\n", range_lock_count));
+    out.push_str(&format!("  Mutex Lock Count:   {}\n", mutex_lock_count));
+    out.push_str(&format!(
+        "  Mutex Busy Time:    {} (avg: {} / lock)\n",
+        format_duration(mutex_busy_time),
+        format_duration(avg_hold)
+    ));
+    out.push_str(&format!("  Mutex Wait Time:    {}\n", format_duration(mutex_wait_time)));
+
+    let mut op_stats: Vec<_> = fs.inner.op_stats().into_iter().filter(|s| s.count > 0).collect();
+    if !op_stats.is_empty() {
+        op_stats.sort_by_key(|s| std::cmp::Reverse(s.busy_time));
+        out.push('\n');
+        out.push_str("[Mutex Contention by Operation]\n");
+        out.push_str(&format!(
+            "  {:<12} {:>8} {:>12} {:>12} {:>12} {:>12}\n",
+            "OPERATION", "ACQUIRES", "TOTAL TIME", "AVG HOLD", "MAX HOLD", "WAIT TIME"
+        ));
+        out.push_str(&format!(
+            "  {:-<12} {:-<8} {:-<12} {:-<12} {:-<12} {:-<12}\n",
+            "", "", "", "", "", ""
+        ));
+        for s in op_stats {
+            out.push_str(&format!(
+                "  {:<12} {:>8} {:>12} {:>12} {:>12} {:>12}\n",
+                s.tag.name(),
+                s.count,
+                format_duration(s.busy_time),
+                format_duration(s.avg_hold_time()),
+                format_duration(s.max_hold_time),
+                format_duration(s.wait_time),
+            ));
+        }
+    }
 
     // 6. Replication Remotes (if configured)
     let remotes_count = fs
@@ -541,6 +596,9 @@ mod tests {
         assert!(status.contains("Open Dir Handles:   0"));
         assert!(status.contains("Active File Locks:  0"));
         assert!(status.contains("Active Range Locks: 0"));
+        assert!(status.contains("Mutex Lock Count:"));
+        assert!(status.contains("Mutex Busy Time:"));
+        assert!(status.contains("Mutex Wait Time:"));
 
         // Verify reading .status virtual file via handle
         let v_ino = fs.lookup_child(1, ".status").expect(".status must exist");
@@ -619,7 +677,7 @@ mod tests {
         // 1 root + 1 subfolder = 2 directories, 2 files, 1 symlink = 5 active inodes
         assert!(status.contains("Active Inodes:      5 (2 directories, 2 files, 1 symlinks, 0 special)"));
         assert!(status.contains("Live Staged Inodes: 5")); // root, f1, f2, sub, link
-        assert!(status.contains("Staged Data:        23 B"));
+        assert!(status.contains("Staged Data:        52 B"));
         assert!(status.contains("Open File Handles:  2"));
         assert!(status.contains("Open Virt Handles:  0"));
         assert!(status.contains("Open Dir Handles:   1"));
@@ -627,6 +685,10 @@ mod tests {
         assert!(status.contains("Active Range Locks: 1"));
         assert!(status.contains("Decrypted Records:  4.00 KiB / 64.00 MiB"));
         assert!(status.contains("Block Cache:        In-Memory (limit: 10.00 MiB)"));
+        assert!(status.contains("[Mutex Contention by Operation]"));
+        assert!(status.contains("write"));
+        assert!(status.contains("create"));
+        assert!(status.contains("mkdir"));
 
         // Clean up handles
         fs.release_file_handle(fh_file1, f1.ino).unwrap();

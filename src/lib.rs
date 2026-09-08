@@ -16,6 +16,7 @@ pub mod remote;
 pub mod shim;
 pub mod stats;
 pub mod storage;
+pub mod sync;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 pub mod wire;
@@ -51,6 +52,7 @@ pub use remote::{
 pub use remote::{CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, MockRemoteStore, RemoteStoreMetrics};
 pub use stats::VolumeStats;
 pub use storage::{FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter, WriteMode};
+pub use sync::{ActionGuard, ActionMutex, OpStatSnapshot, OpTag, PostUnlockQueue};
 #[cfg(any(test, feature = "testing"))]
 pub use test_utils::wait_until;
 
