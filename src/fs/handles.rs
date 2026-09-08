@@ -5,7 +5,7 @@
 //! Directory handles hold an immutable snapshot of the listing taken at `opendir`, so a
 //! paginated `readdir` is isolated from concurrent mutations.
 
-use super::{DirHandle, Handle, HandleKind, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
+use super::{DirHandle, FileHandle, Handle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -14,19 +14,21 @@ impl InMemoryFS {
 
     pub fn open_file_handle(&self, ino: u64, flags: u32) -> u64 {
         let is_virtual = self.virtual_files.is_virtual_ino(ino);
-        let kind = if is_virtual {
+        let file_handle = if is_virtual {
             let content = self.virtual_files.generate_content(ino, self).unwrap_or_default();
-            HandleKind::Virtual(Arc::new(content.into_bytes()))
+            FileHandle::Virtual {
+                ino,
+                flags,
+                data: Arc::new(content.into_bytes()),
+            }
         } else {
-            HandleKind::Regular
+            FileHandle::Regular { ino, flags }
         };
 
         let fh = self.allocate_fh();
         let mut inner = self.inner.lock().unwrap();
-        inner.handles.insert(fh, Handle { ino, flags, kind });
-        if !is_virtual {
-            *inner.open_counts.entry(ino).or_insert(0) += 1;
-        }
+        inner.handles.insert(fh, Handle::File(file_handle));
+        *inner.open_counts.entry(ino).or_insert(0) += 1;
         fh
     }
 
@@ -35,16 +37,16 @@ impl InMemoryFS {
     /// Returns:
     /// - `Err(libc::EBADF)` if the handle does not exist or was opened for a different inode.
     /// - `Err(libc::EISDIR)` if the handle refers to a directory.
-    pub fn extract_file_handle(&self, ino: u64, fh: u64) -> Result<Handle, i32> {
+    pub fn extract_file_handle(&self, ino: u64, fh: u64) -> Result<FileHandle, i32> {
         let inner = self.inner.lock().unwrap();
         let handle = inner.handles.get(&fh).ok_or(libc::EBADF)?;
-        if handle.ino != ino {
+        if handle.ino() != ino {
             return Err(libc::EBADF);
         }
-        if handle.is_dir() {
-            return Err(libc::EISDIR);
+        match handle {
+            Handle::File(f) => Ok(f.clone()),
+            Handle::Directory(_) => Err(libc::EISDIR),
         }
-        Ok(handle.clone())
     }
 
     /// Validates and extracts a directory handle for the given inode and handle ID.
@@ -55,25 +57,21 @@ impl InMemoryFS {
     pub fn extract_dir_handle(&self, ino: u64, fh: u64) -> Result<DirHandle, i32> {
         let inner = self.inner.lock().unwrap();
         let handle = inner.handles.get(&fh).ok_or(libc::EBADF)?;
-        if handle.ino != ino {
+        if handle.ino() != ino {
             return Err(libc::EBADF);
         }
-        match &handle.kind {
-            HandleKind::Directory(entries) => Ok(DirHandle {
-                ino: handle.ino,
-                flags: handle.flags,
-                entries: Arc::clone(entries),
-            }),
-            _ => Err(libc::ENOTDIR),
+        match handle {
+            Handle::Directory(d) => Ok(d.clone()),
+            Handle::File(_) => Err(libc::ENOTDIR),
         }
     }
 
     pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
         let handle = self.extract_file_handle(ino, fh)?;
-        match handle.kind {
-            HandleKind::Virtual(buf) => {
-                let start = (offset as usize).min(buf.len());
-                let end = (start + size).min(buf.len());
+        match handle {
+            FileHandle::Virtual { data, .. } => {
+                let start = (offset as usize).min(data.len());
+                let end = (start + size).min(data.len());
                 let slice_len = end - start;
                 Ok(ReadPlan {
                     total_len: slice_len,
@@ -83,7 +81,7 @@ impl InMemoryFS {
                             dst_offset: 0,
                             len: slice_len,
                             source: ReadSliceSource::Cache {
-                                data: buf,
+                                data,
                                 src_offset: start,
                             },
                         }]
@@ -92,8 +90,7 @@ impl InMemoryFS {
                     },
                 })
             }
-            HandleKind::Regular => self.plan_read_file_data(ino, offset, size),
-            HandleKind::Directory(_) => unreachable!("extract_file_handle rejects directory handles"),
+            FileHandle::Regular { .. } => self.plan_read_file_data(ino, offset, size),
         }
     }
 
@@ -105,31 +102,30 @@ impl InMemoryFS {
     pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
         let is_last_handle = {
             let mut inner = self.inner.lock().unwrap();
-            let handle = match inner.handles.get(&fh) {
-                Some(h) if h.ino == ino && !h.is_dir() => inner.handles.remove(&fh).unwrap(),
+            match inner.handles.get(&fh) {
+                Some(h) if h.ino() == ino && !h.is_dir() => {
+                    inner.handles.remove(&fh);
+                }
                 _ => return Err(libc::EBADF),
-            };
-
-            let is_last = !inner.handles.values().any(|h| h.ino == ino);
-
-            if !handle.is_virtual() {
-                if let Some(count) = inner.open_counts.get_mut(&ino) {
-                    *count = count.saturating_sub(1);
-                }
-                if inner.open_counts.get(&ino) == Some(&0) {
-                    inner.open_counts.remove(&ino);
-                }
-
-                let remaining = inner.open_counts.get(&ino).copied().unwrap_or(0);
-                if remaining == 0
-                    && let Some(attr) = inner.get_attr(ino)
-                    && attr.nlink == 0
-                {
-                    inner.tombstone(ino);
-                }
             }
 
-            is_last
+            let remaining = if let Some(count) = inner.open_counts.get_mut(&ino) {
+                *count = count.saturating_sub(1);
+                let rem = *count;
+                if rem == 0 {
+                    inner.open_counts.remove(&ino);
+                    if let Some(attr) = inner.get_attr(ino)
+                        && attr.nlink == 0
+                    {
+                        inner.tombstone(ino);
+                    }
+                }
+                rem
+            } else {
+                0
+            };
+
+            remaining == 0
         };
 
         // Clean up locks outside inner critical section
@@ -168,11 +164,11 @@ impl InMemoryFS {
         let fh = self.allocate_fh();
         self.inner.lock().unwrap().handles.insert(
             fh,
-            Handle {
+            Handle::Directory(DirHandle {
                 ino,
                 flags,
-                kind: HandleKind::Directory(Arc::new(entries)),
-            },
+                entries: Arc::new(entries),
+            }),
         );
         fh
     }
@@ -180,7 +176,7 @@ impl InMemoryFS {
     pub fn release_dir_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
         let mut inner = self.inner.lock().unwrap();
         match inner.handles.get(&fh) {
-            Some(h) if h.ino == ino && h.is_dir() => {
+            Some(h) if h.ino() == ino && h.is_dir() => {
                 inner.handles.remove(&fh);
                 Ok(())
             }
@@ -273,8 +269,8 @@ mod tests {
         let fh2 = fs.open_file_handle(ino, libc::O_WRONLY as u32);
         assert_ne!(fh1, fh2);
         assert_eq!(fs.open_count(ino), 2);
-        assert_eq!(fs.extract_file_handle(ino, fh1).unwrap().ino, ino);
-        assert_eq!(fs.extract_file_handle(ino, fh2).unwrap().ino, ino);
+        assert_eq!(fs.extract_file_handle(ino, fh1).unwrap().ino(), ino);
+        assert_eq!(fs.extract_file_handle(ino, fh2).unwrap().ino(), ino);
 
         // 3. Unlink the file while handles are still open
         crate::operations::links::unlink_core(&fs, 1, "test.txt").unwrap();
@@ -335,18 +331,20 @@ mod tests {
         let h_reg = fs
             .extract_file_handle(reg_ino, fh_reg)
             .expect("Regular handle must exist");
-        assert_eq!(h_reg.ino, reg_ino);
+        assert_eq!(h_reg.ino(), reg_ino);
         assert!(h_reg.is_regular());
         assert!(!h_reg.is_virtual());
-        assert!(!h_reg.is_dir());
 
         let h_virt = fs
             .extract_file_handle(v_ino, fh_virt)
             .expect("Virtual handle must exist");
-        assert_eq!(h_virt.ino, v_ino);
+        assert_eq!(h_virt.ino(), v_ino);
         assert!(!h_virt.is_regular());
         assert!(h_virt.is_virtual());
-        assert!(!h_virt.is_dir());
+
+        // Open count tracking for both regular and virtual files
+        assert_eq!(fs.open_count(reg_ino), 1);
+        assert_eq!(fs.open_count(v_ino), 1);
 
         // Directory handle fails extract_file_handle with EISDIR
         assert_eq!(fs.extract_file_handle(1, fh_dir).unwrap_err(), libc::EISDIR);
@@ -397,8 +395,9 @@ mod tests {
         assert_eq!(fs.release_file_handle(fh_reg, v_ino), Err(libc::EBADF));
         assert_eq!(fs.release_dir_handle(fh_dir, 999), Err(libc::EBADF));
 
-        // Releasing virtual handle with correct inode succeeds
+        // Releasing virtual handle with correct inode succeeds and clears open count
         assert_eq!(fs.release_file_handle(fh_virt, v_ino), Ok(()));
+        assert_eq!(fs.open_count(v_ino), 0);
         assert_eq!(fs.extract_file_handle(v_ino, fh_virt), Err(libc::EBADF));
         assert_eq!(fs.release_file_handle(fh_virt, v_ino), Err(libc::EBADF));
 
@@ -409,7 +408,9 @@ mod tests {
 
         // Regular handle is still present and functional
         assert!(fs.extract_file_handle(reg_ino, fh_reg).is_ok());
+        assert_eq!(fs.open_count(reg_ino), 1);
         assert_eq!(fs.release_file_handle(fh_reg, reg_ino), Ok(()));
+        assert_eq!(fs.open_count(reg_ino), 0);
         assert_eq!(fs.extract_file_handle(reg_ino, fh_reg), Err(libc::EBADF));
 
         // Unified map is now empty

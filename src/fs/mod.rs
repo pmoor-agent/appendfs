@@ -35,40 +35,105 @@ use std::time::SystemTime;
 pub type DirSnapshot = Arc<Vec<(String, u64)>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HandleKind {
-    Regular,
-    Virtual(Arc<Vec<u8>>),
-    Directory(DirSnapshot),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Handle {
-    pub ino: u64,
-    pub flags: u32,
-    pub kind: HandleKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirHandle {
     pub ino: u64,
     pub flags: u32,
     pub entries: DirSnapshot,
 }
 
-impl Handle {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileHandle {
+    Regular { ino: u64, flags: u32 },
+    Virtual { ino: u64, flags: u32, data: Arc<Vec<u8>> },
+}
+
+impl FileHandle {
+    #[inline]
+    pub fn ino(&self) -> u64 {
+        match self {
+            FileHandle::Regular { ino, .. } | FileHandle::Virtual { ino, .. } => *ino,
+        }
+    }
+
+    #[inline]
+    pub fn flags(&self) -> u32 {
+        match self {
+            FileHandle::Regular { flags, .. } | FileHandle::Virtual { flags, .. } => *flags,
+        }
+    }
+
     #[inline]
     pub fn is_regular(&self) -> bool {
-        matches!(self.kind, HandleKind::Regular)
+        matches!(self, FileHandle::Regular { .. })
     }
 
     #[inline]
     pub fn is_virtual(&self) -> bool {
-        matches!(self.kind, HandleKind::Virtual(_))
+        matches!(self, FileHandle::Virtual { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handle {
+    File(FileHandle),
+    Directory(DirHandle),
+}
+
+impl Handle {
+    #[inline]
+    pub fn ino(&self) -> u64 {
+        match self {
+            Handle::File(f) => f.ino(),
+            Handle::Directory(d) => d.ino,
+        }
+    }
+
+    #[inline]
+    pub fn flags(&self) -> u32 {
+        match self {
+            Handle::File(f) => f.flags(),
+            Handle::Directory(d) => d.flags,
+        }
+    }
+
+    #[inline]
+    pub fn is_file(&self) -> bool {
+        matches!(self, Handle::File(_))
     }
 
     #[inline]
     pub fn is_dir(&self) -> bool {
-        matches!(self.kind, HandleKind::Directory(_))
+        matches!(self, Handle::Directory(_))
+    }
+
+    #[inline]
+    pub fn as_file(&self) -> Option<&FileHandle> {
+        match self {
+            Handle::File(f) => Some(f),
+            Handle::Directory(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_dir(&self) -> Option<&DirHandle> {
+        match self {
+            Handle::Directory(d) => Some(d),
+            Handle::File(_) => None,
+        }
+    }
+}
+
+impl From<FileHandle> for Handle {
+    #[inline]
+    fn from(f: FileHandle) -> Self {
+        Handle::File(f)
+    }
+}
+
+impl From<DirHandle> for Handle {
+    #[inline]
+    fn from(d: DirHandle) -> Self {
+        Handle::Directory(d)
     }
 }
 
@@ -117,10 +182,10 @@ impl FsInner {
         let mut virtual_count = 0;
         let mut dir = 0;
         for h in self.handles.values() {
-            match &h.kind {
-                HandleKind::Regular => regular += 1,
-                HandleKind::Virtual(_) => virtual_count += 1,
-                HandleKind::Directory(_) => dir += 1,
+            match h {
+                Handle::File(FileHandle::Regular { .. }) => regular += 1,
+                Handle::File(FileHandle::Virtual { .. }) => virtual_count += 1,
+                Handle::Directory(_) => dir += 1,
             }
         }
         (regular, virtual_count, dir)

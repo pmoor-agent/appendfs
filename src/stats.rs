@@ -536,15 +536,19 @@ mod tests {
         let v_ino = fs.lookup_child(1, ".status").expect(".status must exist");
         let fh = fs.open_file_handle(v_ino, 0);
         assert!(fh > 0);
-        // While open, runtime status query reports 1 open virt handle
-        assert!(format_runtime_status(&fs).contains("Open Virt Handles:  1"));
+        // While open, runtime status query reports 1 open virt handle and 1 open inode
+        let open_status = format_runtime_status(&fs);
+        assert!(open_status.contains("Open Virt Handles:  1"));
+        assert!(open_status.contains("Open Inodes:        1"));
         // The handle itself holds the snapshot taken at open time (before fh was recorded)
         let content = fs.read_handle(v_ino, fh, 0, 4096).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert!(s.contains("=== appendfs Runtime Status ==="));
         assert!(s.contains("Open Virt Handles:  0"));
         fs.release_file_handle(fh, v_ino).unwrap();
-        assert!(format_runtime_status(&fs).contains("Open Virt Handles:  0"));
+        let closed_status = format_runtime_status(&fs);
+        assert!(closed_status.contains("Open Virt Handles:  0"));
+        assert!(closed_status.contains("Open Inodes:        0"));
     }
 
     #[test]
