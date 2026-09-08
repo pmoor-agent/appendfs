@@ -166,8 +166,8 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
 pub fn write(fs: &InMemoryFS, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64) {
     log::trace!("write(ino={}, len={}, offset={}, fh={})", ino, buf.len(), offset, fh);
     let handle = match fs.get_file_handle(fh) {
-        Some(h) => h,
-        None => {
+        Some(h) if h.is_regular() => h,
+        _ => {
             req.reply_err(libc::EBADF);
             return;
         }
@@ -553,7 +553,7 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
 pub fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
     if fh != 0 {
         match fs.get_file_handle(fh) {
-            Some(h) if h.ino == ino => {}
+            Some(h) if h.ino == ino && h.is_regular() => {}
             _ => return Err(libc::EBADF),
         }
     }
@@ -564,7 +564,7 @@ pub fn fsync(fs: &Arc<InMemoryFS>, req: Request, ino: u64, datasync: bool, fh: u
     log::trace!("fsync(ino={}, datasync={}, fh={})", ino, datasync, fh);
     if fh != 0 {
         match fs.get_file_handle(fh) {
-            Some(h) if h.ino == ino => {}
+            Some(h) if h.ino == ino && h.is_regular() => {}
             _ => {
                 req.reply_err(libc::EBADF);
                 return;

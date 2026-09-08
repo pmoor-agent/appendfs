@@ -419,12 +419,11 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push('\n');
 
     // 5. Handles & Locks
-    let (file_handles_count, dir_handles_count, virtual_handles_count, open_inodes_count) = {
+    let (file_handles_count, dir_handles_count, open_inodes_count) = {
         let inner = fs.inner.lock().unwrap();
         (
             inner.file_handles.len(),
             inner.dir_handles.len(),
-            inner.virtual_handles.len(),
             inner.open_counts.len(),
         )
     };
@@ -434,7 +433,6 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push_str("[Handles & Locks]\n");
     out.push_str(&format!("  Open File Handles:  {}\n", file_handles_count));
     out.push_str(&format!("  Open Dir Handles:   {}\n", dir_handles_count));
-    out.push_str(&format!("  Open Virtual FHs:   {}\n", virtual_handles_count));
     out.push_str(&format!("  Open Inodes:        {}\n", open_inodes_count));
     out.push_str(&format!("  Active File Locks:  {}\n", flock_count));
     out.push_str(&format!("  Active Range Locks: {}\n", range_lock_count));

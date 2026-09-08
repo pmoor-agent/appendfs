@@ -32,10 +32,29 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::SystemTime;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileHandleKind {
+    Regular,
+    Virtual(Arc<Vec<u8>>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHandle {
     pub ino: u64,
     pub flags: u32,
+    pub kind: FileHandleKind,
+}
+
+impl FileHandle {
+    #[inline]
+    pub fn is_regular(&self) -> bool {
+        matches!(self.kind, FileHandleKind::Regular)
+    }
+
+    #[inline]
+    pub fn is_virtual(&self) -> bool {
+        matches!(self.kind, FileHandleKind::Virtual(_))
+    }
 }
 
 pub type DirSnapshot = Arc<Vec<(String, u64)>>;
@@ -70,14 +89,12 @@ pub struct FsInner {
     pub live: HashMap<u64, EntryDelta>,
     /// Active write arena staging extent payload allocations for `live`.
     pub live_arena: WriteArena,
-    /// Active open file handles keyed by allocated file handle ID (`fh`).
+    /// Active open file handles (both regular and virtual) keyed by allocated file handle ID (`fh`).
     pub file_handles: FileHandleMap,
     /// Active open directory handle snapshots keyed by allocated file handle ID (`fh`).
     pub dir_handles: DirectoryHandleMap,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
     pub open_counts: HashMap<u64, u32>,
-    /// Active open virtual file handles holding frozen point-in-time snapshot strings.
-    pub virtual_handles: HashMap<u64, Arc<Vec<u8>>>,
     /// Timestamp of the latest recovered operation / summary snapshot (if recovered).
     pub recovered_time: Option<SystemTime>,
 }
@@ -204,7 +221,6 @@ impl InMemoryFS {
             file_handles: HashMap::new(),
             dir_handles: HashMap::new(),
             open_counts: HashMap::new(),
-            virtual_handles: HashMap::new(),
             recovered_time: None,
         };
 
