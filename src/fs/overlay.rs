@@ -8,6 +8,7 @@ use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, ReadPlan};
 use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SpecialDelta, SymlinkDelta};
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
+use crate::sync::OpTag;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -415,23 +416,25 @@ impl InMemoryFS {
     }
 
     pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
-        let mut inner = self.inner.lock().unwrap();
-        let plan = inner.with_inode_layers(ino, |layers| {
-            layers.plan_read_file_data(offset, size, self.log_cache.as_deref())
-        })?;
+        self.with_inner(OpTag::ReadPlan, |inner| {
+            let plan = inner.with_inode_layers(ino, |layers| {
+                layers.plan_read_file_data(offset, size, self.log_cache.as_deref())
+            })?;
 
-        if self.track_atime && plan.total_len > 0 {
-            let now = self.clock.now();
-            inner.update_attr_delta(
-                ino,
-                AttrDelta {
-                    atime: Some(now),
-                    ..Default::default()
-                },
-            );
-        }
+            if self.track_atime && plan.total_len > 0 {
+                let now = self.clock.now();
+                inner.update_attr_delta(
+                    ino,
+                    AttrDelta {
+                        atime: Some(now),
+                        ..Default::default()
+                    },
+                );
+                inner.record_mutation(0);
+            }
 
-        Ok(plan)
+            Ok(plan)
+        })
     }
 
     pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {

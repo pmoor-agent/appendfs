@@ -3598,7 +3598,7 @@ fn test_fuse_async_fsync_and_singlethread_loop() {
         }));
     }
 
-    // Thread 3: Large streaming writes that repeatedly trigger notify_mutation thresholds
+    // Thread 3: Large streaming writes that repeatedly trigger auto-flush thresholds
     {
         let p = mount_path.join("large_stream.bin");
         threads.push(thread::spawn(move || {

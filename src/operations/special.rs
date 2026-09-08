@@ -2,6 +2,7 @@ use crate::fs::InMemoryFS;
 use crate::node::{AttrDelta, FileDelta, NodeDelta, SpecialDelta};
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType, Request};
+use crate::sync::OpTag;
 
 pub fn mknod_core(
     fs: &InMemoryFS,
@@ -17,8 +18,7 @@ pub fn mknod_core(
     }
     fs.check_flush_capacity()?;
 
-    let attr = {
-        let mut inner = fs.inner.lock().unwrap();
+    fs.with_inner(OpTag::Mknod, |inner| {
         let now = fs.clock.now();
         log::trace!(
             "mknod(parent={}, name={}, mode=0o{:o}, rdev={}, uid={}, gid={})",
@@ -39,7 +39,7 @@ pub fn mknod_core(
             return Err(libc::ENOTDIR);
         }
 
-        if fs.lookup_child_locked(&inner, parent, name).is_some() {
+        if fs.lookup_child_locked(inner, parent, name).is_some() {
             return Err(libc::EEXIST);
         }
 
@@ -93,8 +93,9 @@ pub fn mknod_core(
 
         inner.insert_new_node(new_ino, new_delta);
         inner.add_dir_entry(parent, name, new_ino, now);
+        inner.record_mutation(name.len());
 
-        FileAttr {
+        Ok(FileAttr {
             ino: new_ino,
             file_type,
             perm,
@@ -106,11 +107,8 @@ pub fn mknod_core(
             atime: now,
             mtime: now,
             ctime: now,
-        }
-    };
-
-    fs.notify_mutation(0);
-    Ok(attr)
+        })
+    })
 }
 
 pub fn mknod(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32, rdev: u32) {

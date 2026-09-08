@@ -1,4 +1,7 @@
 use crate::fs::InMemoryFS;
+use crate::node::AttrDelta;
+use crate::sync::OpTag;
+use std::collections::HashMap;
 
 pub const XATTR_NAME_MAX: usize = 255;
 pub const XATTR_SIZE_MAX: usize = 65536;
@@ -62,8 +65,17 @@ pub fn setxattr_core(fs: &InMemoryFS, ino: u64, name: &str, value: &[u8], flags:
     }
 
     let now = fs.clock.now();
-    fs.set_xattr(ino, name, value.to_vec(), now);
-    fs.notify_mutation(name.len() + value.len());
+    let mut xattrs = HashMap::new();
+    xattrs.insert(name.to_string(), Some(value.to_vec()));
+    let delta = AttrDelta {
+        ctime: Some(now),
+        xattrs: Some(xattrs),
+        ..Default::default()
+    };
+    fs.with_inner(OpTag::Xattr, |inner| {
+        inner.update_attr_delta(ino, delta);
+        inner.record_mutation(name.len() + value.len());
+    });
     Ok(())
 }
 
@@ -112,8 +124,17 @@ pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<(), i32
     }
 
     let now = fs.clock.now();
-    fs.remove_xattr(ino, name, now);
-    fs.notify_mutation(name.len());
+    let mut xattrs = HashMap::new();
+    xattrs.insert(name.to_string(), None);
+    let delta = AttrDelta {
+        ctime: Some(now),
+        xattrs: Some(xattrs),
+        ..Default::default()
+    };
+    fs.with_inner(OpTag::Xattr, |inner| {
+        inner.update_attr_delta(ino, delta);
+        inner.record_mutation(name.len());
+    });
     Ok(())
 }
 

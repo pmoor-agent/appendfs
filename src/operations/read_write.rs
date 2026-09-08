@@ -3,6 +3,7 @@ use crate::log::SharedExtentState;
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType, Request};
+use crate::sync::OpTag;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -127,8 +128,7 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
     let file_offset = offset as u64;
     let write_len = buf.len() as u64;
 
-    let should_trigger = {
-        let mut inner = fs.inner.lock().unwrap();
+    fs.with_inner(OpTag::Write, |inner| {
         let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
             return Err(libc::EISDIR);
@@ -156,12 +156,9 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
             f.attr_delta.mtime = Some(now);
             f.attr_delta.ctime = Some(now);
         }
-        inner.record_mutation(write_len as usize, fs.max_buffer_size, fs.max_staged_ops)
-    };
-
-    fs.notify_flush_trigger(should_trigger);
-
-    Ok(buf.len())
+        inner.record_mutation(write_len as usize);
+        Ok(buf.len())
+    })
 }
 
 pub fn write(fs: &InMemoryFS, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64) {
@@ -239,45 +236,34 @@ pub fn setattr_core(
         attr_delta.ctime = Some(now);
     }
 
-    if (to_set & FUSE_SET_ATTR_SIZE) != 0 && attr.file_type == FileType::RegularFile {
-        log::trace!("truncating file to {}", size);
-        let new_size = size as u64;
-        let mut inner = fs.inner.lock().unwrap();
-        // The `get_attr` check above happened before this lock was taken, so the file may
-        // have been unlinked in between. If its tombstone has already been frozen out of
-        // `live`, inserting a delta here would resurrect the inode at the next fold.
-        if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
-            return Err(libc::ENOENT);
+    fs.with_inner(OpTag::SetAttr, |inner| {
+        if (to_set & FUSE_SET_ATTR_SIZE) != 0 && attr.file_type == FileType::RegularFile {
+            log::trace!("truncating file to {}", size);
+            let new_size = size as u64;
+            // The `get_attr` check above happened before this lock was taken, so the file may
+            // have been unlinked in between. If its tombstone has already been frozen out of
+            // `live`, inserting a delta here would resurrect the inode at the next fold.
+            if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
+                return Err(libc::ENOENT);
+            }
+            let entry = inner
+                .live
+                .entry(ino)
+                .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
+            if let EntryDelta::Node(NodeDelta::File(f)) = entry {
+                let mask_len = u64::MAX - new_size;
+                f.extents
+                    .insert(new_size, mask_len, SharedExtentState::new_zero(mask_len));
+                f.size = Some(new_size);
+                f.attr_delta.mtime = Some(now);
+                f.attr_delta.ctime = Some(now);
+            }
         }
-        let entry = inner
-            .live
-            .entry(ino)
-            .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
-        if let EntryDelta::Node(NodeDelta::File(f)) = entry {
-            // One unbounded hole from the cut upwards. It does both jobs at once: it
-            // replaces this delta's own extents above `new_size`, and it masks the layers
-            // below, so a later grow re-exposes zeros rather than whatever `base` still
-            // holds there. The size clamp in `read_file_data` hides that only for as long
-            // as the file stays short.
-            //
-            // Unbounded rather than sized to the current file length, because a later
-            // truncate overwrites this hole: sizing the replacement by the size the
-            // *previous* truncate left behind would stop short of what that one had
-            // masked, and the range between the two cuts would come back to life on the
-            // next grow. This is exactly the reach the scalar `truncate_mask` used to
-            // have.
-            let mask_len = u64::MAX - new_size;
-            f.extents
-                .insert(new_size, mask_len, SharedExtentState::new_zero(mask_len));
-            f.size = Some(new_size);
-            f.attr_delta.mtime = Some(now);
-            f.attr_delta.ctime = Some(now);
-        }
-    }
 
-    fs.update_attr_delta(ino, attr_delta);
-
-    fs.notify_mutation(0);
+        inner.update_attr_delta(ino, attr_delta);
+        inner.record_mutation(0);
+        Ok(())
+    })?;
 
     let updated_attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
     Ok(updated_attr)
@@ -311,8 +297,7 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
     }
 
     let now = fs.clock.now();
-    {
-        let mut inner = fs.inner.lock().unwrap();
+    fs.with_inner(OpTag::Fallocate, |inner| {
         // As in `write_core`: `get_attr` ran before this lock, so the inode may have been
         // unlinked and its tombstone frozen out of `live` in between. Inserting a delta
         // then would resurrect it at the next fold.
@@ -329,10 +314,9 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
             f.attr_delta.mtime = Some(now);
             f.attr_delta.ctime = Some(now);
         }
-    }
-
-    fs.notify_mutation(0);
-    Ok(())
+        inner.record_mutation(0);
+        Ok(())
+    })
 }
 
 /// Raises a file's recorded size to `new_size`, without writing anything.
@@ -341,8 +325,7 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
 /// growing the size alone is enough to make the new range read as zeros.
 fn grow_size_to(fs: &InMemoryFS, ino: u64, new_size: u64) -> Result<(), i32> {
     let now = fs.clock.now();
-    {
-        let mut inner = fs.inner.lock().unwrap();
+    fs.with_inner(OpTag::SetAttr, |inner| {
         let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
         let entry = inner
             .live
@@ -356,10 +339,9 @@ fn grow_size_to(fs: &InMemoryFS, ino: u64, new_size: u64) -> Result<(), i32> {
                 f.attr_delta.ctime = Some(now);
             }
         }
-    }
-
-    fs.notify_mutation(0);
-    Ok(())
+        inner.record_mutation(0);
+        Ok(())
+    })
 }
 
 /// `fallocate(2)`.
@@ -473,8 +455,7 @@ pub fn create_core(
     }
     fs.check_flush_capacity()?;
 
-    let attr = {
-        let mut inner = fs.inner.lock().unwrap();
+    fs.with_inner(OpTag::Create, |inner| {
         let now = fs.clock.now();
         log::trace!(
             "create(parent={}, name={}, mode=0o{:o}, flags=0x{:x}, uid={}, gid={})",
@@ -495,7 +476,7 @@ pub fn create_core(
             return Err(libc::ENOTDIR);
         }
 
-        if fs.lookup_child_locked(&inner, parent, name).is_some() {
+        if fs.lookup_child_locked(inner, parent, name).is_some() {
             return Err(libc::EEXIST);
         }
 
@@ -518,8 +499,9 @@ pub fn create_core(
 
         inner.insert_new_node(new_ino, new_delta);
         inner.add_dir_entry(parent, name, new_ino, now);
+        inner.record_mutation(name.len());
 
-        FileAttr {
+        Ok(FileAttr {
             ino: new_ino,
             file_type: FileType::RegularFile,
             perm: mode & 0o7777,
@@ -531,12 +513,8 @@ pub fn create_core(
             atime: now,
             mtime: now,
             ctime: now,
-        }
-    };
-
-    fs.notify_mutation(0);
-
-    Ok(attr)
+        })
+    })
 }
 
 pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32, flags: u32) {

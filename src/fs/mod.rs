@@ -26,7 +26,9 @@ use crate::clock::{Clock, SystemClock};
 use crate::log::{BackgroundFlusher, LogFileCache, LogManifest, LogWriter};
 use crate::node::{EntryDelta, Node};
 use crate::storage::Storage;
+use crate::sync::{ActionGuard, ActionMutex, OpTag, PostUnlockQueue};
 use std::collections::{HashMap, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -194,21 +196,21 @@ pub struct FsInner {
 
 impl FsInner {
     /// Records a mutation of `additional_bytes` and increments staged operation count by 1.
-    /// If thresholds are reached, freezes the active `live` layer into `flushing` immediately.
-    /// Returns true if a batch was frozen into `flushing`, false otherwise.
-    pub fn record_mutation(&mut self, additional_bytes: usize, max_buffer_size: usize, max_staged_ops: usize) -> bool {
+    pub fn record_mutation(&mut self, additional_bytes: usize) {
         self.staged_bytes += additional_bytes;
         self.staged_ops += 1;
-        if self.staged_bytes >= max_buffer_size || self.staged_ops >= max_staged_ops {
-            self.freeze_live()
-        } else {
-            false
-        }
     }
 
-    /// Freezes `live` into the `flushing` queue and transfers staged byte/op counts.
-    /// Returns true if a batch was frozen, false if `live` was empty.
-    pub fn freeze_live(&mut self) -> bool {
+    /// Freezes `live` into the `flushing` queue and transfers staged byte/op counts,
+    /// provided that the `flushing` queue depth does not exceed `max_flush_queue_depth`.
+    ///
+    /// If `flushing.len() >= max_flush_queue_depth`, this is a no-op that preserves `live`
+    /// and staged byte/op counters, returning `false`.
+    /// Returns `true` if a batch was frozen, or `false` if `live` was empty or `flushing` was full.
+    pub fn freeze_live(&mut self, max_flush_queue_depth: usize) -> bool {
+        if self.flushing.len() >= max_flush_queue_depth {
+            return false;
+        }
         if !self.live.is_empty() {
             let entries = std::mem::take(&mut self.live);
             let chunk_size = self.live_arena.chunk_size;
@@ -225,6 +227,26 @@ impl FsInner {
             true
         } else {
             false
+        }
+    }
+
+    /// Merges a flushed batch into `base`.
+    pub fn fold_flushed_batch(&mut self, flushed: FlushBatch) {
+        for (ino, entry) in flushed.entries {
+            match entry {
+                EntryDelta::Tombstone => {
+                    self.base.remove(&ino);
+                }
+                EntryDelta::Node(delta) => {
+                    if let Some(existing_arc) = self.base.get(&ino).cloned() {
+                        let mut node_clone = (*existing_arc).clone();
+                        delta.apply_to_node(&mut node_clone);
+                        self.base.insert(ino, Arc::new(node_clone));
+                    } else {
+                        self.base.insert(ino, Arc::new(delta.to_node()));
+                    }
+                }
+            }
         }
     }
 }
@@ -246,10 +268,91 @@ impl FsInner {
     }
 }
 
+/// An RAII guard for the consolidated filesystem state returned by [`InMemoryFS::lock_inner`].
+///
+/// Tracks whether mutations occurred during the guard's lifetime. When dropped, if a mutation
+/// occurred and staged thresholds (`max_buffer_size` or `max_staged_ops`) were reached, attempts
+/// to freeze `live` into `flushing` (subject to `max_flush_queue_depth`) and defers waking up the
+/// flusher until after the mutex is unlocked.
+pub struct FsInnerGuard<'a> {
+    guard: ActionGuard<'a, FsInner>,
+    fs: &'a InMemoryFS,
+    mutation_occurred: bool,
+}
+
+impl<'a> FsInnerGuard<'a> {
+    /// Records a mutation of `additional_bytes`, increments staged operation count by 1,
+    /// and flags that a mutation occurred in this lock session.
+    pub fn record_mutation(&mut self, additional_bytes: usize) {
+        self.guard.record_mutation(additional_bytes);
+        self.mutation_occurred = true;
+    }
+
+    /// Parks a task to be executed immediately after the mutex lock is released.
+    pub fn defer(&mut self, task: impl FnOnce() + 'a) {
+        self.guard.defer(task);
+    }
+
+    /// Registers a hook to run right before unlocking (with the lock still held).
+    pub fn before_unlock(&mut self, hook: impl for<'q> FnOnce(&mut FsInner, &mut PostUnlockQueue<'q, 'a>) + 'a) {
+        self.guard.before_unlock(hook);
+    }
+
+    /// Returns the operation tag associated with this guard.
+    pub fn tag(&self) -> OpTag {
+        self.guard.tag()
+    }
+
+    /// Overrides the operation tag associated with this guard.
+    pub fn set_tag(&mut self, tag: OpTag) {
+        self.guard.set_tag(tag);
+    }
+
+    /// Returns whether any mutation was recorded during this lock session.
+    pub fn mutation_occurred(&self) -> bool {
+        self.mutation_occurred
+    }
+}
+
+impl<'a> Deref for FsInnerGuard<'a> {
+    type Target = FsInner;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<'a> DerefMut for FsInnerGuard<'a> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl<'a> Drop for FsInnerGuard<'a> {
+    fn drop(&mut self) {
+        if self.mutation_occurred {
+            let max_buffer_size = self.fs.max_buffer_size;
+            let max_staged_ops = self.fs.max_staged_ops;
+            let max_flush_queue_depth = self.fs.max_flush_queue_depth;
+            if self.guard.staged_bytes >= max_buffer_size || self.guard.staged_ops >= max_staged_ops {
+                let froze = self.guard.freeze_live(max_flush_queue_depth);
+                if froze || !self.guard.flushing.is_empty() {
+                    let fs = self.fs;
+                    self.guard.defer(move || {
+                        fs.notify_flush_trigger(true);
+                    });
+                }
+            }
+        }
+    }
+}
+
 pub struct InMemoryFS {
     /// Consolidated critical section protecting all in-memory metadata, layer overlay,
     /// file/dir handles, open counts, and write arena buffers.
-    pub inner: Mutex<FsInner>,
+    pub inner: ActionMutex<FsInner>,
     /// Independent whole-file BSD flock and POSIX byte-range record lock manager.
     pub locks: LockManager,
     /// Atomic counter for allocating unique file and directory handle IDs (`fh`).
@@ -373,7 +476,7 @@ impl InMemoryFS {
         };
 
         let fs = Self {
-            inner: Mutex::new(inner),
+            inner: ActionMutex::new(inner),
             locks: LockManager::new(),
             next_fh: AtomicU64::new(1),
             manifest,
@@ -407,6 +510,28 @@ impl InMemoryFS {
         };
         fs.register_runtime_status();
         fs
+    }
+
+    /// Acquires the inner filesystem lock associated with `tag`.
+    ///
+    /// When the returned guard is dropped, if mutations occurred and staged byte or op
+    /// thresholds were reached, freezes the active `live` layer into `flushing` (if queue depth
+    /// allows) and schedules a deferred post-unlock flush trigger.
+    pub fn lock_inner(&self, tag: OpTag) -> FsInnerGuard<'_> {
+        FsInnerGuard {
+            guard: self.inner.lock_tag(tag).unwrap(),
+            fs: self,
+            mutation_occurred: false,
+        }
+    }
+
+    /// Executes `f` within the scope of the inner filesystem lock tagged with `tag`.
+    ///
+    /// The lock is released and any deferred post-unlock tasks (such as background
+    /// flusher wakeups) are guaranteed to run immediately when `f` returns.
+    pub fn with_inner<R>(&self, tag: OpTag, f: impl FnOnce(&mut FsInnerGuard<'_>) -> R) -> R {
+        let mut guard = self.lock_inner(tag);
+        f(&mut guard)
     }
 
     /// Number of dirty bytes currently staged in the active `live` layer.
@@ -594,4 +719,63 @@ impl Default for InMemoryFS {
 
 pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
     fs.get_parent_dir_inode(child_ino)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fs_inner_guard_mutation_tracking() {
+        let fs = InMemoryFS::new();
+        {
+            let guard = fs.lock_inner(OpTag::ReadPlan);
+            assert!(!guard.mutation_occurred());
+            assert_eq!(guard.staged_bytes, 0);
+            assert_eq!(guard.staged_ops, 0);
+        }
+        {
+            let mut guard = fs.lock_inner(OpTag::Write);
+            assert!(!guard.mutation_occurred());
+            guard.record_mutation(128);
+            assert!(guard.mutation_occurred());
+            assert_eq!(guard.staged_bytes, 128);
+            assert_eq!(guard.staged_ops, 1);
+        }
+        // After guard drops, staged bytes/ops persist on FsInner, but new guard starts with mutation_occurred = false
+        {
+            let guard = fs.lock_inner(OpTag::Other);
+            assert!(!guard.mutation_occurred());
+            assert_eq!(guard.staged_bytes, 128);
+            assert_eq!(guard.staged_ops, 1);
+        }
+    }
+
+    #[test]
+    fn test_fs_inner_guard_drop_auto_freeze_on_threshold() {
+        let mut fs = InMemoryFS::new();
+        fs.max_buffer_size = 50;
+        fs.max_staged_ops = 5;
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
+        // File creation recorded name.len() = 8
+        assert_eq!(fs.flush_queue_depth(), 0);
+        assert_eq!(fs.staged_bytes(), 8);
+        assert_eq!(fs.staged_ops(), 1);
+
+        // Perform write below threshold (20 bytes: staged_bytes = 28, staged_ops = 2)
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 20], 0).unwrap();
+        assert_eq!(fs.flush_queue_depth(), 0);
+        assert_eq!(fs.staged_bytes(), 28);
+        assert_eq!(fs.staged_ops(), 2);
+
+        // Perform write that crosses max_buffer_size (30 bytes: 28 + 30 = 58 >= 50)
+        crate::operations::read_write::write_core(&fs, file.ino, &[0xBB; 30], 20).unwrap();
+        // Guard drop during write_core should have auto-frozen live into flushing queue
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.staged_ops(), 0);
+        assert_eq!(fs.flushing_bytes(), 58);
+        assert_eq!(fs.flushing_ops(), 3);
+    }
 }
