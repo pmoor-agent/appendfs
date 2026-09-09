@@ -1,6 +1,5 @@
-use crate::log::{ExtentState, SharedExtentState};
+use crate::extent_map::{Extent, ExtentMap};
 use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, NodeDelta, SpecialDelta, SymlinkDelta};
-use crate::range_map::RangeMap;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
@@ -292,28 +291,28 @@ impl From<&FileDelta> for LogFileDelta {
             // Matched exhaustively on purpose: an `if let` here would silently drop any
             // state it did not name, which for a hole means losing the punch entirely and
             // resurrecting the data it masked at the next recovery.
-            let log_extent = match entry.value.read_state() {
-                ExtentState::Disk {
+            let log_extent = match &entry.extent {
+                Extent::Disk {
                     record_log_offset,
                     record_size,
                     length,
                     ..
                 } => LogExtent {
                     file_offset: start,
-                    record_log_offset,
-                    record_size,
-                    length: length as u64,
+                    record_log_offset: *record_log_offset,
+                    record_size: *record_size,
+                    length: *length as u64,
                 },
-                ExtentState::Zero { length } => LogExtent {
+                Extent::Zero { length } => LogExtent {
                     file_offset: start,
                     record_log_offset: 0,
                     record_size: 0,
-                    length,
+                    length: *length,
                 },
                 // The flush that emits this record converts staged extents to `Disk`
                 // first, so anything still staged is not durable yet and must not be
                 // referenced from the log.
-                ExtentState::Staged { .. } => continue,
+                Extent::Staged { .. } => continue,
             };
             extents.push(log_extent);
         }
@@ -327,12 +326,12 @@ impl From<&FileDelta> for LogFileDelta {
 
 impl LogFileDelta {
     pub fn into_file_delta(self, generation: u64) -> FileDelta {
-        let mut extents = RangeMap::new();
+        let mut extents = ExtentMap::with_capacity(self.extents.len());
         for ext in self.extents {
             let state = if ext.record_log_offset == 0 {
-                SharedExtentState::new_zero(ext.length)
+                Extent::new_zero(ext.length)
             } else {
-                SharedExtentState::new_disk(generation, ext.record_log_offset, ext.record_size, 0, ext.length as u32)
+                Extent::new_disk(generation, ext.record_log_offset, ext.record_size, 0, ext.length as u32)
             };
             extents.insert(ext.file_offset, ext.length, state);
         }

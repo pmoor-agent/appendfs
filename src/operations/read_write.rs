@@ -1,7 +1,6 @@
+use crate::extent_map::{Extent, ExtentMap};
 use crate::fs::InMemoryFS;
-use crate::log::SharedExtentState;
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
-use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType, Request};
 use crate::sync::OpTag;
 use std::sync::Arc;
@@ -146,8 +145,8 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
         if let EntryDelta::Node(NodeDelta::File(f)) = entry {
             let mut cur_offset = file_offset;
             for (chunk_data, payload_offset, slice_len) in slices {
-                let shared_state = SharedExtentState::new_staged(chunk_data, payload_offset, slice_len);
-                f.extents.insert(cur_offset, slice_len as u64, shared_state);
+                let extent = Extent::new_staged(chunk_data, payload_offset, slice_len);
+                f.extents.insert(cur_offset, slice_len as u64, extent);
                 cur_offset += slice_len as u64;
             }
             let current_size = f.size.unwrap_or(attr.size as u64);
@@ -250,8 +249,7 @@ pub fn setattr_core(
                 .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
             if let EntryDelta::Node(NodeDelta::File(f)) = entry {
                 let mask_len = u64::MAX - new_size;
-                f.extents
-                    .insert(new_size, mask_len, SharedExtentState::new_zero(mask_len));
+                f.extents.insert(new_size, mask_len, Extent::new_zero(mask_len));
                 f.size = Some(new_size);
                 f.attr_delta.mtime = Some(now);
                 f.attr_delta.ctime = Some(now);
@@ -306,8 +304,7 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
             .entry(ino)
             .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
         if let EntryDelta::Node(NodeDelta::File(f)) = entry {
-            f.extents
-                .insert(offset, end - offset, SharedExtentState::new_zero(end - offset));
+            f.extents.insert(offset, end - offset, Extent::new_zero(end - offset));
             f.attr_delta.mtime = Some(now);
             f.attr_delta.ctime = Some(now);
         }
@@ -478,7 +475,7 @@ pub fn create_core(
 
         let new_ino = fs.allocate_inode();
         let new_delta = NodeDelta::File(FileDelta {
-            extents: RangeMap::new(),
+            extents: ExtentMap::new(),
             size: Some(0),
             attr_delta: AttrDelta {
                 mode: Some(mode & 0o7777),

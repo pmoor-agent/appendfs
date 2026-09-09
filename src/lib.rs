@@ -7,11 +7,11 @@ pub mod compat;
 pub mod compress;
 pub mod crypto;
 pub mod dump;
+pub mod extent_map;
 pub mod fs;
 pub mod log;
 pub mod node;
 pub mod operations;
-pub mod range_map;
 pub mod remote;
 pub mod shim;
 pub mod stats;
@@ -34,13 +34,13 @@ pub use cli::{
 };
 pub use clock::{AdvancingClock, Clock, MockClock, SystemClock, format_local_civil_time, parse_timestamp};
 pub use dump::{dump_file, dump_log_file, dump_log_reader, dump_summary_file, dump_summary_reader};
+pub use extent_map::{Extent, ExtentEntry, ExtentMap};
 pub use fs::InMemoryFS;
 pub use log::{
     BackgroundFlusher, ExtentState, LogFileCache, LogReader, LogRecord, LogWriter, RecoveryTarget, SharedExtentState,
     SummaryFooter, SummaryHeader, SummaryReader, export_summary, init_volume, init_volume_with_clock, recover_fs,
 };
 pub use node::{InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta};
-pub use range_map::{RangeEntry, RangeMap, RangeValue};
 pub use remote::{
     BatchLeaderGuard, BlockCache, ConcurrencyLimiter, ConcurrencyPermit, ConfiguredRemote,
     DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, FollowerBlock, MemoryBlockCache, OnDiskBlockCache,

@@ -1200,7 +1200,7 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
     let orphan_node = appendfs::Node {
         meta: appendfs::InodeMeta::new(0o644, 1, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
         kind: appendfs::NodeKind::File {
-            range_map: appendfs::RangeMap::new(),
+            extent_map: appendfs::ExtentMap::new(),
             size: 256,
         },
     };

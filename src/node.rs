@@ -1,5 +1,4 @@
-use crate::log::SharedExtentState;
-use crate::range_map::RangeMap;
+use crate::extent_map::ExtentMap;
 use crate::shim::{FileAttr, FileType};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -87,24 +86,12 @@ impl InodeMeta {
 /// Type-specific contents and payloads for inodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeKind {
-    Directory {
-        parent: u64,
-        entries: Vec<(String, u64)>,
-    },
-    File {
-        range_map: RangeMap<SharedExtentState>,
-        size: u64,
-    },
-    Symlink {
-        target: String,
-    },
+    Directory { parent: u64, entries: Vec<(String, u64)> },
+    File { extent_map: ExtentMap, size: u64 },
+    Symlink { target: String },
     Fifo,
-    CharDevice {
-        rdev: u32,
-    },
-    BlockDevice {
-        rdev: u32,
-    },
+    CharDevice { rdev: u32 },
+    BlockDevice { rdev: u32 },
     Socket,
 }
 
@@ -130,7 +117,7 @@ impl Node {
         Self {
             meta: InodeMeta::new(perm, 1, uid, gid, time),
             kind: NodeKind::File {
-                range_map: RangeMap::new(),
+                extent_map: ExtentMap::new(),
                 size: 0,
             },
         }
@@ -342,7 +329,7 @@ pub struct DirectoryDelta {
 
 #[derive(Debug, Clone, Default)]
 pub struct FileDelta {
-    pub extents: RangeMap<SharedExtentState>,
+    pub extents: ExtentMap,
     pub size: Option<u64>,
     pub attr_delta: AttrDelta,
 }
@@ -467,9 +454,9 @@ impl NodeDelta {
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
                 node.apply_attr_delta(&d.attr_delta);
             }
-            (NodeKind::File { range_map, size }, NodeDelta::File(f)) => {
+            (NodeKind::File { extent_map, size }, NodeDelta::File(f)) => {
                 for (start, entry) in f.extents.iter() {
-                    range_map.insert(*start, entry.length, entry.value.clone());
+                    extent_map.insert(*start, entry.length(), entry.extent.clone());
                 }
                 if let Some(s) = f.size {
                     *size = s;
@@ -478,7 +465,7 @@ impl NodeDelta {
                 // compacts a truncation away: the `Zero` extent that masked the discarded
                 // range has done its job by overwriting those entries on the way in, and
                 // has no one left below it to mask once it reaches `base`.
-                range_map.truncate(*size);
+                extent_map.truncate(*size);
                 node.apply_attr_delta(&f.attr_delta);
             }
             (NodeKind::Symlink { target }, NodeDelta::Symlink(s)) => {

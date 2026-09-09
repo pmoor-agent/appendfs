@@ -9,7 +9,7 @@
 //! one can straddle that move and miss the batch entirely.
 
 use super::InMemoryFS;
-use crate::log::{ExtentState, SharedExtentState};
+use crate::extent_map::Extent;
 use crate::node::{EntryDelta, Node, NodeDelta, NodeKind};
 use crate::shim::{FileAttr, FileType};
 use std::collections::{BTreeSet, HashMap};
@@ -272,7 +272,7 @@ impl<'a> InodeLayerStack<'a> {
         let mut filled = vec![false; read_len];
         let mut raw_slices = Vec::new();
 
-        let mut add_extent = |ext_start: u64, ext_len: u64, shared_state: &SharedExtentState| {
+        let mut add_extent = |ext_start: u64, ext_len: u64, extent: &Extent| {
             let seg_start = std::cmp::max(offset, ext_start);
             let seg_end = std::cmp::min(offset + read_len as u64, ext_start + ext_len);
             if seg_start >= seg_end {
@@ -304,37 +304,39 @@ impl<'a> InodeLayerStack<'a> {
                 let sub_len = sub_end - sub_start;
                 let inner_offset = slice_inner_offset + (sub_start - dst_offset);
 
-                let state = shared_state.read_state();
-                let source = match state {
-                    ExtentState::Zero { .. } => ReadSliceSource::Zero,
-                    ExtentState::Staged {
+                let source = match extent {
+                    Extent::Zero { .. } => ReadSliceSource::Zero,
+                    Extent::Staged {
                         data,
                         payload_offset,
                         length: _,
                     } => {
-                        let src_offset = payload_offset as usize + inner_offset;
-                        ReadSliceSource::Memory { data, src_offset }
+                        let src_offset = *payload_offset as usize + inner_offset;
+                        ReadSliceSource::Memory {
+                            data: data.clone(),
+                            src_offset,
+                        }
                     }
-                    ExtentState::Disk {
+                    Extent::Disk {
                         generation,
                         record_log_offset,
                         record_size,
                         payload_offset,
                         length: _,
                     } => {
-                        let cached = log_cache.and_then(|c| c.get_cached_record(generation, record_log_offset));
+                        let cached = log_cache.and_then(|c| c.get_cached_record(*generation, *record_log_offset));
                         if let Some(cached_data) = cached {
-                            let src_offset = payload_offset as usize + inner_offset;
+                            let src_offset = *payload_offset as usize + inner_offset;
                             ReadSliceSource::Cache {
                                 data: cached_data,
                                 src_offset,
                             }
                         } else {
                             ReadSliceSource::Disk {
-                                generation,
-                                record_log_offset,
-                                record_size,
-                                payload_offset,
+                                generation: *generation,
+                                record_log_offset: *record_log_offset,
+                                record_size: *record_size,
+                                payload_offset: *payload_offset,
                                 slice_inner_offset: inner_offset as u32,
                             }
                         }
@@ -357,8 +359,8 @@ impl<'a> InodeLayerStack<'a> {
                     break;
                 }
                 EntryDelta::Node(NodeDelta::File(f)) => {
-                    for (ext_start, ext_len, shared_state) in f.extents.query(offset, read_len as u64) {
-                        add_extent(ext_start, ext_len, &shared_state);
+                    for (ext_start, ext_len, extent) in f.extents.query(offset, read_len as u64) {
+                        add_extent(ext_start, ext_len, &extent);
                     }
                 }
                 _ => {}
@@ -367,9 +369,9 @@ impl<'a> InodeLayerStack<'a> {
 
         if !hit_tombstone && let Some(arc) = self.base {
             let node = arc.as_ref();
-            if let NodeKind::File { range_map, .. } = &node.kind {
-                for (ext_start, ext_len, shared_state) in range_map.query(offset, read_len as u64) {
-                    add_extent(ext_start, ext_len, &shared_state);
+            if let NodeKind::File { extent_map, .. } = &node.kind {
+                for (ext_start, ext_len, extent) in extent_map.query(offset, read_len as u64) {
+                    add_extent(ext_start, ext_len, &extent);
                 }
             }
         }
@@ -679,6 +681,7 @@ fn execute_cold_slices(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extent_map::{Extent, ExtentMap};
     use crate::fs::{FlushBatch, WriteArena};
 
     #[test]
@@ -800,16 +803,17 @@ mod tests {
 
     #[test]
     fn test_plan_read_file_data_multi_layer_precedence() {
+        use crate::extent_map::ExtentMap;
         use crate::node::{FileDelta, InodeMeta};
-        use crate::range_map::RangeMap;
         use std::time::SystemTime;
 
         let fs = InMemoryFS::new();
+
         let attr = crate::operations::read_write::create_core(&fs, 1, "layers.bin", 0o644, 0, 1000, 1000).unwrap();
 
         // 1. Base layer: Disk extent at 0..100
-        let shared_disk = SharedExtentState::new_disk(1, 1024, 137, 0, 100);
-        let mut base_range = RangeMap::new();
+        let shared_disk = Extent::new_disk(1, 1024, 137, 0, 100);
+        let mut base_range = ExtentMap::new();
         base_range.insert(0, 100, shared_disk);
         let mut base_map = HashMap::new();
         base_map.insert(
@@ -817,7 +821,7 @@ mod tests {
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
                 kind: NodeKind::File {
-                    range_map: base_range,
+                    extent_map: base_range,
                     size: 100,
                 },
             }),
@@ -827,7 +831,7 @@ mod tests {
         // 2. Flushing layer: punch hole (Zero) at 20..40
         let mut flushing_batch = HashMap::new();
         let mut f_delta = FileDelta::default();
-        f_delta.extents.insert(20, 20, SharedExtentState::new_zero(20));
+        f_delta.extents.insert(20, 20, Extent::new_zero(20));
         flushing_batch.insert(attr.ino, EntryDelta::Node(NodeDelta::File(f_delta)));
         fs.inner
             .lock()
@@ -839,7 +843,7 @@ mod tests {
         let mut live_delta = FileDelta::default();
         live_delta
             .extents
-            .insert(30, 20, SharedExtentState::new_staged_buffer(vec![0xBB; 20], 0, 20));
+            .insert(30, 20, Extent::new_staged_buffer(vec![0xBB; 20], 0, 20));
         fs.inner
             .lock()
             .unwrap()
@@ -893,7 +897,6 @@ mod tests {
     #[test]
     fn test_plan_read_file_data_decrypted_record_cache_hit() {
         use crate::node::InodeMeta;
-        use crate::range_map::RangeMap;
         use std::time::SystemTime;
 
         let mut fs = InMemoryFS::new();
@@ -902,8 +905,8 @@ mod tests {
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "cached.bin", 0o644, 0, 1000, 1000).unwrap();
 
-        let shared_disk = SharedExtentState::new_disk(1, 1024, 137, 0, 100);
-        let mut base_range = RangeMap::new();
+        let shared_disk = Extent::new_disk(1, 1024, 137, 0, 100);
+        let mut base_range = ExtentMap::new();
         base_range.insert(0, 100, shared_disk);
         let mut base_map = HashMap::new();
         base_map.insert(
@@ -911,7 +914,7 @@ mod tests {
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
                 kind: NodeKind::File {
-                    range_map: base_range,
+                    extent_map: base_range,
                     size: 100,
                 },
             }),

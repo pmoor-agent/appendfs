@@ -705,8 +705,10 @@ impl InMemoryFS {
 
 impl Drop for InMemoryFS {
     fn drop(&mut self) {
-        self.destroy();
-        let _ = self.sync_and_export_summary();
+        if !std::thread::panicking() {
+            self.destroy();
+            let _ = self.sync_and_export_summary();
+        }
     }
 }
 

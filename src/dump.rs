@@ -674,10 +674,10 @@ pub fn dump_summary_reader_with_path(
                 NodeKind::Symlink { .. } => {
                     symlink_count += 1;
                 }
-                NodeKind::File { range_map, size, .. } => {
+                NodeKind::File { extent_map, size, .. } => {
                     file_count += 1;
                     total_logical_bytes += *size;
-                    let num_extents = range_map.len();
+                    let num_extents = extent_map.len();
                     total_file_extents += num_extents;
                     if num_extents > max_file_extents {
                         max_file_extents = num_extents;
@@ -846,11 +846,11 @@ pub fn dump_summary_reader_with_path(
         let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
         for sync_node in inodes.values() {
             let node = sync_node.as_ref();
-            if let NodeKind::File { range_map, .. } = &node.kind {
-                for (_, entry) in range_map.iter() {
-                    if let ExtentState::Disk { generation, length, .. } = entry.value.read_state() {
-                        let stats = live_map.entry(generation).or_insert((0, 0));
-                        stats.0 += length as u64;
+            if let NodeKind::File { extent_map, .. } = &node.kind {
+                for (_, entry) in extent_map.iter() {
+                    if let ExtentState::Disk { generation, length, .. } = &entry.extent {
+                        let stats = live_map.entry(*generation).or_insert((0, 0));
+                        stats.0 += *length as u64;
                         stats.1 += 1;
                     }
                 }
@@ -929,7 +929,7 @@ pub fn dump_summary_reader_with_path(
                         )
                         .unwrap();
                     }
-                    NodeKind::File { range_map, size, .. } => {
+                    NodeKind::File { extent_map, size, .. } => {
                         writeln!(
                             out,
                             "#{:<5} [Inode {:<5}] RegularFile {:?} (size {}, extents {}, mode 0o{:o}, uid {}, gid {}, mtime: {})",
@@ -937,7 +937,7 @@ pub fn dump_summary_reader_with_path(
                             ino,
                             path_str,
                             format_bytes(*size),
-                            range_map.len(),
+                            extent_map.len(),
                             node.meta.perm,
                             node.meta.uid,
                             node.meta.gid,
@@ -947,12 +947,12 @@ pub fn dump_summary_reader_with_path(
 
                         // Verbose Level 2: Physical Extents Dump
                         if verbosity >= 2 {
-                            if range_map.is_empty() {
+                            if extent_map.is_empty() {
                                 writeln!(out, "      extents: (empty / 0 bytes)").unwrap();
                             } else {
-                                writeln!(out, "      extents ({}):", range_map.len()).unwrap();
-                                for (ext_idx, (&start, entry)) in range_map.iter().enumerate() {
-                                    let state_desc = match entry.value.read_state() {
+                                writeln!(out, "      extents ({}):", extent_map.len()).unwrap();
+                                for (ext_idx, (&start, entry)) in extent_map.iter().enumerate() {
+                                    let state_desc = match &entry.extent {
                                         ExtentState::Disk {
                                             generation,
                                             record_log_offset,
@@ -962,12 +962,12 @@ pub fn dump_summary_reader_with_path(
                                         } => {
                                             format!(
                                                 "{} [record offset 0x{:08x} / {:<8}, rec_size {}, payload offset {:<4}, len {}]",
-                                                crate::log::log_filename(generation),
+                                                crate::log::log_filename(*generation),
                                                 record_log_offset,
                                                 record_log_offset,
-                                                format_bytes(record_size as u64),
+                                                format_bytes(*record_size as u64),
                                                 payload_offset,
-                                                format_bytes(length as u64)
+                                                format_bytes(*length as u64)
                                             )
                                         }
                                         ExtentState::Staged {
@@ -978,12 +978,12 @@ pub fn dump_summary_reader_with_path(
                                             format!(
                                                 "Staged Memory Buffer [payload offset {}, len {}, data buf {}]",
                                                 payload_offset,
-                                                format_bytes(length as u64),
+                                                format_bytes(*length as u64),
                                                 format_bytes(data.read().map(|g| g.len() as u64).unwrap_or(0))
                                             )
                                         }
                                         ExtentState::Zero { length } => {
-                                            format!("hole (reads as zeros) [len {}]", format_bytes(length))
+                                            format!("hole (reads as zeros) [len {}]", format_bytes(*length))
                                         }
                                     };
                                     writeln!(
@@ -991,8 +991,8 @@ pub fn dump_summary_reader_with_path(
                                         "        [{:>2}] [0x{:08x} .. 0x{:08x}] ({:>10}) -> {}",
                                         ext_idx + 1,
                                         start,
-                                        start + entry.length,
-                                        format_bytes(entry.length),
+                                        start + entry.length(),
+                                        format_bytes(entry.length()),
                                         state_desc
                                     )
                                     .unwrap();
@@ -1275,11 +1275,11 @@ mod tests {
 
     #[test]
     fn test_dump_summary_file_summary_and_verbosity_levels() {
+        use crate::extent_map::{Extent, ExtentMap};
         use crate::fs::InMemoryFS;
+        use crate::log::LogManifest;
         use crate::log::summary::{SummarySnapshot, export_summary, init_volume};
-        use crate::log::{LogManifest, SharedExtentState};
         use crate::node::{InodeMeta, Node, NodeKind};
-        use crate::range_map::RangeMap;
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1314,14 +1314,14 @@ mod tests {
         });
 
         // Create fragmented file (inode 3) with 2 extents
-        let mut rmap = RangeMap::new();
-        rmap.insert(0, 4096, SharedExtentState::new_disk(1, 100, 4133, 20, 4096));
-        rmap.insert(4096, 4096, SharedExtentState::new_disk(2, 200, 4133, 20, 4096));
+        let mut rmap = ExtentMap::new();
+        rmap.insert(0, 4096, Extent::new_disk(1, 100, 4133, 20, 4096));
+        rmap.insert(4096, 4096, Extent::new_disk(2, 200, 4133, 20, 4096));
 
         let file_node = Arc::new(Node {
             meta: InodeMeta::new(0o644, 1, 1000, 1000, now),
             kind: NodeKind::File {
-                range_map: rmap,
+                extent_map: rmap,
                 size: 8192,
             },
         });

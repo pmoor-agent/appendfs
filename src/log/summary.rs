@@ -1,8 +1,7 @@
 use crate::crypto::VolumeKey;
+use crate::extent_map::ExtentMap;
 use crate::fs::InMemoryFS;
-use crate::log::SharedExtentState;
 use crate::node::{Node, NodeKind};
-use crate::range_map::RangeMap;
 use crate::storage::{Storage, StorageReader, WriteMode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -191,7 +190,7 @@ fn write_summary_body(
         let mut node_to_serialize = node_arc.as_ref().clone();
         match node_to_serialize.kind {
             NodeKind::Directory { ref mut entries, .. } => entries.sort_by(|a, b| a.0.cmp(&b.0)),
-            NodeKind::File { ref mut range_map, .. } => *range_map = coalesce_extents(range_map),
+            NodeKind::File { ref mut extent_map, .. } => *extent_map = coalesce_extents(extent_map),
             _ => {}
         }
 
@@ -224,61 +223,8 @@ fn write_summary_body(
 
 /// Merges adjacent extents that are physically contiguous in the same log record, so a
 /// sequential write reloads as one extent rather than one per flush chunk.
-fn coalesce_extents(range_map: &RangeMap<SharedExtentState>) -> RangeMap<SharedExtentState> {
-    let entries: Vec<(u64, u64, SharedExtentState)> = range_map
-        .iter()
-        .map(|(start, e)| (*start, e.length, e.value.clone()))
-        .collect();
-
-    let mut coalesced = RangeMap::new();
-    let mut current: Option<(u64, u64, SharedExtentState)> = None;
-
-    for (start, len, state) in entries {
-        if let Some((cur_start, cur_len, cur_state)) = current.take() {
-            let mut merged = false;
-            if cur_start + cur_len == start
-                && let (
-                    crate::log::ExtentState::Disk {
-                        generation: g1,
-                        record_log_offset: r1,
-                        record_size: rec_size1,
-                        payload_offset: p1,
-                        length: _,
-                    },
-                    crate::log::ExtentState::Disk {
-                        generation: g2,
-                        record_log_offset: r2,
-                        record_size: rec_size2,
-                        payload_offset: p2,
-                        length: _,
-                    },
-                ) = (cur_state.read_state(), state.read_state())
-                && g1 == g2
-                && r1 == r2
-                && rec_size1 == rec_size2
-                && p1 as u64 + cur_len == p2 as u64
-            {
-                current = Some((
-                    cur_start,
-                    cur_len + len,
-                    SharedExtentState::new_disk(g1, r1, rec_size1, p1, (cur_len + len) as u32),
-                ));
-                merged = true;
-            }
-            if !merged {
-                coalesced.insert(cur_start, cur_len, cur_state);
-                current = Some((start, len, state));
-            }
-        } else {
-            current = Some((start, len, state));
-        }
-    }
-
-    if let Some((cur_start, cur_len, cur_state)) = current {
-        coalesced.insert(cur_start, cur_len, cur_state);
-    }
-
-    coalesced
+fn coalesce_extents(extent_map: &ExtentMap) -> ExtentMap {
+    extent_map.coalesce()
 }
 
 /// Returns the physical filename for a given summary snapshot (e.g. "000001.summary").
@@ -870,6 +816,7 @@ impl SummaryReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extent_map::Extent;
     use crate::node::InodeMeta;
     use crate::storage::{FaultStorage, MemoryStorage};
     use std::time::SystemTime;
@@ -891,14 +838,14 @@ mod tests {
             }),
         );
 
-        let mut rmap = RangeMap::new();
-        rmap.insert(0, 100, SharedExtentState::new_disk(1, 24, 137, 0, 100));
+        let mut rmap = ExtentMap::new();
+        rmap.insert(0, 100, Extent::new_disk(1, 24, 137, 0, 100));
         snapshot.insert(
             2,
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
                 kind: NodeKind::File {
-                    range_map: rmap,
+                    extent_map: rmap,
                     size: 100,
                 },
             }),
@@ -941,9 +888,9 @@ mod tests {
 
         let node2 = reader.read_inode(2).unwrap().unwrap();
         match node2.kind {
-            NodeKind::File { range_map, .. } => {
-                assert_eq!(range_map.len(), 1);
-                let extent = range_map.query(0, 100);
+            NodeKind::File { extent_map, .. } => {
+                assert_eq!(extent_map.len(), 1);
+                let extent = extent_map.query(0, 100);
                 assert_eq!(extent.len(), 1);
                 assert_eq!(extent[0].1, 100);
             }
@@ -964,7 +911,7 @@ mod tests {
                 Arc::new(Node {
                     meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
                     kind: NodeKind::File {
-                        range_map: RangeMap::new(),
+                        extent_map: ExtentMap::new(),
                         size: i * 10,
                     },
                 }),
