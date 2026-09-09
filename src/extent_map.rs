@@ -304,7 +304,7 @@ impl Extent {
 /// An entry in `ExtentMap` representing an extent at `file_offset`.
 ///
 /// The inner `Extent` is the single source of truth for the extent's length and physical location.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtentEntry {
     pub file_offset: u64,
     pub extent: Extent,
@@ -705,73 +705,34 @@ impl<'a> Iterator for ExtentMapIter<'a> {
 
 impl<'a> ExactSizeIterator for ExtentMapIter<'a> {}
 
-// Serialization: Emits a struct named "RangeMap" containing a map field "map", matching
-// the on-disk wire format of existing v1 summary files.
+// Serialization: Emits a compact sequence of sorted ExtentEntry items.
 impl Serialize for ExtentMap {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        use serde::ser::SerializeStruct;
-
-        #[derive(Serialize)]
-        struct WireRangeEntry<'a> {
-            length: u64,
-            value: &'a Extent,
-        }
-
-        struct MapHelper<'a>(&'a ExtentMap);
-
-        impl<'a> Serialize for MapHelper<'a> {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                use serde::ser::SerializeMap;
-                let mut map = serializer.serialize_map(Some(self.0.len()))?;
-                for (&offset, entry) in self.0.iter() {
-                    let wire = WireRangeEntry {
-                        length: entry.length(),
-                        value: &entry.extent,
-                    };
-                    map.serialize_entry(&offset, &wire)?;
+        match &self.inner {
+            ExtentMapInner::Vector(vec) => vec.serialize(serializer),
+            ExtentMapInner::Tree(tree) => {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(tree.len()))?;
+                for entry in tree.values() {
+                    seq.serialize_element(entry)?;
                 }
-                map.end()
+                seq.end()
             }
         }
-
-        let mut s = serializer.serialize_struct("RangeMap", 1)?;
-        s.serialize_field("map", &MapHelper(self))?;
-        s.end()
     }
 }
 
-// Deserialization: Reads entries directly into a compact Vector, avoiding B-tree allocations
-// entirely during volume recovery and summary loads.
+// Deserialization: Reads entries directly into a compact Vector in a single allocation,
+// avoiding B-tree allocations entirely during volume recovery and summary loads.
 impl<'de> Deserialize<'de> for ExtentMap {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        struct WireRangeEntry {
-            #[allow(dead_code)]
-            length: u64,
-            value: Extent,
-        }
-
-        #[derive(Deserialize)]
-        struct RangeMapHelper {
-            map: BTreeMap<u64, WireRangeEntry>,
-        }
-        let helper = RangeMapHelper::deserialize(deserializer)?;
-        let mut vec = Vec::with_capacity(helper.map.len());
-        for (offset, wire) in helper.map {
-            vec.push(ExtentEntry {
-                file_offset: offset,
-                extent: wire.value,
-            });
-        }
+        let vec = Vec::<ExtentEntry>::deserialize(deserializer)?;
         Ok(Self {
             inner: ExtentMapInner::Vector(vec),
         })

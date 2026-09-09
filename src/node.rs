@@ -86,25 +86,12 @@ impl InodeMeta {
 /// Type-specific contents and payloads for inodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeKind {
-    Directory {
-        parent: u64,
-        entries: Vec<(String, u64)>,
-    },
-    File {
-        #[serde(rename = "range_map")]
-        extent_map: ExtentMap,
-        size: u64,
-    },
-    Symlink {
-        target: String,
-    },
+    Directory { parent: u64, entries: Vec<(String, u64)> },
+    File { extent_map: ExtentMap, size: u64 },
+    Symlink { target: String },
     Fifo,
-    CharDevice {
-        rdev: u32,
-    },
-    BlockDevice {
-        rdev: u32,
-    },
+    CharDevice { rdev: u32 },
+    BlockDevice { rdev: u32 },
     Socket,
 }
 
