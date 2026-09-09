@@ -1,5 +1,5 @@
 use crate::extent_map::{Extent, ExtentMap};
-use crate::fs::InMemoryFS;
+use crate::fs::{FileHandle, InMemoryFS};
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
 use crate::shim::{FileAttr, FileType, Request};
 use crate::sync::OpTag;
@@ -78,27 +78,65 @@ pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, f
 }
 
 pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
-    let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
-    if attr.file_type != FileType::RegularFile {
-        return Err(libc::EISDIR);
+    let write_requested = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0;
+    if write_requested && fs.is_read_only() {
+        return Err(libc::EROFS);
     }
 
-    if (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0 {
-        if fs.is_read_only() {
-            return Err(libc::EROFS);
-        }
-        if fs.is_virtual_ino(ino) {
+    if fs.is_virtual_ino(ino) {
+        if write_requested {
             return Err(libc::EACCES);
         }
-    }
-
-    let fh = fs.open_file_handle(ino, flags);
-
-    if (flags & libc::O_TRUNC as u32) != 0 {
+        // Virtual files generate content outside the inner lock to prevent lock-ordering inversions
+        // or self-deadlocks (since status generators query filesystem layer state).
+        let content = fs.virtual_files.generate_content(ino, fs).unwrap_or_default();
+        let fh = fs.allocate_fh();
+        fs.with_inner(OpTag::Handle, |inner| {
+            let attr = fs.get_attr_locked(inner, ino).ok_or(libc::ENOENT)?;
+            if attr.file_type != FileType::RegularFile {
+                return Err(libc::EISDIR);
+            }
+            inner.insert_file_handle(
+                fh,
+                FileHandle::Virtual {
+                    ino,
+                    flags,
+                    data: Arc::new(content.into_bytes()),
+                },
+            );
+            Ok(fh)
+        })
+    } else {
+        // Regular files: validate, open, and optionally truncate in a single critical section!
         let now = fs.clock.now();
-        let _ = setattr_core(fs, ino, 0, 0, 0, 0, now, now, FUSE_SET_ATTR_SIZE | FUSE_SET_ATTR_MTIME);
+        let trunc = (flags & libc::O_TRUNC as u32) != 0;
+        if trunc {
+            fs.check_flush_capacity()?;
+        }
+        let fh = fs.allocate_fh();
+        fs.with_inner(OpTag::Handle, |inner| {
+            let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+            if attr.file_type != FileType::RegularFile {
+                return Err(libc::EISDIR);
+            }
+            inner.insert_file_handle(fh, FileHandle::Regular { ino, flags });
+            if trunc {
+                let entry = inner
+                    .live
+                    .entry(ino)
+                    .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
+                if let EntryDelta::Node(NodeDelta::File(f)) = entry {
+                    let mask_len = u64::MAX;
+                    f.extents.insert(0, mask_len, Extent::new_zero(mask_len));
+                    f.size = Some(0);
+                    f.attr_delta.mtime = Some(now);
+                    f.attr_delta.ctime = Some(now);
+                }
+                inner.record_mutation(0);
+            }
+            Ok(fh)
+        })
     }
-    Ok(fh)
 }
 
 pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
@@ -109,8 +147,8 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
     }
 }
 
-pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
-    log::trace!("write(ino={}, len={}, offset={})", ino, buf.len(), offset);
+pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
+    log::trace!("write(ino={}, fh={}, len={}, offset={})", ino, fh, buf.len(), offset);
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
@@ -127,9 +165,12 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
     let write_len = buf.len() as u64;
 
     fs.with_inner(OpTag::Write, |inner| {
+        if fh != 0 {
+            inner.validate_regular_handle(ino, fh)?;
+        }
         let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
-            return Err(libc::EISDIR);
+            return Err(libc::EBADF);
         }
 
         if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
@@ -159,20 +200,13 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
     })
 }
 
+pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
+    write_handle_core(fs, ino, 0, buf, offset)
+}
+
 pub fn write(fs: &InMemoryFS, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64) {
     log::trace!("write(ino={}, len={}, offset={}, fh={})", ino, buf.len(), offset, fh);
-    let handle = match fs.extract_file_handle(ino, fh) {
-        Ok(h) => h,
-        Err(e) => {
-            req.reply_err(e);
-            return;
-        }
-    };
-    if !handle.is_regular() {
-        req.reply_err(libc::EBADF);
-        return;
-    }
-    match write_core(fs, ino, buf, offset) {
+    match write_handle_core(fs, ino, fh, buf, offset) {
         Ok(count) => req.reply_write(count),
         Err(e) => req.reply_err(e),
     }
@@ -434,8 +468,8 @@ pub fn setattr(
         Err(e) => req.reply_err(e),
     }
 }
-
-pub fn create_core(
+#[allow(clippy::too_many_arguments)]
+fn create_internal(
     fs: &InMemoryFS,
     parent: u64,
     name: &str,
@@ -443,7 +477,8 @@ pub fn create_core(
     flags: u32,
     uid: u32,
     gid: u32,
-) -> Result<FileAttr, i32> {
+    open_handle: bool,
+) -> Result<(FileAttr, Option<u64>), i32> {
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
@@ -494,29 +529,51 @@ pub fn create_core(
         inner.add_dir_entry(parent, name, new_ino, now);
         inner.record_mutation(name.len());
 
-        Ok(FileAttr {
-            ino: new_ino,
-            file_type: FileType::RegularFile,
-            perm: mode & 0o7777,
-            nlink: 1,
-            uid,
-            gid,
-            rdev: 0,
-            size: 0,
-            atime: now,
-            mtime: now,
-            ctime: now,
-        })
+        let fh = if open_handle {
+            let fh = fs.allocate_fh();
+            inner.insert_file_handle(fh, FileHandle::Regular { ino: new_ino, flags });
+            Some(fh)
+        } else {
+            None
+        };
+
+        Ok((
+            FileAttr {
+                ino: new_ino,
+                file_type: FileType::RegularFile,
+                perm: mode & 0o7777,
+                nlink: 1,
+                uid,
+                gid,
+                rdev: 0,
+                size: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+            },
+            fh,
+        ))
     })
+}
+
+pub fn create_core(
+    fs: &InMemoryFS,
+    parent: u64,
+    name: &str,
+    mode: u32,
+    flags: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<FileAttr, i32> {
+    create_internal(fs, parent, name, mode, flags, uid, gid, false).map(|(attr, _)| attr)
 }
 
 pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32, flags: u32) {
     let uid = req.uid();
     let gid = req.gid();
-    match create_core(fs, parent, name, mode, flags, uid, gid) {
-        Ok(attr) => {
-            let fh = fs.open_file_handle(attr.ino, flags);
-            req.reply_create(&attr, 1.0, 1.0, fh);
+    match create_internal(fs, parent, name, mode, flags, uid, gid, true) {
+        Ok((attr, fh)) => {
+            req.reply_create(&attr, 1.0, 1.0, fh.unwrap());
         }
         Err(e) => req.reply_err(e),
     }
@@ -524,24 +581,18 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
 
 pub fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
     if fh != 0 {
-        let handle = fs.extract_file_handle(ino, fh)?;
-        if !handle.is_regular() {
-            return Err(libc::EBADF);
-        }
+        fs.with_inner(OpTag::Handle, |inner| inner.validate_regular_handle(ino, fh))?;
     }
     fs.sync_log().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
 }
 
 pub fn fsync(fs: &Arc<InMemoryFS>, req: Request, ino: u64, datasync: bool, fh: u64) {
     log::trace!("fsync(ino={}, datasync={}, fh={})", ino, datasync, fh);
-    if fh != 0 {
-        match fs.extract_file_handle(ino, fh) {
-            Ok(h) if h.is_regular() => {}
-            _ => {
-                req.reply_err(libc::EBADF);
-                return;
-            }
-        }
+    if fh != 0
+        && let Err(e) = fs.with_inner(OpTag::Handle, |inner| inner.validate_regular_handle(ino, fh))
+    {
+        req.reply_err(e);
+        return;
     }
     if fs.log_writer.is_none() {
         req.reply_err(0);

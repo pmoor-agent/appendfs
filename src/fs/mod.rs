@@ -253,6 +253,55 @@ impl FsInner {
 
 impl FsInner {
     #[inline]
+    pub fn get_file_handle(&self, ino: u64, fh: u64) -> Result<&FileHandle, i32> {
+        let handle = self.handles.get(&fh).ok_or(libc::EBADF)?;
+        if handle.ino() != ino {
+            return Err(libc::EBADF);
+        }
+        match handle {
+            Handle::File(f) => Ok(f),
+            Handle::Directory(_) => Err(libc::EISDIR),
+        }
+    }
+
+    #[inline]
+    pub fn validate_file_handle(&self, ino: u64, fh: u64) -> Result<(), i32> {
+        self.get_file_handle(ino, fh).map(|_| ())
+    }
+
+    #[inline]
+    pub fn validate_regular_handle(&self, ino: u64, fh: u64) -> Result<(), i32> {
+        match self.get_file_handle(ino, fh)? {
+            FileHandle::Regular { .. } => Ok(()),
+            FileHandle::Virtual { .. } => Err(libc::EBADF),
+        }
+    }
+
+    #[inline]
+    pub fn get_dir_handle(&self, ino: u64, fh: u64) -> Result<&DirHandle, i32> {
+        let handle = self.handles.get(&fh).ok_or(libc::EBADF)?;
+        if handle.ino() != ino {
+            return Err(libc::EBADF);
+        }
+        match handle {
+            Handle::Directory(d) => Ok(d),
+            Handle::File(_) => Err(libc::ENOTDIR),
+        }
+    }
+
+    #[inline]
+    pub fn insert_file_handle(&mut self, fh: u64, file_handle: FileHandle) {
+        let ino = file_handle.ino();
+        self.handles.insert(fh, Handle::File(file_handle));
+        *self.open_counts.entry(ino).or_insert(0) += 1;
+    }
+
+    #[inline]
+    pub fn insert_dir_handle(&mut self, fh: u64, dir_handle: DirHandle) {
+        self.handles.insert(fh, Handle::Directory(dir_handle));
+    }
+
+    #[inline]
     pub fn handle_counts(&self) -> (usize, usize, usize) {
         let mut regular = 0;
         let mut virtual_count = 0;
