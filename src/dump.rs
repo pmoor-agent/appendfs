@@ -674,10 +674,10 @@ pub fn dump_summary_reader_with_path(
                 NodeKind::Symlink { .. } => {
                     symlink_count += 1;
                 }
-                NodeKind::File { range_map, size, .. } => {
+                NodeKind::File { extent_map, size, .. } => {
                     file_count += 1;
                     total_logical_bytes += *size;
-                    let num_extents = range_map.len();
+                    let num_extents = extent_map.len();
                     total_file_extents += num_extents;
                     if num_extents > max_file_extents {
                         max_file_extents = num_extents;
@@ -846,8 +846,8 @@ pub fn dump_summary_reader_with_path(
         let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
         for sync_node in inodes.values() {
             let node = sync_node.as_ref();
-            if let NodeKind::File { range_map, .. } = &node.kind {
-                for (_, entry) in range_map.iter() {
+            if let NodeKind::File { extent_map, .. } = &node.kind {
+                for (_, entry) in extent_map.iter() {
                     if let ExtentState::Disk { generation, length, .. } = &entry.extent {
                         let stats = live_map.entry(*generation).or_insert((0, 0));
                         stats.0 += *length as u64;
@@ -929,7 +929,7 @@ pub fn dump_summary_reader_with_path(
                         )
                         .unwrap();
                     }
-                    NodeKind::File { range_map, size, .. } => {
+                    NodeKind::File { extent_map, size, .. } => {
                         writeln!(
                             out,
                             "#{:<5} [Inode {:<5}] RegularFile {:?} (size {}, extents {}, mode 0o{:o}, uid {}, gid {}, mtime: {})",
@@ -937,7 +937,7 @@ pub fn dump_summary_reader_with_path(
                             ino,
                             path_str,
                             format_bytes(*size),
-                            range_map.len(),
+                            extent_map.len(),
                             node.meta.perm,
                             node.meta.uid,
                             node.meta.gid,
@@ -947,11 +947,11 @@ pub fn dump_summary_reader_with_path(
 
                         // Verbose Level 2: Physical Extents Dump
                         if verbosity >= 2 {
-                            if range_map.is_empty() {
+                            if extent_map.is_empty() {
                                 writeln!(out, "      extents: (empty / 0 bytes)").unwrap();
                             } else {
-                                writeln!(out, "      extents ({}):", range_map.len()).unwrap();
-                                for (ext_idx, (&start, entry)) in range_map.iter().enumerate() {
+                                writeln!(out, "      extents ({}):", extent_map.len()).unwrap();
+                                for (ext_idx, (&start, entry)) in extent_map.iter().enumerate() {
                                     let state_desc = match &entry.extent {
                                         ExtentState::Disk {
                                             generation,
@@ -991,8 +991,8 @@ pub fn dump_summary_reader_with_path(
                                         "        [{:>2}] [0x{:08x} .. 0x{:08x}] ({:>10}) -> {}",
                                         ext_idx + 1,
                                         start,
-                                        start + entry.length,
-                                        format_bytes(entry.length),
+                                        start + entry.length(),
+                                        format_bytes(entry.length()),
                                         state_desc
                                     )
                                     .unwrap();
@@ -1321,7 +1321,7 @@ mod tests {
         let file_node = Arc::new(Node {
             meta: InodeMeta::new(0o644, 1, 1000, 1000, now),
             kind: NodeKind::File {
-                range_map: rmap,
+                extent_map: rmap,
                 size: 8192,
             },
         });

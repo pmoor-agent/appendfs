@@ -11,7 +11,7 @@ pub mod writer;
 
 pub use cache::LogFileCache;
 pub use codec::{RecordId, decode as decode_record, encode as encode_record};
-pub use extent::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION, zero_extent_fields, zero_extent_len};
+pub use extent::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION, zero_extent_len};
 pub use flusher::BackgroundFlusher;
 pub use manifest::{
     GenerationLiveStats, LogFileInfo, LogManifest, log_filename, log_filename_with_revision, parse_log_filename,

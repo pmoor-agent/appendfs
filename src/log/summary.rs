@@ -190,7 +190,7 @@ fn write_summary_body(
         let mut node_to_serialize = node_arc.as_ref().clone();
         match node_to_serialize.kind {
             NodeKind::Directory { ref mut entries, .. } => entries.sort_by(|a, b| a.0.cmp(&b.0)),
-            NodeKind::File { ref mut range_map, .. } => *range_map = coalesce_extents(range_map),
+            NodeKind::File { ref mut extent_map, .. } => *extent_map = coalesce_extents(extent_map),
             _ => {}
         }
 
@@ -223,8 +223,8 @@ fn write_summary_body(
 
 /// Merges adjacent extents that are physically contiguous in the same log record, so a
 /// sequential write reloads as one extent rather than one per flush chunk.
-fn coalesce_extents(range_map: &ExtentMap) -> ExtentMap {
-    range_map.coalesce()
+fn coalesce_extents(extent_map: &ExtentMap) -> ExtentMap {
+    extent_map.coalesce()
 }
 
 /// Returns the physical filename for a given summary snapshot (e.g. "000001.summary").
@@ -845,7 +845,7 @@ mod tests {
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
                 kind: NodeKind::File {
-                    range_map: rmap,
+                    extent_map: rmap,
                     size: 100,
                 },
             }),
@@ -888,9 +888,9 @@ mod tests {
 
         let node2 = reader.read_inode(2).unwrap().unwrap();
         match node2.kind {
-            NodeKind::File { range_map, .. } => {
-                assert_eq!(range_map.len(), 1);
-                let extent = range_map.query(0, 100);
+            NodeKind::File { extent_map, .. } => {
+                assert_eq!(extent_map.len(), 1);
+                let extent = extent_map.query(0, 100);
                 assert_eq!(extent.len(), 1);
                 assert_eq!(extent[0].1, 100);
             }
@@ -911,7 +911,7 @@ mod tests {
                 Arc::new(Node {
                     meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
                     kind: NodeKind::File {
-                        range_map: ExtentMap::new(),
+                        extent_map: ExtentMap::new(),
                         size: i * 10,
                     },
                 }),

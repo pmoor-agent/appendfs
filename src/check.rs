@@ -255,9 +255,9 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
         let node = node_arc.as_ref();
         match &node.kind {
             NodeKind::Directory { .. } => report.directories += 1,
-            NodeKind::File { range_map, size, .. } => {
+            NodeKind::File { extent_map, size, .. } => {
                 report.regular_files += 1;
-                report.total_extents += range_map.len();
+                report.total_extents += extent_map.len();
                 report.total_data_bytes += size;
             }
             NodeKind::Symlink { .. } => report.symlinks += 1,
@@ -516,10 +516,10 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
 
     for (&ino, node_arc) in base_map.iter() {
         let node = node_arc.as_ref();
-        if let NodeKind::File { range_map, size, .. } = &node.kind {
-            for (offset, entry) in range_map.iter() {
+        if let NodeKind::File { extent_map, size, .. } = &node.kind {
+            for (offset, entry) in extent_map.iter() {
                 let file_offset = *offset;
-                let extent_len = entry.length;
+                let extent_len = entry.length();
 
                 if extent_len == 0 {
                     report.issues.push(IntegrityIssue::error(
@@ -924,7 +924,7 @@ mod tests {
         let orphan_node = Node {
             meta: InodeMeta::new(0o644, 0, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
             kind: NodeKind::File {
-                range_map: ExtentMap::new(),
+                extent_map: ExtentMap::new(),
                 size: 0,
             },
         };
@@ -1015,7 +1015,7 @@ mod tests {
         let bad_file = Node {
             meta: InodeMeta::new(0o644, 1, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
             kind: NodeKind::File {
-                range_map: rm,
+                extent_map: rm,
                 size: 120, // Extent ends at 150 > size 120!
             },
         };
@@ -1176,8 +1176,8 @@ mod tests {
             let base = &inner.base;
             let node_arc = base.get(&f.ino).unwrap();
             let node = node_arc.as_ref();
-            if let NodeKind::File { range_map, .. } = &node.kind {
-                let entry = range_map.iter().next().unwrap().1;
+            if let NodeKind::File { extent_map, .. } = &node.kind {
+                let entry = extent_map.iter().next().unwrap().1;
                 if let ExtentState::Disk { record_log_offset, .. } = &entry.extent {
                     *record_log_offset
                 } else {

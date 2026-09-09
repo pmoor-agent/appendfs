@@ -14,13 +14,6 @@ pub fn zero_extent_len(record_log_offset: u64) -> u64 {
     record_log_offset
 }
 
-/// Encodes a hole as `(generation, record_log_offset, record_size, payload_offset, length)` for an
-/// on-disk extent descriptor.
-#[inline]
-pub fn zero_extent_fields(length: u64) -> (u64, u64, u32, u32, u32) {
-    (ZERO_EXTENT_GENERATION, length, 0, 0, 0)
-}
-
 /// Represents the physical location and state of a file extent slice.
 ///
 /// Plain value enum with zero heap allocations on clone for `Disk` and `Zero` variants,
@@ -45,6 +38,9 @@ pub enum Extent {
     Zero { length: u64 },
 }
 
+// RwLock<Vec<u8>> does not implement PartialEq. Extent implements PartialEq by comparing Staged
+// buffers via pointer equality (Arc::ptr_eq) for O(1) lock-free comparison, required by PartialEq/Eq
+// derives on ExtentEntry, ExtentMap, NodeKind, and Node.
 impl PartialEq for Extent {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -93,6 +89,19 @@ struct SerializedExtent {
     length: u32,
 }
 
+impl SerializedExtent {
+    #[inline]
+    fn zero(length: u64) -> Self {
+        Self {
+            generation: ZERO_EXTENT_GENERATION,
+            record_log_offset: length,
+            record_size: 0,
+            payload_offset: 0,
+            length: 0,
+        }
+    }
+}
+
 impl Serialize for Extent {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -113,17 +122,7 @@ impl Serialize for Extent {
                 length: *length,
             }
             .serialize(serializer),
-            Extent::Zero { length } => {
-                let (generation, record_log_offset, record_size, payload_offset, length) = zero_extent_fields(*length);
-                SerializedExtent {
-                    generation,
-                    record_log_offset,
-                    record_size,
-                    payload_offset,
-                    length,
-                }
-                .serialize(serializer)
-            }
+            Extent::Zero { length } => SerializedExtent::zero(*length).serialize(serializer),
             Extent::Staged { .. } => Err(serde::ser::Error::custom(
                 "cannot serialize an extent that has not been flushed to disk",
             )),
@@ -201,7 +200,8 @@ impl Extent {
     pub fn allocated_len(&self) -> u64 {
         match self {
             Self::Zero { .. } => 0,
-            other => other.length(),
+            Self::Disk { record_size, .. } => *record_size as u64,
+            Self::Staged { length, .. } => *length as u64,
         }
     }
 
@@ -243,7 +243,7 @@ impl Extent {
     }
 
     /// Attempts to coalesce `next` into `self` if both are contiguous slices of the same
-    /// backing arena chunk, disk record, or both are holes.
+    /// backing arena chunk or both are holes.
     pub fn try_coalesce_with(&mut self, next: &Extent) -> bool {
         match (self, next) {
             (
@@ -259,29 +259,6 @@ impl Extent {
                 },
             ) => {
                 if Arc::ptr_eq(d1, d2) && *p1 + *l1 == *p2 {
-                    *l1 += *l2;
-                    true
-                } else {
-                    false
-                }
-            }
-            (
-                Self::Disk {
-                    generation: g1,
-                    record_log_offset: r1,
-                    record_size: s1,
-                    payload_offset: p1,
-                    length: l1,
-                },
-                Self::Disk {
-                    generation: g2,
-                    record_log_offset: r2,
-                    record_size: s2,
-                    payload_offset: p2,
-                    length: l2,
-                },
-            ) => {
-                if g1 == g2 && r1 == r2 && s1 == s2 && *p1 + *l1 == *p2 {
                     *l1 += *l2;
                     true
                 } else {
@@ -324,14 +301,21 @@ impl Extent {
     }
 }
 
-/// An entry in `ExtentMap` representing a continuous span of `length` bytes at `file_offset`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// An entry in `ExtentMap` representing an extent at `file_offset`.
+///
+/// The inner `Extent` is the single source of truth for the extent's length and physical location.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtentEntry {
-    #[serde(skip)]
     pub file_offset: u64,
-    pub length: u64,
-    #[serde(rename = "value")]
     pub extent: Extent,
+}
+
+impl ExtentEntry {
+    /// Returns the logical byte length of this extent.
+    #[inline]
+    pub fn length(&self) -> u64 {
+        self.extent.length()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +332,18 @@ enum ExtentMapInner {
 /// Starts as a sorted `Vector` of extents for cache-friendly $O(1)$ appends, fast sequential loading,
 /// and $O(\log N)$ binary search queries. Seamlessly promotes to a `BTreeMap` on non-sequential
 /// overwrites or middle splits.
+///
+/// # Thread Safety & Concurrency Model
+///
+/// `ExtentMap` is **thread-compatible** (`Send + Sync`):
+/// - **External Synchronization for Mutation**: When mutable (`&mut self`), such as in the live
+///   staging layer (`inner.live`), it is protected by the `InMemoryFS` inner mutex (`ActionMutex`).
+/// - **Concurrent Lock-Free Reads**: All read operations (`query`, `iter`, `len`, `is_empty`) take `&self`
+///   and perform zero internal mutation (Vector mode binary searches via `partition_point` without
+///   allocating or promoting).
+/// - **Flush Pipeline & Layered Snapshots**: Once a live delta is frozen into a `FlushBatch` or folded into
+///   an immutable `Arc<Node>` in `base`, it is strictly read-only. Both the background flusher thread and
+///   concurrent layered read walks ([`InodeLayerStack`]) query it safely in parallel without locks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtentMap {
     inner: ExtentMapInner,
@@ -433,21 +429,19 @@ impl ExtentMap {
             ExtentMapInner::Vector(vec) => {
                 let is_append = match vec.last() {
                     None => true,
-                    Some(last) => new_start >= last.file_offset + last.length,
+                    Some(last) => new_start >= last.file_offset + last.length(),
                 };
 
                 if is_append {
                     // Attempt contiguous coalescing with the last extent
                     if let Some(last) = vec.last_mut()
-                        && last.file_offset + last.length == new_start
+                        && last.file_offset + last.length() == new_start
                         && last.extent.try_coalesce_with(&new_extent)
                     {
-                        last.length += new_len;
                         return;
                     }
                     vec.push(ExtentEntry {
                         file_offset: new_start,
-                        length: new_len,
                         extent: new_extent,
                     });
                     return;
@@ -476,7 +470,7 @@ impl ExtentMap {
         if let Some((&start, _)) = tree
             .range(..=new_start)
             .next_back()
-            .filter(|&(start, entry)| *start + entry.length > new_start)
+            .filter(|&(start, entry)| *start + entry.length() > new_start)
         {
             candidates.push(start);
         }
@@ -491,7 +485,7 @@ impl ExtentMap {
                 Some(e) => e.clone(),
                 None => continue,
             };
-            let end = start + entry.length;
+            let end = start + entry.length();
 
             if start < new_start && end > new_end {
                 // Middle split
@@ -501,7 +495,6 @@ impl ExtentMap {
                     start,
                     ExtentEntry {
                         file_offset: start,
-                        length: new_start - start,
                         extent: left_extent,
                     },
                 );
@@ -512,7 +505,6 @@ impl ExtentMap {
                     new_end,
                     ExtentEntry {
                         file_offset: new_end,
-                        length: end - new_end,
                         extent: right_extent,
                     },
                 );
@@ -524,7 +516,6 @@ impl ExtentMap {
                     start,
                     ExtentEntry {
                         file_offset: start,
-                        length: new_start - start,
                         extent: left_extent,
                     },
                 );
@@ -537,7 +528,6 @@ impl ExtentMap {
                     new_end,
                     ExtentEntry {
                         file_offset: new_end,
-                        length: end - new_end,
                         extent: right_extent,
                     },
                 );
@@ -551,7 +541,6 @@ impl ExtentMap {
             new_start,
             ExtentEntry {
                 file_offset: new_start,
-                length: new_len,
                 extent: new_extent,
             },
         );
@@ -573,7 +562,7 @@ impl ExtentMap {
                 let mut results = Vec::new();
 
                 let idx = vec.partition_point(|e| e.file_offset <= query_start);
-                let start_idx = if idx > 0 && vec[idx - 1].file_offset + vec[idx - 1].length > query_start {
+                let start_idx = if idx > 0 && vec[idx - 1].file_offset + vec[idx - 1].length() > query_start {
                     idx - 1
                 } else {
                     idx
@@ -584,7 +573,7 @@ impl ExtentMap {
                         break;
                     }
                     let start = entry.file_offset;
-                    let end = start + entry.length;
+                    let end = start + entry.length();
                     let seg_start = std::cmp::max(start, query_start);
                     let seg_end = std::cmp::min(end, query_end);
                     let seg_len = seg_end - seg_start;
@@ -607,7 +596,7 @@ impl ExtentMap {
                 let prev_entry = tree
                     .range(..=query_start)
                     .next_back()
-                    .filter(|&(start, entry)| *start + entry.length > query_start)
+                    .filter(|&(start, entry)| *start + entry.length() > query_start)
                     .map(|(&start, entry)| (start, entry));
 
                 use std::ops::Bound;
@@ -616,7 +605,7 @@ impl ExtentMap {
                     .map(|(&start, entry)| (start, entry));
 
                 for (start, entry) in prev_entry.into_iter().chain(rest_entries) {
-                    let end = start + entry.length;
+                    let end = start + entry.length();
                     let seg_start = std::cmp::max(start, query_start);
                     let seg_end = std::cmp::min(end, query_end);
                     let seg_len = seg_end - seg_start;
@@ -645,11 +634,10 @@ impl ExtentMap {
                 vec.truncate(idx);
                 if idx > 0 {
                     let last = &mut vec[idx - 1];
-                    let end = last.file_offset + last.length;
+                    let end = last.file_offset + last.length();
                     if end > new_len {
                         let trimmed_len = new_len - last.file_offset;
                         last.extent.trim_right(trimmed_len);
-                        last.length = trimmed_len;
                     }
                 }
             }
@@ -659,11 +647,10 @@ impl ExtentMap {
                     tree.remove(&k);
                 }
                 if let Some((&start, entry)) = tree.range_mut(..new_len).next_back() {
-                    let end = start + entry.length;
+                    let end = start + entry.length();
                     if end > new_len {
                         let trimmed_len = new_len - start;
                         entry.extent.trim_right(trimmed_len);
-                        entry.length = trimmed_len;
                     }
                 }
             }
@@ -674,7 +661,7 @@ impl ExtentMap {
     pub fn coalesce(&self) -> Self {
         let mut coalesced = Self::with_capacity(self.len());
         for (&start, entry) in self.iter() {
-            coalesced.insert(start, entry.length, entry.extent.clone());
+            coalesced.insert(start, entry.length(), entry.extent.clone());
         }
         coalesced
     }
@@ -726,7 +713,15 @@ impl Serialize for ExtentMap {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
+
+        #[derive(Serialize)]
+        struct WireRangeEntry<'a> {
+            length: u64,
+            value: &'a Extent,
+        }
+
         struct MapHelper<'a>(&'a ExtentMap);
+
         impl<'a> Serialize for MapHelper<'a> {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
@@ -735,7 +730,11 @@ impl Serialize for ExtentMap {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(self.0.len()))?;
                 for (&offset, entry) in self.0.iter() {
-                    map.serialize_entry(&offset, entry)?;
+                    let wire = WireRangeEntry {
+                        length: entry.length(),
+                        value: &entry.extent,
+                    };
+                    map.serialize_entry(&offset, &wire)?;
                 }
                 map.end()
             }
@@ -755,14 +754,23 @@ impl<'de> Deserialize<'de> for ExtentMap {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        struct WireRangeEntry {
+            #[allow(dead_code)]
+            length: u64,
+            value: Extent,
+        }
+
+        #[derive(Deserialize)]
         struct RangeMapHelper {
-            map: BTreeMap<u64, ExtentEntry>,
+            map: BTreeMap<u64, WireRangeEntry>,
         }
         let helper = RangeMapHelper::deserialize(deserializer)?;
         let mut vec = Vec::with_capacity(helper.map.len());
-        for (offset, mut entry) in helper.map {
-            entry.file_offset = offset;
-            vec.push(entry);
+        for (offset, wire) in helper.map {
+            vec.push(ExtentEntry {
+                file_offset: offset,
+                extent: wire.value,
+            });
         }
         Ok(Self {
             inner: ExtentMapInner::Vector(vec),
@@ -809,7 +817,7 @@ mod tests {
         em.insert(50, 100, Extent::new_disk(2, 20, 100, 0, 100));
         assert!(em.is_tree());
 
-        let entries: Vec<_> = em.iter().map(|(&k, e)| (k, e.length)).collect();
+        let entries: Vec<_> = em.iter().map(|(&k, e)| (k, e.length())).collect();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0], (0, 50));
         assert_eq!(entries[1], (50, 100));
@@ -856,7 +864,7 @@ mod tests {
         assert!(em.is_vector());
         assert_eq!(em.len(), 2);
 
-        let entries: Vec<_> = em.iter().map(|(&k, e)| (k, e.length)).collect();
+        let entries: Vec<_> = em.iter().map(|(&k, e)| (k, e.length())).collect();
         assert_eq!(entries[0], (0, 50));
         assert_eq!(entries[1], (50, 20));
         assert!(em.query(70, 50).is_empty());
@@ -905,7 +913,7 @@ mod tests {
         em.insert(200, 300, Extent::new_disk(2, 0, 300, 0, 300));
         assert!(em.is_tree());
 
-        let entries: Vec<(u64, u64)> = em.iter().map(|(&k, v)| (k, v.length)).collect();
+        let entries: Vec<(u64, u64)> = em.iter().map(|(&k, v)| (k, v.length())).collect();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0], (0, 200));
         assert_eq!(entries[1], (200, 300));
@@ -925,7 +933,7 @@ mod tests {
         assert_eq!(em.len(), 1);
         let (&start, entry) = em.iter().next().unwrap();
         assert_eq!(start, 50);
-        assert_eq!(entry.length, 350);
+        assert_eq!(entry.length(), 350);
     }
 
     #[test]
@@ -940,7 +948,7 @@ mod tests {
         em.insert(50, 400, Extent::new_disk(4, 0, 400, 0, 400));
         assert!(em.is_tree());
 
-        let entries: Vec<(u64, u64)> = em.iter().map(|(&k, v)| (k, v.length)).collect();
+        let entries: Vec<(u64, u64)> = em.iter().map(|(&k, v)| (k, v.length())).collect();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0], (0, 50));
         assert_eq!(entries[1], (50, 400));
@@ -956,7 +964,7 @@ mod tests {
 
         em.truncate(80);
         assert!(em.is_tree());
-        let entries: Vec<(u64, u64)> = em.iter().map(|(&k, v)| (k, v.length)).collect();
+        let entries: Vec<(u64, u64)> = em.iter().map(|(&k, v)| (k, v.length())).collect();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0], (0, 50));
         assert_eq!(entries[1], (50, 30));
@@ -973,6 +981,6 @@ mod tests {
         let entries: Vec<_> = em.iter().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(*entries[0].0, 0);
-        assert_eq!(entries[0].1.length, 100);
+        assert_eq!(entries[0].1.length(), 100);
     }
 }

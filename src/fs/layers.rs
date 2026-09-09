@@ -369,8 +369,8 @@ impl<'a> InodeLayerStack<'a> {
 
         if !hit_tombstone && let Some(arc) = self.base {
             let node = arc.as_ref();
-            if let NodeKind::File { range_map, .. } = &node.kind {
-                for (ext_start, ext_len, extent) in range_map.query(offset, read_len as u64) {
+            if let NodeKind::File { extent_map, .. } = &node.kind {
+                for (ext_start, ext_len, extent) in extent_map.query(offset, read_len as u64) {
                     add_extent(ext_start, ext_len, &extent);
                 }
             }
@@ -821,7 +821,7 @@ mod tests {
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
                 kind: NodeKind::File {
-                    range_map: base_range,
+                    extent_map: base_range,
                     size: 100,
                 },
             }),
@@ -914,7 +914,7 @@ mod tests {
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
                 kind: NodeKind::File {
-                    range_map: base_range,
+                    extent_map: base_range,
                     size: 100,
                 },
             }),

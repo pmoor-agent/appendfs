@@ -384,8 +384,8 @@ impl InMemoryFS {
         let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
         for node_arc in base.values() {
             let node = node_arc.as_ref();
-            if let NodeKind::File { range_map, .. } = &node.kind {
-                for (_, entry) in range_map.iter() {
+            if let NodeKind::File { extent_map, .. } = &node.kind {
+                for (_, entry) in extent_map.iter() {
                     if let Extent::Disk { generation, length, .. } = &entry.extent {
                         let stats = live_map.entry(*generation).or_insert((0, 0));
                         stats.0 += *length as u64;
@@ -683,16 +683,16 @@ mod tests {
             let inner = fs.inner.lock().unwrap();
             let node_arc = inner.base.get(&ino).expect("inode missing in base");
             let node = node_arc.as_ref();
-            if let NodeKind::File { range_map, size, .. } = &node.kind {
+            if let NodeKind::File { extent_map, size, .. } = &node.kind {
                 assert_eq!(*size, 50);
                 assert_eq!(
-                    range_map.len(),
+                    extent_map.len(),
                     1,
                     "Expected exactly 1 consolidated RangeEntry in base!"
                 );
-                let (start, entry) = range_map.iter().next().unwrap();
+                let (start, entry) = extent_map.iter().next().unwrap();
                 assert_eq!(*start, 0);
-                assert_eq!(entry.length, 50);
+                assert_eq!(entry.length(), 50);
                 assert!(matches!(entry.extent, Extent::Disk { length: 50, .. }));
             } else {
                 panic!("Expected NodeKind::File in base");
@@ -768,19 +768,19 @@ mod tests {
             {
                 let inner = fs.inner.lock().unwrap();
                 let node = inner.base.get(&ino).expect("inode missing in base");
-                if let NodeKind::File { range_map, size, .. } = &node.kind {
+                if let NodeKind::File { extent_map, size, .. } = &node.kind {
                     assert_eq!(*size as usize, TOTAL);
                     assert_eq!(
-                        range_map.len(),
+                        extent_map.len(),
                         TOTAL.div_ceil(CAP),
                         "expected one extent per capped chunk (encrypted={})",
                         encrypted
                     );
-                    for (_, entry) in range_map.iter() {
+                    for (_, entry) in extent_map.iter() {
                         assert!(
-                            entry.length as usize <= CAP,
+                            entry.length() as usize <= CAP,
                             "extent of {} bytes exceeds the {} byte cap (encrypted={})",
-                            entry.length,
+                            entry.length(),
                             CAP,
                             encrypted
                         );
@@ -1071,7 +1071,7 @@ mod tests {
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, clock.now()),
                 kind: NodeKind::File {
-                    range_map: ExtentMap::new(),
+                    extent_map: ExtentMap::new(),
                     size: 0,
                 },
             }),
@@ -1762,13 +1762,13 @@ mod tests {
         {
             let inner = from_log.inner.lock().unwrap();
             let node = inner.base.get(&ino).unwrap();
-            if let crate::node::NodeKind::File { ref range_map, .. } = node.kind {
-                let hole_entry = range_map
+            if let crate::node::NodeKind::File { ref extent_map, .. } = node.kind {
+                let hole_entry = extent_map
                     .iter()
                     .find(|(start, _)| **start == 100)
                     .expect("hole entry at offset 100")
                     .1;
-                assert_eq!(hole_entry.length, hole_len);
+                assert_eq!(hole_entry.length(), hole_len);
                 assert!(matches!(hole_entry.extent, Extent::Zero { length } if length == hole_len));
             } else {
                 panic!("Expected file node");
@@ -1806,13 +1806,13 @@ mod tests {
         {
             let inner = from_summary.inner.lock().unwrap();
             let node = inner.base.get(&ino).unwrap();
-            if let crate::node::NodeKind::File { ref range_map, .. } = node.kind {
-                let hole_entry = range_map
+            if let crate::node::NodeKind::File { ref extent_map, .. } = node.kind {
+                let hole_entry = extent_map
                     .iter()
                     .find(|(start, _)| **start == 100)
                     .expect("hole entry at offset 100 in summary")
                     .1;
-                assert_eq!(hole_entry.length, hole_len);
+                assert_eq!(hole_entry.length(), hole_len);
                 assert!(matches!(hole_entry.extent, Extent::Zero { length } if length == hole_len));
             } else {
                 panic!("Expected file node");
