@@ -181,6 +181,8 @@ pub struct FsInner {
     pub handles: HandleMap,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
     pub open_counts: HashMap<u64, u32>,
+    /// Monotonically increasing file handle descriptor ID generator.
+    pub next_fh: u64,
     /// Timestamp of the latest recovered operation / summary snapshot (if recovered).
     pub recovered_time: Option<SystemTime>,
 
@@ -252,6 +254,13 @@ impl FsInner {
 }
 
 impl FsInner {
+    #[inline]
+    pub fn allocate_fh(&mut self) -> u64 {
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        fh
+    }
+
     #[inline]
     pub fn get_file_handle(&self, ino: u64, fh: u64) -> Result<&FileHandle, i32> {
         let handle = self.handles.get(&fh).ok_or(libc::EBADF)?;
@@ -404,8 +413,6 @@ pub struct InMemoryFS {
     pub inner: ActionMutex<FsInner>,
     /// Independent whole-file BSD flock and POSIX byte-range record lock manager.
     pub locks: LockManager,
-    /// Atomic counter for allocating unique file and directory handle IDs (`fh`).
-    pub next_fh: AtomicU64,
     /// Authoritative manifest of all active log generations and lineage.
     pub manifest: Arc<RwLock<LogManifest>>,
     pub next_inode: AtomicU64,
@@ -516,6 +523,7 @@ impl InMemoryFS {
             live_arena: WriteArena::new(),
             handles: HashMap::new(),
             open_counts: HashMap::new(),
+            next_fh: 1,
             recovered_time: None,
             staged_bytes: 0,
             staged_ops: 0,
@@ -526,7 +534,6 @@ impl InMemoryFS {
         let fs = Self {
             inner: ActionMutex::new(inner),
             locks: LockManager::new(),
-            next_fh: AtomicU64::new(1),
             manifest,
             next_inode: AtomicU64::new(2),
             last_tx_id: AtomicU64::new(0),

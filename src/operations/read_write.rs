@@ -90,12 +90,12 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
         // Virtual files generate content outside the inner lock to prevent lock-ordering inversions
         // or self-deadlocks (since status generators query filesystem layer state).
         let content = fs.virtual_files.generate_content(ino, fs).unwrap_or_default();
-        let fh = fs.allocate_fh();
-        fs.with_inner(OpTag::Handle, |inner| {
+        fs.with_inner(OpTag::Open, |inner| {
             let attr = fs.get_attr_locked(inner, ino).ok_or(libc::ENOENT)?;
             if attr.file_type != FileType::RegularFile {
                 return Err(libc::EISDIR);
             }
+            let fh = inner.allocate_fh();
             inner.insert_file_handle(
                 fh,
                 FileHandle::Virtual {
@@ -110,15 +110,12 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
         // Regular files: validate, open, and optionally truncate in a single critical section!
         let now = fs.clock.now();
         let trunc = (flags & libc::O_TRUNC as u32) != 0;
-        if trunc {
-            fs.check_flush_capacity()?;
-        }
-        let fh = fs.allocate_fh();
-        fs.with_inner(OpTag::Handle, |inner| {
+        fs.with_inner(OpTag::Open, |inner| {
             let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
             if attr.file_type != FileType::RegularFile {
                 return Err(libc::EISDIR);
             }
+            let fh = inner.allocate_fh();
             inner.insert_file_handle(fh, FileHandle::Regular { ino, flags });
             if trunc {
                 let entry = inner
@@ -149,6 +146,9 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
 
 pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
     log::trace!("write(ino={}, fh={}, len={}, offset={})", ino, fh, buf.len(), offset);
+    if fh == 0 {
+        return Err(libc::EBADF);
+    }
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
@@ -165,9 +165,7 @@ pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset:
     let write_len = buf.len() as u64;
 
     fs.with_inner(OpTag::Write, |inner| {
-        if fh != 0 {
-            inner.validate_regular_handle(ino, fh)?;
-        }
+        inner.validate_regular_handle(ino, fh)?;
         let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
             return Err(libc::EBADF);
@@ -200,8 +198,15 @@ pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset:
     })
 }
 
+#[cfg(any(test, feature = "testing"))]
 pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
-    write_handle_core(fs, ino, 0, buf, offset)
+    if fs.is_virtual_ino(ino) {
+        return Err(libc::EPERM);
+    }
+    let fh = open_core(fs, ino, libc::O_RDWR as u32)?;
+    let res = write_handle_core(fs, ino, fh, buf, offset);
+    let _ = release_core(fs, ino, fh);
+    res
 }
 
 pub fn write(fs: &InMemoryFS, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64) {
@@ -530,7 +535,7 @@ fn create_internal(
         inner.record_mutation(name.len());
 
         let fh = if open_handle {
-            let fh = fs.allocate_fh();
+            let fh = inner.allocate_fh();
             inner.insert_file_handle(fh, FileHandle::Regular { ino: new_ino, flags });
             Some(fh)
         } else {

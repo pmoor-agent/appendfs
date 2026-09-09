@@ -9,7 +9,6 @@ use super::{DirHandle, FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSou
 use crate::node::AttrDelta;
 use crate::sync::OpTag;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 impl InMemoryFS {
     // --- POSIX File & Directory Handle Tracking ---
@@ -27,11 +26,11 @@ impl InMemoryFS {
             FileHandle::Regular { ino, flags }
         };
 
-        let fh = self.allocate_fh();
         self.with_inner(OpTag::Handle, |inner| {
+            let fh = inner.allocate_fh();
             inner.insert_file_handle(fh, file_handle);
-        });
-        fh
+            fh
+        })
     }
 
     /// Test-only helper to inspect file handle state.
@@ -160,13 +159,14 @@ impl InMemoryFS {
 
     // --- Directory Handle Snapshot Management ---
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn allocate_fh(&self) -> u64 {
-        self.next_fh.fetch_add(1, Ordering::SeqCst)
+        self.with_inner(OpTag::Handle, |inner| inner.allocate_fh())
     }
 
     pub fn open_dir_handle(&self, ino: u64, flags: u32, entries: Vec<(String, u64)>) -> u64 {
-        let fh = self.allocate_fh();
         self.with_inner(OpTag::Handle, |inner| {
+            let fh = inner.allocate_fh();
             inner.insert_dir_handle(
                 fh,
                 DirHandle {
@@ -175,8 +175,8 @@ impl InMemoryFS {
                     entries: Arc::new(entries),
                 },
             );
-        });
-        fh
+            fh
+        })
     }
 
     pub fn release_dir_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {

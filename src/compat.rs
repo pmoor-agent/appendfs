@@ -5,13 +5,20 @@ use crate::operations::dir::mkdir_core;
 use crate::operations::links::{link_core, readlink_core, symlink_core};
 use crate::operations::read_write::{
     FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_UID, create_core,
-    open_core, read_core, release_core, setattr_core, write_core,
+    open_core, read_core, release_core, setattr_core, write_handle_core,
 };
 use crate::operations::special::mknod_core;
 use crate::operations::xattr::setxattr_core;
 use crate::shim::FileType;
 use crate::storage::{OsStorage, Storage};
 use crate::{VolumeHeader, VolumeKey};
+
+fn compat_write(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
+    let fh = open_core(fs, ino, libc::O_RDWR as u32)?;
+    let res = write_handle_core(fs, ino, fh, buf, offset);
+    let _ = release_core(fs, ino, fh);
+    res
+}
 
 use std::fs;
 use std::io;
@@ -148,7 +155,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
 
     clock.set_offset(50);
     let hello_file = create_core(fs, 1, "hello.txt", 0o644, 0, 1001, 1001)?;
-    write_core(fs, hello_file.ino, b"Hello, AppendFS ", 0)?;
+    compat_write(fs, hello_file.ino, b"Hello, AppendFS ", 0)?;
     setxattr_core(fs, hello_file.ino, "user.test_attr", b"compat_v1", 0)?;
 
     // Commit Batch 1 to log
@@ -199,7 +206,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
 
     // Complete /hello.txt write
     clock.set_offset(110);
-    write_core(fs, hello_file.ino, b"v1 compatibility world!\n", 16)?;
+    compat_write(fs, hello_file.ino, b"v1 compatibility world!\n", 16)?;
 
     let empty_file = create_core(fs, dir_a.ino, "empty_file.txt", 0o640, 0, 1001, 1001)?;
     setattr_core(
@@ -216,7 +223,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
 
     let data_bin = create_core(fs, subdir_1.ino, "data.bin", 0o600, 0, 1002, 1002)?;
     let bin_data = compat_data_bin();
-    write_core(fs, data_bin.ino, &bin_data, 0)?;
+    compat_write(fs, data_bin.ino, &bin_data, 0)?;
     setattr_core(
         fs,
         data_bin.ino,
@@ -231,7 +238,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
 
     let multi_extent = create_core(fs, dir_b.ino, "multi_extent.dat", 0o644, 0, 1003, 1003)?;
     let p1 = compat_multi_extent_part1();
-    write_core(fs, multi_extent.ino, &p1, 0)?;
+    compat_write(fs, multi_extent.ino, &p1, 0)?;
 
     // Commit Batch 2 to log
     fs.flush_log().map_err(|_| libc::EIO)?;
@@ -239,7 +246,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     // --- BATCH 3: Multi-extent part 2, sparse file, hardlink, symlinks, special files, and attrs ---
     clock.set_offset(170);
     let p2 = compat_multi_extent_part2();
-    write_core(fs, multi_extent.ino, &p2, 16384)?;
+    compat_write(fs, multi_extent.ino, &p2, 16384)?;
     setattr_core(
         fs,
         multi_extent.ino,
@@ -269,7 +276,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     // Sparse file: 4096-byte hole, 100 bytes of 0xAA at offset 4096
     clock.set_offset(190);
     let sparse_file = create_core(fs, 1, "sparse_file.bin", 0o644, 0, 1001, 1001)?;
-    write_core(fs, sparse_file.ino, &[0xAA; 100], 4096)?;
+    compat_write(fs, sparse_file.ino, &[0xAA; 100], 4096)?;
     setattr_core(
         fs,
         sparse_file.ino,

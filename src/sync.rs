@@ -26,9 +26,12 @@ pub enum OpTag {
     Fold = 15,
     Layer = 16,
     Other = 17,
+    Open = 18,
+    OpenDir = 19,
+    ReadDir = 20,
 }
 
-pub const OP_TAG_COUNT: usize = 18;
+pub const OP_TAG_COUNT: usize = 21;
 pub const ALL_OP_TAGS: [OpTag; OP_TAG_COUNT] = [
     OpTag::Write,
     OpTag::ReadPlan,
@@ -48,6 +51,9 @@ pub const ALL_OP_TAGS: [OpTag; OP_TAG_COUNT] = [
     OpTag::Fold,
     OpTag::Layer,
     OpTag::Other,
+    OpTag::Open,
+    OpTag::OpenDir,
+    OpTag::ReadDir,
 ];
 
 impl OpTag {
@@ -71,6 +77,9 @@ impl OpTag {
             OpTag::Fold => "fold",
             OpTag::Layer => "layer",
             OpTag::Other => "other",
+            OpTag::Open => "open",
+            OpTag::OpenDir => "opendir",
+            OpTag::ReadDir => "readdir",
         }
     }
 
@@ -106,6 +115,9 @@ impl Default for OpMetrics {
 
 const fn new_op_metrics_array() -> [OpMetrics; OP_TAG_COUNT] {
     [
+        OpMetrics::new(),
+        OpMetrics::new(),
+        OpMetrics::new(),
         OpMetrics::new(),
         OpMetrics::new(),
         OpMetrics::new(),
