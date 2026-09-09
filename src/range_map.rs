@@ -83,8 +83,23 @@ impl<V> RangeMap<V> {
         }
         let new_end = new_start + new_len;
 
-        // Collect all candidate start keys that begin before new_end
-        let candidates: Vec<u64> = self.map.range(..new_end).map(|(&start, _)| start).collect();
+        // Since intervals in RangeMap are strictly disjoint and ordered by start offset,
+        // at most one interval can start before or at new_start and still overlap [new_start, new_end):
+        let mut candidates = Vec::new();
+        if let Some((&start, _)) = self
+            .map
+            .range(..=new_start)
+            .next_back()
+            .filter(|&(start, entry)| *start + entry.length > new_start)
+        {
+            candidates.push(start);
+        }
+
+        // Any other overlapping intervals must have start in (new_start, new_end):
+        use std::ops::Bound;
+        for (&start, _) in self.map.range((Bound::Excluded(new_start), Bound::Excluded(new_end))) {
+            candidates.push(start);
+        }
 
         for start in candidates {
             let entry = match self.map.get(&start) {
@@ -92,11 +107,6 @@ impl<V> RangeMap<V> {
                 None => continue,
             };
             let end = start + entry.length;
-
-            if end <= new_start {
-                // Non-overlapping: entry strictly precedes new range
-                continue;
-            }
 
             if start < new_start && end > new_end {
                 // Case 1: Middle split (new range falls strictly inside existing range).
@@ -187,11 +197,23 @@ impl<V> RangeMap<V> {
         let query_end = query_start + query_len;
         let mut results = Vec::new();
 
-        for (&start, entry) in self.map.range(..query_end) {
+        // 1. Check if the single preceding entry (start <= query_start) overlaps query_start:
+        let prev_entry = self
+            .map
+            .range(..=query_start)
+            .next_back()
+            .filter(|&(start, entry)| *start + entry.length > query_start)
+            .map(|(&start, entry)| (start, entry));
+
+        // 2. Any other overlapping entries must have start in (query_start, query_end):
+        use std::ops::Bound;
+        let rest_entries = self
+            .map
+            .range((Bound::Excluded(query_start), Bound::Excluded(query_end)))
+            .map(|(&start, entry)| (start, entry));
+
+        for (start, entry) in prev_entry.into_iter().chain(rest_entries) {
             let end = start + entry.length;
-            if end <= query_start {
-                continue;
-            }
 
             let seg_start = std::cmp::max(start, query_start);
             let seg_end = std::cmp::min(end, query_end);
@@ -595,5 +617,107 @@ mod tests {
         // Querying the now-freed [30,100) region must return nothing - a later grow
         // reads this as a hole, not stale data.
         assert!(range_map.query(30, 70).is_empty());
+    }
+
+    #[test]
+    fn test_sequential_appends_and_queries() {
+        let mut range_map = RangeMap::new();
+        let num_appends = 1000;
+        let chunk_size = 64;
+
+        for i in 0..num_appends {
+            range_map.insert(
+                i * chunk_size,
+                chunk_size,
+                TestSlice {
+                    file_id: i as u32,
+                    offset: 0,
+                    length: chunk_size,
+                },
+            );
+        }
+
+        assert_eq!(range_map.iter().count(), num_appends as usize);
+
+        // Query across boundary of two adjacent appends
+        let q = range_map.query(chunk_size - 10, 20);
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].0, chunk_size - 10);
+        assert_eq!(q[0].1, 10);
+        assert_eq!(q[0].2.file_id, 0);
+        assert_eq!(q[0].2.offset, chunk_size - 10);
+        assert_eq!(q[1].0, chunk_size);
+        assert_eq!(q[1].1, 10);
+        assert_eq!(q[1].2.file_id, 1);
+        assert_eq!(q[1].2.offset, 0);
+
+        // Query beyond end
+        assert!(range_map.query(num_appends * chunk_size, 100).is_empty());
+    }
+
+    #[test]
+    fn test_multi_interval_overwrite_and_gaps() {
+        let mut range_map = RangeMap::new();
+
+        // [0, 100), [200, 300), [400, 500)
+        range_map.insert(
+            0,
+            100,
+            TestSlice {
+                file_id: 1,
+                offset: 0,
+                length: 100,
+            },
+        );
+        range_map.insert(
+            200,
+            100,
+            TestSlice {
+                file_id: 2,
+                offset: 0,
+                length: 100,
+            },
+        );
+        range_map.insert(
+            400,
+            100,
+            TestSlice {
+                file_id: 3,
+                offset: 0,
+                length: 100,
+            },
+        );
+
+        // Overwrite [50, 450):
+        // Overlaps tail of [0, 100), all of [200, 300), and head of [400, 500).
+        range_map.insert(
+            50,
+            400,
+            TestSlice {
+                file_id: 4,
+                offset: 0,
+                length: 400,
+            },
+        );
+
+        let entries: Vec<(u64, RangeEntry<TestSlice>)> = range_map.iter().map(|(&k, v)| (k, v.clone())).collect();
+        assert_eq!(entries.len(), 3);
+
+        // Left trimmed portion: [0, 50)
+        assert_eq!(entries[0].0, 0);
+        assert_eq!(entries[0].1.length, 50);
+        assert_eq!(entries[0].1.value.file_id, 1);
+        assert_eq!(entries[0].1.value.offset, 0);
+
+        // New range: [50, 450)
+        assert_eq!(entries[1].0, 50);
+        assert_eq!(entries[1].1.length, 400);
+        assert_eq!(entries[1].1.value.file_id, 4);
+
+        // Right trimmed portion: [450, 500)
+        assert_eq!(entries[2].0, 450);
+        assert_eq!(entries[2].1.length, 50);
+        assert_eq!(entries[2].1.value.file_id, 3);
+        assert_eq!(entries[2].1.value.offset, 50);
     }
 }
