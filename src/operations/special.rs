@@ -1,6 +1,6 @@
+use crate::extent_map::ExtentMap;
 use crate::fs::InMemoryFS;
 use crate::node::{AttrDelta, FileDelta, NodeDelta, SpecialDelta};
-use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType, Request};
 use crate::sync::OpTag;
 
@@ -81,7 +81,7 @@ pub fn mknod_core(
             ),
             _ => (
                 NodeDelta::File(FileDelta {
-                    extents: RangeMap::new(),
+                    extents: ExtentMap::new(),
                     size: Some(0),
                     attr_delta,
                 }),

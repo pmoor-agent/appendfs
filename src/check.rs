@@ -507,7 +507,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
         }
     }
 
-    // Pass 3: File Extent & RangeMap Validation
+    // Pass 3: File Extent & ExtentMap Validation
     let active_generations: HashSet<u64> = manifest.logs.iter().map(|l| l.generation).collect();
     let cache = fs
         .log_cache
@@ -553,8 +553,10 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                     record_size: _,
                     payload_offset: _,
                     length: _,
-                } = entry.value.read_state()
+                } = &entry.extent
                 {
+                    let generation = *generation;
+                    let record_log_offset = *record_log_offset;
                     if !active_generations.contains(&generation) {
                         report.issues.push(IntegrityIssue::error(
                             "EXTENT_UNKNOWN_GENERATION",
@@ -845,9 +847,9 @@ mod tests {
     use super::*;
     use crate::clock::SystemClock;
     use crate::crypto::VolumeKey;
-    use crate::log::{LogWriter, SharedExtentState};
+    use crate::extent_map::ExtentMap;
+    use crate::log::LogWriter;
     use crate::node::{InodeMeta, Node, NodeKind};
-    use crate::range_map::RangeMap;
     use std::sync::Arc;
 
     #[test]
@@ -922,7 +924,7 @@ mod tests {
         let orphan_node = Node {
             meta: InodeMeta::new(0o644, 0, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
             kind: NodeKind::File {
-                range_map: RangeMap::new(),
+                range_map: ExtentMap::new(),
                 size: 0,
             },
         };
@@ -1004,8 +1006,12 @@ mod tests {
         .unwrap();
 
         // Inject file with extent beyond its size
-        let mut rm = RangeMap::new();
-        rm.insert(100, 50, SharedExtentState::new_staged_buffer(vec![0; 50], 0, 50));
+        let mut rm = crate::extent_map::ExtentMap::new();
+        rm.insert(
+            100,
+            50,
+            crate::extent_map::Extent::new_staged_buffer(vec![0; 50], 0, 50),
+        );
         let bad_file = Node {
             meta: InodeMeta::new(0o644, 1, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
             kind: NodeKind::File {
@@ -1172,8 +1178,8 @@ mod tests {
             let node = node_arc.as_ref();
             if let NodeKind::File { range_map, .. } = &node.kind {
                 let entry = range_map.iter().next().unwrap().1;
-                if let ExtentState::Disk { record_log_offset, .. } = entry.value.read_state() {
-                    record_log_offset
+                if let ExtentState::Disk { record_log_offset, .. } = &entry.extent {
+                    *record_log_offset
                 } else {
                     panic!("Expected Disk extent");
                 }

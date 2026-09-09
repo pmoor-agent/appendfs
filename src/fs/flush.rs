@@ -6,10 +6,8 @@
 //! records directly onto `base`, guaranteeing identical state transitions across crash recovery.
 
 use super::{FlushBatch, FsInner, InMemoryFS};
-use crate::log::{
-    BackgroundFlusher, ExtentState, GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE,
-    SharedExtentState,
-};
+use crate::extent_map::Extent;
+use crate::log::{BackgroundFlusher, GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE};
 use crate::node::{EntryDelta, NodeDelta, NodeKind};
 use crate::storage::Storage;
 use crate::sync::OpTag;
@@ -139,14 +137,14 @@ impl InMemoryFS {
                         let mut current_run: Option<(u64, Vec<u8>)> = None;
 
                         for (&offset, entry) in f.extents.iter() {
-                            if let ExtentState::Staged {
+                            if let Extent::Staged {
                                 data,
                                 payload_offset,
                                 length,
-                            } = entry.value.read_state()
+                            } = &entry.extent
                             {
                                 let guard = data.read().unwrap();
-                                let slice = &guard[payload_offset as usize..(payload_offset + length) as usize];
+                                let slice = &guard[*payload_offset as usize..(*payload_offset + *length) as usize];
                                 match current_run {
                                     Some((start_off, ref mut bytes)) if start_off + bytes.len() as u64 == offset => {
                                         bytes.extend_from_slice(slice);
@@ -183,13 +181,8 @@ impl InMemoryFS {
                             written_count += 1;
                             flushed_data_bytes += chunk_len as u64;
 
-                            let disk_extent = SharedExtentState::new_disk(
-                                generation,
-                                record_log_offset,
-                                record_size,
-                                0,
-                                chunk_len as u32,
-                            );
+                            let disk_extent =
+                                Extent::new_disk(generation, record_log_offset, record_size, 0, chunk_len as u32);
                             f.extents
                                 .insert(start_off + chunk_start as u64, chunk_len as u64, disk_extent);
 
@@ -393,9 +386,9 @@ impl InMemoryFS {
             let node = node_arc.as_ref();
             if let NodeKind::File { range_map, .. } = &node.kind {
                 for (_, entry) in range_map.iter() {
-                    if let ExtentState::Disk { generation, length, .. } = entry.value.read_state() {
-                        let stats = live_map.entry(generation).or_insert((0, 0));
-                        stats.0 += length as u64;
+                    if let Extent::Disk { generation, length, .. } = &entry.extent {
+                        let stats = live_map.entry(*generation).or_insert((0, 0));
+                        stats.0 += *length as u64;
                         stats.1 += 1;
                     }
                 }
@@ -599,11 +592,11 @@ fn estimate_batch_bytes(frozen: &HashMap<u64, EntryDelta>, max_extent_size: usiz
         match entry {
             EntryDelta::Node(NodeDelta::File(f)) => {
                 for (_, entry) in f.extents.iter() {
-                    if let ExtentState::Staged { length, .. } = entry.value.read_state() {
+                    if let Extent::Staged { length, .. } = &entry.extent {
                         // One header per emitted chunk. Coalescing can merge adjacent staged
                         // extents into fewer records than this, so it stays an upper bound.
-                        let chunks = (length as u64).div_ceil(max_extent_size as u64).max(1);
-                        estimated_bytes += chunks * RECORD_HEADER_SIZE as u64 + length as u64;
+                        let chunks = (*length as u64).div_ceil(max_extent_size as u64).max(1);
+                        estimated_bytes += chunks * RECORD_HEADER_SIZE as u64 + *length as u64;
                     }
                 }
                 estimated_bytes += RECORD_HEADER_SIZE as u64 + 256 + f.extents.len() as u64 * 24;
@@ -629,9 +622,9 @@ fn estimate_batch_bytes(frozen: &HashMap<u64, EntryDelta>, max_extent_size: usiz
 mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
+    use crate::extent_map::ExtentMap;
     use crate::node::{AttrDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind};
     use crate::operations::read_write::write_core;
-    use crate::range_map::RangeMap;
     use crate::storage::Storage;
     use std::time::SystemTime;
 
@@ -672,11 +665,11 @@ mod tests {
             write_core(&fs, ino, &byte, i as i64).unwrap();
         }
 
-        // Verify that live has 50 individual extent entries before flush
+        // Verify that live extent map coalesced the sequential writes in memory
         {
             let inner = fs.inner.lock().unwrap();
             if let Some(EntryDelta::Node(NodeDelta::File(f))) = inner.live.get(&ino) {
-                assert_eq!(f.extents.len(), 50);
+                assert_eq!(f.extents.len(), 1);
             } else {
                 panic!("File not found in live layer");
             }
@@ -700,10 +693,7 @@ mod tests {
                 let (start, entry) = range_map.iter().next().unwrap();
                 assert_eq!(*start, 0);
                 assert_eq!(entry.length, 50);
-                assert!(matches!(
-                    entry.value.read_state(),
-                    crate::log::ExtentState::Disk { length: 50, .. }
-                ));
+                assert!(matches!(entry.extent, Extent::Disk { length: 50, .. }));
             } else {
                 panic!("Expected NodeKind::File in base");
             }
@@ -1081,7 +1071,7 @@ mod tests {
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, clock.now()),
                 kind: NodeKind::File {
-                    range_map: RangeMap::new(),
+                    range_map: ExtentMap::new(),
                     size: 0,
                 },
             }),
@@ -1779,7 +1769,7 @@ mod tests {
                     .expect("hole entry at offset 100")
                     .1;
                 assert_eq!(hole_entry.length, hole_len);
-                assert!(matches!(hole_entry.value.read_state(), ExtentState::Zero { length } if length == hole_len));
+                assert!(matches!(hole_entry.extent, Extent::Zero { length } if length == hole_len));
             } else {
                 panic!("Expected file node");
             }
@@ -1823,7 +1813,7 @@ mod tests {
                     .expect("hole entry at offset 100 in summary")
                     .1;
                 assert_eq!(hole_entry.length, hole_len);
-                assert!(matches!(hole_entry.value.read_state(), ExtentState::Zero { length } if length == hole_len));
+                assert!(matches!(hole_entry.extent, Extent::Zero { length } if length == hole_len));
             } else {
                 panic!("Expected file node");
             }

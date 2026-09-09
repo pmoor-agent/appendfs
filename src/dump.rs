@@ -848,9 +848,9 @@ pub fn dump_summary_reader_with_path(
             let node = sync_node.as_ref();
             if let NodeKind::File { range_map, .. } = &node.kind {
                 for (_, entry) in range_map.iter() {
-                    if let ExtentState::Disk { generation, length, .. } = entry.value.read_state() {
-                        let stats = live_map.entry(generation).or_insert((0, 0));
-                        stats.0 += length as u64;
+                    if let ExtentState::Disk { generation, length, .. } = &entry.extent {
+                        let stats = live_map.entry(*generation).or_insert((0, 0));
+                        stats.0 += *length as u64;
                         stats.1 += 1;
                     }
                 }
@@ -952,7 +952,7 @@ pub fn dump_summary_reader_with_path(
                             } else {
                                 writeln!(out, "      extents ({}):", range_map.len()).unwrap();
                                 for (ext_idx, (&start, entry)) in range_map.iter().enumerate() {
-                                    let state_desc = match entry.value.read_state() {
+                                    let state_desc = match &entry.extent {
                                         ExtentState::Disk {
                                             generation,
                                             record_log_offset,
@@ -962,12 +962,12 @@ pub fn dump_summary_reader_with_path(
                                         } => {
                                             format!(
                                                 "{} [record offset 0x{:08x} / {:<8}, rec_size {}, payload offset {:<4}, len {}]",
-                                                crate::log::log_filename(generation),
+                                                crate::log::log_filename(*generation),
                                                 record_log_offset,
                                                 record_log_offset,
-                                                format_bytes(record_size as u64),
+                                                format_bytes(*record_size as u64),
                                                 payload_offset,
-                                                format_bytes(length as u64)
+                                                format_bytes(*length as u64)
                                             )
                                         }
                                         ExtentState::Staged {
@@ -978,12 +978,12 @@ pub fn dump_summary_reader_with_path(
                                             format!(
                                                 "Staged Memory Buffer [payload offset {}, len {}, data buf {}]",
                                                 payload_offset,
-                                                format_bytes(length as u64),
+                                                format_bytes(*length as u64),
                                                 format_bytes(data.read().map(|g| g.len() as u64).unwrap_or(0))
                                             )
                                         }
                                         ExtentState::Zero { length } => {
-                                            format!("hole (reads as zeros) [len {}]", format_bytes(length))
+                                            format!("hole (reads as zeros) [len {}]", format_bytes(*length))
                                         }
                                     };
                                     writeln!(
@@ -1275,11 +1275,11 @@ mod tests {
 
     #[test]
     fn test_dump_summary_file_summary_and_verbosity_levels() {
+        use crate::extent_map::{Extent, ExtentMap};
         use crate::fs::InMemoryFS;
+        use crate::log::LogManifest;
         use crate::log::summary::{SummarySnapshot, export_summary, init_volume};
-        use crate::log::{LogManifest, SharedExtentState};
         use crate::node::{InodeMeta, Node, NodeKind};
-        use crate::range_map::RangeMap;
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1314,9 +1314,9 @@ mod tests {
         });
 
         // Create fragmented file (inode 3) with 2 extents
-        let mut rmap = RangeMap::new();
-        rmap.insert(0, 4096, SharedExtentState::new_disk(1, 100, 4133, 20, 4096));
-        rmap.insert(4096, 4096, SharedExtentState::new_disk(2, 200, 4133, 20, 4096));
+        let mut rmap = ExtentMap::new();
+        rmap.insert(0, 4096, Extent::new_disk(1, 100, 4133, 20, 4096));
+        rmap.insert(4096, 4096, Extent::new_disk(2, 200, 4133, 20, 4096));
 
         let file_node = Arc::new(Node {
             meta: InodeMeta::new(0o644, 1, 1000, 1000, now),

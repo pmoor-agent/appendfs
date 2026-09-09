@@ -27,7 +27,7 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 ┌────────────────────────────────────▼────────────────────────────────────┐
 │                             InMemoryFS Engine                           │
 │  ┌─────────────────────────────────┐   ┌─────────────────────────────┐  │
-│  │ Inode & Directory Metadata Tree │   │ RangeMap Fragment Allocator │  │
+│  │ Inode & Directory Metadata Tree │   │ ExtentMap Fragment Allocator│  │
 │  └─────────────────────────────────┘   └─────────────────────────────┘  │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │            In-Memory Mutation & Write Staging Buffer              │  │
@@ -86,10 +86,12 @@ Each entry in the log file consists of a header and an optional compressed/encry
 - **`WritePayload`:** Compressed & encrypted byte sequence belonging to a file write (optionally deduplicated via FastCDC).
 - **`MetadataPayload`:** Serialized metadata update (permissions, UID/GID, target link paths, timestamps, extended attribute key-values).
 
-### 3.4 In-Memory Index & Fragment Tracking (`RangeMap<V>`)
-- Filesystem content is tracked using the `RangeMap<V>` data structure.
-- When a staged write is flushed, `appendfs` receives physical `(gen_seq, log_offset, length)` extent descriptors.
-- `RangeMap` inserts these extent slices into the target file's offset range `[file_offset, file_offset + length)`. Overlapping extent slices are trimmed or split in memory automatically without modifying previous log entries.
+### 3.4 In-Memory Index & Fragment Tracking (`ExtentMap`)
+- Filesystem file content is tracked using the specialized `ExtentMap` data structure.
+- Files start out in compact `Vector` mode (a sorted list of contiguous extents) optimized for $O(1)$ appends, contiguous arena chunk coalescing, and $O(\log N)$ binary search queries.
+- On non-sequential overwrites or middle splits, `ExtentMap` seamlessly promotes in-place to an interval `BTreeMap` that trims and splits overlapping extents.
+- Extents use a plain value `Extent` enum (`Staged`, `Disk`, `Zero`) without reference-counting indirection or interior locks.
+- Upon flush or snapshot export, extents are persisted and cleanly deserialized directly back into compact `Vector` form.
 
 ---
 

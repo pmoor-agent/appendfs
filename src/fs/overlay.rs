@@ -5,8 +5,8 @@
 //! layer locks in a safe order - see [`super::layers`] for why the order matters.
 
 use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, ReadPlan};
+use crate::extent_map::ExtentMap;
 use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SpecialDelta, SymlinkDelta};
-use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
 use crate::sync::OpTag;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -97,7 +97,7 @@ impl FsInner {
                 self.live.insert(
                     ino,
                     EntryDelta::Node(NodeDelta::File(FileDelta {
-                        extents: RangeMap::new(),
+                        extents: ExtentMap::new(),
                         size: None,
                         attr_delta: delta,
                     })),
