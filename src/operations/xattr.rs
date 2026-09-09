@@ -19,14 +19,16 @@ pub enum ListxattrResult {
 }
 
 pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Result<GetxattrResult, i32> {
-    if fs.get_attr(ino).is_none() {
+    let inner = fs.inner.lock_tag(OpTag::Xattr).unwrap();
+    if fs.get_attr_locked(&inner, ino).is_none() {
         return Err(libc::ENOENT);
     }
     if fs.is_virtual_ino(ino) {
         return Err(libc::ENODATA);
     }
 
-    let val = fs.get_xattr(ino, name).ok_or(libc::ENODATA)?;
+    let val = inner.get_xattr(ino, name).ok_or(libc::ENODATA)?;
+    drop(inner);
     if size == 0 {
         Ok(GetxattrResult::Size(val.len()))
     } else if size < val.len() {
@@ -80,7 +82,8 @@ pub fn setxattr_core(fs: &InMemoryFS, ino: u64, name: &str, value: &[u8], flags:
 }
 
 pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<ListxattrResult, i32> {
-    if fs.get_attr(ino).is_none() {
+    let inner = fs.inner.lock_tag(OpTag::Xattr).unwrap();
+    if fs.get_attr_locked(&inner, ino).is_none() {
         return Err(libc::ENOENT);
     }
     if fs.is_virtual_ino(ino) {
@@ -91,7 +94,8 @@ pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<Listxatt
         });
     }
 
-    let keys = fs.list_xattrs(ino).ok_or(libc::ENOENT)?;
+    let keys = inner.list_xattrs(ino).ok_or(libc::ENOENT)?;
+    drop(inner);
     let mut buf = Vec::new();
     for key in keys {
         buf.extend_from_slice(key.as_bytes());
@@ -229,5 +233,43 @@ mod tests {
             }
             _ => panic!("Expected Data result"),
         }
+    }
+
+    #[test]
+    fn test_xattr_single_lock_acquisition_tagged_xattr() {
+        let fs = InMemoryFS::new();
+        let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino = attr.ino;
+        setxattr_core(&fs, ino, "user.tag", b"v1", 0).unwrap();
+
+        // Test getxattr_core
+        let pre_stats = fs.inner.op_stats();
+        let pre_xattr = pre_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;
+        let pre_total = fs.inner.lock_count();
+
+        let val = getxattr_core(&fs, ino, "user.tag", 10).unwrap();
+        assert_eq!(val, GetxattrResult::Data(b"v1".to_vec()));
+
+        let post_stats = fs.inner.op_stats();
+        let post_xattr = post_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;
+        let post_total = fs.inner.lock_count();
+
+        assert_eq!(post_xattr - pre_xattr, 1);
+        assert_eq!(post_total - pre_total, 1);
+
+        // Test listxattr_core
+        let pre_stats = fs.inner.op_stats();
+        let pre_xattr = pre_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;
+        let pre_total = fs.inner.lock_count();
+
+        let keys = listxattr_core(&fs, ino, 100).unwrap();
+        assert_eq!(keys, ListxattrResult::Data(b"user.tag\0".to_vec()));
+
+        let post_stats = fs.inner.op_stats();
+        let post_xattr = post_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;
+        let post_total = fs.inner.lock_count();
+
+        assert_eq!(post_xattr - pre_xattr, 1);
+        assert_eq!(post_total - pre_total, 1);
     }
 }

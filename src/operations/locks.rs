@@ -502,7 +502,7 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     );
 
     let (start, end) = {
-        let inner = fs.inner.lock().unwrap();
+        let inner = fs.inner.lock_tag(OpTag::Handle).unwrap();
         if let Err(err) = inner.validate_file_handle(ino, fh) {
             req.reply_err(err);
             return;
@@ -749,7 +749,7 @@ fn coalesce_ranges(ranges: &mut Vec<RangeLock>) {
 
 pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<ShimFlock, i32> {
     let (start, end) = {
-        let inner = fs.inner.lock().unwrap();
+        let inner = fs.inner.lock_tag(OpTag::Handle).unwrap();
         inner.validate_file_handle(ino, fh)?;
         normalize_range(&inner, ino, &lock)?
     };
@@ -798,7 +798,7 @@ pub fn setlk_core(
     sleep: bool,
 ) -> Result<(), i32> {
     let (start, end) = {
-        let inner = fs.inner.lock().unwrap();
+        let inner = fs.inner.lock_tag(OpTag::Handle).unwrap();
         inner.validate_file_handle(ino, fh)?;
         normalize_range(&inner, ino, &lock)?
     };

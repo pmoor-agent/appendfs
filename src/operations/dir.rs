@@ -1,65 +1,54 @@
-use crate::fs::{DirHandle, InMemoryFS, find_parent_inode};
+#[cfg(any(test, feature = "testing"))]
+use crate::fs::find_parent_inode;
+use crate::fs::{DirHandle, InMemoryFS};
 use crate::node::{AttrDelta, DirectoryDelta, NodeDelta};
 use crate::shim::{self, FileAttr, FileType, Request};
 use crate::sync::OpTag;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-pub fn lookup(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
+pub fn lookup_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FileAttr, i32> {
     log::trace!("lookup(parent={}, name={})", parent, name);
     if name.len() > 255 {
-        req.reply_err(libc::ENAMETOOLONG);
-        return;
+        return Err(libc::ENAMETOOLONG);
     }
-    let parent_attr = match fs.get_attr(parent) {
-        Some(attr) => attr,
-        None => {
-            req.reply_err(libc::ENOENT);
-            return;
-        }
-    };
+    let inner = fs.inner.lock_tag(OpTag::Lookup).unwrap();
+    let parent_attr = fs.get_attr_locked(&inner, parent).ok_or(libc::ENOENT)?;
     if parent_attr.file_type != FileType::Directory {
-        req.reply_err(libc::ENOTDIR);
-        return;
+        return Err(libc::ENOTDIR);
     }
 
     if name == "." {
-        req.reply_entry(&parent_attr, 1.0, 1.0);
-        return;
+        return Ok(parent_attr);
     }
     if name == ".." {
         let dotdot_ino = if parent == 1 {
             1
         } else {
-            find_parent_inode(fs, parent).unwrap_or(1)
+            inner.get_parent_dir_inode(parent).unwrap_or(1)
         };
-        match fs.get_attr(dotdot_ino) {
-            Some(attr) => req.reply_entry(&attr, 1.0, 1.0),
-            None => req.reply_err(libc::ENOENT),
-        }
-        return;
+        return fs.get_attr_locked(&inner, dotdot_ino).ok_or(libc::ENOENT);
     }
 
-    let child_ino = match fs.lookup_child(parent, name) {
-        Some(ino) => ino,
-        None => {
-            req.reply_err(libc::ENOENT);
-            return;
-        }
-    };
+    let child_ino = fs.lookup_child_locked(&inner, parent, name).ok_or(libc::ENOENT)?;
+    fs.get_attr_locked(&inner, child_ino).ok_or(libc::ENOENT)
+}
 
-    match fs.get_attr(child_ino) {
-        Some(attr) => req.reply_entry(&attr, 1.0, 1.0),
-        None => req.reply_err(libc::ENOENT),
+pub fn lookup(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
+    match lookup_core(fs, parent, name) {
+        Ok(attr) => req.reply_entry(&attr, 1.0, 1.0),
+        Err(e) => req.reply_err(e),
     }
 }
 
 pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, i32> {
-    let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
+    let inner = fs.inner.lock_tag(OpTag::ReadDir).unwrap();
+    let attr = fs.get_attr_locked(&inner, ino).ok_or(libc::ENOENT)?;
     if attr.file_type != FileType::Directory {
         return Err(libc::ENOTDIR);
     }
-    let mut entries = fs.list_directory(ino).ok_or(libc::ENOENT)?;
+    let mut entries = inner.list_directory(ino).ok_or(libc::ENOENT)?;
+    drop(inner);
     if ino == 1 {
         let mut map: BTreeMap<String, u64> = entries.into_iter().collect();
         for (name, v_ino) in fs.list_virtual_entries() {
@@ -438,5 +427,64 @@ mod tests {
         // 7. rmdir "d2" from root -> root drops to 2
         rmdir_core(&fs, 1, "d2").unwrap();
         assert_eq!(fs.get_attr(1).unwrap().nlink, 2);
+    }
+
+    #[test]
+    fn test_lookup_core_single_lock_acquisition_tagged_lookup() {
+        let fs = InMemoryFS::new();
+        let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+
+        let pre_stats = fs.inner.op_stats();
+        let pre_lookup = pre_stats.iter().find(|s| s.tag == OpTag::Lookup).unwrap().count;
+        let pre_getattr = pre_stats.iter().find(|s| s.tag == OpTag::GetAttr).unwrap().count;
+        let pre_total = fs.inner.lock_count();
+
+        let attr = lookup_core(&fs, 1, "test.txt").unwrap();
+        assert_eq!(attr.ino, file.ino);
+
+        let post_stats = fs.inner.op_stats();
+        let post_lookup = post_stats.iter().find(|s| s.tag == OpTag::Lookup).unwrap().count;
+        let post_getattr = post_stats.iter().find(|s| s.tag == OpTag::GetAttr).unwrap().count;
+        let post_total = fs.inner.lock_count();
+
+        // Exactly 1 lock acquisition, tagged OpTag::Lookup
+        assert_eq!(post_lookup - pre_lookup, 1);
+        assert_eq!(post_getattr - pre_getattr, 0);
+        assert_eq!(post_total - pre_total, 1);
+
+        // Test "." and ".."
+        let dot_attr = lookup_core(&fs, 1, ".").unwrap();
+        assert_eq!(dot_attr.ino, 1);
+        let dotdot_attr = lookup_core(&fs, 1, "..").unwrap();
+        assert_eq!(dotdot_attr.ino, 1);
+
+        // Test virtual file lookup
+        let v_attr = lookup_core(&fs, 1, ".status").unwrap();
+        assert_eq!(v_attr.ino, fs.lookup_child(1, ".status").unwrap());
+    }
+
+    #[test]
+    fn test_list_dir_core_single_lock_acquisition_tagged_readdir() {
+        let fs = InMemoryFS::new();
+        let _ = mkdir_core(&fs, 1, "sub1", 0o755, 1000, 1000).unwrap();
+
+        let pre_stats = fs.inner.op_stats();
+        let pre_readdir = pre_stats.iter().find(|s| s.tag == OpTag::ReadDir).unwrap().count;
+        let pre_getattr = pre_stats.iter().find(|s| s.tag == OpTag::GetAttr).unwrap().count;
+        let pre_total = fs.inner.lock_count();
+
+        let entries = list_dir_core(&fs, 1).unwrap();
+        assert!(entries.iter().any(|(name, _)| name == "sub1"));
+        assert!(entries.iter().any(|(name, _)| name == ".status"));
+
+        let post_stats = fs.inner.op_stats();
+        let post_readdir = post_stats.iter().find(|s| s.tag == OpTag::ReadDir).unwrap().count;
+        let post_getattr = post_stats.iter().find(|s| s.tag == OpTag::GetAttr).unwrap().count;
+        let post_total = fs.inner.lock_count();
+
+        // Exactly 1 lock acquisition, tagged OpTag::ReadDir
+        assert_eq!(post_readdir - pre_readdir, 1);
+        assert_eq!(post_getattr - pre_getattr, 0);
+        assert_eq!(post_total - pre_total, 1);
     }
 }
