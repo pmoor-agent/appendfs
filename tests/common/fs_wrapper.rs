@@ -1,9 +1,9 @@
-use appendfs::InMemoryFS;
 use appendfs::clock::{Clock, SystemClock};
 use appendfs::crypto::VolumeKey;
 use appendfs::log::recover_fs;
 use appendfs::shim::{FileAttr, FileType};
 use appendfs::storage::{FaultStorage, MemoryStorage, Storage};
+use appendfs::{InMemoryFS, OpTag};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -112,7 +112,7 @@ impl TestFS {
         fs.set_storage(storage.clone());
 
         // Export initial 000000.summary snapshot to initialize volume at clock.now()
-        let snapshot = fs.snapshot_all();
+        let snapshot = fs.snapshot_all(OpTag::Flush);
         let manifest = fs.manifest.read().unwrap().clone();
         let _ = appendfs::log::export_summary(
             &appendfs::log::SummarySnapshot {
@@ -157,7 +157,7 @@ impl TestFS {
         fs.set_storage(storage.clone());
 
         // Export initial 000000.summary snapshot
-        let snapshot = fs.snapshot_all();
+        let snapshot = fs.snapshot_all(OpTag::Flush);
         let manifest = fs.manifest.read().unwrap().clone();
         let _ = appendfs::log::export_summary(
             &appendfs::log::SummarySnapshot {

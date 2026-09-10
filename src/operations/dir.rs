@@ -12,7 +12,7 @@ pub fn lookup_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FileAttr,
     if name.len() > 255 {
         return Err(libc::ENAMETOOLONG);
     }
-    let inner = fs.inner.lock_tag(OpTag::Lookup).unwrap();
+    let inner = fs.inner.lock(OpTag::Lookup).unwrap();
     let parent_attr = fs.get_attr_locked(&inner, parent).ok_or(libc::ENOENT)?;
     if parent_attr.file_type != FileType::Directory {
         return Err(libc::ENOTDIR);
@@ -42,7 +42,7 @@ pub fn lookup(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
 }
 
 pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, i32> {
-    let inner = fs.inner.lock_tag(OpTag::ReadDir).unwrap();
+    let inner = fs.inner.lock(OpTag::ReadDir).unwrap();
     let attr = fs.get_attr_locked(&inner, ino).ok_or(libc::ENOENT)?;
     if attr.file_type != FileType::Directory {
         return Err(libc::ENOTDIR);

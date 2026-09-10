@@ -19,7 +19,7 @@ pub enum ListxattrResult {
 }
 
 pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Result<GetxattrResult, i32> {
-    let inner = fs.inner.lock_tag(OpTag::Xattr).unwrap();
+    let inner = fs.inner.lock(OpTag::Xattr).unwrap();
     if fs.get_attr_locked(&inner, ino).is_none() {
         return Err(libc::ENOENT);
     }
@@ -83,7 +83,7 @@ pub fn setxattr_core(fs: &InMemoryFS, ino: u64, name: &str, value: &[u8], flags:
 }
 
 pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<ListxattrResult, i32> {
-    let inner = fs.inner.lock_tag(OpTag::Xattr).unwrap();
+    let inner = fs.inner.lock(OpTag::Xattr).unwrap();
     if fs.get_attr_locked(&inner, ino).is_none() {
         return Err(libc::ENOENT);
     }

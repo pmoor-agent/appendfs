@@ -6,6 +6,7 @@ use crate::log::reader::{LogReader, LogRecord};
 use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode};
 use crate::log::summary::SummaryReader;
 use crate::node::EntryDelta;
+use crate::sync::OpTag;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::Arc;
@@ -108,7 +109,7 @@ pub fn recover_fs(
     {
         let created = oldest_reader.file_header().created_at;
         last_op_time = Some(created);
-        if let Some(root_arc) = fs_instance.inner.lock().unwrap().base.get_mut(&1) {
+        if let Some(root_arc) = fs_instance.inner.lock(OpTag::Other).unwrap().base.get_mut(&1) {
             let root_node = Arc::make_mut(root_arc);
             root_node.meta.atime = created;
             root_node.meta.mtime = created;
@@ -132,7 +133,7 @@ pub fn recover_fs(
         last_tx_id = reader.header.last_tx_id;
         last_op_time = Some(reader.header.created_at);
 
-        fs_instance.inner.lock().unwrap().base = inodes_map;
+        fs_instance.inner.lock(OpTag::Other).unwrap().base = inodes_map;
         *fs_instance.manifest.write().unwrap() = reader.manifest.clone();
         // Carried from the summary's plaintext blob so a later export writes back the same
         // identity, rather than defaulting to plaintext and silently downgrading the volume.
@@ -329,12 +330,12 @@ pub fn recover_fs(
     }
     fs_instance
         .inner
-        .lock()
+        .lock(OpTag::Other)
         .unwrap()
         .base
         .retain(|_ino, arc| arc.meta.nlink > 0 || arc.is_dir());
     fs_instance.last_tx_id.store(last_tx_id, Ordering::SeqCst);
-    fs_instance.set_recovered_time(last_op_time);
+    fs_instance.set_recovered_time(OpTag::Other, last_op_time);
 
     Ok(fs_instance)
 }

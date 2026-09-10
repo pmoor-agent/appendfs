@@ -1280,6 +1280,7 @@ mod tests {
         use crate::log::LogManifest;
         use crate::log::summary::{SummarySnapshot, export_summary, init_volume};
         use crate::node::{InodeMeta, Node, NodeKind};
+        use crate::sync::OpTag;
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1336,13 +1337,13 @@ mod tests {
         });
 
         {
-            let mut inner = fs.inner.lock().unwrap();
+            let mut inner = fs.inner.lock(OpTag::Other).unwrap();
             inner.base.insert(1, root_node);
             inner.base.insert(2, dir_node);
             inner.base.insert(3, file_node);
         }
 
-        let snapshot = fs.snapshot_all();
+        let snapshot = fs.snapshot_all(OpTag::Other);
         let manifest = LogManifest {
             logs: vec![
                 crate::log::LogFileInfo {

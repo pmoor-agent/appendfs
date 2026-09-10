@@ -3,6 +3,7 @@ use crate::log::LogFileCache;
 use crate::log::extent::ExtentState;
 use crate::log::record::{OpCode, RECORD_HEADER_SIZE, RecordHeader};
 use crate::node::NodeKind;
+use crate::sync::OpTag;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -248,7 +249,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
     // 0. Extract manifest and base snapshot
     let manifest = fs.manifest.read().unwrap().clone();
 
-    let base_map = fs.inner.lock().unwrap().base.clone();
+    let base_map = fs.inner.lock(OpTag::Other).unwrap().base.clone();
     report.total_inodes = base_map.len();
 
     for (&_ino, node_arc) in base_map.iter() {
@@ -928,7 +929,11 @@ mod tests {
                 size: 0,
             },
         };
-        fs.inner.lock().unwrap().base.insert(orphan_ino, Arc::new(orphan_node));
+        fs.inner
+            .lock(OpTag::Other)
+            .unwrap()
+            .base
+            .insert(orphan_ino, Arc::new(orphan_node));
 
         let report = check_fs_integrity(&fs, None, false);
         assert!(!report.is_clean());
@@ -974,7 +979,7 @@ mod tests {
 
         // Corrupt nlink on test.txt in base (set nlink to 5 instead of 1)
         {
-            let mut inner = fs.inner.lock().unwrap();
+            let mut inner = fs.inner.lock(OpTag::Other).unwrap();
             let node_arc = inner.base.get_mut(&f.ino).unwrap();
             let mut node = (**node_arc).clone();
             node.meta.nlink = 5;
@@ -1015,10 +1020,10 @@ mod tests {
                 size: 120, // Extent ends at 150 > size 120!
             },
         };
-        fs.inner.lock().unwrap().base.insert(2, Arc::new(bad_file));
+        fs.inner.lock(OpTag::Other).unwrap().base.insert(2, Arc::new(bad_file));
         // Link to root
         {
-            let mut inner = fs.inner.lock().unwrap();
+            let mut inner = fs.inner.lock(OpTag::Other).unwrap();
             let root_arc = inner.base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
             if let NodeKind::Directory { entries, .. } = &mut root.kind {
@@ -1068,7 +1073,7 @@ mod tests {
         };
 
         {
-            let mut inner = fs.inner.lock().unwrap();
+            let mut inner = fs.inner.lock(OpTag::Other).unwrap();
             inner.base.insert(2, Arc::new(dir_a));
             inner.base.insert(3, Arc::new(dir_b));
             let root_arc = inner.base.get_mut(&1).unwrap();
@@ -1114,7 +1119,7 @@ mod tests {
         };
 
         {
-            let mut inner = fs.inner.lock().unwrap();
+            let mut inner = fs.inner.lock(OpTag::Other).unwrap();
             inner.base.insert(2, Arc::new(dir_wrong_parent));
             let root_arc = inner.base.get_mut(&1).unwrap();
             let mut root = (**root_arc).clone();
@@ -1168,7 +1173,7 @@ mod tests {
 
         // 1. Initial check must be clean
         let record_offset = {
-            let inner = fs.inner.lock().unwrap();
+            let inner = fs.inner.lock(OpTag::Other).unwrap();
             let base = &inner.base;
             let node_arc = base.get(&f.ino).unwrap();
             let node = node_arc.as_ref();

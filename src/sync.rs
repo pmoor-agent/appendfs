@@ -213,14 +213,9 @@ impl<T> ActionMutex<T> {
         }
     }
 
-    /// Acquires the mutex with `OpTag::Other`, blocking until available.
-    pub fn lock(&self) -> LockResult<ActionGuard<'_, T>> {
-        self.lock_tag(OpTag::Other)
-    }
-
     /// Acquires the mutex with a specific operation tag, blocking until available.
     /// Tracks wait time and starts measuring busy time upon acquisition.
-    pub fn lock_tag(&self, tag: OpTag) -> LockResult<ActionGuard<'_, T>> {
+    pub fn lock(&self, tag: OpTag) -> LockResult<ActionGuard<'_, T>> {
         let wait_start = Instant::now();
         match self.inner.lock() {
             Ok(guard) => {
@@ -244,13 +239,14 @@ impl<T> ActionMutex<T> {
         }
     }
 
-    /// Attempts to acquire the mutex without blocking.
-    pub fn try_lock(&self) -> TryLockResult<ActionGuard<'_, T>> {
-        self.try_lock_tag(OpTag::Other)
+    /// Alias for [`ActionMutex::lock`].
+    #[inline]
+    pub fn lock_tag(&self, tag: OpTag) -> LockResult<ActionGuard<'_, T>> {
+        self.lock(tag)
     }
 
     /// Attempts to acquire the mutex with a specific operation tag without blocking.
-    pub fn try_lock_tag(&self, tag: OpTag) -> TryLockResult<ActionGuard<'_, T>> {
+    pub fn try_lock(&self, tag: OpTag) -> TryLockResult<ActionGuard<'_, T>> {
         match self.inner.try_lock() {
             Ok(guard) => Ok(ActionGuard::new(self, guard, tag)),
             Err(TryLockError::Poisoned(poisoned)) => Err(TryLockError::Poisoned(PoisonError::new(ActionGuard::new(
@@ -262,12 +258,18 @@ impl<T> ActionMutex<T> {
         }
     }
 
+    /// Alias for [`ActionMutex::try_lock`].
+    #[inline]
+    pub fn try_lock_tag(&self, tag: OpTag) -> TryLockResult<ActionGuard<'_, T>> {
+        self.try_lock(tag)
+    }
+
     /// Acquires the lock with `tag` and executes `f` with a mutable reference to the [`ActionGuard`].
     ///
     /// The lock is released and any deferred post-unlock tasks are guaranteed to execute
     /// immediately when `f` returns.
     pub fn with_lock<R>(&self, tag: OpTag, f: impl FnOnce(&mut ActionGuard<'_, T>) -> R) -> R {
-        let mut guard = self.lock_tag(tag).expect("ActionMutex poisoned");
+        let mut guard = self.lock(tag).expect("ActionMutex poisoned");
         f(&mut guard)
     }
 
@@ -491,7 +493,7 @@ mod tests {
         assert_eq!(m.busy_time(), Duration::ZERO);
 
         {
-            let mut guard = m.lock().unwrap();
+            let mut guard = m.lock(OpTag::Other).unwrap();
             assert_eq!(*guard, 42);
             *guard = 100;
             thread::sleep(Duration::from_millis(5));
@@ -499,7 +501,7 @@ mod tests {
 
         assert_eq!(m.lock_count(), 1);
         assert!(m.busy_time() >= Duration::from_millis(4));
-        assert_eq!(*m.lock().unwrap(), 100);
+        assert_eq!(*m.lock(OpTag::Other).unwrap(), 100);
         assert_eq!(m.lock_count(), 2);
     }
 
@@ -511,11 +513,11 @@ mod tests {
         let executed_clone = Arc::clone(&executed);
 
         {
-            let mut guard = m.lock().unwrap();
+            let mut guard = m.lock(OpTag::Other).unwrap();
             *guard += 1;
             guard.defer(move || {
                 // If the lock were still held, acquiring here would deadlock!
-                let val = *m_clone.lock().unwrap();
+                let val = *m_clone.lock(OpTag::Other).unwrap();
                 assert_eq!(val, 1);
                 executed_clone.store(true, Ordering::SeqCst);
             });
@@ -535,7 +537,7 @@ mod tests {
         let post_ran_clone = Arc::clone(&post_ran);
 
         {
-            let mut guard = m.lock().unwrap();
+            let mut guard = m.lock(OpTag::Other).unwrap();
             guard.before_unlock(move |data, queue| {
                 // Inspect data under lock
                 if *data == 10 {
@@ -543,7 +545,7 @@ mod tests {
                     let m_sub = Arc::clone(&m_clone);
                     let p_sub = Arc::clone(&post_ran_clone);
                     queue.defer(move || {
-                        assert_eq!(*m_sub.lock().unwrap(), 20);
+                        assert_eq!(*m_sub.lock(OpTag::Other).unwrap(), 20);
                         p_sub.store(true, Ordering::SeqCst);
                     });
                 }
@@ -552,7 +554,7 @@ mod tests {
             assert!(!post_ran.load(Ordering::SeqCst));
         }
 
-        assert_eq!(*m.lock().unwrap(), 20);
+        assert_eq!(*m.lock(OpTag::Other).unwrap(), 20);
         assert!(post_ran.load(Ordering::SeqCst));
     }
 
@@ -563,7 +565,7 @@ mod tests {
         let m2 = Arc::clone(&m);
 
         let t1 = thread::spawn(move || {
-            let mut g = m1.lock().unwrap();
+            let mut g = m1.lock(OpTag::Other).unwrap();
             thread::sleep(Duration::from_millis(20));
             *g += 1;
         });
@@ -571,14 +573,14 @@ mod tests {
         thread::sleep(Duration::from_millis(5));
 
         let t2 = thread::spawn(move || {
-            let mut g = m2.lock_tag(OpTag::Write).unwrap();
+            let mut g = m2.lock(OpTag::Write).unwrap();
             *g += 1;
         });
 
         t1.join().unwrap();
         t2.join().unwrap();
 
-        assert_eq!(*m.lock().unwrap(), 2);
+        assert_eq!(*m.lock(OpTag::Other).unwrap(), 2);
         assert_eq!(m.lock_count(), 3);
         assert!(m.busy_time() >= Duration::from_millis(18));
         assert!(m.wait_time() >= Duration::from_millis(10));
@@ -587,6 +589,26 @@ mod tests {
         assert_eq!(write_stat.count, 1);
         assert!(write_stat.wait_time >= Duration::from_millis(10));
         assert!(write_stat.avg_wait_time() >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_action_mutex_try_lock() {
+        let m = Arc::new(ActionMutex::new(10));
+        let m_clone = Arc::clone(&m);
+
+        let guard = m.lock(OpTag::Other).unwrap();
+        assert!(m_clone.try_lock(OpTag::Write).is_err());
+        drop(guard);
+
+        let mut try_guard = m.try_lock(OpTag::Write).unwrap();
+        assert_eq!(*try_guard, 10);
+        *try_guard = 20;
+        drop(try_guard);
+
+        assert_eq!(*m.lock(OpTag::Other).unwrap(), 20);
+        let stats = m.op_stats();
+        let write_stat = stats.iter().find(|s| s.tag == OpTag::Write).unwrap();
+        assert_eq!(write_stat.count, 1);
     }
 
     #[test]
@@ -602,7 +624,7 @@ mod tests {
             let d_sub = Arc::clone(&deferred_ran_clone);
             guard.defer(move || {
                 // Must be unlocked here so we can re-acquire without deadlock!
-                assert_eq!(*m_sub.lock().unwrap(), 150);
+                assert_eq!(*m_sub.lock(OpTag::Other).unwrap(), 150);
                 d_sub.store(true, Ordering::SeqCst);
             });
             **guard * 2
@@ -637,7 +659,7 @@ mod tests {
         for (tag, expected_name) in tags_to_test {
             assert_eq!(tag.name(), expected_name);
             assert_eq!(tag.as_str(), expected_name);
-            let _guard = m.lock_tag(tag).unwrap();
+            let _guard = m.lock(tag).unwrap();
         }
 
         let stats = m.op_stats();

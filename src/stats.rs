@@ -1,6 +1,7 @@
 use crate::fs::InMemoryFS;
 use crate::log::manifest::GenerationLiveStats;
 use crate::node::NodeKind;
+use crate::sync::OpTag;
 use std::fmt::Write as FmtWrite;
 
 /// Aggregate statistics and fragmentation status for an appendfs volume.
@@ -28,7 +29,7 @@ impl VolumeStats {
     /// Collects volume statistics from an in-memory filesystem state.
     pub fn collect(fs: &InMemoryFS) -> Self {
         let manifest = fs.manifest.read().unwrap().clone();
-        let inner = fs.inner.lock().unwrap();
+        let inner = fs.inner.lock(OpTag::Other).unwrap();
         let base = &inner.base;
         let total_inodes = base.len();
 
@@ -237,7 +238,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     let next_ino = fs.next_inode.load(Ordering::SeqCst);
     let last_tx = fs.last_tx_id.load(Ordering::SeqCst);
 
-    let rec_time_str = match fs.recovered_time() {
+    let rec_time_str = match fs.recovered_time(OpTag::Other) {
         Some(t) => {
             let elapsed = fs.clock.now().duration_since(t).unwrap_or_default().as_secs();
             format!("{}s ago", elapsed)
@@ -276,7 +277,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
 
     // 2. Inodes Across Layers
     let (total_active, dirs, files, symlinks, special, live_len, flushing_batches, base_len) = {
-        fs.with_layers(|live, flushing, base| {
+        fs.with_layers(OpTag::Other, |live, flushing, base| {
             use std::collections::HashSet;
             let mut seen = HashSet::new();
             let mut dirs = 0;
@@ -341,7 +342,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
 
     // 3. Flush Layer Stats
     let (staged_bytes, staged_ops, flushing_bytes, flushing_ops) = {
-        let inner = fs.inner.lock().unwrap();
+        let inner = fs.inner.lock(OpTag::Other).unwrap();
         (
             inner.staged_bytes,
             inner.staged_ops,
@@ -444,7 +445,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
 
     // 5. Handles & Locks
     let (file_handles_count, virt_handles_count, dir_handles_count, open_inodes_count) = {
-        let inner = fs.inner.lock().unwrap();
+        let inner = fs.inner.lock(OpTag::Other).unwrap();
         let (reg, virt, dir) = inner.handle_counts();
         (reg, virt, dir, inner.open_counts.len())
     };

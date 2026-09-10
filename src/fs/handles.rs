@@ -197,7 +197,6 @@ mod tests {
     #[test]
     fn test_dir_handle_snapshot_isolation_and_lifecycle() {
         let fs = InMemoryFS::new();
-        let now = fs.clock.now();
 
         // 1. Create two files under root
         crate::operations::read_write::create_core(&fs, 1, "alpha.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -218,7 +217,7 @@ mod tests {
 
         // 3. Mutate directory: add charlie.txt, delete alpha.txt
         crate::operations::read_write::create_core(&fs, 1, "charlie.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.remove_dir_entry(1, "alpha.txt", now);
+        crate::operations::links::unlink_core(&fs, 1, "alpha.txt").unwrap();
 
         // 4. fh1 MUST retain its original snapshot (.status, alpha, bravo)
         let snap1_recheck = fs
@@ -324,7 +323,7 @@ mod tests {
 
         // All 3 handles exist in the unified map
         {
-            let inner = fs.inner.lock().unwrap();
+            let inner = fs.inner.lock(OpTag::Handle).unwrap();
             assert_eq!(inner.handles.len(), 3);
             assert_eq!(inner.handle_counts(), (1, 1, 1));
             assert!(inner.handles.contains_key(&fh_reg));
@@ -420,7 +419,7 @@ mod tests {
 
         // Unified map is now empty
         {
-            let inner = fs.inner.lock().unwrap();
+            let inner = fs.inner.lock(OpTag::Handle).unwrap();
             assert!(inner.handles.is_empty());
         }
     }
