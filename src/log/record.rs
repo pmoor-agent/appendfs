@@ -333,7 +333,7 @@ impl LogFileDelta {
             } else {
                 Extent::new_disk(generation, ext.record_log_offset, ext.record_size, 0, ext.length as u32)
             };
-            extents.insert(ext.file_offset, ext.length, state);
+            extents.insert(ext.file_offset, state);
         }
         FileDelta {
             extents,

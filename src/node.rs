@@ -456,7 +456,7 @@ impl NodeDelta {
             }
             (NodeKind::File { extent_map, size }, NodeDelta::File(f)) => {
                 for (start, entry) in f.extents.iter() {
-                    extent_map.insert(*start, entry.length(), entry.extent.clone());
+                    extent_map.insert(*start, entry.extent.clone());
                 }
                 if let Some(s) = f.size {
                     *size = s;

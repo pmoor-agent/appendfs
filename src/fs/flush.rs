@@ -183,8 +183,7 @@ impl InMemoryFS {
 
                             let disk_extent =
                                 Extent::new_disk(generation, record_log_offset, record_size, 0, chunk_len as u32);
-                            f.extents
-                                .insert(start_off + chunk_start as u64, chunk_len as u64, disk_extent);
+                            f.extents.insert(start_off + chunk_start as u64, disk_extent);
 
                             chunk_start += chunk_len;
                             if chunk_start >= data.len() {

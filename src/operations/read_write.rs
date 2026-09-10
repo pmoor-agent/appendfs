@@ -124,7 +124,7 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
                     .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
                 if let EntryDelta::Node(NodeDelta::File(f)) = entry {
                     let mask_len = u64::MAX;
-                    f.extents.insert(0, mask_len, Extent::new_zero(mask_len));
+                    f.extents.insert(0, Extent::new_zero(mask_len));
                     f.size = Some(0);
                     f.attr_delta.mtime = Some(now);
                     f.attr_delta.ctime = Some(now);
@@ -182,7 +182,7 @@ pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset:
             let mut cur_offset = file_offset;
             for (chunk_data, payload_offset, slice_len) in slices {
                 let extent = Extent::new_staged(chunk_data, payload_offset, slice_len);
-                f.extents.insert(cur_offset, slice_len as u64, extent);
+                f.extents.insert(cur_offset, extent);
                 cur_offset += slice_len as u64;
             }
             let current_size = f.size.unwrap_or(attr.size as u64);
@@ -280,7 +280,7 @@ pub fn setattr_core(
                 .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
             if let EntryDelta::Node(NodeDelta::File(f)) = entry {
                 let mask_len = u64::MAX - new_size;
-                f.extents.insert(new_size, mask_len, Extent::new_zero(mask_len));
+                f.extents.insert(new_size, Extent::new_zero(mask_len));
                 f.size = Some(new_size);
                 f.attr_delta.mtime = Some(now);
                 f.attr_delta.ctime = Some(now);
@@ -314,7 +314,7 @@ fn punch_hole_locked(inner: &mut FsInner, ino: u64, offset: u64, len: u64, now: 
         .entry(ino)
         .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
     if let EntryDelta::Node(NodeDelta::File(f)) = entry {
-        f.extents.insert(offset, end - offset, Extent::new_zero(end - offset));
+        f.extents.insert(offset, Extent::new_zero(end - offset));
         f.attr_delta.mtime = Some(now);
         f.attr_delta.ctime = Some(now);
     }

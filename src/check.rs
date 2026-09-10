@@ -1007,11 +1007,7 @@ mod tests {
 
         // Inject file with extent beyond its size
         let mut rm = crate::extent_map::ExtentMap::new();
-        rm.insert(
-            100,
-            50,
-            crate::extent_map::Extent::new_staged_buffer(vec![0; 50], 0, 50),
-        );
+        rm.insert(100, crate::extent_map::Extent::new_staged_buffer(vec![0; 50], 0, 50));
         let bad_file = Node {
             meta: InodeMeta::new(0o644, 1, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
             kind: NodeKind::File {
