@@ -338,32 +338,6 @@ impl InMemoryFS {
         self.get_attr_locked(&self.inner.lock_tag(OpTag::GetAttr).unwrap(), ino)
     }
 
-    pub fn get_attrs_batch(&self, inos: &[u64]) -> HashMap<u64, FileAttr> {
-        let mut result = HashMap::with_capacity(inos.len());
-        let mut regular_inos = Vec::with_capacity(inos.len());
-
-        for &ino in inos {
-            if self.virtual_files.is_virtual_ino(ino) {
-                result.insert(ino, self.virtual_files.file_attr(ino, 0, self.clock.now()));
-            } else {
-                regular_inos.push(ino);
-            }
-        }
-
-        if regular_inos.is_empty() {
-            return result;
-        }
-
-        let inner = self.inner.lock_tag(OpTag::GetAttr).unwrap();
-        for &ino in &regular_inos {
-            if let Some(attr) = inner.get_attr(ino) {
-                result.insert(ino, attr);
-            }
-        }
-
-        result
-    }
-
     pub fn lookup_child_locked(&self, inner: &FsInner, parent: u64, name: &str) -> Option<u64> {
         if parent == 1
             && let Some(ino) = self.virtual_files.get_ino_by_name(name)

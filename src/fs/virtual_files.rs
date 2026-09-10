@@ -219,10 +219,16 @@ mod tests {
         assert_eq!(items_all[1].name, "..");
         assert_eq!(items_all[1].next_offset, 2);
 
-        // Verify get_attrs_batch resolves all items including virtual files!
+        // Verify get_attr resolves all items including virtual files!
         let inos: Vec<u64> = items_all.iter().map(|item| item.ino).collect();
-        let attrs = fs.get_attrs_batch(&inos);
-        assert_eq!(attrs.len(), 7); // 1 (root) + 2 regular + 4 virtual
+        let mut unique_inos = std::collections::HashSet::new();
+        let mut attrs_count = 0;
+        for &ino in &inos {
+            if unique_inos.insert(ino) && fs.get_attr(ino).is_some() {
+                attrs_count += 1;
+            }
+        }
+        assert_eq!(attrs_count, 7); // 1 (root) + 2 regular + 4 virtual
 
         // Page 2: simulate reading with offset = 2 (skip . and ..)
         let items_p2: Vec<_> = iter_dir_entries(&fs, 1, &entries, 2).collect();
