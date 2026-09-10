@@ -1266,4 +1266,398 @@ mod tests {
         assert_eq!(std::mem::size_of::<crate::node::NodeKind>(), 48);
         assert_eq!(std::mem::size_of::<crate::node::Node>(), 120);
     }
+
+    #[test]
+    fn test_randomized_differential_extent_map() {
+        let seeds: u64 = std::env::var("FUZZ_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let steps: usize = std::env::var("FUZZ_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+
+        for seed in 1..=seeds {
+            run_randomized_extent_map_test(seed, steps);
+        }
+    }
+
+    fn read_extent_bytes(ext: &Extent, disk_store: &std::collections::HashMap<(u64, u64), Vec<u8>>) -> Vec<u8> {
+        match ext {
+            Extent::Staged {
+                data,
+                payload_offset,
+                length,
+            } => {
+                let buf = data.read().unwrap();
+                let start = *payload_offset as usize;
+                let end = start + *length as usize;
+                buf[start..end].to_vec()
+            }
+            Extent::Disk {
+                generation,
+                record_log_offset,
+                payload_offset,
+                length,
+                ..
+            } => {
+                let buf = &disk_store[&(*generation, *record_log_offset)];
+                let start = *payload_offset as usize;
+                let end = start + *length as usize;
+                buf[start..end].to_vec()
+            }
+            Extent::Zero { length } => vec![0u8; *length as usize],
+        }
+    }
+
+    fn run_randomized_extent_map_test(seed: u64, steps: usize) {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::collections::HashMap;
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        const CAPACITY: usize = 1024 * 1024; // 1 MiB
+
+        let mut shadow = vec![0u8; CAPACITY];
+        let mut written = vec![false; CAPACITY];
+        let mut min_written = usize::MAX;
+        let mut max_written = 0usize;
+
+        let mut em = ExtentMap::new();
+        let mut disk_store: HashMap<(u64, u64), Vec<u8>> = HashMap::new();
+        let mut next_disk_log_offset = 1000u64;
+
+        // Optionally hold a reusable staged buffer to test contiguous coalescing
+        type ActiveStagedBuffer = (Arc<RwLock<Vec<u8>>>, usize, usize);
+        let mut last_staged_buffer: Option<ActiveStagedBuffer> = None;
+
+        for step in 0..steps {
+            // 10% chance of truncation when there are written extents
+            if rng.gen_range(0..10) == 0 && max_written > 0 {
+                let new_len = match rng.gen_range(0..4) {
+                    0 => 0,                                                                      // Truncate to 0
+                    1 if min_written > 0 => rng.gen_range(0..min_written), // Truncate before min_written
+                    2 if min_written <= max_written => rng.gen_range(min_written..=max_written), // Truncate in the middle
+                    _ if max_written < CAPACITY => rng.gen_range(max_written..CAPACITY),         // Truncate beyond end
+                    _ => 0,
+                };
+
+                em.truncate(new_len as u64);
+                last_staged_buffer = None;
+
+                if new_len < max_written {
+                    shadow[new_len..max_written].fill(0);
+                    written[new_len..max_written].fill(false);
+                    if let Some(last) = written[..new_len].iter().rposition(|&w| w) {
+                        max_written = last + 1;
+                        min_written = written[..new_len].iter().position(|&w| w).unwrap();
+                    } else {
+                        min_written = usize::MAX;
+                        max_written = 0;
+                    }
+                }
+                continue;
+            }
+
+            // Decide operation kind
+            // We want to test various scenarios:
+            // 0: Strict append
+            // 1: Append with gap
+            // 2: Entire range overwrite
+            // 3: Strict prefix overwrite
+            // 4: Strict suffix overwrite
+            // 5: Middle split / overwrite
+            // 6: Left overlap
+            // 7: Right overlap
+            // 8: Contiguous coalescing append (sharing backing buffer)
+            // 9: Random range
+            let op = rng.gen_range(0..10);
+
+            let (start, len, is_contiguous_append) = match op {
+                // Strict append
+                0 if min_written < max_written && max_written < CAPACITY => {
+                    let len = rng.gen_range(1..=(CAPACITY - max_written).min(64 * 1024));
+                    (max_written, len, false)
+                }
+                // Append with gap
+                1 if min_written < max_written && max_written + 16 < CAPACITY => {
+                    let max_gap = (CAPACITY - max_written - 8).min(4096);
+                    let gap = rng.gen_range(1..=max_gap);
+                    let start = max_written + gap;
+                    let len = rng.gen_range(1..=(CAPACITY - start).min(64 * 1024));
+                    (start, len, false)
+                }
+                // Entire range overwrite
+                2 if min_written < max_written && max_written < CAPACITY => {
+                    let start = rng.gen_range(0..=min_written);
+                    let end = rng.gen_range(max_written..=CAPACITY);
+                    let len = end - start;
+                    (start, len, false)
+                }
+                // Strict prefix overwrite
+                3 if min_written < max_written => {
+                    let len = rng.gen_range(1..=(max_written - min_written).min(32 * 1024));
+                    (min_written, len, false)
+                }
+                // Strict suffix overwrite
+                4 if min_written < max_written => {
+                    let len = rng.gen_range(1..=(max_written - min_written).min(32 * 1024));
+                    let start = max_written - len;
+                    (start, len, false)
+                }
+                // Middle split / overwrite
+                5 if min_written < max_written && max_written - min_written >= 4 => {
+                    let start = rng.gen_range(min_written + 1..max_written - 2);
+                    let max_len = (max_written - start - 1).min(16 * 1024);
+                    let len = rng.gen_range(1..=max_len);
+                    (start, len, false)
+                }
+                // Left overlap
+                6 if min_written < max_written && min_written > 1 => {
+                    let start = rng.gen_range(0..min_written);
+                    let end = rng.gen_range(min_written + 1..=max_written);
+                    (start, end - start, false)
+                }
+                // Right overlap
+                7 if min_written < max_written && max_written + 1 < CAPACITY => {
+                    let start = rng.gen_range(min_written..max_written);
+                    let end = rng.gen_range(max_written + 1..CAPACITY);
+                    (start, end - start, false)
+                }
+                // Contiguous coalescing append
+                8 if last_staged_buffer.is_some() && last_staged_buffer.as_ref().unwrap().2 < CAPACITY => {
+                    let (_, _, end_offset) = last_staged_buffer.as_ref().unwrap();
+                    let start = *end_offset;
+                    let len = rng.gen_range(1..=(CAPACITY - start).min(16 * 1024));
+                    (start, len, true)
+                }
+                // Random range fallback
+                _ => {
+                    let start = rng.gen_range(0..CAPACITY - 1024);
+                    let len = rng.gen_range(1..=(CAPACITY - start).min(64 * 1024));
+                    (start, len, false)
+                }
+            };
+
+            if len == 0 {
+                continue;
+            }
+
+            let extent = if is_contiguous_append {
+                let (buf, payload_offset, end_offset) = last_staged_buffer.as_mut().unwrap();
+                let mut data = vec![0u8; len];
+                rng.fill(&mut data[..]);
+                // Ensure non-zero data bytes so they can be distinguished from holes
+                for b in &mut data {
+                    if *b == 0 {
+                        *b = (step as u8).wrapping_add(1);
+                    }
+                }
+                buf.write().unwrap().extend_from_slice(&data);
+                let ext = Extent::new_staged(Arc::clone(buf), *payload_offset as u32, len as u32);
+                *payload_offset += len;
+                *end_offset += len;
+                shadow[start..start + len].copy_from_slice(&data);
+                ext
+            } else {
+                // Pick extent kind: 50% Staged, 35% Disk, 15% Zero
+                let kind = rng.gen_range(0..100);
+                if kind < 50 {
+                    // Staged extent
+                    let mut data = vec![0u8; len];
+                    rng.fill(&mut data[..]);
+                    for b in &mut data {
+                        if *b == 0 {
+                            *b = (step as u8).wrapping_add(1);
+                        }
+                    }
+                    let buf = Arc::new(RwLock::new(data.clone()));
+                    let ext = Extent::new_staged(Arc::clone(&buf), 0, len as u32);
+                    last_staged_buffer = Some((buf, len, start + len));
+                    shadow[start..start + len].copy_from_slice(&data);
+                    ext
+                } else if kind < 85 {
+                    // Disk extent
+                    let mut data = vec![0u8; len];
+                    rng.fill(&mut data[..]);
+                    for b in &mut data {
+                        if *b == 0 {
+                            *b = (step as u8).wrapping_add(1);
+                        }
+                    }
+                    let generation = 1;
+                    let log_offset = next_disk_log_offset;
+                    next_disk_log_offset += len as u64;
+                    disk_store.insert((generation, log_offset), data.clone());
+                    let ext = Extent::new_disk(generation, log_offset, len as u32, 0, len as u32);
+                    last_staged_buffer = None;
+                    shadow[start..start + len].copy_from_slice(&data);
+                    ext
+                } else {
+                    // Zero extent (hole)
+                    let ext = Extent::new_zero(len as u64);
+                    last_staged_buffer = None;
+                    shadow[start..start + len].fill(0);
+                    ext
+                }
+            };
+
+            written[start..start + len].fill(true);
+            min_written = min_written.min(start);
+            max_written = max_written.max(start + len);
+            em.insert(start as u64, len as u64, extent);
+
+            // Periodic mid-run sanity checks
+            if step % 50 == 0 {
+                // Verify ordering and disjointness
+                let mut prev_end = 0u64;
+                for (&k, entry) in em.iter() {
+                    assert_eq!(k, entry.file_offset);
+                    assert!(k >= prev_end, "overlapping extents at {k} < {prev_end}");
+                    assert!(entry.length() > 0);
+                    prev_end = k + entry.length();
+                }
+                assert_eq!(em.len(), em.iter().count());
+                assert_eq!(em.is_empty(), em.iter().count() == 0);
+            }
+
+            // Periodic coalesce check
+            if step % 100 == 0 && step > 0 && min_written < max_written {
+                let coalesced = em.coalesce();
+                let query_span = (max_written - min_written) as u64;
+                let c_results = coalesced.query(min_written as u64, query_span);
+                let mut c_reconstructed = vec![0u8; max_written - min_written];
+                for (seg_start, seg_len, ext) in c_results {
+                    let seg_bytes = read_extent_bytes(&ext, &disk_store);
+                    let rel_start = (seg_start - min_written as u64) as usize;
+                    let rel_end = rel_start + seg_len as usize;
+                    c_reconstructed[rel_start..rel_end].copy_from_slice(&seg_bytes);
+                }
+                let mut expected = vec![0u8; max_written - min_written];
+                expected.copy_from_slice(&shadow[min_written..max_written]);
+                // Compare only written bytes
+                for i in min_written..max_written {
+                    if written[i] {
+                        assert_eq!(c_reconstructed[i - min_written], expected[i - min_written]);
+                    }
+                }
+            }
+        }
+
+        // Final verification
+        if min_written == usize::MAX {
+            assert_eq!(em.len(), 0);
+            assert!(em.is_empty_storage());
+            return;
+        }
+
+        assert!(min_written < max_written);
+        let query_span = (max_written - min_written) as u64;
+        let results = em.query(min_written as u64, query_span);
+
+        let mut reconstructed = vec![0u8; max_written - min_written];
+        let mut covered = vec![false; max_written - min_written];
+
+        for (seg_start, seg_len, ext) in results {
+            let seg_bytes = read_extent_bytes(&ext, &disk_store);
+            assert_eq!(seg_bytes.len(), seg_len as usize);
+            let rel_start = (seg_start - min_written as u64) as usize;
+            let rel_end = rel_start + seg_len as usize;
+            reconstructed[rel_start..rel_end].copy_from_slice(&seg_bytes);
+            covered[rel_start..rel_end].fill(true);
+        }
+
+        // Verify that every byte in [min_written..max_written] matches the shadow array exactly
+        for i in min_written..max_written {
+            let rel = i - min_written;
+            if written[i] {
+                assert!(covered[rel], "offset {i} should be covered by an extent");
+                assert_eq!(reconstructed[rel], shadow[i], "byte mismatch at file offset {i}");
+            } else {
+                assert!(
+                    !covered[rel],
+                    "unwritten gap offset {i} should not be covered by an extent"
+                );
+            }
+        }
+
+        // Test 50 random sub-range queries
+        for _ in 0..50 {
+            let q_start = rng.gen_range(0..CAPACITY - 512);
+            let q_len = rng.gen_range(1..=16 * 1024);
+            let q_end = (q_start + q_len).min(CAPACITY);
+            let actual_q_len = q_end - q_start;
+
+            let q_results = em.query(q_start as u64, actual_q_len as u64);
+            let mut q_reconstructed = vec![0u8; actual_q_len];
+            let mut q_covered = vec![false; actual_q_len];
+
+            for (seg_start, seg_len, ext) in q_results {
+                let seg_bytes = read_extent_bytes(&ext, &disk_store);
+                assert_eq!(seg_bytes.len(), seg_len as usize);
+                let rel_start = (seg_start - q_start as u64) as usize;
+                let rel_end = rel_start + seg_len as usize;
+                q_reconstructed[rel_start..rel_end].copy_from_slice(&seg_bytes);
+                q_covered[rel_start..rel_end].fill(true);
+            }
+
+            for idx in 0..actual_q_len {
+                let file_pos = q_start + idx;
+                if written[file_pos] {
+                    assert!(
+                        q_covered[idx],
+                        "subquery at {q_start}..{q_end}: offset {file_pos} should be covered"
+                    );
+                    assert_eq!(
+                        q_reconstructed[idx], shadow[file_pos],
+                        "subquery byte mismatch at offset {file_pos}"
+                    );
+                } else {
+                    assert!(
+                        !q_covered[idx],
+                        "subquery at {q_start}..{q_end}: unwritten offset {file_pos} should not be covered"
+                    );
+                }
+            }
+        }
+
+        // Storage invariant checks on original map
+        assert_eq!(em.is_empty(), em.iter().count() == 0);
+        assert_eq!(em.iter().count(), em.len());
+
+        // Coalescing test at the end: verifies coalesced map reproduces exact content
+        // and demotes to Single / Empty mode.
+        let coalesced = em.coalesce();
+        if coalesced.is_empty() {
+            assert!(coalesced.is_empty_storage());
+        } else if coalesced.len() == 1 {
+            assert!(
+                coalesced.is_single(),
+                "coalesced map with 1 extent must demote to Single mode"
+            );
+        } else {
+            assert!(
+                coalesced.is_vector(),
+                "coalesced map with >1 extents must be in Vector mode"
+            );
+        }
+        let c_results = coalesced.query(min_written as u64, query_span);
+        let mut c_reconstructed = vec![0u8; max_written - min_written];
+        for (seg_start, seg_len, ext) in c_results {
+            let seg_bytes = read_extent_bytes(&ext, &disk_store);
+            let rel_start = (seg_start - min_written as u64) as usize;
+            let rel_end = rel_start + seg_len as usize;
+            c_reconstructed[rel_start..rel_end].copy_from_slice(&seg_bytes);
+        }
+        for i in min_written..max_written {
+            if written[i] {
+                assert_eq!(
+                    c_reconstructed[i - min_written],
+                    shadow[i],
+                    "coalesced map byte mismatch at {i}"
+                );
+            }
+        }
+    }
 }
