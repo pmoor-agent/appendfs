@@ -445,6 +445,12 @@ impl From<LogNodeDelta> for NodeDelta {
     }
 }
 
+impl std::fmt::Display for LogNodeDelta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", crate::dump::format_log_node_delta(self))
+    }
+}
+
 /// Persisted on-disk representation of an entry delta (Node delta or Tombstone).
 /// Serialized with a single 1-byte discriminant tag (0 = Tombstone, 1..=7 = Node variants).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -553,6 +559,12 @@ impl LogEntryDelta {
             LogEntryDelta::Node(n) => EntryDelta::Node(n.into_node_delta(generation)),
             LogEntryDelta::Tombstone => EntryDelta::Tombstone,
         }
+    }
+}
+
+impl std::fmt::Display for LogEntryDelta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", crate::dump::format_log_entry_delta(self))
     }
 }
 
