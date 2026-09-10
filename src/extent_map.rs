@@ -318,18 +318,36 @@ impl ExtentEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum ExtentMapInner {
-    /// Compact sorted vector of disjoint extents. The default for files, append-only writes,
-    /// and disk loading.
+    /// Zero extents. Completely zero heap allocation.
+    Empty,
+    /// Exactly one extent stored inline without heap allocation.
+    Single(ExtentEntry),
+    /// Compact sorted vector of disjoint extents. Used for files with multiple extents.
     Vector(Vec<ExtentEntry>),
     /// BTreeMap for files that have received non-sequential overwrites or middle splits.
     Tree(BTreeMap<u64, ExtentEntry>),
 }
 
+impl PartialEq for ExtentMapInner {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Empty, Self::Empty) => true,
+            (Self::Single(e1), Self::Single(e2)) => e1 == e2,
+            (Self::Vector(v1), Self::Vector(v2)) => v1 == v2,
+            (Self::Tree(t1), Self::Tree(t2)) => t1 == t2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ExtentMapInner {}
+
 /// Specialized extent container for AppendFS files.
 ///
-/// Starts as a sorted `Vector` of extents for cache-friendly $O(1)$ appends, fast sequential loading,
+/// Starts inline as `Empty` or `Single` with zero heap allocations. Files with multiple sequential
+/// appends promote to a sorted `Vector` of extents for cache-friendly $O(1)$ appends, fast sequential loading,
 /// and $O(\log N)$ binary search queries. Seamlessly promotes to a `BTreeMap` on non-sequential
 /// overwrites or middle splits.
 ///
@@ -344,10 +362,24 @@ enum ExtentMapInner {
 /// - **Flush Pipeline & Layered Snapshots**: Once a live delta is frozen into a `FlushBatch` or folded into
 ///   an immutable `Arc<Node>` in `base`, it is strictly read-only. Both the background flusher thread and
 ///   concurrent layered read walks ([`InodeLayerStack`]) query it safely in parallel without locks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ExtentMap {
     inner: ExtentMapInner,
 }
+
+impl PartialEq for ExtentMap {
+    fn eq(&self, other: &Self) -> bool {
+        if self.inner == other.inner {
+            return true;
+        }
+        if self.len() != other.len() {
+            return false;
+        }
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for ExtentMap {}
 
 impl Default for ExtentMap {
     fn default() -> Self {
@@ -356,18 +388,34 @@ impl Default for ExtentMap {
 }
 
 impl ExtentMap {
-    /// Creates an empty `ExtentMap` initialized in compact `Vector` mode.
+    /// Creates an empty `ExtentMap` with zero heap allocations.
     pub fn new() -> Self {
         Self {
-            inner: ExtentMapInner::Vector(Vec::new()),
+            inner: ExtentMapInner::Empty,
         }
     }
 
-    /// Creates an empty `ExtentMap` in `Vector` mode preallocated with capacity.
+    /// Creates an empty `ExtentMap`. Preallocates `Vector` capacity only if `cap > 1`.
     pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            inner: ExtentMapInner::Vector(Vec::with_capacity(cap)),
+        if cap <= 1 {
+            Self::new()
+        } else {
+            Self {
+                inner: ExtentMapInner::Vector(Vec::with_capacity(cap)),
+            }
         }
+    }
+
+    /// Returns `true` if this map has zero extents and zero allocated storage.
+    #[inline]
+    pub fn is_empty_storage(&self) -> bool {
+        matches!(self.inner, ExtentMapInner::Empty)
+    }
+
+    /// Returns `true` if this map stores exactly one extent inline without heap allocation.
+    #[inline]
+    pub fn is_single(&self) -> bool {
+        matches!(self.inner, ExtentMapInner::Single(_))
     }
 
     /// Returns `true` if this map is currently stored in compact `Vector` mode.
@@ -385,6 +433,8 @@ impl ExtentMap {
     #[inline]
     pub fn is_empty(&self) -> bool {
         match &self.inner {
+            ExtentMapInner::Empty => true,
+            ExtentMapInner::Single(_) => false,
             ExtentMapInner::Vector(v) => v.is_empty(),
             ExtentMapInner::Tree(t) => t.is_empty(),
         }
@@ -393,21 +443,22 @@ impl ExtentMap {
     #[inline]
     pub fn len(&self) -> usize {
         match &self.inner {
+            ExtentMapInner::Empty => 0,
+            ExtentMapInner::Single(_) => 1,
             ExtentMapInner::Vector(v) => v.len(),
             ExtentMapInner::Tree(t) => t.len(),
         }
     }
 
     pub fn clear(&mut self) {
-        match &mut self.inner {
-            ExtentMapInner::Vector(v) => v.clear(),
-            ExtentMapInner::Tree(t) => t.clear(),
-        }
+        self.inner = ExtentMapInner::Empty;
     }
 
     /// Iterates over all `(&file_offset, &ExtentEntry)` pairs in order of `file_offset`.
     pub fn iter(&self) -> ExtentMapIter<'_> {
         match &self.inner {
+            ExtentMapInner::Empty => ExtentMapIter::Empty,
+            ExtentMapInner::Single(entry) => ExtentMapIter::Single(Some(entry)),
             ExtentMapInner::Vector(v) => ExtentMapIter::Vector { slice: v, idx: 0 },
             ExtentMapInner::Tree(t) => ExtentMapIter::Tree(t.iter()),
         }
@@ -415,8 +466,9 @@ impl ExtentMap {
 
     /// Inserts a new extent `[new_start, new_start + new_len)` with `extent`.
     ///
-    /// If the insert is append-only (starts at or after the end of the current file), it stays
-    /// in high-performance `Vector` mode and attempts contiguous coalescing.
+    /// If empty or single, it stays inline with zero heap allocations.
+    /// If the insert is append-only, it transitions to or stays in high-performance
+    /// `Vector` mode and attempts contiguous coalescing.
     ///
     /// If the insert overlaps earlier regions (random overwrite or middle split), the map
     /// promotes to a `BTreeMap` and handles splitting and trimming.
@@ -426,6 +478,58 @@ impl ExtentMap {
         }
 
         match &mut self.inner {
+            ExtentMapInner::Empty => {
+                self.inner = ExtentMapInner::Single(ExtentEntry {
+                    file_offset: new_start,
+                    extent: new_extent,
+                });
+                return;
+            }
+            ExtentMapInner::Single(entry) => {
+                let entry_start = entry.file_offset;
+                let entry_len = entry.length();
+                let entry_end = entry_start + entry_len;
+                let new_end = new_start + new_len;
+
+                // Case 1: Contiguous append that coalesces
+                if entry_end == new_start && entry.extent.try_coalesce_with(&new_extent) {
+                    return;
+                }
+
+                // Case 2: Append after existing extent (with gap or non-coalescing)
+                if new_start >= entry_end {
+                    let old_entry = match std::mem::replace(&mut self.inner, ExtentMapInner::Empty) {
+                        ExtentMapInner::Single(e) => e,
+                        _ => unreachable!(),
+                    };
+                    let mut vec = Vec::with_capacity(4);
+                    vec.push(old_entry);
+                    vec.push(ExtentEntry {
+                        file_offset: new_start,
+                        extent: new_extent,
+                    });
+                    self.inner = ExtentMapInner::Vector(vec);
+                    return;
+                }
+
+                // Case 3: Full overwrite of the single extent
+                if new_start <= entry_start && new_end >= entry_end {
+                    *entry = ExtentEntry {
+                        file_offset: new_start,
+                        extent: new_extent,
+                    };
+                    return;
+                }
+
+                // Case 4: Non-sequential write or partial overlap: promote to Tree
+                let old_entry = match std::mem::replace(&mut self.inner, ExtentMapInner::Empty) {
+                    ExtentMapInner::Single(e) => e,
+                    _ => unreachable!(),
+                };
+                let mut tree = BTreeMap::new();
+                tree.insert(old_entry.file_offset, old_entry);
+                self.inner = ExtentMapInner::Tree(tree);
+            }
             ExtentMapInner::Vector(vec) => {
                 let is_append = match vec.last() {
                     None => true,
@@ -555,6 +659,29 @@ impl ExtentMap {
         let query_end = query_start + query_len;
 
         match &self.inner {
+            ExtentMapInner::Empty => Vec::new(),
+            ExtentMapInner::Single(entry) => {
+                let start = entry.file_offset;
+                let end = start + entry.length();
+                if query_start >= end || query_end <= start {
+                    return Vec::new();
+                }
+                let seg_start = std::cmp::max(start, query_start);
+                let seg_end = std::cmp::min(end, query_end);
+                let seg_len = seg_end - seg_start;
+                if seg_len == 0 {
+                    return Vec::new();
+                }
+
+                let mut ext = entry.extent.clone();
+                if seg_start > start {
+                    ext.trim_left(seg_start - start);
+                }
+                if seg_end < end {
+                    ext.trim_right(seg_len);
+                }
+                vec![(seg_start, seg_len, ext)]
+            }
             ExtentMapInner::Vector(vec) => {
                 if vec.is_empty() {
                     return Vec::new();
@@ -628,7 +755,23 @@ impl ExtentMap {
     /// Truncates the map to `new_len`: removes all extents past `new_len` and trims
     /// any extent straddling the boundary.
     pub fn truncate(&mut self, new_len: u64) {
+        if new_len == 0 {
+            self.inner = ExtentMapInner::Empty;
+            return;
+        }
+
         match &mut self.inner {
+            ExtentMapInner::Empty => {}
+            ExtentMapInner::Single(entry) => {
+                let start = entry.file_offset;
+                let end = start + entry.length();
+                if new_len <= start {
+                    self.inner = ExtentMapInner::Empty;
+                } else if new_len < end {
+                    let trimmed_len = new_len - start;
+                    entry.extent.trim_right(trimmed_len);
+                }
+            }
             ExtentMapInner::Vector(vec) => {
                 let idx = vec.partition_point(|e| e.file_offset < new_len);
                 vec.truncate(idx);
@@ -639,6 +782,9 @@ impl ExtentMap {
                         let trimmed_len = new_len - last.file_offset;
                         last.extent.trim_right(trimmed_len);
                     }
+                }
+                if vec.is_empty() {
+                    self.inner = ExtentMapInner::Empty;
                 }
             }
             ExtentMapInner::Tree(tree) => {
@@ -653,21 +799,45 @@ impl ExtentMap {
                         entry.extent.trim_right(trimmed_len);
                     }
                 }
+                if tree.is_empty() {
+                    self.inner = ExtentMapInner::Empty;
+                }
             }
         }
     }
 
-    /// Coalesces adjacent physically contiguous extents into a fresh compact `Vector`-backed `ExtentMap`.
+    /// Coalesces adjacent physically contiguous extents into a fresh compact `ExtentMap`.
     pub fn coalesce(&self) -> Self {
-        let mut coalesced = Self::with_capacity(self.len());
-        for (&start, entry) in self.iter() {
-            coalesced.insert(start, entry.length(), entry.extent.clone());
+        match &self.inner {
+            ExtentMapInner::Empty => Self::new(),
+            ExtentMapInner::Single(entry) => {
+                let mut em = Self::new();
+                em.insert(entry.file_offset, entry.length(), entry.extent.clone());
+                em
+            }
+            ExtentMapInner::Vector(_) | ExtentMapInner::Tree(_) => {
+                let mut coalesced = Self::with_capacity(self.len());
+                for (&start, entry) in self.iter() {
+                    coalesced.insert(start, entry.length(), entry.extent.clone());
+                }
+                if let ExtentMapInner::Vector(mut vec) = coalesced.inner {
+                    if vec.is_empty() {
+                        coalesced.inner = ExtentMapInner::Empty;
+                    } else if vec.len() == 1 {
+                        coalesced.inner = ExtentMapInner::Single(vec.pop().unwrap());
+                    } else {
+                        coalesced.inner = ExtentMapInner::Vector(vec);
+                    }
+                }
+                coalesced
+            }
         }
-        coalesced
     }
 }
 
 pub enum ExtentMapIter<'a> {
+    Empty,
+    Single(Option<&'a ExtentEntry>),
     Vector { slice: &'a [ExtentEntry], idx: usize },
     Tree(std::collections::btree_map::Iter<'a, u64, ExtentEntry>),
 }
@@ -678,6 +848,8 @@ impl<'a> Iterator for ExtentMapIter<'a> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self {
+            Self::Empty => None,
+            Self::Single(opt) => opt.take().map(|entry| (&entry.file_offset, entry)),
             Self::Vector { slice, idx } => {
                 if *idx < slice.len() {
                     let entry = &slice[*idx];
@@ -694,6 +866,11 @@ impl<'a> Iterator for ExtentMapIter<'a> {
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
+            Self::Empty => (0, Some(0)),
+            Self::Single(opt) => {
+                let len = if opt.is_some() { 1 } else { 0 };
+                (len, Some(len))
+            }
             Self::Vector { slice, idx } => {
                 let remaining = slice.len().saturating_sub(*idx);
                 (remaining, Some(remaining))
@@ -712,6 +889,11 @@ impl Serialize for ExtentMap {
         S: serde::Serializer,
     {
         match &self.inner {
+            ExtentMapInner::Empty => {
+                let empty: &[ExtentEntry] = &[];
+                empty.serialize(serializer)
+            }
+            ExtentMapInner::Single(entry) => std::slice::from_ref(entry).serialize(serializer),
             ExtentMapInner::Vector(vec) => vec.serialize(serializer),
             ExtentMapInner::Tree(tree) => {
                 use serde::ser::SerializeSeq;
@@ -725,17 +907,58 @@ impl Serialize for ExtentMap {
     }
 }
 
-// Deserialization: Reads entries directly into a compact Vector in a single allocation,
-// avoiding B-tree allocations entirely during volume recovery and summary loads.
+// Deserialization: Reads entries directly into Empty or Single mode without heap allocation,
+// or into a compact Vector for multi-extent files, avoiding B-tree allocations entirely.
 impl<'de> Deserialize<'de> for ExtentMap {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let vec = Vec::<ExtentEntry>::deserialize(deserializer)?;
-        Ok(Self {
-            inner: ExtentMapInner::Vector(vec),
-        })
+        struct ExtentMapVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ExtentMapVisitor {
+            type Value = ExtentMap;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a sequence of ExtentEntry")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let first = match seq.next_element()? {
+                    None => {
+                        return Ok(ExtentMap {
+                            inner: ExtentMapInner::Empty,
+                        });
+                    }
+                    Some(first) => first,
+                };
+
+                let second = match seq.next_element()? {
+                    None => {
+                        return Ok(ExtentMap {
+                            inner: ExtentMapInner::Single(first),
+                        });
+                    }
+                    Some(second) => second,
+                };
+
+                let cap = seq.size_hint().map(|h| h + 2).unwrap_or(4);
+                let mut vec = Vec::with_capacity(cap);
+                vec.push(first);
+                vec.push(second);
+                while let Some(entry) = seq.next_element()? {
+                    vec.push(entry);
+                }
+                Ok(ExtentMap {
+                    inner: ExtentMapInner::Vector(vec),
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(ExtentMapVisitor)
     }
 }
 
@@ -744,24 +967,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_appends_stay_in_vector_mode() {
+    fn test_appends_stay_in_single_and_vector_mode() {
         let mut em = ExtentMap::new();
-        assert!(em.is_vector());
+        assert!(em.is_empty_storage());
+        assert_eq!(em.len(), 0);
 
         em.insert(0, 100, Extent::new_zero(100));
-        assert!(em.is_vector());
+        assert!(em.is_single());
         assert_eq!(em.len(), 1);
 
-        // Contiguous zero extent should coalesce
+        // Contiguous zero extent should coalesce and stay in Single mode
         em.insert(100, 100, Extent::new_zero(100));
-        assert!(em.is_vector());
+        assert!(em.is_single());
         assert_eq!(em.len(), 1);
         let q = em.query(0, 200);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].0, 0);
         assert_eq!(q[0].1, 200);
 
-        // Append with gap stays in vector mode
+        // Append with gap promotes to vector mode
         em.insert(300, 50, Extent::new_zero(50));
         assert!(em.is_vector());
         assert_eq!(em.len(), 2);
@@ -771,6 +995,7 @@ mod tests {
     fn test_overwrite_promotes_to_tree_mode() {
         let mut em = ExtentMap::new();
         em.insert(0, 100, Extent::new_zero(100));
+        assert!(em.is_single());
         em.insert(100, 100, Extent::new_disk(1, 10, 100, 0, 100));
         assert!(em.is_vector());
 
@@ -786,49 +1011,69 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_query_and_boundary_cases() {
+    fn test_single_extent_operations() {
         let mut em = ExtentMap::new();
-        em.insert(0, 50, Extent::new_disk(1, 0, 50, 0, 50));
-        em.insert(50, 50, Extent::new_disk(2, 0, 50, 0, 50));
-        em.insert(100, 50, Extent::new_disk(3, 0, 50, 0, 50));
-        assert!(em.is_vector());
+        em.insert(100, 200, Extent::new_disk(1, 10, 200, 0, 200));
+        assert!(em.is_single());
+        assert_eq!(em.len(), 1);
 
-        // Query spanning boundary of first two
-        let q = em.query(40, 20);
-        assert_eq!(q.len(), 2);
-        assert_eq!(q[0].0, 40);
-        assert_eq!(q[0].1, 10);
-        assert_eq!(q[1].0, 50);
-        assert_eq!(q[1].1, 10);
-        assert!(em.is_vector());
+        // Query completely before
+        assert!(em.query(0, 50).is_empty());
+        assert!(em.query(50, 50).is_empty());
 
-        // Query before any extent
-        let q = em.query(0, 10);
+        // Query completely after
+        assert!(em.query(300, 50).is_empty());
+        assert!(em.query(350, 50).is_empty());
+
+        // Query exact match
+        let q = em.query(100, 200);
         assert_eq!(q.len(), 1);
-        assert_eq!(q[0].0, 0);
-        assert_eq!(q[0].1, 10);
+        assert_eq!(q[0].0, 100);
+        assert_eq!(q[0].1, 200);
 
-        // Query past end
-        assert!(em.query(200, 50).is_empty());
-    }
+        // Query partial overlap head
+        let q = em.query(50, 100);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].0, 100);
+        assert_eq!(q[0].1, 50);
 
-    #[test]
-    fn test_vector_truncate() {
-        let mut em = ExtentMap::new();
-        em.insert(0, 50, Extent::new_disk(1, 0, 50, 0, 50));
-        em.insert(50, 50, Extent::new_disk(2, 0, 50, 0, 50));
-        em.insert(100, 50, Extent::new_disk(3, 0, 50, 0, 50));
-        assert!(em.is_vector());
+        // Query partial overlap middle
+        let q = em.query(150, 50);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].0, 150);
+        assert_eq!(q[0].1, 50);
 
-        // Truncate at 70: removes [100, 150) and trims [50, 100) down to [50, 70)
-        em.truncate(70);
-        assert!(em.is_vector());
-        assert_eq!(em.len(), 2);
+        // Query partial overlap tail
+        let q = em.query(250, 100);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].0, 250);
+        assert_eq!(q[0].1, 50);
 
-        let entries: Vec<_> = em.iter().map(|(&k, e)| (k, e.length())).collect();
-        assert_eq!(entries[0], (0, 50));
-        assert_eq!(entries[1], (50, 20));
-        assert!(em.query(70, 50).is_empty());
+        // Truncate past end leaves it intact
+        em.truncate(400);
+        assert!(em.is_single());
+        assert_eq!(em.len(), 1);
+        assert_eq!(em.query(100, 200)[0].1, 200);
+
+        // Truncate inside trims right in place
+        em.truncate(250);
+        assert!(em.is_single());
+        assert_eq!(em.len(), 1);
+        assert_eq!(em.query(100, 200)[0].1, 150);
+
+        // Full overwrite of single extent stays in Single mode
+        em.insert(50, 300, Extent::new_disk(2, 20, 300, 0, 300));
+        assert!(em.is_single());
+        assert_eq!(em.len(), 1);
+        let q = em.query(0, 500);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].0, 50);
+        assert_eq!(q[0].1, 300);
+
+        // Truncate before start clears to Empty
+        em.truncate(30);
+        assert!(em.is_empty_storage());
+        assert_eq!(em.len(), 0);
     }
 
     #[test]
@@ -841,8 +1086,8 @@ mod tests {
         em.insert(100, 150, Extent::new_staged(Arc::clone(&buffer), 100, 150));
         em.insert(250, 200, Extent::new_staged(Arc::clone(&buffer), 250, 200));
 
-        assert!(em.is_vector());
-        // All 3 contiguous appends should have merged into 1 extent entry!
+        // All 3 contiguous appends should coalesce and remain in Single mode!
+        assert!(em.is_single());
         assert_eq!(em.len(), 1);
         let q = em.query(0, 500);
         assert_eq!(q.len(), 1);
@@ -852,6 +1097,26 @@ mod tests {
 
     #[test]
     fn test_wire_serialization_round_trip() {
+        // 1. Empty map
+        let em_empty = ExtentMap::new();
+        let bytes_empty = crate::wire::serialize(&em_empty).expect("serialize empty ExtentMap");
+        let decoded_empty: ExtentMap = crate::wire::deserialize(&bytes_empty).expect("deserialize empty ExtentMap");
+        assert!(decoded_empty.is_empty_storage());
+        assert_eq!(decoded_empty.len(), 0);
+
+        // 2. Single extent map
+        let mut em_single = ExtentMap::new();
+        em_single.insert(0, 1024, Extent::new_disk(1, 100, 1056, 32, 1024));
+        let bytes_single = crate::wire::serialize(&em_single).expect("serialize single ExtentMap");
+        let decoded_single: ExtentMap = crate::wire::deserialize(&bytes_single).expect("deserialize single ExtentMap");
+        assert!(
+            decoded_single.is_single(),
+            "deserialized single map must be in Single mode"
+        );
+        assert_eq!(decoded_single.len(), 1);
+        assert_eq!(decoded_single.query(0, 2000), em_single.query(0, 2000));
+
+        // 3. Multi extent map
         let mut em = ExtentMap::new();
         em.insert(0, 1024, Extent::new_disk(1, 100, 1056, 32, 1024));
         em.insert(1024, 2048, Extent::new_zero(2048));
@@ -860,9 +1125,56 @@ mod tests {
         let bytes = crate::wire::serialize(&em).expect("serialize ExtentMap");
         let decoded: ExtentMap = crate::wire::deserialize(&bytes).expect("deserialize ExtentMap");
 
-        assert!(decoded.is_vector(), "deserialized map must start in Vector mode");
+        assert!(decoded.is_vector(), "deserialized multi map must start in Vector mode");
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded.query(0, 8000), em.query(0, 8000));
+    }
+
+    #[test]
+    fn test_cross_mode_equality() {
+        let mut em_single = ExtentMap::new();
+        em_single.insert(0, 100, Extent::new_disk(1, 10, 100, 0, 100));
+
+        let mut em_vec = ExtentMap::with_capacity(2);
+        em_vec.insert(0, 100, Extent::new_disk(1, 10, 100, 0, 100));
+        assert!(em_vec.is_vector());
+
+        // Single vs Vector with 1 identical extent must be equal
+        assert_eq!(em_single, em_vec);
+
+        // Vector vs Tree with identical extents must be equal
+        let mut em_tree = ExtentMap::new();
+        em_tree.insert(0, 200, Extent::new_disk(1, 10, 200, 0, 200));
+        em_tree.insert(100, 50, Extent::new_disk(2, 20, 50, 0, 50)); // promotes to Tree
+        assert!(em_tree.is_tree());
+
+        let mut em_vec2 = ExtentMap::new();
+        for (&start, entry) in em_tree.iter() {
+            em_vec2.insert(start, entry.length(), entry.extent.clone());
+        }
+        assert!(em_vec2.is_vector() || em_vec2.is_single());
+        assert_eq!(em_tree, em_vec2);
+
+        // Empty vs Vector with 0 elements
+        let em_empty = ExtentMap::new();
+        let em_empty_vec = ExtentMap::with_capacity(5);
+        assert_eq!(em_empty, em_empty_vec);
+    }
+
+    #[test]
+    fn test_coalesce_demotes_vector_to_single() {
+        let mut em = ExtentMap::with_capacity(3);
+        assert!(em.is_vector());
+        em.insert(0, 100, Extent::new_zero(100));
+        em.insert(100, 100, Extent::new_zero(100));
+        // In with_capacity(3), it started in vector mode.
+        let coalesced = em.coalesce();
+        assert!(
+            coalesced.is_single(),
+            "coalescing to 1 extent should demote to Single mode"
+        );
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced.query(0, 300)[0].1, 200);
     }
 
     #[test]
@@ -943,5 +1255,409 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(*entries[0].0, 0);
         assert_eq!(entries[0].1.length(), 100);
+    }
+
+    #[test]
+    fn test_struct_sizes() {
+        assert_eq!(std::mem::size_of::<Extent>(), 32);
+        assert_eq!(std::mem::size_of::<ExtentEntry>(), 40);
+        assert_eq!(std::mem::size_of::<ExtentMap>(), 40);
+        assert_eq!(std::mem::size_of::<ExtentMapInner>(), 40);
+        assert_eq!(std::mem::size_of::<crate::node::NodeKind>(), 48);
+        assert_eq!(std::mem::size_of::<crate::node::Node>(), 120);
+    }
+
+    #[test]
+    fn test_randomized_differential_extent_map() {
+        let seeds: u64 = std::env::var("FUZZ_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let steps: usize = std::env::var("FUZZ_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+
+        for seed in 1..=seeds {
+            run_randomized_extent_map_test(seed, steps);
+        }
+    }
+
+    fn read_extent_bytes(ext: &Extent, disk_store: &std::collections::HashMap<(u64, u64), Vec<u8>>) -> Vec<u8> {
+        match ext {
+            Extent::Staged {
+                data,
+                payload_offset,
+                length,
+            } => {
+                let buf = data.read().unwrap();
+                let start = *payload_offset as usize;
+                let end = start + *length as usize;
+                buf[start..end].to_vec()
+            }
+            Extent::Disk {
+                generation,
+                record_log_offset,
+                payload_offset,
+                length,
+                ..
+            } => {
+                let buf = &disk_store[&(*generation, *record_log_offset)];
+                let start = *payload_offset as usize;
+                let end = start + *length as usize;
+                buf[start..end].to_vec()
+            }
+            Extent::Zero { length } => vec![0u8; *length as usize],
+        }
+    }
+
+    fn run_randomized_extent_map_test(seed: u64, steps: usize) {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::collections::HashMap;
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        const CAPACITY: usize = 1024 * 1024; // 1 MiB
+
+        let mut shadow = vec![0u8; CAPACITY];
+        let mut written = vec![false; CAPACITY];
+        let mut min_written = usize::MAX;
+        let mut max_written = 0usize;
+
+        let mut em = ExtentMap::new();
+        let mut disk_store: HashMap<(u64, u64), Vec<u8>> = HashMap::new();
+        let mut next_disk_log_offset = 1000u64;
+
+        // Optionally hold a reusable staged buffer to test contiguous coalescing
+        type ActiveStagedBuffer = (Arc<RwLock<Vec<u8>>>, usize, usize);
+        let mut last_staged_buffer: Option<ActiveStagedBuffer> = None;
+
+        for step in 0..steps {
+            // 10% chance of truncation when there are written extents
+            if rng.gen_range(0..10) == 0 && max_written > 0 {
+                let new_len = match rng.gen_range(0..4) {
+                    0 => 0,                                                                      // Truncate to 0
+                    1 if min_written > 0 => rng.gen_range(0..min_written), // Truncate before min_written
+                    2 if min_written <= max_written => rng.gen_range(min_written..=max_written), // Truncate in the middle
+                    _ if max_written < CAPACITY => rng.gen_range(max_written..CAPACITY),         // Truncate beyond end
+                    _ => 0,
+                };
+
+                em.truncate(new_len as u64);
+                last_staged_buffer = None;
+
+                if new_len < max_written {
+                    shadow[new_len..max_written].fill(0);
+                    written[new_len..max_written].fill(false);
+                    if let Some(last) = written[..new_len].iter().rposition(|&w| w) {
+                        max_written = last + 1;
+                        min_written = written[..new_len].iter().position(|&w| w).unwrap();
+                    } else {
+                        min_written = usize::MAX;
+                        max_written = 0;
+                    }
+                }
+                continue;
+            }
+
+            // Decide operation kind
+            // We want to test various scenarios:
+            // 0: Strict append
+            // 1: Append with gap
+            // 2: Entire range overwrite
+            // 3: Strict prefix overwrite
+            // 4: Strict suffix overwrite
+            // 5: Middle split / overwrite
+            // 6: Left overlap
+            // 7: Right overlap
+            // 8: Contiguous coalescing append (sharing backing buffer)
+            // 9: Random range
+            let op = rng.gen_range(0..10);
+
+            let (start, len, is_contiguous_append) = match op {
+                // Strict append
+                0 if min_written < max_written && max_written < CAPACITY => {
+                    let len = rng.gen_range(1..=(CAPACITY - max_written).min(64 * 1024));
+                    (max_written, len, false)
+                }
+                // Append with gap
+                1 if min_written < max_written && max_written + 16 < CAPACITY => {
+                    let max_gap = (CAPACITY - max_written - 8).min(4096);
+                    let gap = rng.gen_range(1..=max_gap);
+                    let start = max_written + gap;
+                    let len = rng.gen_range(1..=(CAPACITY - start).min(64 * 1024));
+                    (start, len, false)
+                }
+                // Entire range overwrite
+                2 if min_written < max_written && max_written < CAPACITY => {
+                    let start = rng.gen_range(0..=min_written);
+                    let end = rng.gen_range(max_written..=CAPACITY);
+                    let len = end - start;
+                    (start, len, false)
+                }
+                // Strict prefix overwrite
+                3 if min_written < max_written => {
+                    let len = rng.gen_range(1..=(max_written - min_written).min(32 * 1024));
+                    (min_written, len, false)
+                }
+                // Strict suffix overwrite
+                4 if min_written < max_written => {
+                    let len = rng.gen_range(1..=(max_written - min_written).min(32 * 1024));
+                    let start = max_written - len;
+                    (start, len, false)
+                }
+                // Middle split / overwrite
+                5 if min_written < max_written && max_written - min_written >= 4 => {
+                    let start = rng.gen_range(min_written + 1..max_written - 2);
+                    let max_len = (max_written - start - 1).min(16 * 1024);
+                    let len = rng.gen_range(1..=max_len);
+                    (start, len, false)
+                }
+                // Left overlap
+                6 if min_written < max_written && min_written > 1 => {
+                    let start = rng.gen_range(0..min_written);
+                    let end = rng.gen_range(min_written + 1..=max_written);
+                    (start, end - start, false)
+                }
+                // Right overlap
+                7 if min_written < max_written && max_written + 1 < CAPACITY => {
+                    let start = rng.gen_range(min_written..max_written);
+                    let end = rng.gen_range(max_written + 1..CAPACITY);
+                    (start, end - start, false)
+                }
+                // Contiguous coalescing append
+                8 if last_staged_buffer.is_some() && last_staged_buffer.as_ref().unwrap().2 < CAPACITY => {
+                    let (_, _, end_offset) = last_staged_buffer.as_ref().unwrap();
+                    let start = *end_offset;
+                    let len = rng.gen_range(1..=(CAPACITY - start).min(16 * 1024));
+                    (start, len, true)
+                }
+                // Random range fallback
+                _ => {
+                    let start = rng.gen_range(0..CAPACITY - 1024);
+                    let len = rng.gen_range(1..=(CAPACITY - start).min(64 * 1024));
+                    (start, len, false)
+                }
+            };
+
+            if len == 0 {
+                continue;
+            }
+
+            let extent = if is_contiguous_append {
+                let (buf, payload_offset, end_offset) = last_staged_buffer.as_mut().unwrap();
+                let mut data = vec![0u8; len];
+                rng.fill(&mut data[..]);
+                // Ensure non-zero data bytes so they can be distinguished from holes
+                for b in &mut data {
+                    if *b == 0 {
+                        *b = (step as u8).wrapping_add(1);
+                    }
+                }
+                buf.write().unwrap().extend_from_slice(&data);
+                let ext = Extent::new_staged(Arc::clone(buf), *payload_offset as u32, len as u32);
+                *payload_offset += len;
+                *end_offset += len;
+                shadow[start..start + len].copy_from_slice(&data);
+                ext
+            } else {
+                // Pick extent kind: 50% Staged, 35% Disk, 15% Zero
+                let kind = rng.gen_range(0..100);
+                if kind < 50 {
+                    // Staged extent
+                    let mut data = vec![0u8; len];
+                    rng.fill(&mut data[..]);
+                    for b in &mut data {
+                        if *b == 0 {
+                            *b = (step as u8).wrapping_add(1);
+                        }
+                    }
+                    let buf = Arc::new(RwLock::new(data.clone()));
+                    let ext = Extent::new_staged(Arc::clone(&buf), 0, len as u32);
+                    last_staged_buffer = Some((buf, len, start + len));
+                    shadow[start..start + len].copy_from_slice(&data);
+                    ext
+                } else if kind < 85 {
+                    // Disk extent
+                    let mut data = vec![0u8; len];
+                    rng.fill(&mut data[..]);
+                    for b in &mut data {
+                        if *b == 0 {
+                            *b = (step as u8).wrapping_add(1);
+                        }
+                    }
+                    let generation = 1;
+                    let log_offset = next_disk_log_offset;
+                    next_disk_log_offset += len as u64;
+                    disk_store.insert((generation, log_offset), data.clone());
+                    let ext = Extent::new_disk(generation, log_offset, len as u32, 0, len as u32);
+                    last_staged_buffer = None;
+                    shadow[start..start + len].copy_from_slice(&data);
+                    ext
+                } else {
+                    // Zero extent (hole)
+                    let ext = Extent::new_zero(len as u64);
+                    last_staged_buffer = None;
+                    shadow[start..start + len].fill(0);
+                    ext
+                }
+            };
+
+            written[start..start + len].fill(true);
+            min_written = min_written.min(start);
+            max_written = max_written.max(start + len);
+            em.insert(start as u64, len as u64, extent);
+
+            // Periodic mid-run sanity checks
+            if step % 50 == 0 {
+                // Verify ordering and disjointness
+                let mut prev_end = 0u64;
+                for (&k, entry) in em.iter() {
+                    assert_eq!(k, entry.file_offset);
+                    assert!(k >= prev_end, "overlapping extents at {k} < {prev_end}");
+                    assert!(entry.length() > 0);
+                    prev_end = k + entry.length();
+                }
+                assert_eq!(em.len(), em.iter().count());
+                assert_eq!(em.is_empty(), em.iter().count() == 0);
+            }
+
+            // Periodic coalesce check
+            if step % 100 == 0 && step > 0 && min_written < max_written {
+                let coalesced = em.coalesce();
+                let query_span = (max_written - min_written) as u64;
+                let c_results = coalesced.query(min_written as u64, query_span);
+                let mut c_reconstructed = vec![0u8; max_written - min_written];
+                for (seg_start, seg_len, ext) in c_results {
+                    let seg_bytes = read_extent_bytes(&ext, &disk_store);
+                    let rel_start = (seg_start - min_written as u64) as usize;
+                    let rel_end = rel_start + seg_len as usize;
+                    c_reconstructed[rel_start..rel_end].copy_from_slice(&seg_bytes);
+                }
+                let mut expected = vec![0u8; max_written - min_written];
+                expected.copy_from_slice(&shadow[min_written..max_written]);
+                // Compare only written bytes
+                for i in min_written..max_written {
+                    if written[i] {
+                        assert_eq!(c_reconstructed[i - min_written], expected[i - min_written]);
+                    }
+                }
+            }
+        }
+
+        // Final verification
+        if min_written == usize::MAX {
+            assert_eq!(em.len(), 0);
+            assert!(em.is_empty_storage());
+            return;
+        }
+
+        assert!(min_written < max_written);
+        let query_span = (max_written - min_written) as u64;
+        let results = em.query(min_written as u64, query_span);
+
+        let mut reconstructed = vec![0u8; max_written - min_written];
+        let mut covered = vec![false; max_written - min_written];
+
+        for (seg_start, seg_len, ext) in results {
+            let seg_bytes = read_extent_bytes(&ext, &disk_store);
+            assert_eq!(seg_bytes.len(), seg_len as usize);
+            let rel_start = (seg_start - min_written as u64) as usize;
+            let rel_end = rel_start + seg_len as usize;
+            reconstructed[rel_start..rel_end].copy_from_slice(&seg_bytes);
+            covered[rel_start..rel_end].fill(true);
+        }
+
+        // Verify that every byte in [min_written..max_written] matches the shadow array exactly
+        for i in min_written..max_written {
+            let rel = i - min_written;
+            if written[i] {
+                assert!(covered[rel], "offset {i} should be covered by an extent");
+                assert_eq!(reconstructed[rel], shadow[i], "byte mismatch at file offset {i}");
+            } else {
+                assert!(
+                    !covered[rel],
+                    "unwritten gap offset {i} should not be covered by an extent"
+                );
+            }
+        }
+
+        // Test 50 random sub-range queries
+        for _ in 0..50 {
+            let q_start = rng.gen_range(0..CAPACITY - 512);
+            let q_len = rng.gen_range(1..=16 * 1024);
+            let q_end = (q_start + q_len).min(CAPACITY);
+            let actual_q_len = q_end - q_start;
+
+            let q_results = em.query(q_start as u64, actual_q_len as u64);
+            let mut q_reconstructed = vec![0u8; actual_q_len];
+            let mut q_covered = vec![false; actual_q_len];
+
+            for (seg_start, seg_len, ext) in q_results {
+                let seg_bytes = read_extent_bytes(&ext, &disk_store);
+                assert_eq!(seg_bytes.len(), seg_len as usize);
+                let rel_start = (seg_start - q_start as u64) as usize;
+                let rel_end = rel_start + seg_len as usize;
+                q_reconstructed[rel_start..rel_end].copy_from_slice(&seg_bytes);
+                q_covered[rel_start..rel_end].fill(true);
+            }
+
+            for idx in 0..actual_q_len {
+                let file_pos = q_start + idx;
+                if written[file_pos] {
+                    assert!(
+                        q_covered[idx],
+                        "subquery at {q_start}..{q_end}: offset {file_pos} should be covered"
+                    );
+                    assert_eq!(
+                        q_reconstructed[idx], shadow[file_pos],
+                        "subquery byte mismatch at offset {file_pos}"
+                    );
+                } else {
+                    assert!(
+                        !q_covered[idx],
+                        "subquery at {q_start}..{q_end}: unwritten offset {file_pos} should not be covered"
+                    );
+                }
+            }
+        }
+
+        // Storage invariant checks on original map
+        assert_eq!(em.is_empty(), em.iter().count() == 0);
+        assert_eq!(em.iter().count(), em.len());
+
+        // Coalescing test at the end: verifies coalesced map reproduces exact content
+        // and demotes to Single / Empty mode.
+        let coalesced = em.coalesce();
+        if coalesced.is_empty() {
+            assert!(coalesced.is_empty_storage());
+        } else if coalesced.len() == 1 {
+            assert!(
+                coalesced.is_single(),
+                "coalesced map with 1 extent must demote to Single mode"
+            );
+        } else {
+            assert!(
+                coalesced.is_vector(),
+                "coalesced map with >1 extents must be in Vector mode"
+            );
+        }
+        let c_results = coalesced.query(min_written as u64, query_span);
+        let mut c_reconstructed = vec![0u8; max_written - min_written];
+        for (seg_start, seg_len, ext) in c_results {
+            let seg_bytes = read_extent_bytes(&ext, &disk_store);
+            let rel_start = (seg_start - min_written as u64) as usize;
+            let rel_end = rel_start + seg_len as usize;
+            c_reconstructed[rel_start..rel_end].copy_from_slice(&seg_bytes);
+        }
+        for i in min_written..max_written {
+            if written[i] {
+                assert_eq!(
+                    c_reconstructed[i - min_written],
+                    shadow[i],
+                    "coalesced map byte mismatch at {i}"
+                );
+            }
+        }
     }
 }
