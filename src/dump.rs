@@ -1,6 +1,9 @@
 use crate::crypto::VolumeKey;
 use crate::log::ExtentState;
-use crate::log::record::{FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader};
+use crate::log::record::{
+    FILE_HEADER_SIZE, FileHeader, LogAttrDelta, LogEntryDelta, LogExtent, LogNodeDelta, OpCode, RECORD_HEADER_SIZE,
+    RecordHeader,
+};
 use crate::log::summary::{SUMMARY_MAGIC, SummaryReader};
 use crate::node::NodeKind;
 use crate::storage::{Storage, StorageReader};
@@ -1095,7 +1098,7 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
             }
         }
         Ok(crate::log::record::DecodedPayload::InodeDelta(delta)) => {
-            writeln!(out, "      delta: {:?}", delta).unwrap();
+            writeln!(out, "      delta: {}", format_log_entry_delta(&delta)).unwrap();
         }
         Ok(crate::log::record::DecodedPayload::FlushCommit(b)) => {
             writeln!(
@@ -1168,6 +1171,161 @@ fn format_system_time(time: SystemTime) -> String {
     crate::clock::format_local_civil_time(time)
 }
 
+fn push_attr_delta_fields(attr: &LogAttrDelta, fields: &mut Vec<String>) {
+    if let Some(mode) = attr.mode {
+        fields.push(format!("mode: 0o{:o}", mode));
+    }
+    if let Some(uid) = attr.uid {
+        fields.push(format!("uid: {}", uid));
+    }
+    if let Some(gid) = attr.gid {
+        fields.push(format!("gid: {}", gid));
+    }
+    if let Some(nlink) = attr.nlink {
+        fields.push(format!("nlink: {}", nlink));
+    }
+    if let Some(atime) = attr.atime {
+        fields.push(format!("atime: {}", format_system_time(atime)));
+    }
+    if let Some(mtime) = attr.mtime {
+        fields.push(format!("mtime: {}", format_system_time(mtime)));
+    }
+    if let Some(ctime) = attr.ctime {
+        fields.push(format!("ctime: {}", format_system_time(ctime)));
+    }
+    if let Some(created_at) = attr.created_at {
+        fields.push(format!("created_at: {}", format_system_time(created_at)));
+    }
+    if let Some(ref xattrs) = attr.xattrs {
+        if xattrs.is_empty() {
+            fields.push("xattrs: []".to_string());
+        } else {
+            let xattr_strs: Vec<String> = xattrs
+                .iter()
+                .map(|(k, v)| match v {
+                    Some(val) => format!("set {:?} ({} B)", k, val.len()),
+                    None => format!("remove {:?}", k),
+                })
+                .collect();
+            fields.push(format!("xattrs: [{}]", xattr_strs.join(", ")));
+        }
+    }
+}
+
+fn format_log_extent(ext: &LogExtent) -> String {
+    let end = ext.file_offset.saturating_add(ext.length);
+    if ext.record_log_offset == 0 {
+        format!(
+            "[0x{:x}..0x{:x} ({}) -> hole]",
+            ext.file_offset,
+            end,
+            format_bytes(ext.length)
+        )
+    } else {
+        format!(
+            "[0x{:x}..0x{:x} ({}) -> log offset 0x{:08x}]",
+            ext.file_offset,
+            end,
+            format_bytes(ext.length),
+            ext.record_log_offset
+        )
+    }
+}
+
+fn format_fields(kind: &str, fields: &[String]) -> String {
+    if fields.is_empty() {
+        format!("{} {{}}", kind)
+    } else {
+        format!("{} {{ {} }}", kind, fields.join(", "))
+    }
+}
+
+/// Formats a `LogNodeDelta` into a human-readable sparse string where only modified fields are displayed.
+pub fn format_log_node_delta(node: &LogNodeDelta) -> String {
+    match node {
+        LogNodeDelta::Directory(d) => {
+            let mut fields = Vec::new();
+            if let Some(parent) = d.parent {
+                fields.push(format!("parent: {}", parent));
+            }
+            if !d.added.is_empty() {
+                let added_strs: Vec<String> = d
+                    .added
+                    .iter()
+                    .map(|(name, ino)| format!("{:?} -> Inode {}", name, ino))
+                    .collect();
+                fields.push(format!("added: [{}]", added_strs.join(", ")));
+            }
+            if !d.removed.is_empty() {
+                let removed_strs: Vec<String> = d.removed.iter().map(|name| format!("{:?}", name)).collect();
+                fields.push(format!("removed: [{}]", removed_strs.join(", ")));
+            }
+            push_attr_delta_fields(&d.attr_delta, &mut fields);
+            format_fields("Directory", &fields)
+        }
+        LogNodeDelta::File(f) => {
+            let mut fields = Vec::new();
+            if !f.extents.is_empty() {
+                let ext_strs: Vec<String> = f.extents.iter().map(format_log_extent).collect();
+                fields.push(format!("extents: [{}]", ext_strs.join(", ")));
+            }
+            if let Some(size) = f.size {
+                if size >= 1024 {
+                    fields.push(format!("size: {} ({})", size, format_bytes(size)));
+                } else {
+                    fields.push(format!("size: {} B", size));
+                }
+            }
+            push_attr_delta_fields(&f.attr_delta, &mut fields);
+            format_fields("File", &fields)
+        }
+        LogNodeDelta::Symlink(s) => {
+            let mut fields = Vec::new();
+            if let Some(ref target) = s.target {
+                fields.push(format!("target: {:?}", target));
+            }
+            push_attr_delta_fields(&s.attr_delta, &mut fields);
+            format_fields("Symlink", &fields)
+        }
+        LogNodeDelta::Fifo(s) => {
+            let mut fields = Vec::new();
+            if s.rdev != 0 {
+                fields.push(format!("rdev: 0x{:x}", s.rdev));
+            }
+            push_attr_delta_fields(&s.attr_delta, &mut fields);
+            format_fields("Fifo", &fields)
+        }
+        LogNodeDelta::CharDevice(s) => {
+            let mut fields = Vec::new();
+            fields.push(format!("rdev: 0x{:x}", s.rdev));
+            push_attr_delta_fields(&s.attr_delta, &mut fields);
+            format_fields("CharDevice", &fields)
+        }
+        LogNodeDelta::BlockDevice(s) => {
+            let mut fields = Vec::new();
+            fields.push(format!("rdev: 0x{:x}", s.rdev));
+            push_attr_delta_fields(&s.attr_delta, &mut fields);
+            format_fields("BlockDevice", &fields)
+        }
+        LogNodeDelta::Socket(s) => {
+            let mut fields = Vec::new();
+            if s.rdev != 0 {
+                fields.push(format!("rdev: 0x{:x}", s.rdev));
+            }
+            push_attr_delta_fields(&s.attr_delta, &mut fields);
+            format_fields("Socket", &fields)
+        }
+    }
+}
+
+/// Formats a `LogEntryDelta` into a human-readable sparse string where only modified fields are displayed.
+pub fn format_log_entry_delta(delta: &LogEntryDelta) -> String {
+    match delta {
+        LogEntryDelta::Tombstone => "Tombstone".to_string(),
+        LogEntryDelta::Node(node) => format_log_node_delta(node),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1229,6 +1387,7 @@ mod tests {
         let v1_dump = dump_log_file(storage.as_ref(), "000001.log", 1, None).unwrap();
         assert!(v1_dump.contains("Sequential Record Stream"));
         assert!(v1_dump.contains("InodeDelta"));
+        assert!(v1_dump.contains("delta: Directory { parent: 1, added: [\"test.txt\" -> Inode 2], mode: 0o755 }"));
         assert!(v1_dump.contains("Data"));
         assert!(v1_dump.contains("FlushCommit"));
         assert!(v1_dump.contains("[COMMITTED]"));
@@ -1409,5 +1568,143 @@ mod tests {
         assert!(dump_snap_v2.contains("extents (2):"));
         assert!(dump_snap_v2.contains("000001.log [record offset 0x00000064 / 100"));
         assert!(dump_snap_v2.contains("000002.log [record offset 0x000000c8 / 200"));
+    }
+
+    #[test]
+    fn test_format_log_entry_delta_sparse_file_only_atime() {
+        use crate::clock::unix_to_system_time;
+        use crate::log::record::{LogAttrDelta, LogEntryDelta, LogFileDelta, LogNodeDelta};
+
+        let atime = unix_to_system_time(1789074226, 459059828);
+        let delta = LogEntryDelta::Node(LogNodeDelta::File(LogFileDelta {
+            extents: vec![],
+            size: None,
+            attr_delta: LogAttrDelta {
+                atime: Some(atime),
+                ..Default::default()
+            },
+        }));
+
+        let formatted = format_log_entry_delta(&delta);
+        assert!(formatted.starts_with("File { atime: 1789074226.459059828s"));
+        assert!(formatted.ends_with(" }"));
+        assert!(!formatted.contains("extents"));
+        assert!(!formatted.contains("size"));
+        assert!(!formatted.contains("mode"));
+        assert!(!formatted.contains("uid"));
+        assert!(!formatted.contains("gid"));
+        assert!(!formatted.contains("nlink"));
+        assert!(!formatted.contains("mtime"));
+        assert!(!formatted.contains("ctime"));
+        assert!(!formatted.contains("created_at"));
+        assert!(!formatted.contains("xattrs"));
+        assert!(!formatted.contains("None"));
+    }
+
+    #[test]
+    fn test_format_log_entry_delta_file_extents_and_size() {
+        use crate::log::record::{LogAttrDelta, LogEntryDelta, LogExtent, LogFileDelta, LogNodeDelta};
+
+        let delta = LogEntryDelta::Node(LogNodeDelta::File(LogFileDelta {
+            extents: vec![
+                LogExtent {
+                    file_offset: 0,
+                    record_log_offset: 28,
+                    record_size: 4124,
+                    length: 4096,
+                },
+                LogExtent {
+                    file_offset: 4096,
+                    record_log_offset: 0,
+                    record_size: 0,
+                    length: 8192,
+                },
+            ],
+            size: Some(12288),
+            attr_delta: LogAttrDelta::default(),
+        }));
+
+        let formatted = format_log_entry_delta(&delta);
+        assert_eq!(
+            formatted,
+            "File { extents: [[0x0..0x1000 (4.00 KiB) -> log offset 0x0000001c], [0x1000..0x3000 (8.00 KiB) -> hole]], size: 12288 (12.00 KiB) }"
+        );
+
+        let small_size_delta = LogEntryDelta::Node(LogNodeDelta::File(LogFileDelta {
+            extents: vec![],
+            size: Some(100),
+            attr_delta: LogAttrDelta::default(),
+        }));
+        assert_eq!(format_log_entry_delta(&small_size_delta), "File { size: 100 B }");
+    }
+
+    #[test]
+    fn test_format_log_entry_delta_directory_and_symlink() {
+        use crate::log::record::{LogAttrDelta, LogDirectoryDelta, LogEntryDelta, LogNodeDelta, LogSymlinkDelta};
+
+        let dir_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta {
+            parent: Some(1),
+            added: vec![("hello.txt".to_string(), 2)],
+            removed: vec!["old.txt".to_string()],
+            attr_delta: LogAttrDelta {
+                mode: Some(0o755),
+                uid: Some(1000),
+                gid: Some(1000),
+                nlink: Some(2),
+                ..Default::default()
+            },
+        }));
+        assert_eq!(
+            format_log_entry_delta(&dir_delta),
+            "Directory { parent: 1, added: [\"hello.txt\" -> Inode 2], removed: [\"old.txt\"], mode: 0o755, uid: 1000, gid: 1000, nlink: 2 }"
+        );
+
+        let symlink_delta = LogEntryDelta::Node(LogNodeDelta::Symlink(LogSymlinkDelta {
+            target: Some("/target/path".to_string()),
+            attr_delta: LogAttrDelta {
+                mode: Some(0o777),
+                ..Default::default()
+            },
+        }));
+        assert_eq!(
+            format_log_entry_delta(&symlink_delta),
+            "Symlink { target: \"/target/path\", mode: 0o777 }"
+        );
+    }
+
+    #[test]
+    fn test_format_log_entry_delta_special_nodes_and_xattrs() {
+        use crate::log::record::{LogAttrDelta, LogEntryDelta, LogNodeDelta, LogSpecialDelta};
+
+        let fifo_delta = LogEntryDelta::Node(LogNodeDelta::Fifo(LogSpecialDelta {
+            rdev: 0,
+            attr_delta: LogAttrDelta {
+                mode: Some(0o644),
+                ..Default::default()
+            },
+        }));
+        assert_eq!(format_log_entry_delta(&fifo_delta), "Fifo { mode: 0o644 }");
+
+        let char_delta = LogEntryDelta::Node(LogNodeDelta::CharDevice(LogSpecialDelta {
+            rdev: 0x105,
+            attr_delta: LogAttrDelta {
+                mode: Some(0o660),
+                xattrs: Some(vec![
+                    ("user.test".to_string(), Some(vec![1, 2, 3])),
+                    ("user.old".to_string(), None),
+                ]),
+                ..Default::default()
+            },
+        }));
+        assert_eq!(
+            format_log_entry_delta(&char_delta),
+            "CharDevice { rdev: 0x105, mode: 0o660, xattrs: [set \"user.test\" (3 B), remove \"user.old\"] }"
+        );
+
+        let tombstone = LogEntryDelta::Tombstone;
+        assert_eq!(format_log_entry_delta(&tombstone), "Tombstone");
+
+        let empty_file = LogEntryDelta::Node(LogNodeDelta::File(Default::default()));
+        assert_eq!(format_log_entry_delta(&empty_file), "File {}");
     }
 }
