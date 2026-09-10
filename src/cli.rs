@@ -20,10 +20,15 @@ pub const DEFAULT_MAX_EXTENT_SIZE: usize = 4 * 1024 * 1024;
 /// Default maximum staged mutation operations before triggering an automatic flush (10,000 ops).
 pub const DEFAULT_MAX_BUFFER_OPS: usize = 10_000;
 
-/// Default maximum number of frozen flush batches allowed to pile up before mutations are
-/// refused with ENOSPC/EIO. Bounds worst-case unflushed memory at roughly this many times
-/// `DEFAULT_MAX_BUFFER_SIZE` when the log is not draining.
-pub const DEFAULT_MAX_FLUSH_QUEUE_DEPTH: usize = 4;
+/// Default maximum number of frozen flush batches allowed to queue up in memory before
+/// auto-freezing is bounded (16 batches).
+pub const DEFAULT_MAX_FLUSH_QUEUE_DEPTH: usize = 16;
+
+/// Default maximum total bytes across all frozen flush batches queued in memory (256 MiB).
+pub const DEFAULT_MAX_FLUSH_QUEUE_BYTES: usize = 2 * DEFAULT_MAX_BUFFER_SIZE;
+
+/// Default maximum total mutating operations across all frozen flush batches queued in memory (20,000 ops).
+pub const DEFAULT_MAX_FLUSH_QUEUE_OPS: usize = 2 * DEFAULT_MAX_BUFFER_OPS;
 
 pub use crate::remote::block_cache::DEFAULT_DECRYPTED_CACHE_SIZE;
 
@@ -378,6 +383,18 @@ pub struct MountArgs {
     /// Interval in rolled log generations before generating a new .summary snapshot file during log rolls (default: 10, 0 to disable generation-based trigger)
     #[arg(long = "summary-interval-generations", default_value_t = DEFAULT_SUMMARY_INTERVAL_GENERATIONS)]
     pub summary_interval_generations: u64,
+
+    /// Maximum number of frozen flush batches queued in memory before freezing is blocked (default: 16)
+    #[arg(long = "max-flush-queue-depth", default_value_t = DEFAULT_MAX_FLUSH_QUEUE_DEPTH)]
+    pub max_flush_queue_depth: usize,
+
+    /// Maximum total bytes across all frozen flush batches queued in memory before freezing is blocked (default: 256 MiB)
+    #[arg(long = "max-flush-queue-bytes", default_value_t = DEFAULT_MAX_FLUSH_QUEUE_BYTES)]
+    pub max_flush_queue_bytes: usize,
+
+    /// Maximum total mutating operations across all frozen flush batches queued in memory before freezing is blocked (default: 20000)
+    #[arg(long = "max-flush-queue-ops", default_value_t = DEFAULT_MAX_FLUSH_QUEUE_OPS)]
+    pub max_flush_queue_ops: usize,
 }
 
 impl std::ops::Deref for MountArgs {

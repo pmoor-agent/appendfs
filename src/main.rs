@@ -440,6 +440,9 @@ fn cmd_mount(args: MountArgs) {
     fs_instance.max_buffer_size = args.flush_threshold;
     fs_instance.max_staged_ops = args.flush_threshold_ops;
     fs_instance.max_extent_size = args.max_extent_size;
+    fs_instance.max_flush_queue_depth = args.max_flush_queue_depth;
+    fs_instance.max_flush_queue_bytes = args.max_flush_queue_bytes;
+    fs_instance.max_flush_queue_ops = args.max_flush_queue_ops;
     fs_instance.flush_interval.store(args.flush_interval, Ordering::SeqCst);
     fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
 

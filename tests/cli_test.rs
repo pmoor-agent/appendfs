@@ -223,3 +223,46 @@ fn test_cli_remote_add_and_list_upload_partial_logs() {
         stderr
     );
 }
+
+#[test]
+fn test_cli_mount_args_flush_queue_bounds_defaults_and_overrides() {
+    use appendfs::cli::{
+        Cli, Commands, DEFAULT_MAX_FLUSH_QUEUE_BYTES, DEFAULT_MAX_FLUSH_QUEUE_DEPTH, DEFAULT_MAX_FLUSH_QUEUE_OPS,
+    };
+    use clap::Parser;
+
+    // Test defaults
+    let cli = Cli::try_parse_from(["appendfs", "mount", "/tmp/log", "/tmp/mnt"]).unwrap();
+    match cli.command {
+        Commands::Mount(args) => {
+            assert_eq!(args.max_flush_queue_depth, DEFAULT_MAX_FLUSH_QUEUE_DEPTH);
+            assert_eq!(args.max_flush_queue_depth, 16);
+            assert_eq!(args.max_flush_queue_bytes, DEFAULT_MAX_FLUSH_QUEUE_BYTES);
+            assert_eq!(args.max_flush_queue_ops, DEFAULT_MAX_FLUSH_QUEUE_OPS);
+        }
+        _ => panic!("expected Commands::Mount"),
+    }
+
+    // Test explicit flags
+    let cli = Cli::try_parse_from([
+        "appendfs",
+        "mount",
+        "/tmp/log",
+        "/tmp/mnt",
+        "--max-flush-queue-depth",
+        "32",
+        "--max-flush-queue-bytes",
+        "67108864",
+        "--max-flush-queue-ops",
+        "5000",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Mount(args) => {
+            assert_eq!(args.max_flush_queue_depth, 32);
+            assert_eq!(args.max_flush_queue_bytes, 67_108_864);
+            assert_eq!(args.max_flush_queue_ops, 5000);
+        }
+        _ => panic!("expected Commands::Mount"),
+    }
+}

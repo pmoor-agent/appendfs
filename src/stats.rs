@@ -353,6 +353,8 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     let max_staged_ops = fs.max_staged_ops;
     let max_extent_size = fs.max_extent_size;
     let max_flush_queue_depth = fs.max_flush_queue_depth;
+    let max_flush_queue_bytes = fs.max_flush_queue_bytes;
+    let max_flush_queue_ops = fs.max_flush_queue_ops;
 
     let bytes_since_summary = fs.bytes_since_last_summary.load(Ordering::SeqCst);
     let summary_interval_bytes = fs.summary_interval_bytes.load(Ordering::SeqCst);
@@ -375,11 +377,13 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     ));
     out.push_str(&format!("  Staged Operations:  {} / {}\n", staged_ops, max_staged_ops));
     out.push_str(&format!(
-        "  Flushing Queue:     {} / {} batches ({} data, {} ops)\n",
+        "  Flushing Queue:     {} / {} batches ({} / {} data, {} / {} ops)\n",
         flushing_batches,
         max_flush_queue_depth,
         format_bytes(flushing_bytes as u64),
-        flushing_ops
+        format_bytes(max_flush_queue_bytes as u64),
+        flushing_ops,
+        max_flush_queue_ops
     ));
     out.push_str(&format!(
         "  Max Extent Size:    {}\n",
