@@ -580,7 +580,7 @@ fn dump_encrypted_summary_without_key(
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "No key supplied: the inode table, manifest and index live in the").unwrap();
+    writeln!(out, "No key supplied: the inode table and manifest live in the").unwrap();
     writeln!(out, "encrypted body and cannot be shown. Pass --key-file to read them.").unwrap();
 
     Ok(out)
@@ -601,8 +601,8 @@ pub fn dump_summary_reader_with_path(
 
     let inodes = reader.read_all_inodes()?;
 
-    // Sort index entries by inode ascending
-    let mut sorted_inodes: Vec<u64> = reader.index_entries().iter().map(|e| e.inode).collect();
+    // Sort inodes ascending
+    let mut sorted_inodes: Vec<u64> = inodes.keys().copied().collect();
     sorted_inodes.sort_unstable();
 
     // Inode type counters

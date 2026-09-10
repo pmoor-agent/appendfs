@@ -598,11 +598,11 @@ fn test_summary_single_file_export_and_recovery() {
     assert_eq!(reader.header.generation, 1);
     assert_eq!(reader.footer.entry_count, 4); // root (1), docs dir (2), file1 (3), file2 (4)
 
-    // Perform O(log N) binary search lookups on index entries
-    let index_entries = reader.index_entries().to_vec();
-    for entry in &index_entries {
-        let node_opt = reader.read_node(entry.inode).unwrap();
-        assert!(node_opt.is_some());
+    // Verify inodes can be read sequentially
+    let all_nodes = reader.read_all_inodes().unwrap();
+    assert_eq!(all_nodes.len(), 4);
+    for ino in 1..=4 {
+        assert!(all_nodes.contains_key(&ino));
     }
 
     // Verify recovery: recover_fs should fast-load state from 000001.summary
@@ -2693,7 +2693,7 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
         let mut bytes = storage.get_file_bytes("000000.summary").unwrap();
         edit(&mut bytes);
         let n = bytes.len();
-        let digest = blake3::hash(&bytes[..n - 60]);
+        let digest = blake3::hash(&bytes[..n - 52]);
         bytes[n - 32..].copy_from_slice(digest.as_bytes());
         storage.insert_file("000000.summary", bytes);
     }
@@ -2703,15 +2703,8 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
             "manifest_offset past the body",
             Box::new(|b: &mut Vec<u8>| {
                 let n = b.len();
-                b[n - 60..n - 52].copy_from_slice(&(1u64 << 40).to_le_bytes());
-            }) as Box<dyn FnOnce(&mut Vec<u8>)>,
-        ),
-        (
-            "index_offset past the body",
-            Box::new(|b: &mut Vec<u8>| {
-                let n = b.len();
                 b[n - 52..n - 44].copy_from_slice(&(1u64 << 40).to_le_bytes());
-            }),
+            }) as Box<dyn FnOnce(&mut Vec<u8>)>,
         ),
         (
             "absurd entry_count",
