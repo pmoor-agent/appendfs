@@ -6,8 +6,8 @@
 
 use std::sync::{Arc, RwLock};
 
-/// Default capacity for an arena chunk buffer (4 MiB).
-pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+/// Default capacity for an arena chunk buffer (16 MiB).
+pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 /// A contiguous, thread-safe memory chunk buffer for staging extent data.
 #[derive(Debug, Clone)]
@@ -144,5 +144,12 @@ mod tests {
         assert_eq!(slices[0].2, 350);
         assert_eq!(arena.chunks.len(), 1);
         assert!(arena.chunks[0].capacity >= 350);
+    }
+
+    #[test]
+    fn test_arena_default_chunk_size() {
+        let arena = WriteArena::default();
+        assert_eq!(arena.chunk_size, 16 * 1024 * 1024);
+        assert_eq!(DEFAULT_CHUNK_SIZE, 16 * 1024 * 1024);
     }
 }
