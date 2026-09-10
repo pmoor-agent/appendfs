@@ -28,6 +28,7 @@ use crate::node::{EntryDelta, Node};
 use crate::storage::Storage;
 use crate::sync::{ActionGuard, ActionMutex, OpTag, PostUnlockQueue};
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -141,6 +142,96 @@ impl From<DirHandle> for Handle {
 
 pub type HandleMap = HashMap<u64, Handle>;
 
+pub type BatchCallback = Box<dyn FnOnce(std::io::Result<()>) + Send + 'static>;
+
+struct BatchCompletionInner {
+    result: Option<std::io::Result<()>>,
+    callbacks: Vec<BatchCallback>,
+}
+
+/// Thread-safe synchronization handle allowing one or more waiters (via non-blocking callbacks
+/// or async wait) to be notified when a specific `FlushBatch` has been committed and synced to disk.
+#[derive(Clone)]
+pub struct BatchCompletion {
+    state: Arc<Mutex<BatchCompletionInner>>,
+}
+
+impl Default for BatchCompletion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for BatchCompletion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let is_done = self.is_completed();
+        f.debug_struct("BatchCompletion")
+            .field("is_completed", &is_done)
+            .finish()
+    }
+}
+
+impl BatchCompletion {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(BatchCompletionInner {
+                result: None,
+                callbacks: Vec::new(),
+            })),
+        }
+    }
+
+    /// Registers an asynchronous callback to be invoked when this batch completes.
+    /// If the batch has already finished, the callback runs immediately.
+    pub fn add_callback(&self, callback: BatchCallback) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(ref res) = guard.result {
+            let res_clone = match res {
+                Ok(()) => Ok(()),
+                Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+            };
+            drop(guard);
+            callback(res_clone);
+        } else {
+            guard.callbacks.push(callback);
+        }
+    }
+
+    /// Marks the batch as completed with `result`, running all registered callbacks.
+    pub fn complete(&self, result: std::io::Result<()>) {
+        let mut guard = self.state.lock().unwrap();
+        assert!(guard.result.is_none(), "batch has already been completed");
+        guard.result = Some(match &result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+        });
+        let callbacks = std::mem::take(&mut guard.callbacks);
+        drop(guard);
+        for cb in callbacks {
+            let res = match &result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+            };
+            cb(res);
+        }
+    }
+
+    /// Asynchronously waits until the batch completes and yields its result.
+    pub async fn wait(&self) -> std::io::Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.add_callback(Box::new(move |res| {
+            let _ = tx.send(res);
+        }));
+        rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Interrupted, "batch cancelled"))?
+    }
+
+    /// Returns true if this batch has already completed.
+    pub fn is_completed(&self) -> bool {
+        self.state.lock().unwrap().result.is_some()
+    }
+}
+
 /// An immutable frozen batch of mutations being written to the log, holding its
 /// corresponding write arena chunk buffers and batch statistics.
 #[derive(Debug, Clone)]
@@ -150,6 +241,7 @@ pub struct FlushBatch {
     pub arena: WriteArena,
     pub bytes: usize,
     pub ops: usize,
+    pub completion: BatchCompletion,
 }
 
 impl FlushBatch {
@@ -161,6 +253,7 @@ impl FlushBatch {
             arena,
             bytes,
             ops,
+            completion: BatchCompletion::new(),
         }
     }
 }
@@ -194,9 +287,36 @@ pub struct FsInner {
     pub flushing_bytes: usize,
     /// Total mutating operations across all frozen batches in `flushing`.
     pub flushing_ops: usize,
+    /// Condition variable notified whenever capacity opens up in the `flushing` queue.
+    pub capacity_cvar: Arc<Condvar>,
 }
 
 impl FsInner {
+    /// Pops the committed batch from the front of the flushing queue, asserting its ID matches `batch.id`,
+    /// and notifies `capacity_cvar` with lock held.
+    pub fn pop_flushed_batch(&mut self, batch: &FlushBatch) -> FlushBatch {
+        let front = self.flushing.front().expect("flushing queue must not be empty");
+        assert_eq!(
+            front.id, batch.id,
+            "front of flushing queue must match committed batch ID"
+        );
+        let popped = self.flushing.pop_front().unwrap();
+        self.flushing_bytes -= popped.bytes;
+        self.flushing_ops -= popped.ops;
+        self.capacity_cvar.notify_all();
+        popped
+    }
+
+    /// Pops the front batch from the flushing queue and notifies `capacity_cvar` with lock held.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn pop_flushing_batch(&mut self) -> Option<FlushBatch> {
+        let batch = self.flushing.pop_front()?;
+        self.flushing_bytes -= batch.bytes;
+        self.flushing_ops -= batch.ops;
+        self.capacity_cvar.notify_all();
+        Some(batch)
+    }
+
     /// Records a mutation of `additional_bytes` and increments staged operation count by 1.
     pub fn record_mutation(&mut self, additional_bytes: usize) {
         self.staged_bytes += additional_bytes;
@@ -529,6 +649,7 @@ impl InMemoryFS {
             staged_ops: 0,
             flushing_bytes: 0,
             flushing_ops: 0,
+            capacity_cvar: Arc::new(Condvar::new()),
         };
 
         let fs = Self {

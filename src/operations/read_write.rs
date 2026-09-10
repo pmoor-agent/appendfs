@@ -567,34 +567,63 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
     }
 }
 
-pub fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
-    if fh != 0 {
-        fs.with_inner(OpTag::Handle, |inner| inner.validate_regular_handle(ino, fh))?;
-    }
-    fs.sync_log().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+#[cfg(any(test, feature = "testing"))]
+pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
+    let completion = fs.rollover_for_fsync(ino, fh)?;
+    let Some(completion) = completion else {
+        if let Some(ref writer) = fs.log_writer {
+            let writer_clone = Arc::clone(writer);
+            tokio::task::spawn_blocking(move || writer_clone.sync())
+                .await
+                .map_err(|_| libc::EIO)?
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        }
+        return Ok(());
+    };
+
+    fs.notify_flush_trigger(true);
+    completion
+        .wait()
+        .await
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
 }
 
-pub fn fsync(fs: &Arc<InMemoryFS>, req: Request, ino: u64, datasync: bool, fh: u64) {
+pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
     log::trace!("fsync(ino={}, datasync={}, fh={})", ino, datasync, fh);
-    if fh != 0
-        && let Err(e) = fs.with_inner(OpTag::Handle, |inner| inner.validate_regular_handle(ino, fh))
-    {
-        req.reply_err(e);
-        return;
-    }
-    if fs.log_writer.is_none() {
+    let completion = match fs.rollover_for_fsync(ino, fh) {
+        Ok(c) => c,
+        Err(e) => {
+            req.reply_err(e);
+            return;
+        }
+    };
+
+    let Some(completion) = completion else {
+        if let Some(ref writer) = fs.log_writer {
+            let guard = fs.begin_async_op();
+            let writer_clone = Arc::clone(writer);
+            crate::async_runtime::spawn(async move {
+                let _guard = guard;
+                let res = tokio::task::spawn_blocking(move || writer_clone.sync()).await;
+                match res {
+                    Ok(Ok(())) => req.reply_err(0),
+                    Ok(Err(e)) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
+                    Err(_) => req.reply_err(libc::EIO),
+                }
+            });
+            return;
+        }
         req.reply_err(0);
         return;
-    }
+    };
+
+    fs.notify_flush_trigger(true);
     let guard = fs.begin_async_op();
-    let fs_clone = Arc::clone(fs);
     crate::async_runtime::spawn(async move {
         let _guard = guard;
-        let res = tokio::task::spawn_blocking(move || fs_clone.sync_log()).await;
-        match res {
-            Ok(Ok(())) => req.reply_err(0),
-            Ok(Err(e)) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
-            Err(_) => req.reply_err(libc::EIO),
+        match completion.wait().await {
+            Ok(()) => req.reply_err(0),
+            Err(e) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     });
 }
@@ -615,6 +644,7 @@ pub fn release(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
 mod tests {
     use super::*;
     use crate::fs::InMemoryFS;
+    use crate::{LogWriter, Storage, SystemClock};
 
     fn file_with(fs: &InMemoryFS, contents: &[u8]) -> u64 {
         let attr = create_core(fs, 1, "f.bin", 0o644, 0, 1000, 1000).unwrap();
@@ -768,5 +798,71 @@ mod tests {
         assert_eq!(post_fallocate - pre_fallocate, 1);
         assert_eq!(post_total - pre_total, 1);
         assert_eq!(fs.get_attr(ino).unwrap().size, 700);
+    }
+
+    #[test]
+    fn test_fsync_single_lock_acquisition() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        let file = create_core(&fs, 1, "fsync_lock.bin", 0o644, 0, 1000, 1000).unwrap();
+        let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
+        write_core(&fs, file.ino, b"test", 0).unwrap();
+
+        let pre_total = fs.inner.lock_count();
+        let pre_stats = fs.inner.op_stats();
+        let pre_flush = pre_stats.iter().find(|s| s.tag == OpTag::Flush).unwrap().count;
+
+        // Call fsync_core rollover with open file handle fh
+        let res = fs.rollover_for_fsync(file.ino, fh);
+        assert!(res.is_ok());
+
+        let post_total = fs.inner.lock_count();
+        let post_stats = fs.inner.op_stats();
+        let post_flush = post_stats.iter().find(|s| s.tag == OpTag::Flush).unwrap().count;
+
+        // Exactly 1 lock acquisition performed for both handle validation and live rollover
+        assert_eq!(post_total - pre_total, 1);
+        assert_eq!(post_flush - pre_flush, 1);
+    }
+
+    #[test]
+    fn test_fsync_and_fsyncdir_core_async() {
+        crate::async_runtime::block_on(async {
+            let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+            let clock = Arc::new(SystemClock);
+            let writer = Arc::new(
+                LogWriter::create(
+                    storage.clone(),
+                    1,
+                    &*clock,
+                    crate::cli::DEFAULT_MAX_LOG_SIZE,
+                    1,
+                    crate::crypto::VolumeKey::plaintext_arc(),
+                )
+                .unwrap(),
+            );
+            let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+            let file = create_core(&fs, 1, "fsync_core.bin", 0o644, 0, 1000, 1000).unwrap();
+            let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
+            write_core(&fs, file.ino, b"async fsync test", 0).unwrap();
+
+            let res = fsync_core(&fs, file.ino, fh).await;
+            assert_eq!(res, Ok(()));
+
+            let dir_res = crate::operations::dir::fsyncdir_core(&fs).await;
+            assert_eq!(dir_res, Ok(()));
+        });
     }
 }
