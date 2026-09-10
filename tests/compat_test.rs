@@ -205,13 +205,13 @@ fn test_v1_deterministic_reproducibility() {
 }
 
 /// Verifies that dump output for all canonical volume files in `fixture_dir` matches
-/// the checked-in golden `.dump` files.
+/// the checked-in golden `-dump.txt` files.
 pub fn verify_fixture_dumps(fixture_dir: &Path) {
     let storage = OsStorage::new(fixture_dir);
     let volume_key = resolve_fixture_volume_key(fixture_dir);
 
     for name in appendfs::compat::COMPAT_FIXTURE_FILES {
-        let dump_filename = format!("{}.dump", name);
+        let dump_filename = format!("{}-dump.txt", name);
         let golden_path = fixture_dir.join(&dump_filename);
         assert!(
             golden_path.is_file(),

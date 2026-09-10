@@ -65,7 +65,11 @@ pub const COMPAT_SUMMARY_1_IV: [u8; 12] = [0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0
 pub const COMPAT_FIXTURE_FILES: &[&str] = &["000000.summary", "000001.log", "000001.summary"];
 
 /// Canonical list of golden fixture dump file basenames.
-pub const COMPAT_FIXTURE_DUMP_FILES: &[&str] = &["000000.summary.dump", "000001.log.dump", "000001.summary.dump"];
+pub const COMPAT_FIXTURE_DUMP_FILES: &[&str] = &[
+    "000000.summary-dump.txt",
+    "000001.log-dump.txt",
+    "000001.summary-dump.txt",
+];
 
 /// Resolves the volume key required to open `fixture_dir`, unlocking encrypted fixtures
 /// with the canonical test passphrase.
@@ -84,12 +88,12 @@ pub fn resolve_fixture_volume_key(fixture_dir: &Path) -> Arc<VolumeKey> {
     }
 }
 
-/// Generates golden `.dump` files for the canonical volume files in `dir`.
+/// Generates golden `-dump.txt` files for the canonical volume files in `dir`.
 pub fn generate_compat_dump_files(dir: &Path, volume_key: Option<&VolumeKey>) -> io::Result<()> {
     let storage = OsStorage::new(dir);
     for name in COMPAT_FIXTURE_FILES {
         let dump_text = crate::dump::dump_file(&storage, name, 1, volume_key)?;
-        fs::write(dir.join(format!("{}.dump", name)), dump_text)?;
+        fs::write(dir.join(format!("{}-dump.txt", name)), dump_text)?;
     }
     Ok(())
 }
