@@ -923,13 +923,13 @@ mod tests {
     fn test_fs_inner_guard_mutation_tracking() {
         let fs = InMemoryFS::new();
         {
-            let guard = fs.lock_inner(OpTag::ReadPlan);
+            let guard = fs.lock_inner_for_tests();
             assert!(!guard.mutation_occurred());
             assert_eq!(guard.staged_bytes, 0);
             assert_eq!(guard.staged_ops, 0);
         }
         {
-            let mut guard = fs.lock_inner(OpTag::Write);
+            let mut guard = fs.lock_inner_for_tests();
             assert!(!guard.mutation_occurred());
             guard.record_mutation(128);
             assert!(guard.mutation_occurred());

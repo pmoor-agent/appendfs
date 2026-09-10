@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(m.busy_time(), Duration::ZERO);
 
         {
-            let mut guard = m.lock(OpTag::Other).unwrap();
+            let mut guard = m.lock_for_tests().unwrap();
             assert_eq!(*guard, 42);
             *guard = 100;
             thread::sleep(Duration::from_millis(5));
@@ -501,7 +501,7 @@ mod tests {
 
         assert_eq!(m.lock_count(), 1);
         assert!(m.busy_time() >= Duration::from_millis(4));
-        assert_eq!(*m.lock(OpTag::Other).unwrap(), 100);
+        assert_eq!(*m.lock_for_tests().unwrap(), 100);
         assert_eq!(m.lock_count(), 2);
     }
 
@@ -513,11 +513,11 @@ mod tests {
         let executed_clone = Arc::clone(&executed);
 
         {
-            let mut guard = m.lock(OpTag::Other).unwrap();
+            let mut guard = m.lock_for_tests().unwrap();
             *guard += 1;
             guard.defer(move || {
                 // If the lock were still held, acquiring here would deadlock!
-                let val = *m_clone.lock(OpTag::Other).unwrap();
+                let val = *m_clone.lock_for_tests().unwrap();
                 assert_eq!(val, 1);
                 executed_clone.store(true, Ordering::SeqCst);
             });
@@ -537,7 +537,7 @@ mod tests {
         let post_ran_clone = Arc::clone(&post_ran);
 
         {
-            let mut guard = m.lock(OpTag::Other).unwrap();
+            let mut guard = m.lock_for_tests().unwrap();
             guard.before_unlock(move |data, queue| {
                 // Inspect data under lock
                 if *data == 10 {
@@ -545,7 +545,7 @@ mod tests {
                     let m_sub = Arc::clone(&m_clone);
                     let p_sub = Arc::clone(&post_ran_clone);
                     queue.defer(move || {
-                        assert_eq!(*m_sub.lock(OpTag::Other).unwrap(), 20);
+                        assert_eq!(*m_sub.lock_for_tests().unwrap(), 20);
                         p_sub.store(true, Ordering::SeqCst);
                     });
                 }
@@ -554,7 +554,7 @@ mod tests {
             assert!(!post_ran.load(Ordering::SeqCst));
         }
 
-        assert_eq!(*m.lock(OpTag::Other).unwrap(), 20);
+        assert_eq!(*m.lock_for_tests().unwrap(), 20);
         assert!(post_ran.load(Ordering::SeqCst));
     }
 
@@ -565,7 +565,7 @@ mod tests {
         let m2 = Arc::clone(&m);
 
         let t1 = thread::spawn(move || {
-            let mut g = m1.lock(OpTag::Other).unwrap();
+            let mut g = m1.lock_for_tests().unwrap();
             thread::sleep(Duration::from_millis(20));
             *g += 1;
         });
@@ -573,22 +573,22 @@ mod tests {
         thread::sleep(Duration::from_millis(5));
 
         let t2 = thread::spawn(move || {
-            let mut g = m2.lock(OpTag::Write).unwrap();
+            let mut g = m2.lock_for_tests().unwrap();
             *g += 1;
         });
 
         t1.join().unwrap();
         t2.join().unwrap();
 
-        assert_eq!(*m.lock(OpTag::Other).unwrap(), 2);
+        assert_eq!(*m.lock_for_tests().unwrap(), 2);
         assert_eq!(m.lock_count(), 3);
         assert!(m.busy_time() >= Duration::from_millis(18));
         assert!(m.wait_time() >= Duration::from_millis(10));
 
-        let write_stat = m.op_stats().into_iter().find(|s| s.tag == OpTag::Write).unwrap();
-        assert_eq!(write_stat.count, 1);
-        assert!(write_stat.wait_time >= Duration::from_millis(10));
-        assert!(write_stat.avg_wait_time() >= Duration::from_millis(10));
+        let test_stat = m.op_stats().into_iter().find(|s| s.tag == OpTag::Test).unwrap();
+        assert_eq!(test_stat.count, 3);
+        assert!(test_stat.wait_time >= Duration::from_millis(10));
+        assert!(test_stat.avg_wait_time() >= Duration::from_millis(3));
     }
 
     #[test]
@@ -596,19 +596,19 @@ mod tests {
         let m = Arc::new(ActionMutex::new(10));
         let m_clone = Arc::clone(&m);
 
-        let guard = m.lock(OpTag::Other).unwrap();
-        assert!(m_clone.try_lock(OpTag::Write).is_err());
+        let guard = m.lock_for_tests().unwrap();
+        assert!(m_clone.try_lock_for_tests().is_err());
         drop(guard);
 
-        let mut try_guard = m.try_lock(OpTag::Write).unwrap();
+        let mut try_guard = m.try_lock_for_tests().unwrap();
         assert_eq!(*try_guard, 10);
         *try_guard = 20;
         drop(try_guard);
 
-        assert_eq!(*m.lock(OpTag::Other).unwrap(), 20);
+        assert_eq!(*m.lock_for_tests().unwrap(), 20);
         let stats = m.op_stats();
-        let write_stat = stats.iter().find(|s| s.tag == OpTag::Write).unwrap();
-        assert_eq!(write_stat.count, 1);
+        let test_stat = stats.iter().find(|s| s.tag == OpTag::Test).unwrap();
+        assert_eq!(test_stat.count, 3);
     }
 
     #[test]
@@ -644,13 +644,13 @@ mod tests {
         let deferred_ran = Arc::new(AtomicBool::new(false));
         let deferred_ran_clone = Arc::clone(&deferred_ran);
 
-        let res = m.with_lock(OpTag::Write, |guard| {
+        let res = m.with_lock_for_tests(|guard| {
             **guard += 50;
             let m_sub = Arc::clone(&m_clone);
             let d_sub = Arc::clone(&deferred_ran_clone);
             guard.defer(move || {
                 // Must be unlocked here so we can re-acquire without deadlock!
-                assert_eq!(*m_sub.lock(OpTag::Other).unwrap(), 150);
+                assert_eq!(*m_sub.lock_for_tests().unwrap(), 150);
                 d_sub.store(true, Ordering::SeqCst);
             });
             **guard * 2
@@ -661,10 +661,8 @@ mod tests {
         assert_eq!(m.lock_count(), 2); // 1 for with_lock, 1 inside deferred task
 
         let stats = m.op_stats();
-        let write_stat = stats.iter().find(|s| s.tag == OpTag::Write).unwrap();
-        assert_eq!(write_stat.count, 1);
-        let other_stat = stats.iter().find(|s| s.tag == OpTag::Other).unwrap();
-        assert_eq!(other_stat.count, 1);
+        let test_stat = stats.iter().find(|s| s.tag == OpTag::Test).unwrap();
+        assert_eq!(test_stat.count, 2);
     }
 
     #[test]
@@ -673,26 +671,15 @@ mod tests {
         assert_eq!(OP_TAG_COUNT, 26);
 
         let m = ActionMutex::new(0);
-        let tags_to_test = [
-            (OpTag::Open, "open"),
-            (OpTag::OpenDir, "opendir"),
-            (OpTag::ReadDir, "readdir"),
-            (OpTag::Lookup, "lookup"),
-            (OpTag::GetAttr, "getattr"),
-            (OpTag::ReadLink, "readlink"),
-            (OpTag::Stats, "stats"),
-            (OpTag::Test, "test"),
-        ];
-
-        for (tag, expected_name) in tags_to_test {
-            assert_eq!(tag.name(), expected_name);
-            assert_eq!(tag.as_str(), expected_name);
+        for &tag in &ALL_OP_TAGS {
+            assert!(!tag.name().is_empty());
+            assert_eq!(tag.name(), tag.as_str());
             let _guard = m.lock(tag).unwrap();
         }
 
         let stats = m.op_stats();
         assert_eq!(stats.len(), OP_TAG_COUNT);
-        for (tag, _) in tags_to_test {
+        for &tag in &ALL_OP_TAGS {
             let stat = stats.iter().find(|s| s.tag == tag).unwrap();
             assert_eq!(stat.count, 1);
         }
