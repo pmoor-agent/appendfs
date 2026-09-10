@@ -59,16 +59,12 @@ pub enum Commands {
     /// Mount volume in read-only mode (with optional point-in-time time-travel recovery)
     #[command(name = "mount-ro")]
     MountRo(MountRoArgs),
-    /// Alias for mount-ro (read-only mount)
-    Mountro(MountRoArgs),
     /// Display volume statistics, inode breakdown, and log live extent ratios
     Stats(StatsArgs),
     /// Inspect and dump records from a single .log file
     Dump(DumpArgs),
     /// Check volume integrity and consistency (hierarchy, link counts, extents, manifests)
-    Check(CheckArgs),
-    /// Alias for check (filesystem consistency check)
-    Fsck(CheckArgs),
+    Fsck(FsckArgs),
     /// Manage remote S3-compatible replication targets
     Remote(RemoteSubcommandArgs),
 }
@@ -460,7 +456,7 @@ pub struct StatsArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct CheckArgs {
+pub struct FsckArgs {
     /// Directory path where the appendfs volume log and summary files are stored
     pub log_dir: PathBuf,
 

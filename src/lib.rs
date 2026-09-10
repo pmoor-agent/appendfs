@@ -29,7 +29,7 @@ pub use check::{
     IntegrityIssue, IntegrityReport, IssueLevel, check_fs_integrity, check_remote_integrity, check_volume,
 };
 pub use cli::{
-    CheckArgs, Cli, Commands, DumpArgs, InitArgs, MountArgs, MountRoArgs, StatsArgs, find_latest_generation,
+    Cli, Commands, DumpArgs, FsckArgs, InitArgs, MountArgs, MountRoArgs, StatsArgs, find_latest_generation,
     find_latest_generation_in_storage,
 };
 pub use clock::{AdvancingClock, Clock, MockClock, SystemClock, format_local_civil_time, parse_timestamp};

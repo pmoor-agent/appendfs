@@ -21,13 +21,13 @@ fn test_cli_stats_on_empty_directory_fails() {
 }
 
 #[test]
-fn test_cli_check_on_empty_directory_fails() {
+fn test_cli_fsck_on_empty_directory_fails() {
     let temp_dir = TempDir::new().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .arg("check")
+        .arg("fsck")
         .arg(temp_dir.path())
         .output()
-        .expect("failed to run appendfs check");
+        .expect("failed to run appendfs fsck");
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

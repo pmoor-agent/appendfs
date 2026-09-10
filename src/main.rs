@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::too_many_lines))]
 use appendfs::cli::{
-    CheckArgs, Cli, Commands, DumpArgs, InitArgs, MountArgs, MountRoArgs, RemoteAddArgs, RemoteCommands,
-    RemoteListArgs, RemoteRmArgs, RemoteSubcommandArgs, StatsArgs,
+    Cli, Commands, DumpArgs, FsckArgs, InitArgs, MountArgs, MountRoArgs, RemoteAddArgs, RemoteCommands, RemoteListArgs,
+    RemoteRmArgs, RemoteSubcommandArgs, StatsArgs,
 };
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{
@@ -258,10 +258,10 @@ fn main() {
     match cli.command {
         Commands::Init(args) => cmd_init(args),
         Commands::Mount(args) => cmd_mount(args),
-        Commands::MountRo(args) | Commands::Mountro(args) => cmd_mount_ro(args),
+        Commands::MountRo(args) => cmd_mount_ro(args),
         Commands::Stats(args) => cmd_stats(args),
         Commands::Dump(args) => cmd_dump(args),
-        Commands::Check(args) | Commands::Fsck(args) => cmd_check(args),
+        Commands::Fsck(args) => cmd_fsck(args),
         Commands::Remote(subargs) => cmd_remote(subargs),
     }
 }
@@ -671,7 +671,7 @@ fn cmd_dump(args: DumpArgs) {
     }
 }
 
-fn cmd_check(args: CheckArgs) {
+fn cmd_fsck(args: FsckArgs) {
     let log_dir = &args.log_dir;
     if let Some(ref remote_name) = args.remote {
         let OpenVolumeStorage {
