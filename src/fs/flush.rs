@@ -348,8 +348,8 @@ impl InMemoryFS {
 
     /// Number of frozen batches currently waiting to be written to the log.
     #[cfg(any(test, feature = "testing"))]
-    pub fn flush_queue_depth(&self, tag: OpTag) -> usize {
-        self.inner.lock(tag).unwrap().flushing.len()
+    pub fn flush_queue_depth(&self) -> usize {
+        self.inner.lock(OpTag::Stats).unwrap().flushing.len()
     }
 
     /// Wakes up the background periodic flusher immediately to drain pending batches.
@@ -422,7 +422,7 @@ impl InMemoryFS {
     /// Dynamically calculates live extent statistics across all active files and log generations.
     pub fn calculate_generation_live_stats(&self) -> Vec<GenerationLiveStats> {
         let manifest = self.manifest.read().unwrap().clone();
-        let base = self.inner.lock(OpTag::Other).unwrap().base.clone();
+        let base = self.inner.lock(OpTag::Stats).unwrap().base.clone();
 
         let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
         for node_arc in base.values() {
@@ -712,7 +712,7 @@ mod tests {
 
         // Verify that live extent map coalesced the sequential writes in memory
         {
-            let inner = fs.inner.lock(OpTag::Other).unwrap();
+            let inner = fs.inner.lock_for_tests().unwrap();
             if let Some(EntryDelta::Node(NodeDelta::File(f))) = inner.live.get(&ino) {
                 assert_eq!(f.extents.len(), 1);
             } else {
@@ -725,7 +725,7 @@ mod tests {
 
         // Verify that base has exactly 1 consolidated extent of length 50
         {
-            let inner = fs.inner.lock(OpTag::Other).unwrap();
+            let inner = fs.inner.lock_for_tests().unwrap();
             let node_arc = inner.base.get(&ino).expect("inode missing in base");
             let node = node_arc.as_ref();
             if let NodeKind::File { extent_map, size, .. } = &node.kind {
@@ -813,7 +813,7 @@ mod tests {
             fs.sync_log().unwrap();
 
             {
-                let inner = fs.inner.lock(OpTag::Other).unwrap();
+                let inner = fs.inner.lock_for_tests().unwrap();
                 let node = inner.base.get(&ino).expect("inode missing in base");
                 if let NodeKind::File { extent_map, size, .. } = &node.kind {
                     assert_eq!(*size as usize, TOTAL);
@@ -1113,7 +1113,7 @@ mod tests {
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         let ino1 = fs.allocate_inode();
-        fs.inner.lock(OpTag::Other).unwrap().base.insert(
+        fs.inner.lock_for_tests().unwrap().base.insert(
             ino1,
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, clock.now()),
@@ -1245,7 +1245,7 @@ mod tests {
             crate::crypto::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let base = recovered.inner.lock(OpTag::Other).unwrap().base.clone();
+        let base = recovered.inner.lock_for_tests().unwrap().base.clone();
         assert_eq!(base.len(), 1); // ONLY root directory (inode 1) remains!
         assert!(base.contains_key(&1));
 
@@ -1353,14 +1353,14 @@ mod tests {
             let name = format!("file_{}.txt", i);
             crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
         }
-        assert_eq!(fs.staged_ops(OpTag::Flush), 4);
+        assert_eq!(fs.staged_ops(), 4);
         assert_eq!(fs.manifest.read().unwrap().logs[0].record_count, 0);
 
         // 5th operation reaches threshold and triggers automatic flush!
         crate::operations::read_write::create_core(&fs, 1, "file_4.txt", 0o644, 0, 1000, 1000).unwrap();
 
         // Staged ops reset to 0 after automatic flush
-        assert_eq!(fs.staged_ops(OpTag::Flush), 0);
+        assert_eq!(fs.staged_ops(), 0);
         assert_eq!(fs.manifest.read().unwrap().logs[0].record_count, 7); // 5 files + 1 root dir + 1 FlushCommit
     }
 
@@ -1409,7 +1409,7 @@ mod tests {
             crate::crypto::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let base = recovered.inner.lock(OpTag::Other).unwrap().base.clone();
+        let base = recovered.inner.lock_for_tests().unwrap().base.clone();
 
         // Only root inode (1) should exist; NO resurrected /file_{ino} or phantom entries!
         assert_eq!(base.len(), 1, "Expected only root inode in base");
@@ -1812,7 +1812,7 @@ mod tests {
         );
 
         {
-            let inner = from_log.inner.lock(OpTag::Other).unwrap();
+            let inner = from_log.inner.lock_for_tests().unwrap();
             let node = inner.base.get(&ino).unwrap();
             if let crate::node::NodeKind::File { ref extent_map, .. } = node.kind {
                 let hole_entry = extent_map
@@ -1856,7 +1856,7 @@ mod tests {
         );
 
         {
-            let inner = from_summary.inner.lock(OpTag::Other).unwrap();
+            let inner = from_summary.inner.lock_for_tests().unwrap();
             let node = inner.base.get(&ino).unwrap();
             if let crate::node::NodeKind::File { ref extent_map, .. } = node.kind {
                 let hole_entry = extent_map
@@ -1950,40 +1950,40 @@ mod tests {
         // Automatic threshold triggered begin_flush()!
         // In unmounted environment without background flusher, threshold trigger flushes inline,
         // so queue depth is 0 and staged counters are 0.
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 0);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 0);
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.staged_ops(), 0);
 
         // Now simulate active background flusher with queued batch:
         // Populate live with 60 bytes
         crate::operations::read_write::write_core(&fs, file.ino, &[0xBB; 60], 100).unwrap();
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 60);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 1);
+        assert_eq!(fs.staged_bytes(), 60);
+        assert_eq!(fs.staged_ops(), 1);
 
         // Freeze batch into queue manually (simulating begin_flush when flusher starts or when threshold hit)
         fs.begin_flush();
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 1);
+        assert_eq!(fs.flush_queue_depth(), 1);
         // Counters must be reset to 0 upon freezing into flushing queue, and moved to flushing counters
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 0);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 0);
-        assert_eq!(fs.flushing_bytes(OpTag::Flush), 60);
-        assert_eq!(fs.flushing_ops(OpTag::Flush), 1);
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.staged_ops(), 0);
+        assert_eq!(fs.flushing_bytes(), 60);
+        assert_eq!(fs.flushing_ops(), 1);
 
         // Subsequent write arriving while batch 1 is in flushing queue
         crate::operations::read_write::write_core(&fs, file.ino, &[0xCC; 20], 160).unwrap();
         // Should NOT trigger another begin_flush()! Queue depth must remain 1
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 1);
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 20);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 1);
-        assert_eq!(fs.flushing_bytes(OpTag::Flush), 60);
-        assert_eq!(fs.flushing_ops(OpTag::Flush), 1);
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.staged_bytes(), 20);
+        assert_eq!(fs.staged_ops(), 1);
+        assert_eq!(fs.flushing_bytes(), 60);
+        assert_eq!(fs.flushing_ops(), 1);
 
         // Another small write
         crate::operations::read_write::write_core(&fs, file.ino, &[0xDD; 20], 180).unwrap();
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 1);
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 40);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 2);
-        assert_eq!(fs.flushing_bytes(OpTag::Flush), 60);
-        assert_eq!(fs.flushing_ops(OpTag::Flush), 1);
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.staged_bytes(), 40);
+        assert_eq!(fs.staged_ops(), 2);
+        assert_eq!(fs.flushing_bytes(), 60);
+        assert_eq!(fs.flushing_ops(), 1);
 
         // Now drain flushing batches
         while let Some(batch) = fs.pop_flushing_batch() {
@@ -1991,10 +1991,10 @@ mod tests {
         }
 
         // Live staged data is preserved and flushing counters are drained to 0
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 40);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 2);
-        assert_eq!(fs.flushing_bytes(OpTag::Flush), 0);
-        assert_eq!(fs.flushing_ops(OpTag::Flush), 0);
+        assert_eq!(fs.staged_bytes(), 40);
+        assert_eq!(fs.staged_ops(), 2);
+        assert_eq!(fs.flushing_bytes(), 0);
+        assert_eq!(fs.flushing_ops(), 0);
     }
 
     #[test]
@@ -2007,24 +2007,24 @@ mod tests {
         // Populate batch 1
         crate::operations::read_write::write_core(&fs, file.ino, &[0x11; 30], 0).unwrap();
         assert!(fs.begin_flush());
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 1);
+        assert_eq!(fs.flush_queue_depth(), 1);
 
         // Populate batch 2
         crate::operations::read_write::write_core(&fs, file.ino, &[0x22; 40], 30).unwrap();
         assert!(fs.begin_flush());
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 2);
+        assert_eq!(fs.flush_queue_depth(), 2);
 
         // Queue is now full (len == max_flush_queue_depth == 2).
         // Populate live with batch 3 candidates
         crate::operations::read_write::write_core(&fs, file.ino, &[0x33; 50], 70).unwrap();
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 50);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 1);
+        assert_eq!(fs.staged_bytes(), 50);
+        assert_eq!(fs.staged_ops(), 1);
 
         // begin_flush must be a no-op that returns false and leaves live and staged accounting untouched
         assert!(!fs.begin_flush());
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 2);
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 50);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 1);
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.staged_bytes(), 50);
+        assert_eq!(fs.staged_ops(), 1);
 
         // Verify data in live is intact and readable across layers
         let read = fs.read_file_data(file.ino, 0, 120).unwrap();
@@ -2035,19 +2035,19 @@ mod tests {
         // Pop one batch from flushing queue to make room
         let popped = fs.pop_flushing_batch().unwrap();
         fs.fold_flushed_batch(popped);
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 1);
+        assert_eq!(fs.flush_queue_depth(), 1);
 
         // Now begin_flush should succeed in freezing the accumulated live mutations
         assert!(fs.begin_flush());
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 2);
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 0);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 0);
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.staged_ops(), 0);
 
         // Drain remaining batches
         while let Some(batch) = fs.pop_flushing_batch() {
             fs.fold_flushed_batch(batch);
         }
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 0);
+        assert_eq!(fs.flush_queue_depth(), 0);
         let read_final = fs.read_file_data(file.ino, 0, 120).unwrap();
         assert_eq!(&read_final[0..30], &[0x11; 30]);
         assert_eq!(&read_final[30..70], &[0x22; 40]);
@@ -2089,31 +2089,27 @@ mod tests {
 
         // Populate live with 20 bytes (below threshold of 100 bytes / 10 ops)
         crate::operations::read_write::write_core(&fs, file.ino, &[0xBB; 20], 50).unwrap();
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 20);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 1);
+        assert_eq!(fs.staged_bytes(), 20);
+        assert_eq!(fs.staged_ops(), 1);
 
         // Direct call to flush_log_locked: should NOT freeze live because thresholds are not met
         fs.flush_log_locked(&writer).unwrap();
-        assert_eq!(
-            fs.staged_bytes(OpTag::Flush),
-            20,
-            "Mutations below threshold should remain in live"
-        );
-        assert_eq!(fs.staged_ops(OpTag::Flush), 1);
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 0);
+        assert_eq!(fs.staged_bytes(), 20, "Mutations below threshold should remain in live");
+        assert_eq!(fs.staged_ops(), 1);
+        assert_eq!(fs.flush_queue_depth(), 0);
 
         // Record mutations exceeding max_buffer_size directly on inner
         {
-            let mut inner = fs.inner.lock(OpTag::Other).unwrap();
+            let mut inner = fs.inner.lock_for_tests().unwrap();
             inner.record_mutation(90); // 20 + 90 = 110 >= 100
         }
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 110);
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 0);
+        assert_eq!(fs.staged_bytes(), 110);
+        assert_eq!(fs.flush_queue_depth(), 0);
 
         // flush_log_locked will detect the threshold is met, freeze it via begin_flush_locked, and drain it
         fs.flush_log_locked(&writer).unwrap();
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 0);
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 0);
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.flush_queue_depth(), 0);
     }
 
     #[test]
@@ -2206,11 +2202,11 @@ mod tests {
         assert!(fs.begin_flush());
 
         // Queue is now saturated at max depth 2
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 2);
+        assert_eq!(fs.flush_queue_depth(), 2);
 
         // Stage live mutations
         crate::operations::read_write::write_core(&fs, file.ino, b"live data", 14).unwrap();
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 9);
+        assert_eq!(fs.staged_bytes(), 9);
 
         // In background thread, call rollover_for_fsync. It will find flushing full, drop inner, and wait on condvar.
         let fs_clone = Arc::clone(&fs);
@@ -2237,8 +2233,8 @@ mod tests {
         // Waiter must now unblock, freeze live mutations into flushing, and return the new completion
         let completion = waiter_handle.join().unwrap().expect("completion expected");
         assert!(rolled_over.load(Ordering::SeqCst));
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 2);
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 0);
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.staged_bytes(), 0);
 
         // Flush remaining batches
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2250,6 +2246,6 @@ mod tests {
         fs.flush_log().unwrap();
         assert!(completed.load(Ordering::SeqCst));
         assert!(completion.is_completed());
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 0);
+        assert_eq!(fs.flush_queue_depth(), 0);
     }
 }

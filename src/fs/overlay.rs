@@ -443,7 +443,7 @@ mod tests {
             "attribute update resurrected a deleted inode"
         );
         assert!(
-            !fs.snapshot_all(OpTag::Other).contains_key(&attr.ino),
+            !fs.snapshot_all(OpTag::Test).contains_key(&attr.ino),
             "resurrected inode leaked into the snapshot as an orphan"
         );
     }

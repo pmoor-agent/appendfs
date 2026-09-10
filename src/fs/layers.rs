@@ -683,7 +683,6 @@ mod tests {
     use super::*;
     use crate::extent_map::{Extent, ExtentMap};
     use crate::fs::{FlushBatch, WriteArena};
-    use crate::sync::OpTag;
 
     #[test]
     fn test_get_attr_across_layers() {
@@ -816,14 +815,14 @@ mod tests {
                 },
             }),
         );
-        fs.inner.lock(OpTag::Layer).unwrap().base = base_map;
+        fs.inner.lock_for_tests().unwrap().base = base_map;
 
         // 2. Flushing layer: punch hole (Zero) at 20..40
         let mut flushing_batch = HashMap::new();
         let mut f_delta = FileDelta::default();
         f_delta.extents.insert(20, Extent::new_zero(20));
         flushing_batch.insert(attr.ino, EntryDelta::Node(NodeDelta::File(f_delta)));
-        fs.inner.lock(OpTag::Layer).unwrap().flushing.push_back(FlushBatch::new(
+        fs.inner.lock_for_tests().unwrap().flushing.push_back(FlushBatch::new(
             1,
             flushing_batch,
             WriteArena::new(),
@@ -837,7 +836,7 @@ mod tests {
             .extents
             .insert(30, Extent::new_staged_buffer(vec![0xBB; 20], 0, 20));
         fs.inner
-            .lock(OpTag::Layer)
+            .lock_for_tests()
             .unwrap()
             .live
             .insert(attr.ino, EntryDelta::Node(NodeDelta::File(live_delta)));
@@ -911,8 +910,8 @@ mod tests {
                 },
             }),
         );
-        fs.inner.lock(OpTag::Layer).unwrap().base = base_map;
-        fs.inner.lock(OpTag::Layer).unwrap().live.remove(&attr.ino);
+        fs.inner.lock_for_tests().unwrap().base = base_map;
+        fs.inner.lock_for_tests().unwrap().live.remove(&attr.ino);
 
         let cached_bytes = Arc::new(vec![0xCC; 100]);
         fs.log_cache

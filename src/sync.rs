@@ -31,10 +31,17 @@ pub enum OpTag {
     Lookup = 20,
     GetAttr = 21,
     ReadLink = 22,
-    Other = 23,
+    Stats = 23,
+    Other = 24,
+    #[cfg(any(test, feature = "testing"))]
+    Test = 25,
 }
 
-pub const OP_TAG_COUNT: usize = 24;
+#[cfg(not(any(test, feature = "testing")))]
+pub const OP_TAG_COUNT: usize = 25;
+#[cfg(any(test, feature = "testing"))]
+pub const OP_TAG_COUNT: usize = 26;
+
 pub const ALL_OP_TAGS: [OpTag; OP_TAG_COUNT] = [
     OpTag::Write,
     OpTag::ReadPlan,
@@ -59,7 +66,10 @@ pub const ALL_OP_TAGS: [OpTag; OP_TAG_COUNT] = [
     OpTag::Lookup,
     OpTag::GetAttr,
     OpTag::ReadLink,
+    OpTag::Stats,
     OpTag::Other,
+    #[cfg(any(test, feature = "testing"))]
+    OpTag::Test,
 ];
 
 impl OpTag {
@@ -88,7 +98,10 @@ impl OpTag {
             OpTag::Lookup => "lookup",
             OpTag::GetAttr => "getattr",
             OpTag::ReadLink => "readlink",
+            OpTag::Stats => "stats",
             OpTag::Other => "other",
+            #[cfg(any(test, feature = "testing"))]
+            OpTag::Test => "test",
         }
     }
 
@@ -123,32 +136,7 @@ impl Default for OpMetrics {
 }
 
 const fn new_op_metrics_array() -> [OpMetrics; OP_TAG_COUNT] {
-    [
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-    ]
+    [const { OpMetrics::new() }; OP_TAG_COUNT]
 }
 
 /// Point-in-time snapshot of operation metrics for reporting.
@@ -239,10 +227,12 @@ impl<T> ActionMutex<T> {
         }
     }
 
-    /// Alias for [`ActionMutex::lock`].
-    #[inline]
-    pub fn lock_tag(&self, tag: OpTag) -> LockResult<ActionGuard<'_, T>> {
-        self.lock(tag)
+    /// Acquires the mutex with [`OpTag::Test`].
+    ///
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn lock_for_tests(&self) -> LockResult<ActionGuard<'_, T>> {
+        self.lock(OpTag::Test)
     }
 
     /// Attempts to acquire the mutex with a specific operation tag without blocking.
@@ -258,10 +248,20 @@ impl<T> ActionMutex<T> {
         }
     }
 
-    /// Alias for [`ActionMutex::try_lock`].
-    #[inline]
-    pub fn try_lock_tag(&self, tag: OpTag) -> TryLockResult<ActionGuard<'_, T>> {
-        self.try_lock(tag)
+    /// Attempts to acquire the mutex with [`OpTag::Test`] without blocking.
+    ///
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn try_lock_for_tests(&self) -> TryLockResult<ActionGuard<'_, T>> {
+        self.try_lock(OpTag::Test)
+    }
+
+    /// Acquires the mutex with [`OpTag::Test`] and executes `f` with a mutable reference to the [`ActionGuard`].
+    ///
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_lock_for_tests<R>(&self, f: impl FnOnce(&mut ActionGuard<'_, T>) -> R) -> R {
+        self.with_lock(OpTag::Test, f)
     }
 
     /// Acquires the lock with `tag` and executes `f` with a mutable reference to the [`ActionGuard`].
@@ -612,6 +612,32 @@ mod tests {
     }
 
     #[test]
+    fn test_action_mutex_test_methods() {
+        let m = Arc::new(ActionMutex::new(42));
+        {
+            let mut g = m.lock_for_tests().unwrap();
+            assert_eq!(*g, 42);
+            *g = 43;
+        }
+        assert_eq!(*m.lock_for_tests().unwrap(), 43);
+
+        let try_res = m.try_lock_for_tests().unwrap();
+        assert_eq!(*try_res, 43);
+        drop(try_res);
+
+        let with_res = m.with_lock_for_tests(|g| {
+            **g = 100;
+            **g * 2
+        });
+        assert_eq!(with_res, 200);
+        assert_eq!(*m.lock_for_tests().unwrap(), 100);
+
+        let stats = m.op_stats();
+        let test_stat = stats.iter().find(|s| s.tag == OpTag::Test).unwrap();
+        assert_eq!(test_stat.count, 5);
+    }
+
+    #[test]
     fn test_action_mutex_with_lock() {
         let m = Arc::new(ActionMutex::new(100));
         let m_clone = Arc::clone(&m);
@@ -644,7 +670,7 @@ mod tests {
     #[test]
     fn test_op_tags_coverage() {
         assert_eq!(ALL_OP_TAGS.len(), OP_TAG_COUNT);
-        assert_eq!(OP_TAG_COUNT, 24);
+        assert_eq!(OP_TAG_COUNT, 26);
 
         let m = ActionMutex::new(0);
         let tags_to_test = [
@@ -654,6 +680,8 @@ mod tests {
             (OpTag::Lookup, "lookup"),
             (OpTag::GetAttr, "getattr"),
             (OpTag::ReadLink, "readlink"),
+            (OpTag::Stats, "stats"),
+            (OpTag::Test, "test"),
         ];
 
         for (tag, expected_name) in tags_to_test {

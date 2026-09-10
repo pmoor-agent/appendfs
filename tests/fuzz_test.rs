@@ -1145,7 +1145,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
         }
 
         {
-            let inner = fs_baseline.fs.inner.lock(OpTag::Handle).unwrap();
+            let inner = fs_baseline.fs.inner.lock_for_tests().unwrap();
             assert!(inner.handles.is_empty(), "seed {seed}: handle leak in baseline");
             assert!(
                 inner.open_counts.is_empty(),
@@ -1153,12 +1153,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
             );
         }
         {
-            let inner = fs_micro.fs.inner.lock(OpTag::Handle).unwrap();
+            let inner = fs_micro.fs.inner.lock_for_tests().unwrap();
             assert!(inner.handles.is_empty(), "seed {seed}: handle leak in micro");
             assert!(inner.open_counts.is_empty(), "seed {seed}: open_counts leak in micro");
         }
         {
-            let inner = fs_remote.fs.inner.lock(OpTag::Handle).unwrap();
+            let inner = fs_remote.fs.inner.lock_for_tests().unwrap();
             assert!(inner.handles.is_empty(), "seed {seed}: handle leak in remote");
             assert!(inner.open_counts.is_empty(), "seed {seed}: open_counts leak in remote");
         }
@@ -1238,7 +1238,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
         appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
-    let map = recovered.snapshot_all(OpTag::Other);
+    let map = recovered.snapshot_all(OpTag::Test);
 
     let root = map.get(&1).unwrap();
     let entries = match &root.kind {

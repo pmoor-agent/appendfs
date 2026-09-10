@@ -1,6 +1,6 @@
 mod common;
+use appendfs::Clock;
 use appendfs::storage::{MemoryStorage, OsStorage, Storage};
-use appendfs::{Clock, OpTag};
 use common::{TestMount, wait_until};
 use std::fs;
 use std::io::Write;
@@ -1127,16 +1127,13 @@ fn test_background_flusher_in_mount_session() {
         .unwrap();
 
     // Staged ops should be 2 initially
-    assert_eq!(fs.staged_ops(OpTag::Flush), 2);
+    assert_eq!(fs.staged_ops(), 2);
 
     // Wait up to 5 seconds for the background flusher to flush dirty ops to disk
     assert!(
-        wait_until(
-            || fs.total_dirty_ops(OpTag::Flush) == 0,
-            std::time::Duration::from_secs(5)
-        ),
+        wait_until(|| fs.total_dirty_ops() == 0, std::time::Duration::from_secs(5)),
         "Dirty ops ({}) must be flushed to 0 by the background flusher",
-        fs.total_dirty_ops(OpTag::Flush)
+        fs.total_dirty_ops()
     );
     let manifest = fs.manifest.read().unwrap();
     assert!(!manifest.logs.is_empty());
@@ -1208,7 +1205,7 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
         },
     };
     fs.inner
-        .lock(OpTag::Other)
+        .lock_for_tests()
         .unwrap()
         .base
         .insert(orphan_ino, std::sync::Arc::new(orphan_node));

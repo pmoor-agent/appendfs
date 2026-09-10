@@ -710,35 +710,51 @@ impl InMemoryFS {
         f(&mut guard)
     }
 
+    /// Acquires the filesystem inner lock with [`OpTag::Test`].
+    ///
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn lock_inner_for_tests(&self) -> FsInnerGuard<'_> {
+        self.lock_inner(OpTag::Test)
+    }
+
+    /// Acquires the filesystem inner lock with [`OpTag::Test`] and executes `f`.
+    ///
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_inner_for_tests<R>(&self, f: impl FnOnce(&mut FsInnerGuard<'_>) -> R) -> R {
+        self.with_inner(OpTag::Test, f)
+    }
+
     /// Number of dirty bytes currently staged in the active `live` layer.
-    pub fn staged_bytes(&self, tag: OpTag) -> usize {
-        self.inner.lock(tag).unwrap().staged_bytes
+    pub fn staged_bytes(&self) -> usize {
+        self.inner.lock(OpTag::Stats).unwrap().staged_bytes
     }
 
     /// Number of mutating operations currently staged in the active `live` layer.
-    pub fn staged_ops(&self, tag: OpTag) -> usize {
-        self.inner.lock(tag).unwrap().staged_ops
+    pub fn staged_ops(&self) -> usize {
+        self.inner.lock(OpTag::Stats).unwrap().staged_ops
     }
 
     /// Total data bytes across all frozen batches waiting in `flushing`.
-    pub fn flushing_bytes(&self, tag: OpTag) -> usize {
-        self.inner.lock(tag).unwrap().flushing_bytes
+    pub fn flushing_bytes(&self) -> usize {
+        self.inner.lock(OpTag::Stats).unwrap().flushing_bytes
     }
 
     /// Total operations across all frozen batches waiting in `flushing`.
-    pub fn flushing_ops(&self, tag: OpTag) -> usize {
-        self.inner.lock(tag).unwrap().flushing_ops
+    pub fn flushing_ops(&self) -> usize {
+        self.inner.lock(OpTag::Stats).unwrap().flushing_ops
     }
 
     /// Total dirty bytes currently in memory (staged in `live` + queued in `flushing`).
-    pub fn total_dirty_bytes(&self, tag: OpTag) -> usize {
-        let inner = self.inner.lock(tag).unwrap();
+    pub fn total_dirty_bytes(&self) -> usize {
+        let inner = self.inner.lock(OpTag::Stats).unwrap();
         inner.staged_bytes + inner.flushing_bytes
     }
 
     /// Total dirty operations currently in memory (staged in `live` + queued in `flushing`).
-    pub fn total_dirty_ops(&self, tag: OpTag) -> usize {
-        let inner = self.inner.lock(tag).unwrap();
+    pub fn total_dirty_ops(&self) -> usize {
+        let inner = self.inner.lock(OpTag::Stats).unwrap();
         inner.staged_ops + inner.flushing_ops
     }
 
@@ -844,12 +860,12 @@ impl InMemoryFS {
         self.read_only.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub fn recovered_time(&self, tag: OpTag) -> Option<SystemTime> {
-        self.inner.lock(tag).unwrap().recovered_time
+    pub fn recovered_time(&self) -> Option<SystemTime> {
+        self.inner.lock(OpTag::Stats).unwrap().recovered_time
     }
 
-    pub fn set_recovered_time(&self, tag: OpTag, time: Option<SystemTime>) {
-        self.inner.lock(tag).unwrap().recovered_time = time;
+    pub fn set_recovered_time(&self, time: Option<SystemTime>) {
+        self.inner.lock(OpTag::Other).unwrap().recovered_time = time;
     }
 
     pub fn set_storage(&mut self, storage: Arc<dyn Storage>) {
@@ -922,7 +938,7 @@ mod tests {
         }
         // After guard drops, staged bytes/ops persist on FsInner, but new guard starts with mutation_occurred = false
         {
-            let guard = fs.lock_inner(OpTag::Other);
+            let guard = fs.lock_inner(OpTag::Test);
             assert!(!guard.mutation_occurred());
             assert_eq!(guard.staged_bytes, 128);
             assert_eq!(guard.staged_ops, 1);
@@ -937,23 +953,23 @@ mod tests {
 
         let file = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
         // File creation recorded name.len() = 8
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 0);
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 8);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 1);
+        assert_eq!(fs.flush_queue_depth(), 0);
+        assert_eq!(fs.staged_bytes(), 8);
+        assert_eq!(fs.staged_ops(), 1);
 
         // Perform write below threshold (20 bytes: staged_bytes = 28, staged_ops = 2)
         crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 20], 0).unwrap();
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 0);
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 28);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 2);
+        assert_eq!(fs.flush_queue_depth(), 0);
+        assert_eq!(fs.staged_bytes(), 28);
+        assert_eq!(fs.staged_ops(), 2);
 
         // Perform write that crosses max_buffer_size (30 bytes: 28 + 30 = 58 >= 50)
         crate::operations::read_write::write_core(&fs, file.ino, &[0xBB; 30], 20).unwrap();
         // Guard drop during write_core should have auto-frozen live into flushing queue
-        assert_eq!(fs.flush_queue_depth(OpTag::Flush), 1);
-        assert_eq!(fs.staged_bytes(OpTag::Flush), 0);
-        assert_eq!(fs.staged_ops(OpTag::Flush), 0);
-        assert_eq!(fs.flushing_bytes(OpTag::Flush), 58);
-        assert_eq!(fs.flushing_ops(OpTag::Flush), 3);
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.staged_ops(), 0);
+        assert_eq!(fs.flushing_bytes(), 58);
+        assert_eq!(fs.flushing_ops(), 3);
     }
 }

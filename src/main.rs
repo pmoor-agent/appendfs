@@ -9,7 +9,7 @@ use appendfs::crypto::{
 };
 use appendfs::log::{LogWriter, SummaryReader};
 use appendfs::storage::{OsStorage, Storage};
-use appendfs::{OpTag, VolumeStats, check_volume, dump_file, init_volume, recover_fs};
+use appendfs::{VolumeStats, check_volume, dump_file, init_volume, recover_fs};
 
 use clap::Parser;
 use std::path::Path;
@@ -576,7 +576,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
         manifest.logs.last().map(|l| l.generation).unwrap_or(1)
     };
     let effective_time_str = fs_instance
-        .recovered_time(OpTag::Other)
+        .recovered_time()
         .map_or_else(|| "N/A".to_string(), appendfs::format_local_civil_time);
 
     println!(

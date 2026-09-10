@@ -335,7 +335,7 @@ pub fn recover_fs(
         .base
         .retain(|_ino, arc| arc.meta.nlink > 0 || arc.is_dir());
     fs_instance.last_tx_id.store(last_tx_id, Ordering::SeqCst);
-    fs_instance.set_recovered_time(OpTag::Other, last_op_time);
+    fs_instance.set_recovered_time(last_op_time);
 
     Ok(fs_instance)
 }

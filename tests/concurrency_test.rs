@@ -440,7 +440,7 @@ fn verify_tree_invariants(fs: &InMemoryFS, storage: &dyn Storage, seed: u64) {
         );
     }
 
-    let snapshot = fs.snapshot_all(OpTag::Other);
+    let snapshot = fs.snapshot_all(OpTag::Test);
     let total_inodes = snapshot.len();
     if visited.len() != total_inodes {
         let mut orphans: Vec<u64> = snapshot.keys().copied().filter(|k| !visited.contains(k)).collect();
@@ -752,7 +752,7 @@ fn run_concurrent_stress(seed: u64) {
     verify_log_replay_matches_live(&fs, storage.clone(), seed);
 
     {
-        let inner = fs.inner.lock(OpTag::Handle).unwrap();
+        let inner = fs.inner.lock_for_tests().unwrap();
         assert!(inner.handles.is_empty(), "seed {}: leaked handles", seed);
         assert!(inner.open_counts.is_empty(), "seed {}: leaked open_counts", seed);
     }

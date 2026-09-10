@@ -4,7 +4,7 @@ use crate::sync::OpTag;
 
 pub fn statfs(fs: &InMemoryFS, req: Request, ino: u64) {
     log::trace!("statfs(ino={})", ino);
-    let active_inodes = fs.snapshot_all(OpTag::Other).len() as u64;
+    let active_inodes = fs.snapshot_all(OpTag::Stats).len() as u64;
 
     req.reply_statfs(&StatfsAttr {
         blocks: 1_000_000,

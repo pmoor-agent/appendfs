@@ -323,7 +323,7 @@ mod tests {
 
         // All 3 handles exist in the unified map
         {
-            let inner = fs.inner.lock(OpTag::Handle).unwrap();
+            let inner = fs.inner.lock_for_tests().unwrap();
             assert_eq!(inner.handles.len(), 3);
             assert_eq!(inner.handle_counts(), (1, 1, 1));
             assert!(inner.handles.contains_key(&fh_reg));
@@ -419,7 +419,7 @@ mod tests {
 
         // Unified map is now empty
         {
-            let inner = fs.inner.lock(OpTag::Handle).unwrap();
+            let inner = fs.inner.lock_for_tests().unwrap();
             assert!(inner.handles.is_empty());
         }
     }
