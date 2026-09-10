@@ -3,7 +3,7 @@ use appendfs::clock::{AdvancingClock, Clock, MockClock, SystemClock};
 use appendfs::log::{LogAttrDelta, LogDirectoryDelta, LogEntryDelta, LogFileDelta, LogNodeDelta, OpCode, recover_fs};
 use appendfs::node::NodeKind;
 use appendfs::storage::{MemoryStorage, Storage};
-use appendfs::{LogWriter, OpTag, RemoteStore};
+use appendfs::{LogWriter, RemoteStore};
 use common::{SnapshotNode, TestFS, TestRng};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1238,7 +1238,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
         appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
-    let map = recovered.snapshot_all(OpTag::Test);
+    let map = recovered.snapshot_all();
 
     let root = map.get(&1).unwrap();
     let entries = match &root.kind {

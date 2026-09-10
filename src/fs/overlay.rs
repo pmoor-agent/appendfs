@@ -353,8 +353,9 @@ impl InMemoryFS {
         self.execute_read_plan_sync(plan)
     }
 
-    pub fn snapshot_all(&self, tag: OpTag) -> HashMap<u64, Arc<Node>> {
-        self.inner.lock(tag).unwrap().snapshot_all()
+    #[cfg(any(test, feature = "testing"))]
+    pub fn snapshot_all(&self) -> HashMap<u64, Arc<Node>> {
+        self.inner.lock_for_tests().unwrap().snapshot_all()
     }
 }
 
@@ -384,11 +385,11 @@ mod tests {
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.sync_log().unwrap();
-        assert!(fs.inner.lock(OpTag::Lookup).unwrap().exists_below_live(attr.ino));
+        assert!(fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino));
 
         crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
         assert!(
-            fs.inner.lock(OpTag::Lookup).unwrap().exists_below_live(attr.ino),
+            fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino),
             "base still describes the inode until the tombstone's batch folds"
         );
 
@@ -396,9 +397,9 @@ mod tests {
         // a writer that validated before taking the lock would insert a fresh delta and
         // resurrect the inode at the next fold - this predicate is what stops it.
         fs.begin_flush();
-        assert!(!fs.inner.lock(OpTag::Lookup).unwrap().live.contains_key(&attr.ino));
+        assert!(!fs.inner.lock_for_tests().unwrap().live.contains_key(&attr.ino));
         assert!(
-            !fs.inner.lock(OpTag::Lookup).unwrap().exists_below_live(attr.ino),
+            !fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino),
             "a tombstone frozen out of live must still report the inode as gone"
         );
     }
@@ -429,7 +430,7 @@ mod tests {
         // A late attribute update - an atime bump racing the unlink, say - must not rebuild
         // the node from `base` and bring it back carrying its old link count, unreferenced
         // by any directory.
-        fs.with_inner(OpTag::SetAttr, |inner| {
+        fs.with_inner_for_tests(|inner| {
             inner.update_attr_delta(
                 attr.ino,
                 AttrDelta {
@@ -443,7 +444,7 @@ mod tests {
             "attribute update resurrected a deleted inode"
         );
         assert!(
-            !fs.snapshot_all(OpTag::Test).contains_key(&attr.ino),
+            !fs.snapshot_all().contains_key(&attr.ino),
             "resurrected inode leaked into the snapshot as an orphan"
         );
     }

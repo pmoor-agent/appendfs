@@ -7,6 +7,7 @@
 // freezing and folding batches underneath the workers, which a single-threaded fuzz test
 // structurally cannot exercise.
 mod common;
+use appendfs::InMemoryFS;
 use appendfs::LogWriter;
 use appendfs::clock::{Clock, SystemClock};
 use appendfs::log::record::DecodedPayload;
@@ -20,7 +21,6 @@ use appendfs::operations::read_write::{
 };
 use appendfs::operations::xattr::{getxattr_core, listxattr_core, removexattr_core, setxattr_core};
 use appendfs::shim::{FileType, ShimFlock};
-use appendfs::{InMemoryFS, OpTag};
 use common::{TestRng, wait_until};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -440,7 +440,7 @@ fn verify_tree_invariants(fs: &InMemoryFS, storage: &dyn Storage, seed: u64) {
         );
     }
 
-    let snapshot = fs.snapshot_all(OpTag::Test);
+    let snapshot = fs.snapshot_all();
     let total_inodes = snapshot.len();
     if visited.len() != total_inodes {
         let mut orphans: Vec<u64> = snapshot.keys().copied().filter(|k| !visited.contains(k)).collect();

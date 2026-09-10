@@ -938,7 +938,7 @@ mod tests {
         }
         // After guard drops, staged bytes/ops persist on FsInner, but new guard starts with mutation_occurred = false
         {
-            let guard = fs.lock_inner(OpTag::Test);
+            let guard = fs.lock_inner_for_tests();
             assert!(!guard.mutation_occurred());
             assert_eq!(guard.staged_bytes, 128);
             assert_eq!(guard.staged_ops, 1);

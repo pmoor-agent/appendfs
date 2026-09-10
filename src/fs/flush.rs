@@ -503,7 +503,7 @@ impl InMemoryFS {
         explicit_iv: Option<[u8; 12]>,
     ) -> std::io::Result<String> {
         self.sync_log()?;
-        let snapshot = self.snapshot_all(OpTag::Flush);
+        let snapshot = self.inner.lock(OpTag::Flush).unwrap().snapshot_all();
         let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
         let last_tx_id = self
             .log_writer
@@ -689,7 +689,7 @@ mod tests {
         let fs = InMemoryFS::with_log(writer);
 
         let ino = fs.allocate_inode();
-        fs.with_inner(OpTag::Create, |inner| {
+        fs.with_inner_for_tests(|inner| {
             inner.insert_new_node(
                 ino,
                 NodeDelta::File(FileDelta {
@@ -792,7 +792,7 @@ mod tests {
             fs.max_extent_size = CAP;
 
             let ino = fs.allocate_inode();
-            fs.with_inner(OpTag::Create, |inner| {
+            fs.with_inner_for_tests(|inner| {
                 inner.insert_new_node(
                     ino,
                     NodeDelta::File(FileDelta {
@@ -1123,7 +1123,7 @@ mod tests {
                 },
             }),
         );
-        fs.with_inner(OpTag::Create, |inner| {
+        fs.with_inner_for_tests(|inner| {
             inner.add_dir_entry(1, "file1.bin", ino1, clock.now());
         });
 
@@ -1503,14 +1503,14 @@ mod tests {
 
         // Freeze into flushing queue (batch 1)
         fs.begin_flush();
-        assert_eq!(fs.inner.lock(OpTag::Flush).unwrap().flushing.len(), 1);
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 1);
 
         // 2. Overwrite in batch 2 (live layer)
         crate::operations::read_write::write_core(&fs, ino, &[0x22; 20], 10).unwrap();
 
         // Freeze into flushing queue (batch 2)
         fs.begin_flush();
-        assert_eq!(fs.inner.lock(OpTag::Flush).unwrap().flushing.len(), 2);
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 2);
 
         // 3. In live layer, truncate to 40 bytes
         let now = clock.now();
@@ -1538,7 +1538,7 @@ mod tests {
         while let Some(batch) = fs.pop_flushing_batch() {
             fs.fold_flushed_batch(batch);
         }
-        assert_eq!(fs.inner.lock(OpTag::Flush).unwrap().flushing.len(), 0);
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 0);
 
         // Read again after folding
         let data_after_fold = fs.read_file_data(ino, 0, 50).unwrap();
@@ -1592,7 +1592,7 @@ mod tests {
 
         // Verify filesystem is NOT wedged: flushing queue still retains the batch, live mutations still work!
         assert_eq!(
-            fs.inner.lock(OpTag::Flush).unwrap().flushing.len(),
+            fs.inner.lock_for_tests().unwrap().flushing.len(),
             1,
             "Failed batch must remain in flushing queue"
         );
@@ -1612,7 +1612,7 @@ mod tests {
             retry_res
         );
         assert_eq!(
-            fs.inner.lock(OpTag::Flush).unwrap().flushing.len(),
+            fs.inner.lock_for_tests().unwrap().flushing.len(),
             0,
             "Flushing queue must be completely drained"
         );
@@ -1708,7 +1708,7 @@ mod tests {
         // 7. Retry flush - MUST succeed cleanly
         let retry_res = fs.flush_log();
         assert!(retry_res.is_ok(), "Retried flush must succeed: {:?}", retry_res);
-        assert_eq!(fs.inner.lock(OpTag::Flush).unwrap().flushing.len(), 0);
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 0);
 
         // 8. Recover filesystem and verify 100% data integrity without checksum mismatches!
         let recovered = crate::log::recover_fs(
