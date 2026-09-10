@@ -146,9 +146,6 @@ pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
 
 pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
     log::trace!("write(ino={}, fh={}, len={}, offset={})", ino, fh, buf.len(), offset);
-    if fh == 0 {
-        return Err(libc::EBADF);
-    }
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
