@@ -54,18 +54,6 @@ pub fn setxattr_core(fs: &InMemoryFS, ino: u64, name: &str, value: &[u8], flags:
         return Err(libc::E2BIG);
     }
 
-    if fs.get_attr(ino).is_none() {
-        return Err(libc::ENOENT);
-    }
-
-    let exists = fs.get_xattr(ino, name).is_some();
-    if (flags & libc::XATTR_CREATE) != 0 && exists {
-        return Err(libc::EEXIST);
-    }
-    if (flags & libc::XATTR_REPLACE) != 0 && !exists {
-        return Err(libc::ENODATA);
-    }
-
     let now = fs.clock.now();
     let mut xattrs = HashMap::new();
     xattrs.insert(name.to_string(), Some(value.to_vec()));
@@ -74,11 +62,24 @@ pub fn setxattr_core(fs: &InMemoryFS, ino: u64, name: &str, value: &[u8], flags:
         xattrs: Some(xattrs),
         ..Default::default()
     };
+
     fs.with_inner(OpTag::Xattr, |inner| {
+        if fs.get_attr_locked(inner, ino).is_none() {
+            return Err(libc::ENOENT);
+        }
+
+        let exists = inner.get_xattr(ino, name).is_some();
+        if (flags & libc::XATTR_CREATE) != 0 && exists {
+            return Err(libc::EEXIST);
+        }
+        if (flags & libc::XATTR_REPLACE) != 0 && !exists {
+            return Err(libc::ENODATA);
+        }
+
         inner.update_attr_delta(ino, delta);
         inner.record_mutation(name.len() + value.len());
-    });
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<ListxattrResult, i32> {
@@ -119,14 +120,6 @@ pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<(), i32
         return Err(libc::EPERM);
     }
 
-    if fs.get_attr(ino).is_none() {
-        return Err(libc::ENOENT);
-    }
-
-    if fs.get_xattr(ino, name).is_none() {
-        return Err(libc::ENODATA);
-    }
-
     let now = fs.clock.now();
     let mut xattrs = HashMap::new();
     xattrs.insert(name.to_string(), None);
@@ -135,11 +128,20 @@ pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<(), i32
         xattrs: Some(xattrs),
         ..Default::default()
     };
+
     fs.with_inner(OpTag::Xattr, |inner| {
+        if fs.get_attr_locked(inner, ino).is_none() {
+            return Err(libc::ENOENT);
+        }
+
+        if inner.get_xattr(ino, name).is_none() {
+            return Err(libc::ENODATA);
+        }
+
         inner.update_attr_delta(ino, delta);
         inner.record_mutation(name.len());
-    });
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -264,6 +266,34 @@ mod tests {
 
         let keys = listxattr_core(&fs, ino, 100).unwrap();
         assert_eq!(keys, ListxattrResult::Data(b"user.tag\0".to_vec()));
+
+        let post_stats = fs.inner.op_stats();
+        let post_xattr = post_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;
+        let post_total = fs.inner.lock_count();
+
+        assert_eq!(post_xattr - pre_xattr, 1);
+        assert_eq!(post_total - pre_total, 1);
+
+        // Test setxattr_core
+        let pre_stats = fs.inner.op_stats();
+        let pre_xattr = pre_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;
+        let pre_total = fs.inner.lock_count();
+
+        setxattr_core(&fs, ino, "user.tag2", b"v2", 0).unwrap();
+
+        let post_stats = fs.inner.op_stats();
+        let post_xattr = post_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;
+        let post_total = fs.inner.lock_count();
+
+        assert_eq!(post_xattr - pre_xattr, 1);
+        assert_eq!(post_total - pre_total, 1);
+
+        // Test removexattr_core
+        let pre_stats = fs.inner.op_stats();
+        let pre_xattr = pre_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;
+        let pre_total = fs.inner.lock_count();
+
+        removexattr_core(&fs, ino, "user.tag2").unwrap();
 
         let post_stats = fs.inner.op_stats();
         let post_xattr = post_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;
