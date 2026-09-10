@@ -1,5 +1,5 @@
 use crate::extent_map::{Extent, ExtentMap};
-use crate::fs::{FileHandle, InMemoryFS};
+use crate::fs::{FileHandle, FsInner, InMemoryFS};
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
 use crate::shim::{FileAttr, FileType, Request};
 use crate::sync::OpTag;
@@ -243,7 +243,6 @@ pub fn setattr_core(
         return Err(libc::EPERM);
     }
 
-    let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
     let now = fs.clock.now();
 
     let mut attr_delta = AttrDelta::default();
@@ -270,15 +269,11 @@ pub fn setattr_core(
     }
 
     fs.with_inner(OpTag::SetAttr, |inner| {
+        let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+
         if (to_set & FUSE_SET_ATTR_SIZE) != 0 && attr.file_type == FileType::RegularFile {
             log::trace!("truncating file to {}", size);
             let new_size = size as u64;
-            // The `get_attr` check above happened before this lock was taken, so the file may
-            // have been unlinked in between. If its tombstone has already been frozen out of
-            // `live`, inserting a delta here would resurrect the inode at the next fold.
-            if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
-                return Err(libc::ENOENT);
-            }
             let entry = inner
                 .live
                 .entry(ino)
@@ -294,11 +289,37 @@ pub fn setattr_core(
 
         inner.update_attr_delta(ino, attr_delta);
         inner.record_mutation(0);
-        Ok(())
-    })?;
+        inner.get_attr(ino).ok_or(libc::ENOENT)
+    })
+}
 
-    let updated_attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
-    Ok(updated_attr)
+/// Internal helper: punches a zero hole in `[offset, offset + len)` within an already-locked `FsInner`.
+fn punch_hole_locked(inner: &mut FsInner, ino: u64, offset: u64, len: u64, now: SystemTime) -> Result<(), i32> {
+    let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+    if attr.file_type != FileType::RegularFile {
+        return Err(libc::EISDIR);
+    }
+
+    let file_size = attr.size as u64;
+    let end = std::cmp::min(offset.saturating_add(len), file_size);
+    if len == 0 || offset >= end {
+        return Ok(());
+    }
+
+    if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
+        return Err(libc::ENOENT);
+    }
+    let entry = inner
+        .live
+        .entry(ino)
+        .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
+    if let EntryDelta::Node(NodeDelta::File(f)) = entry {
+        f.extents.insert(offset, end - offset, Extent::new_zero(end - offset));
+        f.attr_delta.mtime = Some(now);
+        f.attr_delta.ctime = Some(now);
+    }
+    inner.record_mutation(0);
+    Ok(())
 }
 
 /// Deallocates `[offset, offset + len)`, leaving it reading as zeros without changing the
@@ -313,65 +334,29 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-
-    let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
-    if attr.file_type != FileType::RegularFile {
-        return Err(libc::EISDIR);
-    }
-
-    // Past EOF there is nothing to deallocate: those bytes already read as zeros, and a
-    // punch must not extend the file.
-    let file_size = attr.size as u64;
-    let end = std::cmp::min(offset.saturating_add(len), file_size);
-    if len == 0 || offset >= end {
-        return Ok(());
-    }
-
     let now = fs.clock.now();
     fs.with_inner(OpTag::Fallocate, |inner| {
-        // As in `write_core`: `get_attr` ran before this lock, so the inode may have been
-        // unlinked and its tombstone frozen out of `live` in between. Inserting a delta
-        // then would resurrect it at the next fold.
-        if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
-            return Err(libc::ENOENT);
-        }
-        let entry = inner
-            .live
-            .entry(ino)
-            .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
-        if let EntryDelta::Node(NodeDelta::File(f)) = entry {
-            f.extents.insert(offset, end - offset, Extent::new_zero(end - offset));
-            f.attr_delta.mtime = Some(now);
-            f.attr_delta.ctime = Some(now);
-        }
-        inner.record_mutation(0);
-        Ok(())
+        punch_hole_locked(inner, ino, offset, len, now)
     })
 }
 
-/// Raises a file's recorded size to `new_size`, without writing anything.
-///
-/// The gap needs no extents: reads zero-fill anything the extent map does not cover, so
-/// growing the size alone is enough to make the new range read as zeros.
-fn grow_size_to(fs: &InMemoryFS, ino: u64, new_size: u64) -> Result<(), i32> {
-    let now = fs.clock.now();
-    fs.with_inner(OpTag::SetAttr, |inner| {
-        let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
-        let entry = inner
-            .live
-            .entry(ino)
-            .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
-        if let EntryDelta::Node(NodeDelta::File(f)) = entry {
-            let current = f.size.unwrap_or(attr.size as u64);
-            if new_size > current {
-                f.size = Some(new_size);
-                f.attr_delta.mtime = Some(now);
-                f.attr_delta.ctime = Some(now);
-            }
+/// Internal helper: raises a file's recorded size to `new_size` within an already-locked `FsInner`.
+fn grow_size_locked(inner: &mut FsInner, ino: u64, new_size: u64, now: SystemTime) -> Result<(), i32> {
+    let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+    let entry = inner
+        .live
+        .entry(ino)
+        .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
+    if let EntryDelta::Node(NodeDelta::File(f)) = entry {
+        let current = f.size.unwrap_or(attr.size as u64);
+        if new_size > current {
+            f.size = Some(new_size);
+            f.attr_delta.mtime = Some(now);
+            f.attr_delta.ctime = Some(now);
         }
-        inner.record_mutation(0);
-        Ok(())
-    })
+    }
+    inner.record_mutation(0);
+    Ok(())
 }
 
 /// `fallocate(2)`.
@@ -411,38 +396,39 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
         return Err(libc::EOPNOTSUPP);
     }
 
-    let attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
-    if attr.file_type != FileType::RegularFile {
-        return Err(libc::EISDIR);
+    if mode & libc::FALLOC_FL_PUNCH_HOLE != 0 && mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
+        return Err(libc::EINVAL);
     }
 
     let start = offset as u64;
     let len = length as u64;
     let end = start.saturating_add(len);
+    let now = fs.clock.now();
 
-    if mode & libc::FALLOC_FL_PUNCH_HOLE != 0 {
-        // The kernel requires the pairing, and enforcing it keeps callers from assuming a
-        // punch might extend the file.
-        if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
-            return Err(libc::EINVAL);
+    fs.with_inner(OpTag::Fallocate, |inner| {
+        let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+        if attr.file_type != FileType::RegularFile {
+            return Err(libc::EISDIR);
         }
-        return punch_hole_core(fs, ino, start, len);
-    }
 
-    if mode & libc::FALLOC_FL_ZERO_RANGE != 0 {
-        punch_hole_core(fs, ino, start, len)?;
-        // Unlike a punch, zeroing past EOF grows the file unless KEEP_SIZE says otherwise.
-        if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
-            grow_size_to(fs, ino, end)?;
+        if mode & libc::FALLOC_FL_PUNCH_HOLE != 0 {
+            return punch_hole_locked(inner, ino, start, len, now);
         }
-        return Ok(());
-    }
 
-    if mode & libc::FALLOC_FL_KEEP_SIZE != 0 {
-        // Nothing to reserve and nothing to resize.
-        return Ok(());
-    }
-    grow_size_to(fs, ino, end)
+        if mode & libc::FALLOC_FL_ZERO_RANGE != 0 {
+            punch_hole_locked(inner, ino, start, len, now)?;
+            if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
+                grow_size_locked(inner, ino, end, now)?;
+            }
+            return Ok(());
+        }
+
+        if mode & libc::FALLOC_FL_KEEP_SIZE != 0 {
+            return Ok(());
+        }
+
+        grow_size_locked(inner, ino, end, now)
+    })
 }
 
 pub fn fallocate(fs: &InMemoryFS, req: Request, ino: u64, mode: i32, offset: i64, length: i64, _fh: u64) {
@@ -715,5 +701,72 @@ mod tests {
             Err(libc::EROFS)
         );
         assert_eq!(punch_hole_core(&fs, ino, 0, 64), Err(libc::EROFS));
+    }
+
+    #[test]
+    fn test_setattr_and_fallocate_single_lock_acquisition() {
+        let fs = InMemoryFS::new();
+        let ino = file_with(&fs, &[0xAA; 1024]);
+
+        // 1. setattr_core: mode and size change
+        let pre_stats = fs.inner.op_stats();
+        let pre_setattr = pre_stats.iter().find(|s| s.tag == OpTag::SetAttr).unwrap().count;
+        let pre_getattr = pre_stats.iter().find(|s| s.tag == OpTag::GetAttr).unwrap().count;
+        let pre_total = fs.inner.lock_count();
+
+        let updated = setattr_core(
+            &fs,
+            ino,
+            0o755,
+            1001,
+            1002,
+            512,
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            FUSE_SET_ATTR_MODE | FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID | FUSE_SET_ATTR_SIZE,
+        )
+        .unwrap();
+        assert_eq!(updated.size, 512);
+        assert_eq!(updated.perm, 0o755);
+
+        let post_stats = fs.inner.op_stats();
+        let post_setattr = post_stats.iter().find(|s| s.tag == OpTag::SetAttr).unwrap().count;
+        let post_getattr = post_stats.iter().find(|s| s.tag == OpTag::GetAttr).unwrap().count;
+        let post_total = fs.inner.lock_count();
+
+        // Exactly 1 lock acquisition tagged OpTag::SetAttr, 0 GetAttr
+        assert_eq!(post_setattr - pre_setattr, 1);
+        assert_eq!(post_getattr - pre_getattr, 0);
+        assert_eq!(post_total - pre_total, 1);
+
+        // 2. punch_hole_core
+        let pre_stats = fs.inner.op_stats();
+        let pre_fallocate = pre_stats.iter().find(|s| s.tag == OpTag::Fallocate).unwrap().count;
+        let pre_total = fs.inner.lock_count();
+
+        punch_hole_core(&fs, ino, 100, 50).unwrap();
+
+        let post_stats = fs.inner.op_stats();
+        let post_fallocate = post_stats.iter().find(|s| s.tag == OpTag::Fallocate).unwrap().count;
+        let post_total = fs.inner.lock_count();
+
+        assert_eq!(post_fallocate - pre_fallocate, 1);
+        assert_eq!(post_total - pre_total, 1);
+
+        // 3. fallocate_core with ZERO_RANGE (zeroing + extending file)
+        let pre_stats = fs.inner.op_stats();
+        let pre_fallocate = pre_stats.iter().find(|s| s.tag == OpTag::Fallocate).unwrap().count;
+        let pre_total = fs.inner.lock_count();
+
+        fallocate_core(&fs, ino, libc::FALLOC_FL_ZERO_RANGE, 400, 300).unwrap();
+
+        let post_stats = fs.inner.op_stats();
+        let post_fallocate = post_stats.iter().find(|s| s.tag == OpTag::Fallocate).unwrap().count;
+        let post_total = fs.inner.lock_count();
+
+        // Exactly 1 lock acquisition tagged OpTag::Fallocate
+        assert_eq!(post_fallocate - pre_fallocate, 1);
+        assert_eq!(post_total - pre_total, 1);
+        assert_eq!(fs.get_attr(ino).unwrap().size, 700);
     }
 }
