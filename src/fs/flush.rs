@@ -20,7 +20,7 @@ use std::time::Duration;
 impl InMemoryFS {
     // --- Flush & Fold Pipelines ---
 
-    /// Freezes `live` into the `flushing` queue if queue depth is below `max_flush_queue_depth`.
+    /// Freezes `live` into the `flushing` queue if queue depth, bytes, and ops are within capacity limits.
     pub fn begin_flush(&self) -> bool {
         let mut inner = self.inner.lock_tag(OpTag::Flush).unwrap();
         self.begin_flush_locked(&mut inner)
@@ -28,7 +28,11 @@ impl InMemoryFS {
 
     /// Freezes `live` into the `flushing` queue with the inner lock already held.
     pub fn begin_flush_locked(&self, inner: &mut FsInner) -> bool {
-        inner.freeze_live(self.max_flush_queue_depth)
+        inner.freeze_live(
+            self.max_flush_queue_depth,
+            self.max_flush_queue_bytes,
+            self.max_flush_queue_ops,
+        )
     }
 
     /// Pops the front batch from the flushing queue, if any.
@@ -42,7 +46,7 @@ impl InMemoryFS {
     ///
     /// If `fh != 0`, the file handle is validated against `ino` under the lock.
     ///
-    /// If `flushing` queue depth is at capacity (`flushing.len() >= max_flush_queue_depth`),
+    /// If the `flushing` queue is at capacity (depth, bytes, or ops limit reached),
     /// this kicks off the flusher and waits on `capacity_cvar` before retrying.
     pub fn rollover_for_fsync(&self, ino: u64, fh: u64) -> Result<Option<super::BatchCompletion>, i32> {
         let mut inner = self.inner.lock_tag(OpTag::Flush).unwrap();
@@ -54,7 +58,7 @@ impl InMemoryFS {
                 return Ok(None);
             }
             if !inner.live.is_empty() {
-                if inner.freeze_live(self.max_flush_queue_depth) {
+                if self.begin_flush_locked(&mut inner) {
                     let completion = inner.flushing.back().map(|b| b.completion.clone());
                     return Ok(completion);
                 }
@@ -2043,6 +2047,138 @@ mod tests {
         assert_eq!(&read_final[0..30], &[0x11; 30]);
         assert_eq!(&read_final[30..70], &[0x22; 40]);
         assert_eq!(&read_final[70..120], &[0x33; 50]);
+    }
+
+    #[test]
+    fn test_freeze_live_bounded_by_max_flush_queue_bytes() {
+        let mut fs = InMemoryFS::new();
+        fs.max_flush_queue_depth = 10;
+        fs.max_flush_queue_bytes = 100;
+
+        let file =
+            crate::operations::read_write::create_core(&fs, 1, "bytes_bounded.bin", 0o644, 0, 1000, 1000).unwrap();
+        assert!(fs.begin_flush());
+        let init = fs.pop_flushing_batch().unwrap();
+        fs.fold_flushed_batch(init);
+        assert_eq!(fs.flush_queue_depth(), 0);
+        assert_eq!(fs.flushing_bytes(), 0);
+
+        // Populate batch 1: 60 bytes
+        crate::operations::read_write::write_core(&fs, file.ino, &[0x11; 60], 0).unwrap();
+        assert!(fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.flushing_bytes(), 60);
+
+        // Populate batch 2: 40 bytes (total 100 bytes == max_flush_queue_bytes)
+        crate::operations::read_write::write_core(&fs, file.ino, &[0x22; 40], 60).unwrap();
+        assert!(fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.flushing_bytes(), 100);
+
+        // Queue is now saturated on byte capacity (100 >= 100).
+        // Populate live with batch 3 candidates: 30 bytes
+        crate::operations::read_write::write_core(&fs, file.ino, &[0x33; 30], 100).unwrap();
+        assert_eq!(fs.staged_bytes(), 30);
+        assert_eq!(fs.staged_ops(), 1);
+
+        // begin_flush must return false because flushing_bytes >= max_flush_queue_bytes
+        assert!(!fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.flushing_bytes(), 100);
+        assert_eq!(fs.staged_bytes(), 30);
+        assert_eq!(fs.staged_ops(), 1);
+
+        // Verify layered read consistency
+        let read = fs.read_file_data(file.ino, 0, 130).unwrap();
+        assert_eq!(&read[0..60], &[0x11; 60]);
+        assert_eq!(&read[60..100], &[0x22; 40]);
+        assert_eq!(&read[100..130], &[0x33; 30]);
+
+        // Pop one batch (60 bytes) to free byte capacity
+        let popped = fs.pop_flushing_batch().unwrap();
+        fs.fold_flushed_batch(popped);
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.flushing_bytes(), 40);
+
+        // Now begin_flush should succeed
+        assert!(fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.flushing_bytes(), 70);
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.staged_ops(), 0);
+
+        // Drain remaining batches
+        while let Some(batch) = fs.pop_flushing_batch() {
+            fs.fold_flushed_batch(batch);
+        }
+        assert_eq!(fs.flush_queue_depth(), 0);
+        assert_eq!(fs.flushing_bytes(), 0);
+        let read_final = fs.read_file_data(file.ino, 0, 130).unwrap();
+        assert_eq!(&read_final[0..60], &[0x11; 60]);
+        assert_eq!(&read_final[60..100], &[0x22; 40]);
+        assert_eq!(&read_final[100..130], &[0x33; 30]);
+    }
+
+    #[test]
+    fn test_freeze_live_bounded_by_max_flush_queue_ops() {
+        let mut fs = InMemoryFS::new();
+        fs.max_flush_queue_depth = 10;
+        fs.max_flush_queue_ops = 2;
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "ops_bounded.bin", 0o644, 0, 1000, 1000).unwrap();
+        assert!(fs.begin_flush());
+        let init = fs.pop_flushing_batch().unwrap();
+        fs.fold_flushed_batch(init);
+        assert_eq!(fs.flush_queue_depth(), 0);
+        assert_eq!(fs.flushing_ops(), 0);
+
+        // Populate batch 1: 1 op
+        crate::operations::read_write::write_core(&fs, file.ino, &[0x11; 10], 0).unwrap();
+        assert_eq!(fs.staged_ops(), 1);
+        assert!(fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.flushing_ops(), 1);
+
+        // Populate batch 2: 1 op -> total 2 ops == max_flush_queue_ops
+        crate::operations::read_write::write_core(&fs, file.ino, &[0x22; 10], 10).unwrap();
+        assert_eq!(fs.staged_ops(), 1);
+        assert!(fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.flushing_ops(), 2);
+
+        // Queue is now saturated on op capacity (2 >= 2).
+        // Populate live with batch 3 candidates: 1 op
+        crate::operations::read_write::write_core(&fs, file.ino, &[0x33; 10], 20).unwrap();
+        assert_eq!(fs.staged_ops(), 1);
+
+        // begin_flush must return false because flushing_ops >= max_flush_queue_ops
+        assert!(!fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.flushing_ops(), 2);
+        assert_eq!(fs.staged_ops(), 1);
+
+        // Pop one batch (1 op) to free op capacity
+        let popped = fs.pop_flushing_batch().unwrap();
+        fs.fold_flushed_batch(popped);
+        assert_eq!(fs.flush_queue_depth(), 1);
+        assert_eq!(fs.flushing_ops(), 1);
+
+        // Now begin_flush should succeed
+        assert!(fs.begin_flush());
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.flushing_ops(), 2);
+        assert_eq!(fs.staged_ops(), 0);
+
+        // Drain remaining batches
+        while let Some(batch) = fs.pop_flushing_batch() {
+            fs.fold_flushed_batch(batch);
+        }
+        assert_eq!(fs.flush_queue_depth(), 0);
+        assert_eq!(fs.flushing_ops(), 0);
+        let read_final = fs.read_file_data(file.ino, 0, 30).unwrap();
+        assert_eq!(&read_final[0..10], &[0x11; 10]);
+        assert_eq!(&read_final[10..20], &[0x22; 10]);
+        assert_eq!(&read_final[20..30], &[0x33; 10]);
     }
 
     #[test]

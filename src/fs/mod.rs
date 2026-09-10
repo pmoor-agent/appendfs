@@ -324,13 +324,23 @@ impl FsInner {
     }
 
     /// Freezes `live` into the `flushing` queue and transfers staged byte/op counts,
-    /// provided that the `flushing` queue depth does not exceed `max_flush_queue_depth`.
+    /// provided that the `flushing` queue depth does not exceed `max_flush_queue_depth`,
+    /// `flushing_bytes` does not exceed `max_flush_queue_bytes`, and
+    /// `flushing_ops` does not exceed `max_flush_queue_ops`.
     ///
-    /// If `flushing.len() >= max_flush_queue_depth`, this is a no-op that preserves `live`
-    /// and staged byte/op counters, returning `false`.
+    /// If queue depth, byte count, or op count reaches or exceeds capacity, this is a no-op
+    /// that preserves `live` and staged byte/op counters, returning `false`.
     /// Returns `true` if a batch was frozen, or `false` if `live` was empty or `flushing` was full.
-    pub fn freeze_live(&mut self, max_flush_queue_depth: usize) -> bool {
-        if self.flushing.len() >= max_flush_queue_depth {
+    pub fn freeze_live(
+        &mut self,
+        max_flush_queue_depth: usize,
+        max_flush_queue_bytes: usize,
+        max_flush_queue_ops: usize,
+    ) -> bool {
+        if self.flushing.len() >= max_flush_queue_depth
+            || self.flushing_bytes >= max_flush_queue_bytes
+            || self.flushing_ops >= max_flush_queue_ops
+        {
             return false;
         }
         if !self.live.is_empty() {
@@ -514,8 +524,12 @@ impl<'a> Drop for FsInnerGuard<'a> {
             let max_buffer_size = self.fs.max_buffer_size;
             let max_staged_ops = self.fs.max_staged_ops;
             let max_flush_queue_depth = self.fs.max_flush_queue_depth;
+            let max_flush_queue_bytes = self.fs.max_flush_queue_bytes;
+            let max_flush_queue_ops = self.fs.max_flush_queue_ops;
             if self.guard.staged_bytes >= max_buffer_size || self.guard.staged_ops >= max_staged_ops {
-                let froze = self.guard.freeze_live(max_flush_queue_depth);
+                let froze = self
+                    .guard
+                    .freeze_live(max_flush_queue_depth, max_flush_queue_bytes, max_flush_queue_ops);
                 if froze || !self.guard.flushing.is_empty() {
                     let fs = self.fs;
                     self.guard.defer(move || {
@@ -547,6 +561,10 @@ pub struct InMemoryFS {
     pub max_extent_size: usize,
     /// Maximum frozen batches allowed to queue up before auto-freezing is bounded.
     pub max_flush_queue_depth: usize,
+    /// Maximum total bytes across all frozen flush batches allowed to queue up before auto-freezing is bounded.
+    pub max_flush_queue_bytes: usize,
+    /// Maximum total mutating operations across all frozen flush batches allowed to queue up before auto-freezing is bounded.
+    pub max_flush_queue_ops: usize,
     pub flush_interval: AtomicU64,
     pub(crate) flusher: Mutex<Option<BackgroundFlusher>>,
     pub flush_lock: Mutex<()>,
@@ -665,6 +683,8 @@ impl InMemoryFS {
             max_staged_ops: crate::cli::DEFAULT_MAX_BUFFER_OPS,
             max_extent_size: crate::cli::DEFAULT_MAX_EXTENT_SIZE,
             max_flush_queue_depth: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_DEPTH,
+            max_flush_queue_bytes: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_BYTES,
+            max_flush_queue_ops: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_OPS,
             flush_interval: AtomicU64::new(0),
             flusher: Mutex::new(None),
             flush_lock: Mutex::new(()),
