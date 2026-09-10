@@ -5,10 +5,10 @@
 //! Directory handles hold an immutable snapshot of the listing taken at `opendir`, so a
 //! paginated `readdir` is isolated from concurrent mutations.
 
-use super::{DirHandle, FileHandle, Handle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
+use super::{DirHandle, FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
+use crate::node::AttrDelta;
 use crate::sync::OpTag;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 impl InMemoryFS {
     // --- POSIX File & Directory Handle Tracking ---
@@ -26,76 +26,76 @@ impl InMemoryFS {
             FileHandle::Regular { ino, flags }
         };
 
-        let fh = self.allocate_fh();
         self.with_inner(OpTag::Handle, |inner| {
-            inner.handles.insert(fh, Handle::File(file_handle));
-            *inner.open_counts.entry(ino).or_insert(0) += 1;
-        });
-        fh
+            let fh = inner.allocate_fh();
+            inner.insert_file_handle(fh, file_handle);
+            fh
+        })
     }
 
-    /// Validates and extracts an open file handle (either regular or virtual) for the given inode and handle ID.
+    /// Test-only helper to inspect file handle state.
     ///
-    /// Returns:
-    /// - `Err(libc::EBADF)` if the handle does not exist or was opened for a different inode.
-    /// - `Err(libc::EISDIR)` if the handle refers to a directory.
+    /// Not available in production builds to prevent re-introducing two-lock handle access patterns.
+    #[cfg(any(test, feature = "testing"))]
     pub fn extract_file_handle(&self, ino: u64, fh: u64) -> Result<FileHandle, i32> {
-        self.with_inner(OpTag::Handle, |inner| {
-            let handle = inner.handles.get(&fh).ok_or(libc::EBADF)?;
-            if handle.ino() != ino {
-                return Err(libc::EBADF);
-            }
-            match handle {
-                Handle::File(f) => Ok(f.clone()),
-                Handle::Directory(_) => Err(libc::EISDIR),
-            }
-        })
+        self.with_inner(OpTag::Handle, |inner| inner.get_file_handle(ino, fh).cloned())
     }
 
-    /// Validates and extracts a directory handle for the given inode and handle ID.
+    /// Test-only helper to inspect directory handle state.
     ///
-    /// Returns:
-    /// - `Err(libc::EBADF)` if the handle does not exist or was opened for a different inode.
-    /// - `Err(libc::ENOTDIR)` if the handle refers to a file.
+    /// Not available in production builds to prevent re-introducing two-lock handle access patterns.
+    #[cfg(any(test, feature = "testing"))]
     pub fn extract_dir_handle(&self, ino: u64, fh: u64) -> Result<DirHandle, i32> {
-        self.with_inner(OpTag::Handle, |inner| {
-            let handle = inner.handles.get(&fh).ok_or(libc::EBADF)?;
-            if handle.ino() != ino {
-                return Err(libc::EBADF);
-            }
-            match handle {
-                Handle::Directory(d) => Ok(d.clone()),
-                Handle::File(_) => Err(libc::ENOTDIR),
-            }
-        })
+        self.with_inner(OpTag::Handle, |inner| inner.get_dir_handle(ino, fh).cloned())
     }
 
     pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
-        let handle = self.extract_file_handle(ino, fh)?;
-        match handle {
-            FileHandle::Virtual { data, .. } => {
-                let start = (offset as usize).min(data.len());
-                let end = (start + size).min(data.len());
-                let slice_len = end - start;
-                Ok(ReadPlan {
-                    total_len: slice_len,
-                    has_cold_slices: false,
-                    slices: if slice_len > 0 {
-                        vec![ReadSlice {
-                            dst_offset: 0,
-                            len: slice_len,
-                            source: ReadSliceSource::Cache {
-                                data,
-                                src_offset: start,
+        self.with_inner(OpTag::ReadPlan, |inner| {
+            let handle = inner.get_file_handle(ino, fh)?;
+            match handle {
+                FileHandle::Virtual { data, .. } => {
+                    let data = Arc::clone(data);
+                    let start = (offset as usize).min(data.len());
+                    let end = (start + size).min(data.len());
+                    let slice_len = end - start;
+                    Ok(ReadPlan {
+                        total_len: slice_len,
+                        has_cold_slices: false,
+                        slices: if slice_len > 0 {
+                            vec![ReadSlice {
+                                dst_offset: 0,
+                                len: slice_len,
+                                source: ReadSliceSource::Cache {
+                                    data,
+                                    src_offset: start,
+                                },
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                    })
+                }
+                FileHandle::Regular { .. } => {
+                    let plan = inner.with_inode_layers(ino, |layers| {
+                        layers.plan_read_file_data(offset, size, self.log_cache.as_deref())
+                    })?;
+
+                    if self.track_atime && plan.total_len > 0 {
+                        let now = self.clock.now();
+                        inner.update_attr_delta(
+                            ino,
+                            AttrDelta {
+                                atime: Some(now),
+                                ..Default::default()
                             },
-                        }]
-                    } else {
-                        Vec::new()
-                    },
-                })
+                        );
+                        inner.record_mutation(0);
+                    }
+
+                    Ok(plan)
+                }
             }
-            FileHandle::Regular { .. } => self.plan_read_file_data(ino, offset, size),
-        }
+        })
     }
 
     pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
@@ -159,23 +159,24 @@ impl InMemoryFS {
 
     // --- Directory Handle Snapshot Management ---
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn allocate_fh(&self) -> u64 {
-        self.next_fh.fetch_add(1, Ordering::SeqCst)
+        self.with_inner(OpTag::Handle, |inner| inner.allocate_fh())
     }
 
     pub fn open_dir_handle(&self, ino: u64, flags: u32, entries: Vec<(String, u64)>) -> u64 {
-        let fh = self.allocate_fh();
         self.with_inner(OpTag::Handle, |inner| {
-            inner.handles.insert(
+            let fh = inner.allocate_fh();
+            inner.insert_dir_handle(
                 fh,
-                Handle::Directory(DirHandle {
+                DirHandle {
                     ino,
                     flags,
                     entries: Arc::new(entries),
-                }),
+                },
             );
-        });
-        fh
+            fh
+        })
     }
 
     pub fn release_dir_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {

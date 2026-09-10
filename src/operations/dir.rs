@@ -1,4 +1,4 @@
-use crate::fs::{InMemoryFS, find_parent_inode};
+use crate::fs::{DirHandle, InMemoryFS, find_parent_inode};
 use crate::node::{AttrDelta, DirectoryDelta, NodeDelta};
 use crate::shim::{self, FileAttr, FileType, Request};
 use crate::sync::OpTag;
@@ -70,12 +70,43 @@ pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, i3
     Ok(entries)
 }
 
+fn iter_dir_items(
+    ino: u64,
+    dotdot_ino: u64,
+    entries: &[(String, u64)],
+    offset: i64,
+) -> impl Iterator<Item = (&str, u64, i64)> {
+    let offset = offset as usize;
+    let dot = (offset == 0).then_some((".", ino, 1));
+    let dotdot = (offset <= 1).then_some(("..", dotdot_ino, 2));
+    let start_entry_idx = offset.saturating_sub(2);
+    let rest = entries
+        .iter()
+        .enumerate()
+        .skip(start_entry_idx)
+        .map(|(idx, (name, child_ino))| (name.as_str(), *child_ino, (idx + 3) as i64));
+
+    dot.into_iter().chain(dotdot).chain(rest)
+}
+
+#[cfg(any(test, feature = "testing"))]
 pub struct DirItem<'a> {
     pub name: &'a str,
     pub ino: u64,
     pub next_offset: i64,
 }
 
+#[cfg(any(test, feature = "testing"))]
+pub fn iter_dir_entries_with_parent<'a>(
+    ino: u64,
+    dotdot_ino: u64,
+    entries: &'a [(String, u64)],
+    offset: i64,
+) -> impl Iterator<Item = DirItem<'a>> {
+    iter_dir_items(ino, dotdot_ino, entries, offset).map(|(name, ino, next_offset)| DirItem { name, ino, next_offset })
+}
+
+#[cfg(any(test, feature = "testing"))]
 pub fn iter_dir_entries<'a>(
     fs: &InMemoryFS,
     ino: u64,
@@ -87,35 +118,34 @@ pub fn iter_dir_entries<'a>(
     } else {
         find_parent_inode(fs, ino).unwrap_or(1)
     };
-
-    let offset = offset as usize;
-    let dot = (offset == 0).then_some(DirItem {
-        name: ".",
-        ino,
-        next_offset: 1,
-    });
-    let dotdot = (offset <= 1).then_some(DirItem {
-        name: "..",
-        ino: dotdot_ino,
-        next_offset: 2,
-    });
-    let start_entry_idx = offset.saturating_sub(2);
-    let rest = entries
-        .iter()
-        .enumerate()
-        .skip(start_entry_idx)
-        .map(|(idx, (name, child_ino))| DirItem {
-            name: name.as_str(),
-            ino: *child_ino,
-            next_offset: (idx + 3) as i64,
-        });
-
-    dot.into_iter().chain(dotdot).chain(rest)
+    iter_dir_entries_with_parent(ino, dotdot_ino, entries, offset)
 }
 
 pub fn opendir_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
-    let entries = list_dir_core(fs, ino)?;
-    Ok(fs.open_dir_handle(ino, flags, entries))
+    fs.with_inner(OpTag::OpenDir, |inner| {
+        let attr = fs.get_attr_locked(inner, ino).ok_or(libc::ENOENT)?;
+        if attr.file_type != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
+        let mut entries = inner.list_directory(ino).ok_or(libc::ENOENT)?;
+        if ino == 1 {
+            let mut map: BTreeMap<String, u64> = entries.into_iter().collect();
+            for (name, v_ino) in fs.list_virtual_entries() {
+                map.entry(name).or_insert(v_ino);
+            }
+            entries = map.into_iter().collect();
+        }
+        let fh = inner.allocate_fh();
+        inner.insert_dir_handle(
+            fh,
+            DirHandle {
+                ino,
+                flags,
+                entries: Arc::new(entries),
+            },
+        );
+        Ok(fh)
+    })
 }
 
 pub fn opendir(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
@@ -128,23 +158,33 @@ pub fn opendir(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
 
 pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
     log::trace!("readdir(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
-    let dir = match fs.extract_dir_handle(ino, fh) {
-        Ok(dir) => dir,
+    let res = fs.with_inner(OpTag::ReadDir, |inner| {
+        let dir = inner.get_dir_handle(ino, fh)?;
+        let parent_ino = if ino == 1 {
+            1
+        } else {
+            inner.get_parent_dir_inode(ino).unwrap_or(1)
+        };
+        let mut items = Vec::new();
+        for (name, item_ino, next_offset) in iter_dir_items(ino, parent_ino, &dir.entries, offset) {
+            if let Some(attr) = fs.get_attr_locked(inner, item_ino) {
+                items.push((name.to_string(), item_ino, attr.file_type, next_offset));
+            }
+        }
+        Ok(items)
+    });
+
+    let items = match res {
+        Ok(items) => items,
         Err(e) => {
             req.reply_err(e);
             return;
         }
     };
 
-    let items: Vec<DirItem> = iter_dir_entries(fs, ino, &dir.entries, offset).collect();
-    let inos: Vec<u64> = items.iter().map(|item| item.ino).collect();
-    let attrs = fs.get_attrs_batch(&inos);
-
     let mut db = shim::DirectoryBuffer::new(req, size);
-    for item in items {
-        if let Some(attr) = attrs.get(&item.ino)
-            && !db.add(item.name, item.ino, attr.file_type, item.next_offset)
-        {
+    for (name, item_ino, file_type, next_offset) in items {
+        if !db.add(&name, item_ino, file_type, next_offset) {
             break;
         }
     }
@@ -153,23 +193,33 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
 
 pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
     log::trace!("readdirplus(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
-    let dir = match fs.extract_dir_handle(ino, fh) {
-        Ok(dir) => dir,
+    let res = fs.with_inner(OpTag::ReadDir, |inner| {
+        let dir = inner.get_dir_handle(ino, fh)?;
+        let parent_ino = if ino == 1 {
+            1
+        } else {
+            inner.get_parent_dir_inode(ino).unwrap_or(1)
+        };
+        let mut items = Vec::new();
+        for (name, item_ino, next_offset) in iter_dir_items(ino, parent_ino, &dir.entries, offset) {
+            if let Some(attr) = fs.get_attr_locked(inner, item_ino) {
+                items.push((name.to_string(), attr, next_offset));
+            }
+        }
+        Ok(items)
+    });
+
+    let items = match res {
+        Ok(items) => items,
         Err(e) => {
             req.reply_err(e);
             return;
         }
     };
 
-    let items: Vec<DirItem> = iter_dir_entries(fs, ino, &dir.entries, offset).collect();
-    let inos: Vec<u64> = items.iter().map(|item| item.ino).collect();
-    let attrs = fs.get_attrs_batch(&inos);
-
     let mut db = shim::DirectoryBufferPlus::new(req, size);
-    for item in items {
-        if let Some(attr) = attrs.get(&item.ino)
-            && !db.add(item.name, attr, 1.0, 1.0, item.next_offset)
-        {
+    for (name, attr, next_offset) in items {
+        if !db.add(&name, &attr, 1.0, 1.0, next_offset) {
             break;
         }
     }
