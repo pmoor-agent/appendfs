@@ -464,7 +464,7 @@ impl ExtentMap {
         }
     }
 
-    /// Inserts a new extent `[new_start, new_start + new_len)` with `extent`.
+    /// Inserts a new extent `[file_offset, file_offset + extent.length())`.
     ///
     /// If empty or single, it stays inline with zero heap allocations.
     /// If the insert is append-only, it transitions to or stays in high-performance
@@ -472,52 +472,44 @@ impl ExtentMap {
     ///
     /// If the insert overlaps earlier regions (random overwrite or middle split), the map
     /// promotes to a `BTreeMap` and handles splitting and trimming.
-    pub fn insert(&mut self, new_start: u64, new_len: u64, new_extent: Extent) {
+    pub fn insert(&mut self, file_offset: u64, extent: Extent) {
+        let new_len = extent.length();
         if new_len == 0 {
             return;
         }
 
         match &mut self.inner {
             ExtentMapInner::Empty => {
-                self.inner = ExtentMapInner::Single(ExtentEntry {
-                    file_offset: new_start,
-                    extent: new_extent,
-                });
+                self.inner = ExtentMapInner::Single(ExtentEntry { file_offset, extent });
                 return;
             }
             ExtentMapInner::Single(entry) => {
                 let entry_start = entry.file_offset;
                 let entry_len = entry.length();
                 let entry_end = entry_start + entry_len;
-                let new_end = new_start + new_len;
+                let new_end = file_offset + new_len;
 
                 // Case 1: Contiguous append that coalesces
-                if entry_end == new_start && entry.extent.try_coalesce_with(&new_extent) {
+                if entry_end == file_offset && entry.extent.try_coalesce_with(&extent) {
                     return;
                 }
 
                 // Case 2: Append after existing extent (with gap or non-coalescing)
-                if new_start >= entry_end {
+                if file_offset >= entry_end {
                     let old_entry = match std::mem::replace(&mut self.inner, ExtentMapInner::Empty) {
                         ExtentMapInner::Single(e) => e,
                         _ => unreachable!(),
                     };
                     let mut vec = Vec::with_capacity(4);
                     vec.push(old_entry);
-                    vec.push(ExtentEntry {
-                        file_offset: new_start,
-                        extent: new_extent,
-                    });
+                    vec.push(ExtentEntry { file_offset, extent });
                     self.inner = ExtentMapInner::Vector(vec);
                     return;
                 }
 
                 // Case 3: Full overwrite of the single extent
-                if new_start <= entry_start && new_end >= entry_end {
-                    *entry = ExtentEntry {
-                        file_offset: new_start,
-                        extent: new_extent,
-                    };
+                if file_offset <= entry_start && new_end >= entry_end {
+                    *entry = ExtentEntry { file_offset, extent };
                     return;
                 }
 
@@ -533,21 +525,18 @@ impl ExtentMap {
             ExtentMapInner::Vector(vec) => {
                 let is_append = match vec.last() {
                     None => true,
-                    Some(last) => new_start >= last.file_offset + last.length(),
+                    Some(last) => file_offset >= last.file_offset + last.length(),
                 };
 
                 if is_append {
                     // Attempt contiguous coalescing with the last extent
                     if let Some(last) = vec.last_mut()
-                        && last.file_offset + last.length() == new_start
-                        && last.extent.try_coalesce_with(&new_extent)
+                        && last.file_offset + last.length() == file_offset
+                        && last.extent.try_coalesce_with(&extent)
                     {
                         return;
                     }
-                    vec.push(ExtentEntry {
-                        file_offset: new_start,
-                        extent: new_extent,
-                    });
+                    vec.push(ExtentEntry { file_offset, extent });
                     return;
                 }
 
@@ -564,10 +553,17 @@ impl ExtentMap {
         let ExtentMapInner::Tree(ref mut tree) = self.inner else {
             unreachable!();
         };
-        Self::insert_into_tree(tree, new_start, new_len, new_extent);
+        Self::insert_into_tree(tree, file_offset, extent);
     }
 
-    fn insert_into_tree(tree: &mut BTreeMap<u64, ExtentEntry>, new_start: u64, new_len: u64, new_extent: Extent) {
+    /// Inserts an `ExtentEntry` at its `file_offset`.
+    #[inline]
+    pub fn insert_entry(&mut self, entry: ExtentEntry) {
+        self.insert(entry.file_offset, entry.extent);
+    }
+
+    fn insert_into_tree(tree: &mut BTreeMap<u64, ExtentEntry>, new_start: u64, new_extent: Extent) {
+        let new_len = new_extent.length();
         let new_end = new_start + new_len;
 
         let mut candidates = Vec::new();
@@ -812,13 +808,13 @@ impl ExtentMap {
             ExtentMapInner::Empty => Self::new(),
             ExtentMapInner::Single(entry) => {
                 let mut em = Self::new();
-                em.insert(entry.file_offset, entry.length(), entry.extent.clone());
+                em.insert_entry(entry.clone());
                 em
             }
             ExtentMapInner::Vector(_) | ExtentMapInner::Tree(_) => {
                 let mut coalesced = Self::with_capacity(self.len());
-                for (&start, entry) in self.iter() {
-                    coalesced.insert(start, entry.length(), entry.extent.clone());
+                for (_start, entry) in self.iter() {
+                    coalesced.insert_entry(entry.clone());
                 }
                 if let ExtentMapInner::Vector(mut vec) = coalesced.inner {
                     if vec.is_empty() {
@@ -972,12 +968,12 @@ mod tests {
         assert!(em.is_empty_storage());
         assert_eq!(em.len(), 0);
 
-        em.insert(0, 100, Extent::new_zero(100));
+        em.insert(0, Extent::new_zero(100));
         assert!(em.is_single());
         assert_eq!(em.len(), 1);
 
         // Contiguous zero extent should coalesce and stay in Single mode
-        em.insert(100, 100, Extent::new_zero(100));
+        em.insert(100, Extent::new_zero(100));
         assert!(em.is_single());
         assert_eq!(em.len(), 1);
         let q = em.query(0, 200);
@@ -986,7 +982,7 @@ mod tests {
         assert_eq!(q[0].1, 200);
 
         // Append with gap promotes to vector mode
-        em.insert(300, 50, Extent::new_zero(50));
+        em.insert(300, Extent::new_zero(50));
         assert!(em.is_vector());
         assert_eq!(em.len(), 2);
     }
@@ -994,13 +990,13 @@ mod tests {
     #[test]
     fn test_overwrite_promotes_to_tree_mode() {
         let mut em = ExtentMap::new();
-        em.insert(0, 100, Extent::new_zero(100));
+        em.insert(0, Extent::new_zero(100));
         assert!(em.is_single());
-        em.insert(100, 100, Extent::new_disk(1, 10, 100, 0, 100));
+        em.insert(100, Extent::new_disk(1, 10, 100, 0, 100));
         assert!(em.is_vector());
 
         // Overwrite in the middle: triggers promotion to Tree
-        em.insert(50, 100, Extent::new_disk(2, 20, 100, 0, 100));
+        em.insert(50, Extent::new_disk(2, 20, 100, 0, 100));
         assert!(em.is_tree());
 
         let entries: Vec<_> = em.iter().map(|(&k, e)| (k, e.length())).collect();
@@ -1013,7 +1009,7 @@ mod tests {
     #[test]
     fn test_single_extent_operations() {
         let mut em = ExtentMap::new();
-        em.insert(100, 200, Extent::new_disk(1, 10, 200, 0, 200));
+        em.insert(100, Extent::new_disk(1, 10, 200, 0, 200));
         assert!(em.is_single());
         assert_eq!(em.len(), 1);
 
@@ -1062,7 +1058,7 @@ mod tests {
         assert_eq!(em.query(100, 200)[0].1, 150);
 
         // Full overwrite of single extent stays in Single mode
-        em.insert(50, 300, Extent::new_disk(2, 20, 300, 0, 300));
+        em.insert(50, Extent::new_disk(2, 20, 300, 0, 300));
         assert!(em.is_single());
         assert_eq!(em.len(), 1);
         let q = em.query(0, 500);
@@ -1082,9 +1078,9 @@ mod tests {
         let mut em = ExtentMap::new();
 
         // 3 contiguous appends to the same arena buffer
-        em.insert(0, 100, Extent::new_staged(Arc::clone(&buffer), 0, 100));
-        em.insert(100, 150, Extent::new_staged(Arc::clone(&buffer), 100, 150));
-        em.insert(250, 200, Extent::new_staged(Arc::clone(&buffer), 250, 200));
+        em.insert(0, Extent::new_staged(Arc::clone(&buffer), 0, 100));
+        em.insert(100, Extent::new_staged(Arc::clone(&buffer), 100, 150));
+        em.insert(250, Extent::new_staged(Arc::clone(&buffer), 250, 200));
 
         // All 3 contiguous appends should coalesce and remain in Single mode!
         assert!(em.is_single());
@@ -1106,7 +1102,7 @@ mod tests {
 
         // 2. Single extent map
         let mut em_single = ExtentMap::new();
-        em_single.insert(0, 1024, Extent::new_disk(1, 100, 1056, 32, 1024));
+        em_single.insert(0, Extent::new_disk(1, 100, 1056, 32, 1024));
         let bytes_single = crate::wire::serialize(&em_single).expect("serialize single ExtentMap");
         let decoded_single: ExtentMap = crate::wire::deserialize(&bytes_single).expect("deserialize single ExtentMap");
         assert!(
@@ -1118,9 +1114,9 @@ mod tests {
 
         // 3. Multi extent map
         let mut em = ExtentMap::new();
-        em.insert(0, 1024, Extent::new_disk(1, 100, 1056, 32, 1024));
-        em.insert(1024, 2048, Extent::new_zero(2048));
-        em.insert(3072, 4096, Extent::new_disk(2, 500, 4128, 32, 4096));
+        em.insert(0, Extent::new_disk(1, 100, 1056, 32, 1024));
+        em.insert(1024, Extent::new_zero(2048));
+        em.insert(3072, Extent::new_disk(2, 500, 4128, 32, 4096));
 
         let bytes = crate::wire::serialize(&em).expect("serialize ExtentMap");
         let decoded: ExtentMap = crate::wire::deserialize(&bytes).expect("deserialize ExtentMap");
@@ -1133,10 +1129,10 @@ mod tests {
     #[test]
     fn test_cross_mode_equality() {
         let mut em_single = ExtentMap::new();
-        em_single.insert(0, 100, Extent::new_disk(1, 10, 100, 0, 100));
+        em_single.insert(0, Extent::new_disk(1, 10, 100, 0, 100));
 
         let mut em_vec = ExtentMap::with_capacity(2);
-        em_vec.insert(0, 100, Extent::new_disk(1, 10, 100, 0, 100));
+        em_vec.insert(0, Extent::new_disk(1, 10, 100, 0, 100));
         assert!(em_vec.is_vector());
 
         // Single vs Vector with 1 identical extent must be equal
@@ -1144,13 +1140,13 @@ mod tests {
 
         // Vector vs Tree with identical extents must be equal
         let mut em_tree = ExtentMap::new();
-        em_tree.insert(0, 200, Extent::new_disk(1, 10, 200, 0, 200));
-        em_tree.insert(100, 50, Extent::new_disk(2, 20, 50, 0, 50)); // promotes to Tree
+        em_tree.insert(0, Extent::new_disk(1, 10, 200, 0, 200));
+        em_tree.insert(100, Extent::new_disk(2, 20, 50, 0, 50)); // promotes to Tree
         assert!(em_tree.is_tree());
 
         let mut em_vec2 = ExtentMap::new();
         for (&start, entry) in em_tree.iter() {
-            em_vec2.insert(start, entry.length(), entry.extent.clone());
+            em_vec2.insert(start, entry.extent.clone());
         }
         assert!(em_vec2.is_vector() || em_vec2.is_single());
         assert_eq!(em_tree, em_vec2);
@@ -1165,8 +1161,8 @@ mod tests {
     fn test_coalesce_demotes_vector_to_single() {
         let mut em = ExtentMap::with_capacity(3);
         assert!(em.is_vector());
-        em.insert(0, 100, Extent::new_zero(100));
-        em.insert(100, 100, Extent::new_zero(100));
+        em.insert(0, Extent::new_zero(100));
+        em.insert(100, Extent::new_zero(100));
         // In with_capacity(3), it started in vector mode.
         let coalesced = em.coalesce();
         assert!(
@@ -1180,10 +1176,10 @@ mod tests {
     #[test]
     fn test_middle_split() {
         let mut em = ExtentMap::new();
-        em.insert(0, 1000, Extent::new_disk(1, 0, 1000, 0, 1000));
+        em.insert(0, Extent::new_disk(1, 0, 1000, 0, 1000));
 
         // Insert inside range: [200, 500)
-        em.insert(200, 300, Extent::new_disk(2, 0, 300, 0, 300));
+        em.insert(200, Extent::new_disk(2, 0, 300, 0, 300));
         assert!(em.is_tree());
 
         let entries: Vec<(u64, u64)> = em.iter().map(|(&k, v)| (k, v.length())).collect();
@@ -1196,11 +1192,11 @@ mod tests {
     #[test]
     fn test_full_overwrite() {
         let mut em = ExtentMap::new();
-        em.insert(100, 100, Extent::new_disk(1, 0, 100, 0, 100));
-        em.insert(200, 100, Extent::new_disk(2, 0, 100, 0, 100));
+        em.insert(100, Extent::new_disk(1, 0, 100, 0, 100));
+        em.insert(200, Extent::new_disk(2, 0, 100, 0, 100));
 
         // Overwrite both completely: [50, 400)
-        em.insert(50, 350, Extent::new_disk(3, 0, 350, 0, 350));
+        em.insert(50, Extent::new_disk(3, 0, 350, 0, 350));
         assert!(em.is_tree());
 
         assert_eq!(em.len(), 1);
@@ -1213,12 +1209,12 @@ mod tests {
     fn test_multi_interval_overwrite_and_gaps() {
         let mut em = ExtentMap::new();
         // [0, 100), [200, 300), [400, 500)
-        em.insert(0, 100, Extent::new_disk(1, 0, 100, 0, 100));
-        em.insert(200, 100, Extent::new_disk(2, 0, 100, 0, 100));
-        em.insert(400, 100, Extent::new_disk(3, 0, 100, 0, 100));
+        em.insert(0, Extent::new_disk(1, 0, 100, 0, 100));
+        em.insert(200, Extent::new_disk(2, 0, 100, 0, 100));
+        em.insert(400, Extent::new_disk(3, 0, 100, 0, 100));
 
         // Overwrite [50, 450)
-        em.insert(50, 400, Extent::new_disk(4, 0, 400, 0, 400));
+        em.insert(50, Extent::new_disk(4, 0, 400, 0, 400));
         assert!(em.is_tree());
 
         let entries: Vec<(u64, u64)> = em.iter().map(|(&k, v)| (k, v.length())).collect();
@@ -1231,8 +1227,8 @@ mod tests {
     #[test]
     fn test_tree_truncate() {
         let mut em = ExtentMap::new();
-        em.insert(0, 100, Extent::new_disk(1, 0, 100, 0, 100));
-        em.insert(50, 100, Extent::new_disk(2, 0, 100, 0, 100)); // triggers promotion to Tree
+        em.insert(0, Extent::new_disk(1, 0, 100, 0, 100));
+        em.insert(50, Extent::new_disk(2, 0, 100, 0, 100)); // triggers promotion to Tree
         assert!(em.is_tree());
 
         em.truncate(80);
@@ -1247,7 +1243,7 @@ mod tests {
     #[test]
     fn test_query_does_not_mutate_stored_state() {
         let mut em = ExtentMap::new();
-        em.insert(0, 100, Extent::new_disk(1, 0, 100, 0, 100));
+        em.insert(0, Extent::new_disk(1, 0, 100, 0, 100));
 
         let _ = em.query(10, 20);
 
@@ -1506,7 +1502,7 @@ mod tests {
             written[start..start + len].fill(true);
             min_written = min_written.min(start);
             max_written = max_written.max(start + len);
-            em.insert(start as u64, len as u64, extent);
+            em.insert(start as u64, extent);
 
             // Periodic mid-run sanity checks
             if step % 50 == 0 {

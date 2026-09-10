@@ -1315,8 +1315,8 @@ mod tests {
 
         // Create fragmented file (inode 3) with 2 extents
         let mut rmap = ExtentMap::new();
-        rmap.insert(0, 4096, Extent::new_disk(1, 100, 4133, 20, 4096));
-        rmap.insert(4096, 4096, Extent::new_disk(2, 200, 4133, 20, 4096));
+        rmap.insert(0, Extent::new_disk(1, 100, 4133, 20, 4096));
+        rmap.insert(4096, Extent::new_disk(2, 200, 4133, 20, 4096));
 
         let file_node = Arc::new(Node {
             meta: InodeMeta::new(0o644, 1, 1000, 1000, now),

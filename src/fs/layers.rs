@@ -803,7 +803,7 @@ mod tests {
         // 1. Base layer: Disk extent at 0..100
         let shared_disk = Extent::new_disk(1, 1024, 137, 0, 100);
         let mut base_range = ExtentMap::new();
-        base_range.insert(0, 100, shared_disk);
+        base_range.insert(0, shared_disk);
         let mut base_map = HashMap::new();
         base_map.insert(
             attr.ino,
@@ -820,7 +820,7 @@ mod tests {
         // 2. Flushing layer: punch hole (Zero) at 20..40
         let mut flushing_batch = HashMap::new();
         let mut f_delta = FileDelta::default();
-        f_delta.extents.insert(20, 20, Extent::new_zero(20));
+        f_delta.extents.insert(20, Extent::new_zero(20));
         flushing_batch.insert(attr.ino, EntryDelta::Node(NodeDelta::File(f_delta)));
         fs.inner
             .lock()
@@ -832,7 +832,7 @@ mod tests {
         let mut live_delta = FileDelta::default();
         live_delta
             .extents
-            .insert(30, 20, Extent::new_staged_buffer(vec![0xBB; 20], 0, 20));
+            .insert(30, Extent::new_staged_buffer(vec![0xBB; 20], 0, 20));
         fs.inner
             .lock()
             .unwrap()
@@ -896,7 +896,7 @@ mod tests {
 
         let shared_disk = Extent::new_disk(1, 1024, 137, 0, 100);
         let mut base_range = ExtentMap::new();
-        base_range.insert(0, 100, shared_disk);
+        base_range.insert(0, shared_disk);
         let mut base_map = HashMap::new();
         base_map.insert(
             attr.ino,

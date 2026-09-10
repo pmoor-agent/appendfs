@@ -798,7 +798,7 @@ mod tests {
         );
 
         let mut rmap = ExtentMap::new();
-        rmap.insert(0, 100, Extent::new_disk(1, 24, 137, 0, 100));
+        rmap.insert(0, Extent::new_disk(1, 24, 137, 0, 100));
         snapshot.insert(
             2,
             Arc::new(Node {
