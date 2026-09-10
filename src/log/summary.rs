@@ -3,6 +3,7 @@ use crate::extent_map::ExtentMap;
 use crate::fs::InMemoryFS;
 use crate::node::{Node, NodeKind};
 use crate::storage::{Storage, StorageReader, WriteMode};
+use crate::sync::OpTag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
@@ -405,7 +406,7 @@ pub fn init_volume_with_clock_uids_and_iv(
     }
 
     let fs = InMemoryFS::with_clock_and_uids(clock.clone(), uid, gid);
-    let snapshot = fs.snapshot_all();
+    let snapshot = fs.inner.lock(OpTag::Flush).unwrap().snapshot_all();
     let manifest = crate::log::LogManifest {
         logs: Vec::new(),
         next_generation: 1,

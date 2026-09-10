@@ -255,7 +255,7 @@ fn test_disaster_recovery_bootstrap_from_remote() {
 
     // Recover volume in the fresh storage
     let fresh_fs = appendfs::recover_fs(fresh_storage, appendfs::RecoveryTarget::Latest, clock, volume_key).unwrap();
-    let base = fresh_fs.inner.lock().unwrap().base.clone();
+    let base = fresh_fs.inner.lock_for_tests().unwrap().base.clone();
     assert!(base.len() >= 2); // root + important.txt
 }
 
@@ -1982,6 +1982,6 @@ fn test_per_remote_upload_partial_logs_behavior() {
     assert!(fresh_storage.exists("remotes.toml"));
 
     let fresh_fs = appendfs::recover_fs(fresh_storage, appendfs::RecoveryTarget::Latest, clock, volume_key).unwrap();
-    let base = fresh_fs.inner.lock().unwrap().base.clone();
+    let base = fresh_fs.inner.lock_for_tests().unwrap().base.clone();
     assert!(base.len() >= 2); // root + active_doc.txt
 }

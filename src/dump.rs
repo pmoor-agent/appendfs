@@ -1336,7 +1336,7 @@ mod tests {
         });
 
         {
-            let mut inner = fs.inner.lock().unwrap();
+            let mut inner = fs.inner.lock_for_tests().unwrap();
             inner.base.insert(1, root_node);
             inner.base.insert(2, dir_node);
             inner.base.insert(3, file_node);

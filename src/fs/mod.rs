@@ -619,7 +619,7 @@ impl InMemoryFS {
     pub fn with_clock_and_uids(clock: Arc<dyn Clock>, uid: u32, gid: u32) -> Self {
         let fs = Self::with_clock(clock.clone());
         let now = clock.now();
-        if let Some(root) = fs.inner.lock().unwrap().base.get_mut(&1) {
+        if let Some(root) = fs.inner.lock(OpTag::Other).unwrap().base.get_mut(&1) {
             *root = Arc::new(Node::new_dir(1, 0o755, uid, gid, now));
         }
         fs
@@ -715,7 +715,7 @@ impl InMemoryFS {
     /// allows) and schedules a deferred post-unlock flush trigger.
     pub fn lock_inner(&self, tag: OpTag) -> FsInnerGuard<'_> {
         FsInnerGuard {
-            guard: self.inner.lock_tag(tag).unwrap(),
+            guard: self.inner.lock(tag).unwrap(),
             fs: self,
             mutation_occurred: false,
         }
@@ -730,35 +730,51 @@ impl InMemoryFS {
         f(&mut guard)
     }
 
+    /// Acquires the filesystem inner lock with [`OpTag::Test`].
+    ///
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn lock_inner_for_tests(&self) -> FsInnerGuard<'_> {
+        self.lock_inner(OpTag::Test)
+    }
+
+    /// Acquires the filesystem inner lock with [`OpTag::Test`] and executes `f`.
+    ///
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_inner_for_tests<R>(&self, f: impl FnOnce(&mut FsInnerGuard<'_>) -> R) -> R {
+        self.with_inner(OpTag::Test, f)
+    }
+
     /// Number of dirty bytes currently staged in the active `live` layer.
     pub fn staged_bytes(&self) -> usize {
-        self.inner.lock().unwrap().staged_bytes
+        self.inner.lock(OpTag::Stats).unwrap().staged_bytes
     }
 
     /// Number of mutating operations currently staged in the active `live` layer.
     pub fn staged_ops(&self) -> usize {
-        self.inner.lock().unwrap().staged_ops
+        self.inner.lock(OpTag::Stats).unwrap().staged_ops
     }
 
     /// Total data bytes across all frozen batches waiting in `flushing`.
     pub fn flushing_bytes(&self) -> usize {
-        self.inner.lock().unwrap().flushing_bytes
+        self.inner.lock(OpTag::Stats).unwrap().flushing_bytes
     }
 
     /// Total operations across all frozen batches waiting in `flushing`.
     pub fn flushing_ops(&self) -> usize {
-        self.inner.lock().unwrap().flushing_ops
+        self.inner.lock(OpTag::Stats).unwrap().flushing_ops
     }
 
     /// Total dirty bytes currently in memory (staged in `live` + queued in `flushing`).
     pub fn total_dirty_bytes(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock(OpTag::Stats).unwrap();
         inner.staged_bytes + inner.flushing_bytes
     }
 
     /// Total dirty operations currently in memory (staged in `live` + queued in `flushing`).
     pub fn total_dirty_ops(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock(OpTag::Stats).unwrap();
         inner.staged_ops + inner.flushing_ops
     }
 
@@ -865,11 +881,11 @@ impl InMemoryFS {
     }
 
     pub fn recovered_time(&self) -> Option<SystemTime> {
-        self.inner.lock().unwrap().recovered_time
+        self.inner.lock(OpTag::Stats).unwrap().recovered_time
     }
 
     pub fn set_recovered_time(&self, time: Option<SystemTime>) {
-        self.inner.lock().unwrap().recovered_time = time;
+        self.inner.lock(OpTag::Other).unwrap().recovered_time = time;
     }
 
     pub fn set_storage(&mut self, storage: Arc<dyn Storage>) {
@@ -927,13 +943,13 @@ mod tests {
     fn test_fs_inner_guard_mutation_tracking() {
         let fs = InMemoryFS::new();
         {
-            let guard = fs.lock_inner(OpTag::ReadPlan);
+            let guard = fs.lock_inner_for_tests();
             assert!(!guard.mutation_occurred());
             assert_eq!(guard.staged_bytes, 0);
             assert_eq!(guard.staged_ops, 0);
         }
         {
-            let mut guard = fs.lock_inner(OpTag::Write);
+            let mut guard = fs.lock_inner_for_tests();
             assert!(!guard.mutation_occurred());
             guard.record_mutation(128);
             assert!(guard.mutation_occurred());
@@ -942,7 +958,7 @@ mod tests {
         }
         // After guard drops, staged bytes/ops persist on FsInner, but new guard starts with mutation_occurred = false
         {
-            let guard = fs.lock_inner(OpTag::Other);
+            let guard = fs.lock_inner_for_tests();
             assert!(!guard.mutation_occurred());
             assert_eq!(guard.staged_bytes, 128);
             assert_eq!(guard.staged_ops, 1);

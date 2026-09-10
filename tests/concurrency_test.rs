@@ -752,7 +752,7 @@ fn run_concurrent_stress(seed: u64) {
     verify_log_replay_matches_live(&fs, storage.clone(), seed);
 
     {
-        let inner = fs.inner.lock().unwrap();
+        let inner = fs.inner.lock_for_tests().unwrap();
         assert!(inner.handles.is_empty(), "seed {}: leaked handles", seed);
         assert!(inner.open_counts.is_empty(), "seed {}: leaked open_counts", seed);
     }

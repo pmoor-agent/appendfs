@@ -1205,7 +1205,7 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
         },
     };
     fs.inner
-        .lock()
+        .lock_for_tests()
         .unwrap()
         .base
         .insert(orphan_ino, std::sync::Arc::new(orphan_node));

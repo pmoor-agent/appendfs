@@ -31,10 +31,17 @@ pub enum OpTag {
     Lookup = 20,
     GetAttr = 21,
     ReadLink = 22,
-    Other = 23,
+    Stats = 23,
+    Other = 24,
+    #[cfg(any(test, feature = "testing"))]
+    Test = 25,
 }
 
-pub const OP_TAG_COUNT: usize = 24;
+#[cfg(not(any(test, feature = "testing")))]
+pub const OP_TAG_COUNT: usize = 25;
+#[cfg(any(test, feature = "testing"))]
+pub const OP_TAG_COUNT: usize = 26;
+
 pub const ALL_OP_TAGS: [OpTag; OP_TAG_COUNT] = [
     OpTag::Write,
     OpTag::ReadPlan,
@@ -59,7 +66,10 @@ pub const ALL_OP_TAGS: [OpTag; OP_TAG_COUNT] = [
     OpTag::Lookup,
     OpTag::GetAttr,
     OpTag::ReadLink,
+    OpTag::Stats,
     OpTag::Other,
+    #[cfg(any(test, feature = "testing"))]
+    OpTag::Test,
 ];
 
 impl OpTag {
@@ -88,7 +98,10 @@ impl OpTag {
             OpTag::Lookup => "lookup",
             OpTag::GetAttr => "getattr",
             OpTag::ReadLink => "readlink",
+            OpTag::Stats => "stats",
             OpTag::Other => "other",
+            #[cfg(any(test, feature = "testing"))]
+            OpTag::Test => "test",
         }
     }
 
@@ -123,32 +136,7 @@ impl Default for OpMetrics {
 }
 
 const fn new_op_metrics_array() -> [OpMetrics; OP_TAG_COUNT] {
-    [
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-        OpMetrics::new(),
-    ]
+    [const { OpMetrics::new() }; OP_TAG_COUNT]
 }
 
 /// Point-in-time snapshot of operation metrics for reporting.
@@ -213,14 +201,9 @@ impl<T> ActionMutex<T> {
         }
     }
 
-    /// Acquires the mutex with `OpTag::Other`, blocking until available.
-    pub fn lock(&self) -> LockResult<ActionGuard<'_, T>> {
-        self.lock_tag(OpTag::Other)
-    }
-
     /// Acquires the mutex with a specific operation tag, blocking until available.
     /// Tracks wait time and starts measuring busy time upon acquisition.
-    pub fn lock_tag(&self, tag: OpTag) -> LockResult<ActionGuard<'_, T>> {
+    pub fn lock(&self, tag: OpTag) -> LockResult<ActionGuard<'_, T>> {
         let wait_start = Instant::now();
         match self.inner.lock() {
             Ok(guard) => {
@@ -244,13 +227,16 @@ impl<T> ActionMutex<T> {
         }
     }
 
-    /// Attempts to acquire the mutex without blocking.
-    pub fn try_lock(&self) -> TryLockResult<ActionGuard<'_, T>> {
-        self.try_lock_tag(OpTag::Other)
+    /// Acquires the mutex with [`OpTag::Test`].
+    ///
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn lock_for_tests(&self) -> LockResult<ActionGuard<'_, T>> {
+        self.lock(OpTag::Test)
     }
 
     /// Attempts to acquire the mutex with a specific operation tag without blocking.
-    pub fn try_lock_tag(&self, tag: OpTag) -> TryLockResult<ActionGuard<'_, T>> {
+    pub fn try_lock(&self, tag: OpTag) -> TryLockResult<ActionGuard<'_, T>> {
         match self.inner.try_lock() {
             Ok(guard) => Ok(ActionGuard::new(self, guard, tag)),
             Err(TryLockError::Poisoned(poisoned)) => Err(TryLockError::Poisoned(PoisonError::new(ActionGuard::new(
@@ -262,12 +248,28 @@ impl<T> ActionMutex<T> {
         }
     }
 
+    /// Attempts to acquire the mutex with [`OpTag::Test`] without blocking.
+    ///
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn try_lock_for_tests(&self) -> TryLockResult<ActionGuard<'_, T>> {
+        self.try_lock(OpTag::Test)
+    }
+
+    /// Acquires the mutex with [`OpTag::Test`] and executes `f` with a mutable reference to the [`ActionGuard`].
+    ///
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_lock_for_tests<R>(&self, f: impl FnOnce(&mut ActionGuard<'_, T>) -> R) -> R {
+        self.with_lock(OpTag::Test, f)
+    }
+
     /// Acquires the lock with `tag` and executes `f` with a mutable reference to the [`ActionGuard`].
     ///
     /// The lock is released and any deferred post-unlock tasks are guaranteed to execute
     /// immediately when `f` returns.
     pub fn with_lock<R>(&self, tag: OpTag, f: impl FnOnce(&mut ActionGuard<'_, T>) -> R) -> R {
-        let mut guard = self.lock_tag(tag).expect("ActionMutex poisoned");
+        let mut guard = self.lock(tag).expect("ActionMutex poisoned");
         f(&mut guard)
     }
 
@@ -491,7 +493,7 @@ mod tests {
         assert_eq!(m.busy_time(), Duration::ZERO);
 
         {
-            let mut guard = m.lock().unwrap();
+            let mut guard = m.lock_for_tests().unwrap();
             assert_eq!(*guard, 42);
             *guard = 100;
             thread::sleep(Duration::from_millis(5));
@@ -499,7 +501,7 @@ mod tests {
 
         assert_eq!(m.lock_count(), 1);
         assert!(m.busy_time() >= Duration::from_millis(4));
-        assert_eq!(*m.lock().unwrap(), 100);
+        assert_eq!(*m.lock_for_tests().unwrap(), 100);
         assert_eq!(m.lock_count(), 2);
     }
 
@@ -511,11 +513,11 @@ mod tests {
         let executed_clone = Arc::clone(&executed);
 
         {
-            let mut guard = m.lock().unwrap();
+            let mut guard = m.lock_for_tests().unwrap();
             *guard += 1;
             guard.defer(move || {
                 // If the lock were still held, acquiring here would deadlock!
-                let val = *m_clone.lock().unwrap();
+                let val = *m_clone.lock_for_tests().unwrap();
                 assert_eq!(val, 1);
                 executed_clone.store(true, Ordering::SeqCst);
             });
@@ -535,7 +537,7 @@ mod tests {
         let post_ran_clone = Arc::clone(&post_ran);
 
         {
-            let mut guard = m.lock().unwrap();
+            let mut guard = m.lock_for_tests().unwrap();
             guard.before_unlock(move |data, queue| {
                 // Inspect data under lock
                 if *data == 10 {
@@ -543,7 +545,7 @@ mod tests {
                     let m_sub = Arc::clone(&m_clone);
                     let p_sub = Arc::clone(&post_ran_clone);
                     queue.defer(move || {
-                        assert_eq!(*m_sub.lock().unwrap(), 20);
+                        assert_eq!(*m_sub.lock_for_tests().unwrap(), 20);
                         p_sub.store(true, Ordering::SeqCst);
                     });
                 }
@@ -552,7 +554,7 @@ mod tests {
             assert!(!post_ran.load(Ordering::SeqCst));
         }
 
-        assert_eq!(*m.lock().unwrap(), 20);
+        assert_eq!(*m.lock_for_tests().unwrap(), 20);
         assert!(post_ran.load(Ordering::SeqCst));
     }
 
@@ -563,7 +565,7 @@ mod tests {
         let m2 = Arc::clone(&m);
 
         let t1 = thread::spawn(move || {
-            let mut g = m1.lock().unwrap();
+            let mut g = m1.lock_for_tests().unwrap();
             thread::sleep(Duration::from_millis(20));
             *g += 1;
         });
@@ -571,22 +573,68 @@ mod tests {
         thread::sleep(Duration::from_millis(5));
 
         let t2 = thread::spawn(move || {
-            let mut g = m2.lock_tag(OpTag::Write).unwrap();
+            let mut g = m2.lock_for_tests().unwrap();
             *g += 1;
         });
 
         t1.join().unwrap();
         t2.join().unwrap();
 
-        assert_eq!(*m.lock().unwrap(), 2);
+        assert_eq!(*m.lock_for_tests().unwrap(), 2);
         assert_eq!(m.lock_count(), 3);
         assert!(m.busy_time() >= Duration::from_millis(18));
         assert!(m.wait_time() >= Duration::from_millis(10));
 
-        let write_stat = m.op_stats().into_iter().find(|s| s.tag == OpTag::Write).unwrap();
-        assert_eq!(write_stat.count, 1);
-        assert!(write_stat.wait_time >= Duration::from_millis(10));
-        assert!(write_stat.avg_wait_time() >= Duration::from_millis(10));
+        let test_stat = m.op_stats().into_iter().find(|s| s.tag == OpTag::Test).unwrap();
+        assert_eq!(test_stat.count, 3);
+        assert!(test_stat.wait_time >= Duration::from_millis(10));
+        assert!(test_stat.avg_wait_time() >= Duration::from_millis(3));
+    }
+
+    #[test]
+    fn test_action_mutex_try_lock() {
+        let m = Arc::new(ActionMutex::new(10));
+        let m_clone = Arc::clone(&m);
+
+        let guard = m.lock_for_tests().unwrap();
+        assert!(m_clone.try_lock_for_tests().is_err());
+        drop(guard);
+
+        let mut try_guard = m.try_lock_for_tests().unwrap();
+        assert_eq!(*try_guard, 10);
+        *try_guard = 20;
+        drop(try_guard);
+
+        assert_eq!(*m.lock_for_tests().unwrap(), 20);
+        let stats = m.op_stats();
+        let test_stat = stats.iter().find(|s| s.tag == OpTag::Test).unwrap();
+        assert_eq!(test_stat.count, 3);
+    }
+
+    #[test]
+    fn test_action_mutex_test_methods() {
+        let m = Arc::new(ActionMutex::new(42));
+        {
+            let mut g = m.lock_for_tests().unwrap();
+            assert_eq!(*g, 42);
+            *g = 43;
+        }
+        assert_eq!(*m.lock_for_tests().unwrap(), 43);
+
+        let try_res = m.try_lock_for_tests().unwrap();
+        assert_eq!(*try_res, 43);
+        drop(try_res);
+
+        let with_res = m.with_lock_for_tests(|g| {
+            **g = 100;
+            **g * 2
+        });
+        assert_eq!(with_res, 200);
+        assert_eq!(*m.lock_for_tests().unwrap(), 100);
+
+        let stats = m.op_stats();
+        let test_stat = stats.iter().find(|s| s.tag == OpTag::Test).unwrap();
+        assert_eq!(test_stat.count, 5);
     }
 
     #[test]
@@ -596,13 +644,13 @@ mod tests {
         let deferred_ran = Arc::new(AtomicBool::new(false));
         let deferred_ran_clone = Arc::clone(&deferred_ran);
 
-        let res = m.with_lock(OpTag::Write, |guard| {
+        let res = m.with_lock_for_tests(|guard| {
             **guard += 50;
             let m_sub = Arc::clone(&m_clone);
             let d_sub = Arc::clone(&deferred_ran_clone);
             guard.defer(move || {
                 // Must be unlocked here so we can re-acquire without deadlock!
-                assert_eq!(*m_sub.lock().unwrap(), 150);
+                assert_eq!(*m_sub.lock_for_tests().unwrap(), 150);
                 d_sub.store(true, Ordering::SeqCst);
             });
             **guard * 2
@@ -613,36 +661,25 @@ mod tests {
         assert_eq!(m.lock_count(), 2); // 1 for with_lock, 1 inside deferred task
 
         let stats = m.op_stats();
-        let write_stat = stats.iter().find(|s| s.tag == OpTag::Write).unwrap();
-        assert_eq!(write_stat.count, 1);
-        let other_stat = stats.iter().find(|s| s.tag == OpTag::Other).unwrap();
-        assert_eq!(other_stat.count, 1);
+        let test_stat = stats.iter().find(|s| s.tag == OpTag::Test).unwrap();
+        assert_eq!(test_stat.count, 2);
     }
 
     #[test]
     fn test_op_tags_coverage() {
         assert_eq!(ALL_OP_TAGS.len(), OP_TAG_COUNT);
-        assert_eq!(OP_TAG_COUNT, 24);
+        assert_eq!(OP_TAG_COUNT, 26);
 
         let m = ActionMutex::new(0);
-        let tags_to_test = [
-            (OpTag::Open, "open"),
-            (OpTag::OpenDir, "opendir"),
-            (OpTag::ReadDir, "readdir"),
-            (OpTag::Lookup, "lookup"),
-            (OpTag::GetAttr, "getattr"),
-            (OpTag::ReadLink, "readlink"),
-        ];
-
-        for (tag, expected_name) in tags_to_test {
-            assert_eq!(tag.name(), expected_name);
-            assert_eq!(tag.as_str(), expected_name);
-            let _guard = m.lock_tag(tag).unwrap();
+        for &tag in &ALL_OP_TAGS {
+            assert!(!tag.name().is_empty());
+            assert_eq!(tag.name(), tag.as_str());
+            let _guard = m.lock(tag).unwrap();
         }
 
         let stats = m.op_stats();
         assert_eq!(stats.len(), OP_TAG_COUNT);
-        for (tag, _) in tags_to_test {
+        for &tag in &ALL_OP_TAGS {
             let stat = stats.iter().find(|s| s.tag == tag).unwrap();
             assert_eq!(stat.count, 1);
         }

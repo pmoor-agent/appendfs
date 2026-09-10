@@ -22,7 +22,7 @@ impl InMemoryFS {
 
     /// Freezes `live` into the `flushing` queue if queue depth, bytes, and ops are within capacity limits.
     pub fn begin_flush(&self) -> bool {
-        let mut inner = self.inner.lock_tag(OpTag::Flush).unwrap();
+        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
         self.begin_flush_locked(&mut inner)
     }
 
@@ -38,7 +38,7 @@ impl InMemoryFS {
     /// Pops the front batch from the flushing queue, if any.
     #[cfg(any(test, feature = "testing"))]
     pub fn pop_flushing_batch(&self) -> Option<FlushBatch> {
-        self.inner.lock_tag(OpTag::Flush).unwrap().pop_flushing_batch()
+        self.inner.lock(OpTag::Flush).unwrap().pop_flushing_batch()
     }
 
     /// Freezes active `live` mutations into a `FlushBatch` under the inner lock, or retrieves
@@ -49,7 +49,7 @@ impl InMemoryFS {
     /// If the `flushing` queue is at capacity (depth, bytes, or ops limit reached),
     /// this kicks off the flusher and waits on `capacity_cvar` before retrying.
     pub fn rollover_for_fsync(&self, ino: u64, fh: u64) -> Result<Option<super::BatchCompletion>, i32> {
-        let mut inner = self.inner.lock_tag(OpTag::Flush).unwrap();
+        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
         loop {
             if fh != 0 {
                 inner.validate_regular_handle(ino, fh)?;
@@ -66,7 +66,7 @@ impl InMemoryFS {
                 if !self.trigger_flusher() {
                     drop(inner);
                     let _ = self.flush_log();
-                    inner = self.inner.lock_tag(OpTag::Flush).unwrap();
+                    inner = self.inner.lock(OpTag::Flush).unwrap();
                 } else {
                     let cvar = inner.capacity_cvar.clone();
                     let (guard, _) = inner.wait_timeout(&cvar, Duration::from_millis(50));
@@ -87,7 +87,7 @@ impl InMemoryFS {
 
     /// Merges a flushed batch into `base`.
     pub fn fold_flushed_batch(&self, flushed: FlushBatch) {
-        let mut inner = self.inner.lock_tag(OpTag::Fold).unwrap();
+        let mut inner = self.inner.lock(OpTag::Fold).unwrap();
         self.fold_flushed_batch_locked(&mut inner, flushed);
     }
 
@@ -296,7 +296,7 @@ impl InMemoryFS {
         // and staged mutation thresholds are reached.
         loop {
             let mut batch = {
-                let mut inner = self.inner.lock_tag(OpTag::Flush).unwrap();
+                let mut inner = self.inner.lock(OpTag::Flush).unwrap();
                 if inner.staged_bytes >= self.max_buffer_size || inner.staged_ops >= self.max_staged_ops {
                     self.begin_flush_locked(&mut inner);
                 }
@@ -314,7 +314,7 @@ impl InMemoryFS {
 
             // On success: pop from flushing queue (asserting matching ID) and fold into base
             let popped = {
-                let mut inner = self.inner.lock_tag(OpTag::Fold).unwrap();
+                let mut inner = self.inner.lock(OpTag::Fold).unwrap();
                 let popped = inner.pop_flushed_batch(&batch);
                 self.fold_flushed_batch_locked(&mut inner, batch);
                 popped
@@ -353,7 +353,7 @@ impl InMemoryFS {
     /// Number of frozen batches currently waiting to be written to the log.
     #[cfg(any(test, feature = "testing"))]
     pub fn flush_queue_depth(&self) -> usize {
-        self.inner.lock().unwrap().flushing.len()
+        self.inner.lock(OpTag::Stats).unwrap().flushing.len()
     }
 
     /// Wakes up the background periodic flusher immediately to drain pending batches.
@@ -401,7 +401,7 @@ impl InMemoryFS {
             if let Some(mut f) = flusher.take() {
                 f.stop();
                 let completions: Vec<_> = {
-                    let inner = self.inner.lock().unwrap();
+                    let inner = self.inner.lock(OpTag::Flush).unwrap();
                     inner.flushing.iter().map(|b| b.completion.clone()).collect()
                 };
                 for completion in completions {
@@ -426,7 +426,7 @@ impl InMemoryFS {
     /// Dynamically calculates live extent statistics across all active files and log generations.
     pub fn calculate_generation_live_stats(&self) -> Vec<GenerationLiveStats> {
         let manifest = self.manifest.read().unwrap().clone();
-        let base = self.inner.lock().unwrap().base.clone();
+        let base = self.inner.lock(OpTag::Stats).unwrap().base.clone();
 
         let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
         for node_arc in base.values() {
@@ -507,7 +507,7 @@ impl InMemoryFS {
         explicit_iv: Option<[u8; 12]>,
     ) -> std::io::Result<String> {
         self.sync_log()?;
-        let snapshot = self.snapshot_all();
+        let snapshot = self.inner.lock(OpTag::Flush).unwrap().snapshot_all();
         let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
         let last_tx_id = self
             .log_writer
@@ -566,7 +566,7 @@ impl InMemoryFS {
         sealed_gen: u64,
         last_tx_id: u64,
     ) -> std::io::Result<String> {
-        let snapshot = self.inner.lock().unwrap().base.clone();
+        let snapshot = self.inner.lock(OpTag::Flush).unwrap().base.clone();
         let next_inode = self.next_inode.load(Ordering::SeqCst);
         let manifest = self.sync_manifest_md5s_and_snapshot(storage, sealed_gen + 1);
         let now = self.clock.now();
@@ -693,18 +693,20 @@ mod tests {
         let fs = InMemoryFS::with_log(writer);
 
         let ino = fs.allocate_inode();
-        fs.insert_new_node(
-            ino,
-            NodeDelta::File(FileDelta {
-                attr_delta: AttrDelta {
-                    mode: Some(0o644),
-                    nlink: Some(1),
+        fs.with_inner_for_tests(|inner| {
+            inner.insert_new_node(
+                ino,
+                NodeDelta::File(FileDelta {
+                    attr_delta: AttrDelta {
+                        mode: Some(0o644),
+                        nlink: Some(1),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            }),
-        );
-        fs.add_dir_entry(1, "micro.txt", ino, std::time::SystemTime::now());
+                }),
+            );
+            inner.add_dir_entry(1, "micro.txt", ino, std::time::SystemTime::now());
+        });
 
         // Perform 50 sequential 1-byte writes in live
         for i in 0..50u64 {
@@ -714,7 +716,7 @@ mod tests {
 
         // Verify that live extent map coalesced the sequential writes in memory
         {
-            let inner = fs.inner.lock().unwrap();
+            let inner = fs.inner.lock_for_tests().unwrap();
             if let Some(EntryDelta::Node(NodeDelta::File(f))) = inner.live.get(&ino) {
                 assert_eq!(f.extents.len(), 1);
             } else {
@@ -727,7 +729,7 @@ mod tests {
 
         // Verify that base has exactly 1 consolidated extent of length 50
         {
-            let inner = fs.inner.lock().unwrap();
+            let inner = fs.inner.lock_for_tests().unwrap();
             let node_arc = inner.base.get(&ino).expect("inode missing in base");
             let node = node_arc.as_ref();
             if let NodeKind::File { extent_map, size, .. } = &node.kind {
@@ -794,18 +796,20 @@ mod tests {
             fs.max_extent_size = CAP;
 
             let ino = fs.allocate_inode();
-            fs.insert_new_node(
-                ino,
-                NodeDelta::File(FileDelta {
-                    attr_delta: AttrDelta {
-                        mode: Some(0o644),
-                        nlink: Some(1),
+            fs.with_inner_for_tests(|inner| {
+                inner.insert_new_node(
+                    ino,
+                    NodeDelta::File(FileDelta {
+                        attr_delta: AttrDelta {
+                            mode: Some(0o644),
+                            nlink: Some(1),
+                            ..Default::default()
+                        },
                         ..Default::default()
-                    },
-                    ..Default::default()
-                }),
-            );
-            fs.add_dir_entry(1, "big.bin", ino, SystemTime::now());
+                    }),
+                );
+                inner.add_dir_entry(1, "big.bin", ino, SystemTime::now());
+            });
 
             // A single contiguous write many times larger than the cap.
             let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
@@ -813,7 +817,7 @@ mod tests {
             fs.sync_log().unwrap();
 
             {
-                let inner = fs.inner.lock().unwrap();
+                let inner = fs.inner.lock_for_tests().unwrap();
                 let node = inner.base.get(&ino).expect("inode missing in base");
                 if let NodeKind::File { extent_map, size, .. } = &node.kind {
                     assert_eq!(*size as usize, TOTAL);
@@ -1113,7 +1117,7 @@ mod tests {
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         let ino1 = fs.allocate_inode();
-        fs.inner.lock().unwrap().base.insert(
+        fs.inner.lock_for_tests().unwrap().base.insert(
             ino1,
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, clock.now()),
@@ -1123,7 +1127,9 @@ mod tests {
                 },
             }),
         );
-        fs.add_dir_entry(1, "file1.bin", ino1, clock.now());
+        fs.with_inner_for_tests(|inner| {
+            inner.add_dir_entry(1, "file1.bin", ino1, clock.now());
+        });
 
         // Write 100 bytes to file1 in gen 1
         let data1 = vec![0xAA; 100];
@@ -1243,7 +1249,7 @@ mod tests {
             crate::crypto::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let base = recovered.inner.lock().unwrap().base.clone();
+        let base = recovered.inner.lock_for_tests().unwrap().base.clone();
         assert_eq!(base.len(), 1); // ONLY root directory (inode 1) remains!
         assert!(base.contains_key(&1));
 
@@ -1328,12 +1334,12 @@ mod tests {
     }
 
     #[test]
-    fn test_mutation_threshold_triggers_automatic_flush() {
+    fn test_automatic_flush_triggers_on_staged_thresholds() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
             LogWriter::create(
-                storage,
+                storage.clone(),
                 1,
                 &*clock,
                 crate::cli::DEFAULT_MAX_LOG_SIZE,
@@ -1343,8 +1349,8 @@ mod tests {
             .unwrap(),
         );
         let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
-        // Set small operation threshold of 5 ops
-        fs.max_staged_ops = 5;
+        fs.max_buffer_size = 1000;
+        fs.max_staged_ops = 5; // Automatic flush after 5 operations
 
         // Perform 4 create operations - not flushed yet
         for i in 0..4 {
@@ -1379,21 +1385,24 @@ mod tests {
         );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
-        // Create a temp file
-        let file_attr =
-            crate::operations::read_write::create_core(&fs, 1, "temp_scratch.bin", 0o644, 0, 1000, 1000).unwrap();
-        let ino = file_attr.ino;
+        // Create a file, write data, then sync
+        let f = crate::operations::read_write::create_core(&fs, 1, "unlinked.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino = f.ino;
+        crate::operations::read_write::write_core(&fs, ino, b"unlinked content", 0).unwrap();
+        fs.sync_log().unwrap();
 
-        // Open handle (like a POSIX process keeping file open)
-        let _fh = fs.open_file_handle(ino, 0);
+        // Open the file so open_counts > 0
+        let fh = crate::operations::read_write::open_core(&fs, ino, libc::O_RDWR as u32).unwrap();
 
-        // Write data
-        crate::operations::read_write::write_core(&fs, ino, &[0xCC; 128], 0).unwrap();
+        // Unlink the file: removes directory entry, but node is kept in memory because open_count == 1
+        crate::operations::links::unlink_core(&fs, 1, "unlinked.txt").unwrap();
 
-        // Unlink while open in same live batch
-        crate::operations::links::unlink_core(&fs, 1, "temp_scratch.bin").unwrap();
+        // Write more data while unlinked, then sync log
+        crate::operations::read_write::write_core(&fs, ino, b" more content", 16).unwrap();
+        fs.sync_log().unwrap();
 
-        // Flush log to disk
+        // Close the handle: drops open_count to 0 and tombstones the node in live
+        crate::operations::read_write::release_core(&fs, ino, fh).unwrap();
         fs.sync_log().unwrap();
 
         // Recover filesystem from log
@@ -1404,7 +1413,7 @@ mod tests {
             crate::crypto::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let base = recovered.inner.lock().unwrap().base.clone();
+        let base = recovered.inner.lock_for_tests().unwrap().base.clone();
 
         // Only root inode (1) should exist; NO resurrected /file_{ino} or phantom entries!
         assert_eq!(base.len(), 1, "Expected only root inode in base");
@@ -1412,7 +1421,7 @@ mod tests {
         assert!(!base.contains_key(&ino));
 
         let entries = recovered.list_directory(1).unwrap();
-        assert!(entries.is_empty(), "Root directory must be completely empty");
+        assert!(entries.is_empty(), "Expected empty root directory, got: {:?}", entries);
     }
 
     #[test]
@@ -1498,14 +1507,14 @@ mod tests {
 
         // Freeze into flushing queue (batch 1)
         fs.begin_flush();
-        assert_eq!(fs.inner.lock().unwrap().flushing.len(), 1);
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 1);
 
         // 2. Overwrite in batch 2 (live layer)
         crate::operations::read_write::write_core(&fs, ino, &[0x22; 20], 10).unwrap();
 
         // Freeze into flushing queue (batch 2)
         fs.begin_flush();
-        assert_eq!(fs.inner.lock().unwrap().flushing.len(), 2);
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 2);
 
         // 3. In live layer, truncate to 40 bytes
         let now = clock.now();
@@ -1533,7 +1542,7 @@ mod tests {
         while let Some(batch) = fs.pop_flushing_batch() {
             fs.fold_flushed_batch(batch);
         }
-        assert_eq!(fs.inner.lock().unwrap().flushing.len(), 0);
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 0);
 
         // Read again after folding
         let data_after_fold = fs.read_file_data(ino, 0, 50).unwrap();
@@ -1587,7 +1596,7 @@ mod tests {
 
         // Verify filesystem is NOT wedged: flushing queue still retains the batch, live mutations still work!
         assert_eq!(
-            fs.inner.lock().unwrap().flushing.len(),
+            fs.inner.lock_for_tests().unwrap().flushing.len(),
             1,
             "Failed batch must remain in flushing queue"
         );
@@ -1607,7 +1616,7 @@ mod tests {
             retry_res
         );
         assert_eq!(
-            fs.inner.lock().unwrap().flushing.len(),
+            fs.inner.lock_for_tests().unwrap().flushing.len(),
             0,
             "Flushing queue must be completely drained"
         );
@@ -1703,7 +1712,7 @@ mod tests {
         // 7. Retry flush - MUST succeed cleanly
         let retry_res = fs.flush_log();
         assert!(retry_res.is_ok(), "Retried flush must succeed: {:?}", retry_res);
-        assert_eq!(fs.inner.lock().unwrap().flushing.len(), 0);
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 0);
 
         // 8. Recover filesystem and verify 100% data integrity without checksum mismatches!
         let recovered = crate::log::recover_fs(
@@ -1807,7 +1816,7 @@ mod tests {
         );
 
         {
-            let inner = from_log.inner.lock().unwrap();
+            let inner = from_log.inner.lock_for_tests().unwrap();
             let node = inner.base.get(&ino).unwrap();
             if let crate::node::NodeKind::File { ref extent_map, .. } = node.kind {
                 let hole_entry = extent_map
@@ -1851,7 +1860,7 @@ mod tests {
         );
 
         {
-            let inner = from_summary.inner.lock().unwrap();
+            let inner = from_summary.inner.lock_for_tests().unwrap();
             let node = inner.base.get(&ino).unwrap();
             if let crate::node::NodeKind::File { ref extent_map, .. } = node.kind {
                 let hole_entry = extent_map
@@ -2227,7 +2236,7 @@ mod tests {
 
         // Record mutations exceeding max_buffer_size directly on inner
         {
-            let mut inner = fs.inner.lock().unwrap();
+            let mut inner = fs.inner.lock_for_tests().unwrap();
             inner.record_mutation(90); // 20 + 90 = 110 >= 100
         }
         assert_eq!(fs.staged_bytes(), 110);

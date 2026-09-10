@@ -271,60 +271,19 @@ impl FsInner {
 }
 
 impl InMemoryFS {
-    // --- In-Memory Delta Layer Mutations ---
-
-    pub fn insert_new_node(&self, ino: u64, delta: NodeDelta) {
-        self.inner.lock().unwrap().insert_new_node(ino, delta);
-    }
-
-    pub fn tombstone(&self, ino: u64) {
-        self.inner.lock().unwrap().tombstone(ino);
-    }
-
-    pub fn add_dir_entry(&self, parent: u64, name: &str, child_ino: u64, now: SystemTime) {
-        self.inner.lock().unwrap().add_dir_entry(parent, name, child_ino, now);
-    }
-
-    pub fn remove_dir_entry(&self, parent: u64, name: &str, now: SystemTime) {
-        self.inner.lock().unwrap().remove_dir_entry(parent, name, now);
-    }
-
-    pub fn update_dir_parent(&self, ino: u64, new_parent: u64) {
-        self.inner.lock().unwrap().update_dir_parent(ino, new_parent);
-    }
-
     pub fn get_parent_dir_inode(&self, ino: u64) -> Option<u64> {
-        self.inner.lock_tag(OpTag::Lookup).unwrap().get_parent_dir_inode(ino)
-    }
-
-    pub fn update_attr_delta(&self, ino: u64, delta: AttrDelta) {
-        self.inner.lock().unwrap().update_attr_delta(ino, delta);
+        self.inner.lock(OpTag::Lookup).unwrap().get_parent_dir_inode(ino)
     }
 
     // --- Overlay Query & Resolution Methods ---
 
-    pub fn with_inode_layers<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
-        self.inner.lock().unwrap().with_inode_layers(ino, f)
-    }
-
-    pub fn with_inode_layers_below_live<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
-        self.inner.lock().unwrap().with_inode_layers_below_live(ino, f)
-    }
-
     pub fn with_layers<R>(
         &self,
+        tag: OpTag,
         f: impl FnOnce(&HashMap<u64, EntryDelta>, &VecDeque<FlushBatch>, &HashMap<u64, Arc<Node>>) -> R,
     ) -> R {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock(tag).unwrap();
         f(&inner.live, &inner.flushing, &inner.base)
-    }
-
-    pub fn exists_below_live(&self, ino: u64) -> bool {
-        self.inner.lock().unwrap().exists_below_live(ino)
-    }
-
-    pub fn attr_below_live(&self, ino: u64) -> Option<FileAttr> {
-        self.inner.lock().unwrap().attr_below_live(ino)
     }
 
     pub fn get_attr_locked(&self, inner: &FsInner, ino: u64) -> Option<FileAttr> {
@@ -335,7 +294,7 @@ impl InMemoryFS {
     }
 
     pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
-        self.get_attr_locked(&self.inner.lock_tag(OpTag::GetAttr).unwrap(), ino)
+        self.get_attr_locked(&self.inner.lock(OpTag::GetAttr).unwrap(), ino)
     }
 
     pub fn lookup_child_locked(&self, inner: &FsInner, parent: u64, name: &str) -> Option<u64> {
@@ -348,45 +307,23 @@ impl InMemoryFS {
     }
 
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
-        self.lookup_child_locked(&self.inner.lock_tag(OpTag::Lookup).unwrap(), parent, name)
+        self.lookup_child_locked(&self.inner.lock(OpTag::Lookup).unwrap(), parent, name)
     }
 
     pub fn list_directory(&self, parent: u64) -> Option<Vec<(String, u64)>> {
-        self.inner.lock_tag(OpTag::ReadDir).unwrap().list_directory(parent)
+        self.inner.lock(OpTag::ReadDir).unwrap().list_directory(parent)
     }
 
     pub fn read_link(&self, ino: u64) -> Option<String> {
-        self.inner.lock_tag(OpTag::ReadLink).unwrap().read_link(ino)
+        self.inner.lock(OpTag::ReadLink).unwrap().read_link(ino)
     }
 
     pub fn get_xattr(&self, ino: u64, name: &str) -> Option<Vec<u8>> {
-        self.inner.lock_tag(OpTag::Xattr).unwrap().get_xattr(ino, name)
+        self.inner.lock(OpTag::Xattr).unwrap().get_xattr(ino, name)
     }
 
     pub fn list_xattrs(&self, ino: u64) -> Option<Vec<String>> {
-        self.inner.lock_tag(OpTag::Xattr).unwrap().list_xattrs(ino)
-    }
-
-    pub fn set_xattr(&self, ino: u64, name: &str, value: Vec<u8>, now: SystemTime) {
-        let mut xattrs = HashMap::new();
-        xattrs.insert(name.to_string(), Some(value));
-        let delta = AttrDelta {
-            ctime: Some(now),
-            xattrs: Some(xattrs),
-            ..Default::default()
-        };
-        self.update_attr_delta(ino, delta);
-    }
-
-    pub fn remove_xattr(&self, ino: u64, name: &str, now: SystemTime) {
-        let mut xattrs = HashMap::new();
-        xattrs.insert(name.to_string(), None);
-        let delta = AttrDelta {
-            ctime: Some(now),
-            xattrs: Some(xattrs),
-            ..Default::default()
-        };
-        self.update_attr_delta(ino, delta);
+        self.inner.lock(OpTag::Xattr).unwrap().list_xattrs(ino)
     }
 
     pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
@@ -416,8 +353,9 @@ impl InMemoryFS {
         self.execute_read_plan_sync(plan)
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn snapshot_all(&self) -> HashMap<u64, Arc<Node>> {
-        self.inner.lock().unwrap().snapshot_all()
+        self.inner.lock_for_tests().unwrap().snapshot_all()
     }
 }
 
@@ -447,11 +385,11 @@ mod tests {
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.sync_log().unwrap();
-        assert!(fs.exists_below_live(attr.ino));
+        assert!(fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino));
 
         crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
         assert!(
-            fs.exists_below_live(attr.ino),
+            fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino),
             "base still describes the inode until the tombstone's batch folds"
         );
 
@@ -459,9 +397,9 @@ mod tests {
         // a writer that validated before taking the lock would insert a fresh delta and
         // resurrect the inode at the next fold - this predicate is what stops it.
         fs.begin_flush();
-        assert!(!fs.inner.lock().unwrap().live.contains_key(&attr.ino));
+        assert!(!fs.inner.lock_for_tests().unwrap().live.contains_key(&attr.ino));
         assert!(
-            !fs.exists_below_live(attr.ino),
+            !fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino),
             "a tombstone frozen out of live must still report the inode as gone"
         );
     }
@@ -492,13 +430,15 @@ mod tests {
         // A late attribute update - an atime bump racing the unlink, say - must not rebuild
         // the node from `base` and bring it back carrying its old link count, unreferenced
         // by any directory.
-        fs.update_attr_delta(
-            attr.ino,
-            AttrDelta {
-                atime: Some(clock.now()),
-                ..Default::default()
-            },
-        );
+        fs.with_inner_for_tests(|inner| {
+            inner.update_attr_delta(
+                attr.ino,
+                AttrDelta {
+                    atime: Some(clock.now()),
+                    ..Default::default()
+                },
+            );
+        });
         assert!(
             fs.get_attr(attr.ino).is_none(),
             "attribute update resurrected a deleted inode"

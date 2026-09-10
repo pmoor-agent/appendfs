@@ -1,10 +1,9 @@
 mod common;
-use appendfs::LogWriter;
-use appendfs::RemoteStore;
 use appendfs::clock::{AdvancingClock, Clock, MockClock, SystemClock};
 use appendfs::log::{LogAttrDelta, LogDirectoryDelta, LogEntryDelta, LogFileDelta, LogNodeDelta, OpCode, recover_fs};
 use appendfs::node::NodeKind;
 use appendfs::storage::{MemoryStorage, Storage};
+use appendfs::{LogWriter, RemoteStore};
 use common::{SnapshotNode, TestFS, TestRng};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1146,7 +1145,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
         }
 
         {
-            let inner = fs_baseline.fs.inner.lock().unwrap();
+            let inner = fs_baseline.fs.inner.lock_for_tests().unwrap();
             assert!(inner.handles.is_empty(), "seed {seed}: handle leak in baseline");
             assert!(
                 inner.open_counts.is_empty(),
@@ -1154,12 +1153,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
             );
         }
         {
-            let inner = fs_micro.fs.inner.lock().unwrap();
+            let inner = fs_micro.fs.inner.lock_for_tests().unwrap();
             assert!(inner.handles.is_empty(), "seed {seed}: handle leak in micro");
             assert!(inner.open_counts.is_empty(), "seed {seed}: open_counts leak in micro");
         }
         {
-            let inner = fs_remote.fs.inner.lock().unwrap();
+            let inner = fs_remote.fs.inner.lock_for_tests().unwrap();
             assert!(inner.handles.is_empty(), "seed {seed}: handle leak in remote");
             assert!(inner.open_counts.is_empty(), "seed {seed}: open_counts leak in remote");
         }
