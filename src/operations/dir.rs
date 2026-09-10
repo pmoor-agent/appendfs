@@ -362,27 +362,14 @@ pub fn releasedir(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
     }
 }
 
-pub fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), i32> {
-    fs.sync_log().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+#[cfg(any(test, feature = "testing"))]
+pub async fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), i32> {
+    crate::operations::read_write::fsync_core(fs, 0, 0).await
 }
 
-pub fn fsyncdir(fs: &Arc<InMemoryFS>, req: Request, ino: u64, datasync: bool) {
+pub fn fsyncdir(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool) {
     log::trace!("fsyncdir(ino={}, datasync={})", ino, datasync);
-    if fs.log_writer.is_none() {
-        req.reply_err(0);
-        return;
-    }
-    let guard = fs.begin_async_op();
-    let fs_clone = Arc::clone(fs);
-    crate::async_runtime::spawn(async move {
-        let _guard = guard;
-        let res = tokio::task::spawn_blocking(move || fs_clone.sync_log()).await;
-        match res {
-            Ok(Ok(())) => req.reply_err(0),
-            Ok(Err(e)) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
-            Err(_) => req.reply_err(libc::EIO),
-        }
-    });
+    crate::operations::read_write::fsync(fs, req, 0, datasync, 0);
 }
 
 #[cfg(test)]

@@ -32,12 +32,53 @@ impl InMemoryFS {
     }
 
     /// Pops the front batch from the flushing queue, if any.
+    #[cfg(any(test, feature = "testing"))]
     pub fn pop_flushing_batch(&self) -> Option<FlushBatch> {
+        self.inner.lock_tag(OpTag::Flush).unwrap().pop_flushing_batch()
+    }
+
+    /// Freezes active `live` mutations into a `FlushBatch` under the inner lock, or retrieves
+    /// the completion handle of the latest in-flight batch if `live` is empty.
+    ///
+    /// If `fh != 0`, the file handle is validated against `ino` under the lock.
+    ///
+    /// If `flushing` queue depth is at capacity (`flushing.len() >= max_flush_queue_depth`),
+    /// this kicks off the flusher and waits on `capacity_cvar` before retrying.
+    pub fn rollover_for_fsync(&self, ino: u64, fh: u64) -> Result<Option<super::BatchCompletion>, i32> {
         let mut inner = self.inner.lock_tag(OpTag::Flush).unwrap();
-        let batch = inner.flushing.pop_front()?;
-        inner.flushing_bytes -= batch.bytes;
-        inner.flushing_ops -= batch.ops;
-        Some(batch)
+        loop {
+            if fh != 0 {
+                inner.validate_regular_handle(ino, fh)?;
+            }
+            if self.log_writer.is_none() {
+                return Ok(None);
+            }
+            if !inner.live.is_empty() {
+                if inner.freeze_live(self.max_flush_queue_depth) {
+                    let completion = inner.flushing.back().map(|b| b.completion.clone());
+                    return Ok(completion);
+                }
+                // Flushing queue is saturated. Wait on capacity_cvar.
+                if !self.trigger_flusher() {
+                    drop(inner);
+                    let _ = self.flush_log();
+                    inner = self.inner.lock_tag(OpTag::Flush).unwrap();
+                } else {
+                    let cvar = inner.capacity_cvar.clone();
+                    let (guard, _) = inner.wait_timeout(&cvar, Duration::from_millis(50));
+                    inner = guard;
+                }
+                continue;
+            }
+
+            // Live is empty. If there are batches in flight, wait on the latest one.
+            if let Some(back) = inner.flushing.back() {
+                return Ok(Some(back.completion.clone()));
+            }
+
+            // No live mutations and no flushing batches.
+            return Ok(None);
+        }
     }
 
     /// Merges a flushed batch into `base`.
@@ -264,24 +305,17 @@ impl InMemoryFS {
                 }
             };
 
-            let batch_id = batch.id;
-
             // Attempt to write and commit this batch
             self.synthesize_and_write_flushing_layer(&mut batch.entries, writer)?;
 
-            // On success: fold into base, assert front of queue is still batch, and pop
-            {
+            // On success: pop from flushing queue (asserting matching ID) and fold into base
+            let popped = {
                 let mut inner = self.inner.lock_tag(OpTag::Fold).unwrap();
+                let popped = inner.pop_flushed_batch(&batch);
                 self.fold_flushed_batch_locked(&mut inner, batch);
-                let front = inner.flushing.front().expect("flushing queue must not be empty");
-                assert_eq!(
-                    front.id, batch_id,
-                    "front of flushing queue must match committed batch ID"
-                );
-                let popped = inner.flushing.pop_front().unwrap();
-                inner.flushing_bytes -= popped.bytes;
-                inner.flushing_ops -= popped.ops;
-            }
+                popped
+            };
+            popped.completion.complete(Ok(()));
         }
 
         Ok(())
@@ -362,6 +396,16 @@ impl InMemoryFS {
             let mut flusher = self.flusher.lock().unwrap();
             if let Some(mut f) = flusher.take() {
                 f.stop();
+                let completions: Vec<_> = {
+                    let inner = self.inner.lock().unwrap();
+                    inner.flushing.iter().map(|b| b.completion.clone()).collect()
+                };
+                for completion in completions {
+                    completion.complete(Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "filesystem destroyed",
+                    )));
+                }
             }
         }
         self.drain_async_ops();
@@ -2056,6 +2100,143 @@ mod tests {
         // flush_log_locked will detect the threshold is met, freeze it via begin_flush_locked, and drain it
         fs.flush_log_locked(&writer).unwrap();
         assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.flush_queue_depth(), 0);
+    }
+
+    #[test]
+    fn test_fsync_batch_completion_waiters_concurrent() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = Arc::new(InMemoryFS::with_clock_and_log(clock.clone(), Some(writer.clone())));
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "test_fsync.bin", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file.ino, b"waiter data", 0).unwrap();
+
+        // Rollover under lock
+        let completion = fs
+            .rollover_for_fsync(file.ino, 0)
+            .unwrap()
+            .expect("completion expected");
+        assert!(!completion.is_completed());
+
+        // Register 10 concurrent completion callbacks on this exact BatchCompletion
+        let unblocked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..10 {
+            let counter = Arc::clone(&unblocked);
+            completion.add_callback(Box::new(move |res| {
+                res.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        assert_eq!(
+            unblocked.load(Ordering::SeqCst),
+            0,
+            "No callbacks should fire before flush"
+        );
+
+        // Execute flush - commits batch and completes BatchCompletion
+        fs.flush_log().unwrap();
+
+        assert_eq!(
+            unblocked.load(Ordering::SeqCst),
+            10,
+            "All completion callbacks must have been invoked"
+        );
+        assert!(completion.is_completed());
+    }
+
+    #[test]
+    fn test_rollover_for_fsync_queue_saturation_and_condvar_wakeup() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let mut fs_inst = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer.clone()));
+        fs_inst.max_flush_queue_depth = 2;
+        let fs = Arc::new(fs_inst);
+
+        // Install a background flusher handle so trigger_flusher returns true
+        {
+            let mut flusher = fs.flusher.lock().unwrap();
+            *flusher = Some(BackgroundFlusher::start(|| Ok(()), Duration::from_secs(60)));
+        }
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "saturate.bin", 0o644, 0, 1000, 1000).unwrap();
+
+        // Batch 1
+        crate::operations::read_write::write_core(&fs, file.ino, b"batch 1", 0).unwrap();
+        assert!(fs.begin_flush());
+
+        // Batch 2
+        crate::operations::read_write::write_core(&fs, file.ino, b"batch 2", 7).unwrap();
+        assert!(fs.begin_flush());
+
+        // Queue is now saturated at max depth 2
+        assert_eq!(fs.flush_queue_depth(), 2);
+
+        // Stage live mutations
+        crate::operations::read_write::write_core(&fs, file.ino, b"live data", 14).unwrap();
+        assert_eq!(fs.staged_bytes(), 9);
+
+        // In background thread, call rollover_for_fsync. It will find flushing full, drop inner, and wait on condvar.
+        let fs_clone = Arc::clone(&fs);
+        let ino = file.ino;
+        let rolled_over = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rolled_over_clone = Arc::clone(&rolled_over);
+        let waiter_handle = std::thread::spawn(move || {
+            let comp = fs_clone.rollover_for_fsync(ino, 0).unwrap();
+            rolled_over_clone.store(true, Ordering::SeqCst);
+            comp
+        });
+
+        // Verify thread does not immediately return because queue is saturated
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !rolled_over.load(Ordering::SeqCst),
+            "Rollover must block while flushing is saturated"
+        );
+
+        // Pop one batch from flushing queue, freeing capacity and notifying capacity_cvar under the lock
+        let popped = fs.pop_flushing_batch().unwrap();
+        fs.fold_flushed_batch(popped);
+
+        // Waiter must now unblock, freeze live mutations into flushing, and return the new completion
+        let completion = waiter_handle.join().unwrap().expect("completion expected");
+        assert!(rolled_over.load(Ordering::SeqCst));
+        assert_eq!(fs.flush_queue_depth(), 2);
+        assert_eq!(fs.staged_bytes(), 0);
+
+        // Flush remaining batches
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_clone = Arc::clone(&completed);
+        completion.add_callback(Box::new(move |res| {
+            res.unwrap();
+            completed_clone.store(true, Ordering::SeqCst);
+        }));
+        fs.flush_log().unwrap();
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(completion.is_completed());
         assert_eq!(fs.flush_queue_depth(), 0);
     }
 }

@@ -1,7 +1,7 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LockResult, Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult};
+use std::sync::{Condvar, LockResult, Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult};
 use std::time::{Duration, Instant};
 
 /// Tags identifying distinct filesystem operation categories for lock contention profiling.
@@ -389,6 +389,40 @@ impl<'a, T> ActionGuard<'a, T> {
     /// Returns the elapsed duration since this lock guard was acquired.
     pub fn hold_elapsed(&self) -> Duration {
         self.hold_start.elapsed()
+    }
+
+    /// Temporarily releases the lock and waits on `cvar`, re-acquiring the lock before returning.
+    pub fn wait(mut self, cvar: &Condvar) -> Self {
+        let elapsed = self.hold_start.elapsed();
+        let elapsed_nanos = elapsed.as_nanos() as u64;
+        self.mutex.busy_time_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
+        self.mutex.op_metrics[self.tag as usize]
+            .busy_nanos
+            .fetch_add(elapsed_nanos, Ordering::Relaxed);
+
+        let raw_guard = self.guard.take().expect("guard not dropped");
+        let new_guard = cvar.wait(raw_guard).expect("ActionMutex poisoned during wait");
+        self.guard = Some(new_guard);
+        self.hold_start = Instant::now();
+        self
+    }
+
+    /// Temporarily releases the lock and waits on `cvar` for up to `dur`, re-acquiring the lock before returning.
+    pub fn wait_timeout(mut self, cvar: &Condvar, dur: Duration) -> (Self, std::sync::WaitTimeoutResult) {
+        let elapsed = self.hold_start.elapsed();
+        let elapsed_nanos = elapsed.as_nanos() as u64;
+        self.mutex.busy_time_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
+        self.mutex.op_metrics[self.tag as usize]
+            .busy_nanos
+            .fetch_add(elapsed_nanos, Ordering::Relaxed);
+
+        let raw_guard = self.guard.take().expect("guard not dropped");
+        let (new_guard, res) = cvar
+            .wait_timeout(raw_guard, dur)
+            .expect("ActionMutex poisoned during wait");
+        self.guard = Some(new_guard);
+        self.hold_start = Instant::now();
+        (self, res)
     }
 }
 
