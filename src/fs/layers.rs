@@ -685,7 +685,7 @@ mod tests {
     use crate::fs::{FlushBatch, WriteArena};
 
     #[test]
-    fn test_get_attrs_batch_across_layers() {
+    fn test_get_attr_across_layers() {
         let fs = InMemoryFS::new();
 
         // 1. Create file1 in live -> freeze to flushing -> fold to base
@@ -705,26 +705,15 @@ mod tests {
         let attr4 = crate::operations::read_write::create_core(&fs, 1, "file4.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::links::unlink_core(&fs, 1, "file4.txt").unwrap();
 
-        // Inode 999 does not exist
-        let inos = vec![1, attr1.ino, attr2.ino, attr3.ino, attr4.ino, 999];
-        let batch_map = fs.get_attrs_batch(&inos);
-
         // Verify root, file1, file2, file3 are present with matching attributes
-        assert!(batch_map.contains_key(&1));
-        assert_eq!(batch_map.get(&1).unwrap(), &fs.get_attr(1).unwrap());
-
-        assert!(batch_map.contains_key(&attr1.ino));
-        assert_eq!(batch_map.get(&attr1.ino).unwrap(), &fs.get_attr(attr1.ino).unwrap());
-
-        assert!(batch_map.contains_key(&attr2.ino));
-        assert_eq!(batch_map.get(&attr2.ino).unwrap(), &fs.get_attr(attr2.ino).unwrap());
-
-        assert!(batch_map.contains_key(&attr3.ino));
-        assert_eq!(batch_map.get(&attr3.ino).unwrap(), &fs.get_attr(attr3.ino).unwrap());
+        assert!(fs.get_attr(1).is_some());
+        assert_eq!(fs.get_attr(attr1.ino).unwrap().ino, attr1.ino);
+        assert_eq!(fs.get_attr(attr2.ino).unwrap().ino, attr2.ino);
+        assert_eq!(fs.get_attr(attr3.ino).unwrap().ino, attr3.ino);
 
         // Tombstoned inode 4 and non-existent inode 999 must NOT be present
-        assert!(!batch_map.contains_key(&attr4.ino));
-        assert!(!batch_map.contains_key(&999));
+        assert!(fs.get_attr(attr4.ino).is_none());
+        assert!(fs.get_attr(999).is_none());
     }
 
     #[test]

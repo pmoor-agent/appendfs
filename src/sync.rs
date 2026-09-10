@@ -25,13 +25,16 @@ pub enum OpTag {
     Flush = 14,
     Fold = 15,
     Layer = 16,
-    Other = 17,
-    Open = 18,
-    OpenDir = 19,
-    ReadDir = 20,
+    Open = 17,
+    OpenDir = 18,
+    ReadDir = 19,
+    Lookup = 20,
+    GetAttr = 21,
+    ReadLink = 22,
+    Other = 23,
 }
 
-pub const OP_TAG_COUNT: usize = 21;
+pub const OP_TAG_COUNT: usize = 24;
 pub const ALL_OP_TAGS: [OpTag; OP_TAG_COUNT] = [
     OpTag::Write,
     OpTag::ReadPlan,
@@ -50,10 +53,13 @@ pub const ALL_OP_TAGS: [OpTag; OP_TAG_COUNT] = [
     OpTag::Flush,
     OpTag::Fold,
     OpTag::Layer,
-    OpTag::Other,
     OpTag::Open,
     OpTag::OpenDir,
     OpTag::ReadDir,
+    OpTag::Lookup,
+    OpTag::GetAttr,
+    OpTag::ReadLink,
+    OpTag::Other,
 ];
 
 impl OpTag {
@@ -76,10 +82,13 @@ impl OpTag {
             OpTag::Flush => "flush",
             OpTag::Fold => "fold",
             OpTag::Layer => "layer",
-            OpTag::Other => "other",
             OpTag::Open => "open",
             OpTag::OpenDir => "opendir",
             OpTag::ReadDir => "readdir",
+            OpTag::Lookup => "lookup",
+            OpTag::GetAttr => "getattr",
+            OpTag::ReadLink => "readlink",
+            OpTag::Other => "other",
         }
     }
 
@@ -115,6 +124,9 @@ impl Default for OpMetrics {
 
 const fn new_op_metrics_array() -> [OpMetrics; OP_TAG_COUNT] {
     [
+        OpMetrics::new(),
+        OpMetrics::new(),
+        OpMetrics::new(),
         OpMetrics::new(),
         OpMetrics::new(),
         OpMetrics::new(),
@@ -571,5 +583,34 @@ mod tests {
         assert_eq!(write_stat.count, 1);
         let other_stat = stats.iter().find(|s| s.tag == OpTag::Other).unwrap();
         assert_eq!(other_stat.count, 1);
+    }
+
+    #[test]
+    fn test_op_tags_coverage() {
+        assert_eq!(ALL_OP_TAGS.len(), OP_TAG_COUNT);
+        assert_eq!(OP_TAG_COUNT, 24);
+
+        let m = ActionMutex::new(0);
+        let tags_to_test = [
+            (OpTag::Open, "open"),
+            (OpTag::OpenDir, "opendir"),
+            (OpTag::ReadDir, "readdir"),
+            (OpTag::Lookup, "lookup"),
+            (OpTag::GetAttr, "getattr"),
+            (OpTag::ReadLink, "readlink"),
+        ];
+
+        for (tag, expected_name) in tags_to_test {
+            assert_eq!(tag.name(), expected_name);
+            assert_eq!(tag.as_str(), expected_name);
+            let _guard = m.lock_tag(tag).unwrap();
+        }
+
+        let stats = m.op_stats();
+        assert_eq!(stats.len(), OP_TAG_COUNT);
+        for (tag, _) in tags_to_test {
+            let stat = stats.iter().find(|s| s.tag == tag).unwrap();
+            assert_eq!(stat.count, 1);
+        }
     }
 }

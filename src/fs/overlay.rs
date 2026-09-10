@@ -294,7 +294,7 @@ impl InMemoryFS {
     }
 
     pub fn get_parent_dir_inode(&self, ino: u64) -> Option<u64> {
-        self.inner.lock().unwrap().get_parent_dir_inode(ino)
+        self.inner.lock_tag(OpTag::Lookup).unwrap().get_parent_dir_inode(ino)
     }
 
     pub fn update_attr_delta(&self, ino: u64, delta: AttrDelta) {
@@ -335,33 +335,7 @@ impl InMemoryFS {
     }
 
     pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
-        self.get_attr_locked(&self.inner.lock().unwrap(), ino)
-    }
-
-    pub fn get_attrs_batch(&self, inos: &[u64]) -> HashMap<u64, FileAttr> {
-        let mut result = HashMap::with_capacity(inos.len());
-        let mut regular_inos = Vec::with_capacity(inos.len());
-
-        for &ino in inos {
-            if self.virtual_files.is_virtual_ino(ino) {
-                result.insert(ino, self.virtual_files.file_attr(ino, 0, self.clock.now()));
-            } else {
-                regular_inos.push(ino);
-            }
-        }
-
-        if regular_inos.is_empty() {
-            return result;
-        }
-
-        let inner = self.inner.lock().unwrap();
-        for &ino in &regular_inos {
-            if let Some(attr) = inner.get_attr(ino) {
-                result.insert(ino, attr);
-            }
-        }
-
-        result
+        self.get_attr_locked(&self.inner.lock_tag(OpTag::GetAttr).unwrap(), ino)
     }
 
     pub fn lookup_child_locked(&self, inner: &FsInner, parent: u64, name: &str) -> Option<u64> {
@@ -374,23 +348,23 @@ impl InMemoryFS {
     }
 
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
-        self.lookup_child_locked(&self.inner.lock().unwrap(), parent, name)
+        self.lookup_child_locked(&self.inner.lock_tag(OpTag::Lookup).unwrap(), parent, name)
     }
 
     pub fn list_directory(&self, parent: u64) -> Option<Vec<(String, u64)>> {
-        self.inner.lock().unwrap().list_directory(parent)
+        self.inner.lock_tag(OpTag::ReadDir).unwrap().list_directory(parent)
     }
 
     pub fn read_link(&self, ino: u64) -> Option<String> {
-        self.inner.lock().unwrap().read_link(ino)
+        self.inner.lock_tag(OpTag::ReadLink).unwrap().read_link(ino)
     }
 
     pub fn get_xattr(&self, ino: u64, name: &str) -> Option<Vec<u8>> {
-        self.inner.lock().unwrap().get_xattr(ino, name)
+        self.inner.lock_tag(OpTag::Xattr).unwrap().get_xattr(ino, name)
     }
 
     pub fn list_xattrs(&self, ino: u64) -> Option<Vec<String>> {
-        self.inner.lock().unwrap().list_xattrs(ino)
+        self.inner.lock_tag(OpTag::Xattr).unwrap().list_xattrs(ino)
     }
 
     pub fn set_xattr(&self, ino: u64, name: &str, value: Vec<u8>, now: SystemTime) {
