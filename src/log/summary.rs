@@ -8,9 +8,8 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
-// 28 bytes (manifest_offset + index_offset + entry_count + magic) + 32-byte BLAKE3 checksum.
-pub const SUMMARY_FOOTER_SIZE: usize = 60;
-pub const SUMMARY_INDEX_ENTRY_SIZE: usize = 16;
+// 20 bytes (manifest_offset + entry_count + magic) + 32-byte BLAKE3 checksum.
+pub const SUMMARY_FOOTER_SIZE: usize = 52;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
 pub const CURRENT_SUMMARY_VERSION: u32 = 1;
 pub const SUMMARY_HEADER_SIZE: usize = 64;
@@ -83,21 +82,19 @@ impl SummaryHeader {
 /// Footer written at EOF (last `SUMMARY_FOOTER_SIZE` bytes) of `{:06}.summary`.
 ///
 /// `checksum` is a full (untruncated) BLAKE3 hash of everything in the file *before*
-/// the footer - the header, every inode record, the manifest, and the index array.
+/// the footer - the header, every inode record, and the manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryFooter {
     pub manifest_offset: u64,
-    pub index_offset: u64,
     pub entry_count: u64,
     pub magic: [u8; 4],
     pub checksum: [u8; 32],
 }
 
 impl SummaryFooter {
-    pub fn new(manifest_offset: u64, index_offset: u64, entry_count: u64, checksum: [u8; 32]) -> Self {
+    pub fn new(manifest_offset: u64, entry_count: u64, checksum: [u8; 32]) -> Self {
         Self {
             manifest_offset,
-            index_offset,
             entry_count,
             magic: *SUMMARY_MAGIC,
             checksum,
@@ -106,23 +103,6 @@ impl SummaryFooter {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         crate::wire::serialize(self).expect("SummaryFooter serialization failed")
-    }
-
-    pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
-        crate::wire::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-}
-
-/// Fixed 16-byte index entry mapping `inode -> byte_offset` in the `.summary` file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SummaryIndexEntry {
-    pub inode: u64,
-    pub offset: u64,
-}
-
-impl SummaryIndexEntry {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        crate::wire::serialize(self).expect("SummaryIndexEntry serialization failed")
     }
 
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
@@ -176,16 +156,14 @@ impl BodySink<'_> {
     }
 }
 
-/// Serializes every inode, then the manifest, then the index, into `sink`.
+/// Serializes every inode, then the manifest, into `sink`.
 ///
-/// Returns `(manifest_offset, index_offset, entry_count)` for the footer.
+/// Returns `(manifest_offset, entry_count)` for the footer.
 fn write_summary_body(
     sink: &mut BodySink<'_>,
     inodes: &[(u64, Arc<Node>)],
     manifest: &crate::log::LogManifest,
-) -> io::Result<(u64, u64, u64)> {
-    let mut index_entries = Vec::with_capacity(inodes.len());
-
+) -> io::Result<(u64, u64)> {
     for (inode, node_arc) in inodes {
         let mut node_to_serialize = node_arc.as_ref().clone();
         match node_to_serialize.kind {
@@ -197,11 +175,6 @@ fn write_summary_body(
         let payload =
             crate::wire::serialize(&node_to_serialize).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        index_entries.push(SummaryIndexEntry {
-            inode: *inode,
-            offset: sink.offset(),
-        });
-
         sink.append(&inode.to_be_bytes())?;
         sink.append(&(payload.len() as u32).to_be_bytes())?;
         sink.append(&payload)?;
@@ -212,13 +185,7 @@ fn write_summary_body(
     sink.append(&(manifest_bytes.len() as u32).to_be_bytes())?;
     sink.append(&manifest_bytes)?;
 
-    index_entries.sort_by_key(|entry| entry.inode);
-    let index_offset = sink.offset();
-    for entry in &index_entries {
-        sink.append(&entry.to_bytes())?;
-    }
-
-    Ok((manifest_offset, index_offset, index_entries.len() as u64))
+    Ok((manifest_offset, inodes.len() as u64))
 }
 
 /// Merges adjacent extents that are physically contiguous in the same log record, so a
@@ -335,7 +302,7 @@ pub fn export_summary_with_iv(
     let mut manifest_with_md5 = manifest.clone();
     manifest_with_md5.populate_sealed_md5s(storage, generation);
 
-    let (manifest_offset, index_offset, entry_count) = {
+    let (manifest_offset, entry_count) = {
         let mut sink = match buffered {
             Some(ref mut buf) => BodySink::Buffered(buf),
             None => BodySink::Direct {
@@ -358,7 +325,7 @@ pub fn export_summary_with_iv(
     }
 
     let checksum: [u8; 32] = *hasher.finalize().as_bytes();
-    let footer = SummaryFooter::new(manifest_offset, index_offset, entry_count, checksum);
+    let footer = SummaryFooter::new(manifest_offset, entry_count, checksum);
     writer.append(&footer.to_bytes())?;
 
     writer.sync()?;
@@ -468,7 +435,6 @@ pub struct SummaryReader {
     pub manifest: crate::log::LogManifest,
     /// Parsed from the plaintext blob, so callers get volume identity without a second read.
     pub volume_header: crate::crypto::VolumeHeader,
-    index_entries: Vec<SummaryIndexEntry>,
     decrypted_body: Option<Vec<u8>>,
     pub volume_key: Arc<VolumeKey>,
 }
@@ -620,13 +586,13 @@ impl SummaryReader {
         // forged count aborts the process on an oversized allocation.
         footer
             .entry_count
-            .checked_mul(SUMMARY_INDEX_ENTRY_SIZE as u64)
+            .checked_mul(12)
             .filter(|bytes| *bytes <= content_len)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "summary file {} claims {} index entries, more than its {} bytes can hold",
+                        "summary file {} claims {} entries, more than its {} bytes can hold",
                         filename, footer.entry_count, content_len
                     ),
                 )
@@ -638,6 +604,17 @@ impl SummaryReader {
         // from the verified key check value. Trusting the file here would let a cleared
         // byte route an encrypted body down the plaintext path, skipping the AEAD.
         if !volume_key.cipher().is_encrypted() {
+            let body_base = SUMMARY_HEADER_SIZE as u64 + header.volume_header_len as u64;
+            if footer.manifest_offset < body_base || footer.manifest_offset > footer_offset {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "summary file {} has invalid manifest_offset {} (body_base={}, footer_offset={})",
+                        filename, footer.manifest_offset, body_base, footer_offset
+                    ),
+                ));
+            }
+
             // 4. Read LogManifest from manifest_offset
             let mut manifest_len_buf = [0u8; 4];
             reader.read_exact_at(footer.manifest_offset, &mut manifest_len_buf)?;
@@ -647,23 +624,12 @@ impl SummaryReader {
             let manifest: crate::log::LogManifest =
                 crate::wire::deserialize(&manifest_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-            // 5. Read index array from index_offset
-            let mut index_entries = Vec::with_capacity(footer.entry_count as usize);
-            let mut index_read_offset = footer.index_offset;
-            for _ in 0..footer.entry_count {
-                let mut entry_buf = [0u8; SUMMARY_INDEX_ENTRY_SIZE];
-                reader.read_exact_at(index_read_offset, &mut entry_buf)?;
-                index_entries.push(SummaryIndexEntry::from_bytes(&entry_buf)?);
-                index_read_offset += SUMMARY_INDEX_ENTRY_SIZE as u64;
-            }
-
             Ok(Self {
                 reader,
                 header,
                 footer,
                 manifest,
                 volume_header,
-                index_entries,
                 decrypted_body: None,
                 volume_key,
             })
@@ -691,19 +657,23 @@ impl SummaryReader {
                 .decrypt_summary(&header.iv, &header_buf, &ciphertext)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+            if footer.manifest_offset > decrypted.len() as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "summary file {} has manifest_offset {} beyond decrypted body length {}",
+                        filename,
+                        footer.manifest_offset,
+                        decrypted.len()
+                    ),
+                ));
+            }
+
             let len_bytes = body_slice(&decrypted, footer.manifest_offset, 4, "manifest length")?;
             let manifest_len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as u64;
             let manifest_bytes = body_slice(&decrypted, footer.manifest_offset + 4, manifest_len, "manifest")?;
             let manifest: crate::log::LogManifest =
                 crate::wire::deserialize(manifest_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            let mut index_entries = Vec::with_capacity(footer.entry_count as usize);
-            let mut index_offset = footer.index_offset;
-            for _ in 0..footer.entry_count {
-                let entry_bytes = body_slice(&decrypted, index_offset, SUMMARY_INDEX_ENTRY_SIZE as u64, "index entry")?;
-                index_entries.push(SummaryIndexEntry::from_bytes(entry_bytes)?);
-                index_offset += SUMMARY_INDEX_ENTRY_SIZE as u64;
-            }
 
             Ok(Self {
                 reader,
@@ -711,16 +681,10 @@ impl SummaryReader {
                 footer,
                 manifest,
                 volume_header,
-                index_entries,
                 decrypted_body: Some(decrypted),
                 volume_key,
             })
         }
-    }
-
-    /// Returns the slice of all index entries in this summary file.
-    pub fn index_entries(&self) -> &[SummaryIndexEntry] {
-        &self.index_entries
     }
 
     /// Returns the underlying storage reader.
@@ -728,60 +692,28 @@ impl SummaryReader {
         &self.reader
     }
 
-    /// Performs binary search lookup on index array to get the byte offset of a target inode.
-    pub fn lookup_offset(&self, inode: u64) -> Option<u64> {
-        self.index_entries
-            .binary_search_by_key(&inode, |entry| entry.inode)
-            .ok()
-            .map(|idx| self.index_entries[idx].offset)
+    /// Reads and deserializes all inodes sequentially from this summary file into an in-memory HashMap.
+    pub fn read_all_inodes(&self) -> io::Result<HashMap<u64, Arc<Node>>> {
+        if let Some(ref decrypted) = self.decrypted_body {
+            let slice = body_slice(decrypted, 0, self.footer.manifest_offset, "inode records")?;
+            parse_inodes_slice(slice, self.footer.entry_count)
+        } else {
+            let body_base = SUMMARY_HEADER_SIZE as u64 + self.header.volume_header_len as u64;
+            let inodes_len = self.footer.manifest_offset.checked_sub(body_base).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manifest_offset is before volume header in summary",
+                )
+            })? as usize;
+            let inodes_bytes = self.reader.read_vec(body_base, inodes_len)?;
+            parse_inodes_slice(&inodes_bytes, self.footer.entry_count)
+        }
     }
 
     /// Reads and deserializes a single `Node` for `inode` from this summary file.
     pub fn read_inode(&self, inode: u64) -> io::Result<Option<Node>> {
-        let Some(offset) = self.lookup_offset(inode) else {
-            return Ok(None);
-        };
-
-        if let Some(ref body) = self.decrypted_body {
-            let off = offset as usize;
-            if off + 12 > body.len() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupted summary body"));
-            }
-            let read_inode = u64::from_be_bytes(body[off..off + 8].try_into().unwrap());
-            if read_inode != inode {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("summary index mismatch: expected inode {}, found {}", inode, read_inode),
-                ));
-            }
-            let payload_len = u32::from_be_bytes(body[off + 8..off + 12].try_into().unwrap()) as usize;
-            if off + 12 + payload_len > body.len() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupted summary body"));
-            }
-            let payload = &body[off + 12..off + 12 + payload_len];
-            let node =
-                crate::wire::deserialize::<Node>(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            return Ok(Some(node));
-        }
-
-        let mut meta_buf = [0u8; 12];
-        self.reader.read_exact_at(offset, &mut meta_buf)?;
-        let read_inode = u64::from_be_bytes(meta_buf[0..8].try_into().unwrap());
-        if read_inode != inode {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("summary index mismatch: expected inode {}, found {}", inode, read_inode),
-            ));
-        }
-
-        let payload_len = u32::from_be_bytes(meta_buf[8..12].try_into().unwrap()) as usize;
-        let mut payload = vec![0u8; payload_len];
-        self.reader.read_exact_at(offset + 12, &mut payload)?;
-
-        let node =
-            crate::wire::deserialize::<Node>(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        Ok(Some(node))
+        let inodes = self.read_all_inodes()?;
+        Ok(inodes.get(&inode).map(|arc| arc.as_ref().clone()))
     }
 
     /// Alias for `read_inode`.
@@ -790,27 +722,54 @@ impl SummaryReader {
     }
 
     /// Iterates through all `(inode, Node)` stored in this summary file in ascending inode order.
-    pub fn iter_inodes(&self) -> impl Iterator<Item = io::Result<(u64, Node)>> + '_ {
-        self.index_entries.iter().map(move |entry| {
-            let node = self.read_inode(entry.inode)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("inode {} in index but not found in file", entry.inode),
-                )
-            })?;
-            Ok((entry.inode, node))
-        })
+    pub fn iter_inodes(&self) -> io::Result<impl Iterator<Item = (u64, Node)>> {
+        let inodes = self.read_all_inodes()?;
+        let mut entries: Vec<(u64, Node)> = inodes
+            .into_iter()
+            .map(|(ino, arc)| (ino, Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())))
+            .collect();
+        entries.sort_by_key(|(ino, _)| *ino);
+        Ok(entries.into_iter())
     }
+}
 
-    /// Reads all inodes into an in-memory HashMap.
-    pub fn read_all_inodes(&self) -> io::Result<HashMap<u64, Arc<Node>>> {
-        let mut map = HashMap::with_capacity(self.footer.entry_count as usize);
-        for res in self.iter_inodes() {
-            let (ino, node) = res?;
-            map.insert(ino, Arc::new(node));
+/// Parses a sequential slice of `[inode: u64][len: u32][payload]` records into a HashMap.
+fn parse_inodes_slice(slice: &[u8], expected_count: u64) -> io::Result<HashMap<u64, Arc<Node>>> {
+    let mut map = HashMap::with_capacity(expected_count as usize);
+    let mut offset = 0;
+    while offset < slice.len() {
+        if offset + 12 > slice.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "corrupted summary inode framing",
+            ));
         }
-        Ok(map)
+        let ino = u64::from_be_bytes(slice[offset..offset + 8].try_into().unwrap());
+        let payload_len = u32::from_be_bytes(slice[offset + 8..offset + 12].try_into().unwrap()) as usize;
+        offset += 12;
+        if offset + payload_len > slice.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "corrupted summary inode payload",
+            ));
+        }
+        let payload = &slice[offset..offset + payload_len];
+        let node: Node =
+            crate::wire::deserialize(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        map.insert(ino, Arc::new(node));
+        offset += payload_len;
     }
+    if map.len() as u64 != expected_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "summary inode count mismatch: expected {} inodes, parsed {}",
+                expected_count,
+                map.len()
+            ),
+        ));
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -941,7 +900,7 @@ mod tests {
         let reader = SummaryReader::open(storage.as_ref(), &filename, VolumeKey::plaintext_arc()).unwrap();
         assert_eq!(reader.footer.entry_count, 50);
 
-        let all_inodes: Vec<u64> = reader.iter_inodes().map(|res| res.unwrap().0).collect();
+        let all_inodes: Vec<u64> = reader.iter_inodes().unwrap().map(|(ino, _)| ino).collect();
         assert_eq!(all_inodes.len(), 50);
         for i in 1..=50 {
             assert_eq!(all_inodes[(i - 1) as usize], i);
