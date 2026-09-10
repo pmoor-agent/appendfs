@@ -1168,7 +1168,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn format_system_time(time: SystemTime) -> String {
-    crate::clock::format_local_civil_time(time)
+    crate::clock::format_utc_civil_time(time)
 }
 
 fn push_attr_delta_fields(attr: &LogAttrDelta, fields: &mut Vec<String>) {

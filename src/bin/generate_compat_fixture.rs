@@ -47,7 +47,10 @@ fn main() {
         std::process::exit(1);
     }
     println!("Successfully generated fixtures:");
-    println!("  - {}", out_dir.join("000000.summary").display());
-    println!("  - {}", out_dir.join("000001.log").display());
-    println!("  - {}", out_dir.join("000001.summary").display());
+    for name in appendfs::compat::COMPAT_FIXTURE_FILES
+        .iter()
+        .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
+    {
+        println!("  - {}", out_dir.join(name).display());
+    }
 }

@@ -17,7 +17,7 @@
 use appendfs::compat::{create_canonical_compat_volume, verify_compat_tree};
 use appendfs::operations::read_write::{create_core, open_core, read_core, release_core, write_core};
 use appendfs::storage::OsStorage;
-use appendfs::{InMemoryFS, LogWriter, RecoveryTarget, Storage, SummaryReader, VolumeKey, recover_fs};
+use appendfs::{InMemoryFS, LogWriter, RecoveryTarget, Storage, SummaryReader, recover_fs};
 
 fn read_test(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<u8> {
     let fh = open_core(fs, ino, libc::O_RDONLY as u32).expect("open file");
@@ -39,24 +39,7 @@ fn fixture_v1_encrypted_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1_encrypted")
 }
 
-/// Resolves the volume key required to open `fixture_dir`, unlocking encrypted fixtures
-/// with the canonical test passphrase.
-pub fn resolve_fixture_volume_key(fixture_dir: &Path) -> Arc<VolumeKey> {
-    let storage = OsStorage::new(fixture_dir);
-    let summary_file = "000000.summary";
-    let volume_header = SummaryReader::read_volume_header(&storage, summary_file).expect("read fixture volume header");
-    if volume_header.cipher == appendfs::crypto::CipherSuite::None {
-        VolumeKey::plaintext_arc()
-    } else {
-        let master = appendfs::crypto::MasterKey::from_passphrase(
-            appendfs::compat::COMPAT_ENCRYPTED_PASSPHRASE,
-            &volume_header.kdf_salt,
-        )
-        .expect("derive master key from fixture passphrase");
-        let volume_key = volume_header.unlock(&master).expect("unlock encrypted fixture volume");
-        Arc::new(volume_key)
-    }
-}
+pub use appendfs::compat::resolve_fixture_volume_key;
 
 /// Tests recovery when the latest summary file is missing, forcing full log replay and
 /// reconstruction from the earliest summary and all subsequent log records.
@@ -183,7 +166,10 @@ fn test_v1_encrypted_deterministic_reproducibility() {
     .expect("create canonical encrypted compat volume");
 
     let fixture_dir = fixture_v1_encrypted_dir();
-    for name in &["000000.summary", "000001.log", "000001.summary"] {
+    for name in appendfs::compat::COMPAT_FIXTURE_FILES
+        .iter()
+        .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
+    {
         let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
         let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
         assert_eq!(
@@ -202,7 +188,10 @@ fn test_v1_deterministic_reproducibility() {
     create_canonical_compat_volume(temp.path()).expect("create canonical compat volume");
 
     let fixture_dir = fixture_v1_dir();
-    for name in &["000000.summary", "000001.log", "000001.summary"] {
+    for name in appendfs::compat::COMPAT_FIXTURE_FILES
+        .iter()
+        .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
+    {
         let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
         let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
         assert_eq!(
@@ -211,6 +200,36 @@ fn test_v1_deterministic_reproducibility() {
             "Generated file {} differs from checked-in fixture in {}",
             name,
             fixture_dir.display()
+        );
+    }
+}
+
+/// Verifies that dump output for all canonical volume files in `fixture_dir` matches
+/// the checked-in golden `.dump` files.
+pub fn verify_fixture_dumps(fixture_dir: &Path) {
+    let storage = OsStorage::new(fixture_dir);
+    let volume_key = resolve_fixture_volume_key(fixture_dir);
+
+    for name in appendfs::compat::COMPAT_FIXTURE_FILES {
+        let dump_filename = format!("{}.dump", name);
+        let golden_path = fixture_dir.join(&dump_filename);
+        assert!(
+            golden_path.is_file(),
+            "Missing golden dump file {} in fixture {}",
+            dump_filename,
+            fixture_dir.display()
+        );
+        let actual_dump = appendfs::dump_file(&storage, name, 1, Some(volume_key.as_ref()))
+            .unwrap_or_else(|e| panic!("Failed to dump {} in {}: {}", name, fixture_dir.display(), e));
+        let expected_dump = fs::read_to_string(&golden_path)
+            .unwrap_or_else(|e| panic!("Failed to read golden dump {}: {}", golden_path.display(), e));
+        assert_eq!(
+            actual_dump,
+            expected_dump,
+            "Dump of {} in {} differs from golden fixture {}",
+            name,
+            fixture_dir.display(),
+            golden_path.display()
         );
     }
 }
@@ -238,6 +257,7 @@ fn test_all_fixture_versions() {
         println!("Running compatibility checks on fixture: {}", version_name);
         verify_recovery_with_latest_summary_missing(version_dir);
         verify_recovery_from_latest_summary_snapshot(version_dir);
+        verify_fixture_dumps(version_dir);
         verify_python_restore_script(version_dir);
     }
 }

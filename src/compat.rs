@@ -61,6 +61,39 @@ pub const COMPAT_SUMMARY_0_IV: [u8; 12] = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0
 /// Fixed 12-byte IV for generation 1 summary snapshot in canonical encrypted compatibility fixtures.
 pub const COMPAT_SUMMARY_1_IV: [u8; 12] = [0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc];
 
+/// Canonical list of fixture volume file basenames.
+pub const COMPAT_FIXTURE_FILES: &[&str] = &["000000.summary", "000001.log", "000001.summary"];
+
+/// Canonical list of golden fixture dump file basenames.
+pub const COMPAT_FIXTURE_DUMP_FILES: &[&str] = &["000000.summary.dump", "000001.log.dump", "000001.summary.dump"];
+
+/// Resolves the volume key required to open `fixture_dir`, unlocking encrypted fixtures
+/// with the canonical test passphrase.
+pub fn resolve_fixture_volume_key(fixture_dir: &Path) -> Arc<VolumeKey> {
+    let storage = OsStorage::new(fixture_dir);
+    let summary_file = "000000.summary";
+    let volume_header =
+        crate::log::SummaryReader::read_volume_header(&storage, summary_file).expect("read fixture volume header");
+    if volume_header.cipher == crate::crypto::CipherSuite::None {
+        VolumeKey::plaintext_arc()
+    } else {
+        let master = crate::crypto::MasterKey::from_passphrase(COMPAT_ENCRYPTED_PASSPHRASE, &volume_header.kdf_salt)
+            .expect("derive master key from fixture passphrase");
+        let volume_key = volume_header.unlock(&master).expect("unlock encrypted fixture volume");
+        Arc::new(volume_key)
+    }
+}
+
+/// Generates golden `.dump` files for the canonical volume files in `dir`.
+pub fn generate_compat_dump_files(dir: &Path, volume_key: Option<&VolumeKey>) -> io::Result<()> {
+    let storage = OsStorage::new(dir);
+    for name in COMPAT_FIXTURE_FILES {
+        let dump_text = crate::dump::dump_file(&storage, name, 1, volume_key)?;
+        fs::write(dir.join(format!("{}.dump", name)), dump_text)?;
+    }
+    Ok(())
+}
+
 pub fn compat_time(offset_secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(COMPAT_BASE_TIMESTAMP_SECS + offset_secs)
 }
@@ -516,6 +549,9 @@ pub fn create_canonical_compat_volume(out_dir: &Path) -> io::Result<()> {
 
     let _ = fs::remove_file(out_dir.join(".lock"));
 
+    // 5. Generate golden dumps
+    generate_compat_dump_files(out_dir, None)?;
+
     Ok(())
 }
 
@@ -578,7 +614,7 @@ pub fn create_canonical_compat_volume_encrypted(out_dir: &Path, passphrase: &str
 
     let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
     fs.volume_header = volume_header;
-    fs.volume_key = volume_key_arc;
+    fs.volume_key = volume_key_arc.clone();
     fs.deterministic_summary_iv = Some(COMPAT_SUMMARY_1_IV);
     fs.log_writer = Some(writer);
     fs.set_log_dir(out_dir);
@@ -594,6 +630,9 @@ pub fn create_canonical_compat_volume_encrypted(out_dir: &Path, passphrase: &str
     drop(fs);
 
     let _ = fs::remove_file(out_dir.join(".lock"));
+
+    // 5. Generate golden dumps
+    generate_compat_dump_files(out_dir, Some(&volume_key_arc))?;
 
     Ok(())
 }

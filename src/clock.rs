@@ -63,6 +63,29 @@ pub fn format_local_civil_time(time: SystemTime) -> String {
     }
 }
 
+/// Formats a `SystemTime` as `<unix_secs>.<nanos>s (YYYY-MM-DD HH:MM:SS UTC)`.
+pub fn format_utc_civil_time(time: SystemTime) -> String {
+    let (secs, nsecs) = system_time_to_unix(time);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time_t = secs as libc::time_t;
+    let res = unsafe { libc::gmtime_r(&time_t, &mut tm) };
+    if !res.is_null() {
+        format!(
+            "{}.{:09}s ({:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC)",
+            secs,
+            nsecs,
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    } else {
+        format!("{}.{:09}s (unknown time)", secs, nsecs)
+    }
+}
+
 /// Parses a human-readable or unix timestamp string into `SystemTime`.
 /// Supports unix seconds (`1755424800`), decimals (`1755424800.5`),
 /// ISO 8601 / RFC 3339 (`2026-08-17T10:00:00Z`), `2026-08-17 10:00:00`, and `2026-08-17`.
@@ -257,5 +280,12 @@ mod tests {
         assert_eq!(&civil_part[10..11], " ");
         assert_eq!(&civil_part[13..14], ":");
         assert_eq!(&civil_part[16..17], ":");
+    }
+
+    #[test]
+    fn test_format_utc_civil_time() {
+        let time = unix_to_system_time(1700000330, 0);
+        let formatted = format_utc_civil_time(time);
+        assert_eq!(formatted, "1700000330.000000000s (2023-11-14 22:18:50 UTC)");
     }
 }
