@@ -88,10 +88,11 @@ Each entry in the log file consists of a header and an optional compressed/encry
 
 ### 3.4 In-Memory Index & Fragment Tracking (`ExtentMap`)
 - Filesystem file content is tracked using the specialized `ExtentMap` data structure.
-- Files start out in compact `Vector` mode (a sorted list of contiguous extents) optimized for $O(1)$ appends, contiguous arena chunk coalescing, and $O(\log N)$ binary search queries.
+- Files initialize inline (`Empty` or `Single` extent) with zero heap allocations, optimized for single-extent and empty files which represent the majority of filesystem inodes.
+- Appending additional extents transitions the map to a compact sorted `Vector` mode for $O(1)$ appends, contiguous arena chunk coalescing, and $O(\log N)$ binary search queries.
 - On non-sequential overwrites or middle splits, `ExtentMap` seamlessly promotes in-place to an interval `BTreeMap` that trims and splits overlapping extents.
 - Extents use a plain value `Extent` enum (`Staged`, `Disk`, `Zero`) without reference-counting indirection or interior locks.
-- Upon flush or snapshot export, extents are persisted and cleanly deserialized directly back into compact `Vector` form.
+- Upon flush or snapshot export, extents are persisted and cleanly deserialized directly back into inline `Empty`/`Single` or compact `Vector` form with zero intermediate allocations.
 
 ---
 
