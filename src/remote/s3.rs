@@ -16,6 +16,7 @@ pub struct S3RemoteStore {
     pub prefix: String,
     pub signer: Option<SigV4Signer>,
     pub force_path_style: bool,
+    pub storage_class: Option<String>,
     agent: ureq::Agent,
 }
 
@@ -27,6 +28,7 @@ impl S3RemoteStore {
         prefix: impl Into<String>,
         signer: Option<SigV4Signer>,
         force_path_style: bool,
+        storage_class: Option<String>,
     ) -> Self {
         let agent = ureq::builder()
             .timeout_connect(Duration::from_secs(10))
@@ -46,8 +48,14 @@ impl S3RemoteStore {
             prefix: p,
             signer,
             force_path_style,
+            storage_class,
             agent,
         }
+    }
+
+    pub fn with_storage_class(mut self, storage_class: impl Into<String>) -> Self {
+        self.storage_class = Some(storage_class.into());
+        self
     }
 
     fn full_key(&self, key: &str) -> String {
@@ -241,80 +249,10 @@ impl RemoteStore for S3RemoteStore {
             let mut xml_str = String::new();
             reader.read_to_string(&mut xml_str)?;
 
-            let mut xml = XmlReader::from_str(&xml_str);
-            let mut buf = Vec::new();
-
-            let mut in_contents = false;
-            let mut in_key = false;
-            let mut in_size = false;
-            let mut in_etag = false;
-            let mut in_is_trunc = false;
-            let mut in_next_token = false;
-
-            let mut cur_key = String::new();
-            let mut cur_size = 0u64;
-            let mut cur_etag = String::new();
-            let mut is_truncated = false;
-            let mut next_token = String::new();
-
-            while let Ok(event) = xml.read_event_into(&mut buf) {
-                match event {
-                    Event::Start(e) => match e.name().as_ref() {
-                        b"Contents" => {
-                            in_contents = true;
-                            cur_key.clear();
-                            cur_size = 0;
-                            cur_etag.clear();
-                        }
-                        b"Key" if in_contents => in_key = true,
-                        b"Size" if in_contents => in_size = true,
-                        b"ETag" if in_contents => in_etag = true,
-                        b"IsTruncated" => in_is_trunc = true,
-                        b"NextContinuationToken" => in_next_token = true,
-                        _ => {}
-                    },
-                    Event::End(e) => match e.name().as_ref() {
-                        b"Contents" => {
-                            in_contents = false;
-                            // Strip global prefix to make key relative to prefix root
-                            let rel_key = cur_key.strip_prefix(&self.prefix).unwrap_or(&cur_key).to_string();
-                            results.push(RemoteObject {
-                                key: rel_key,
-                                size: cur_size,
-                                etag: Some(cur_etag.trim_matches('"').to_string()),
-                                last_modified: None,
-                            });
-                        }
-                        b"Key" => in_key = false,
-                        b"Size" => in_size = false,
-                        b"ETag" => in_etag = false,
-                        b"IsTruncated" => in_is_trunc = false,
-                        b"NextContinuationToken" => in_next_token = false,
-                        _ => {}
-                    },
-                    Event::Text(t) => {
-                        let text = t.unescape().unwrap_or_default();
-                        if in_key {
-                            cur_key = text.to_string();
-                        } else if in_size {
-                            cur_size = text.parse().unwrap_or(0);
-                        } else if in_etag {
-                            cur_etag = text.to_string();
-                        } else if in_is_trunc {
-                            is_truncated = text.eq_ignore_ascii_case("true");
-                        } else if in_next_token {
-                            next_token = text.to_string();
-                        }
-                    }
-                    Event::Eof => break,
-                    _ => {}
-                }
-                buf.clear();
-            }
-
-            if is_truncated && !next_token.is_empty() {
-                continuation_token = Some(next_token);
-            } else {
+            let (page_objects, next_token) = parse_list_objects_v2_page(&xml_str, &self.prefix);
+            results.extend(page_objects);
+            continuation_token = next_token;
+            if continuation_token.is_none() {
                 break;
             }
         }
@@ -339,11 +277,13 @@ impl RemoteStore for S3RemoteStore {
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(0);
                 let etag = resp.header("etag").map(|e| e.trim_matches('"').to_string());
+                let storage_class = resp.header("x-amz-storage-class").map(|s| s.to_string());
                 Ok(Some(RemoteObject {
                     key: key.to_string(),
                     size,
                     etag,
                     last_modified: None,
+                    storage_class,
                 }))
             }
             Err(ureq::Error::Status(404, _)) => Ok(None),
@@ -358,6 +298,9 @@ impl RemoteStore for S3RemoteStore {
             ("Content-Length".to_string(), len.to_string()),
             ("Content-Type".to_string(), "application/octet-stream".to_string()),
         ];
+        if let Some(ref sc) = self.storage_class {
+            extra_headers.push(("x-amz-storage-class".to_string(), sc.clone()));
+        }
         if let Some(md5_bytes) = content_md5 {
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(md5_bytes);
@@ -435,6 +378,77 @@ impl RemoteStore for S3RemoteStore {
     }
 }
 
+fn parse_list_objects_v2_page(xml_str: &str, global_prefix: &str) -> (Vec<RemoteObject>, Option<String>) {
+    let mut xml = XmlReader::from_str(xml_str);
+    let mut buf = Vec::new();
+    let mut results = Vec::new();
+
+    let mut current_tag = Vec::new();
+    let mut in_contents = false;
+
+    let mut cur_key = String::new();
+    let mut cur_size = 0u64;
+    let mut cur_etag = String::new();
+    let mut cur_storage_class = None;
+    let mut is_truncated = false;
+    let mut next_token = String::new();
+
+    while let Ok(event) = xml.read_event_into(&mut buf) {
+        match event {
+            Event::Start(e) => {
+                let qname = e.name();
+                let name = qname.as_ref();
+                if name == b"Contents" {
+                    in_contents = true;
+                    cur_key.clear();
+                    cur_size = 0;
+                    cur_etag.clear();
+                    cur_storage_class = None;
+                }
+                current_tag.clear();
+                current_tag.extend_from_slice(name);
+            }
+            Event::End(e) => {
+                if e.name().as_ref() == b"Contents" {
+                    in_contents = false;
+                    let rel_key = cur_key.strip_prefix(global_prefix).unwrap_or(&cur_key).to_string();
+                    results.push(RemoteObject {
+                        key: rel_key,
+                        size: cur_size,
+                        etag: Some(cur_etag.trim_matches('"').to_string()),
+                        last_modified: None,
+                        storage_class: cur_storage_class.take(),
+                    });
+                }
+                current_tag.clear();
+            }
+            Event::Text(t) => {
+                let text = t.unescape().unwrap_or_default();
+                match current_tag.as_slice() {
+                    b"Key" if in_contents => cur_key = text.to_string(),
+                    b"Size" if in_contents => cur_size = text.parse().unwrap_or(0),
+                    b"ETag" if in_contents => cur_etag = text.to_string(),
+                    b"StorageClass" if in_contents => cur_storage_class = Some(text.to_string()),
+                    b"IsTruncated" => is_truncated = text.eq_ignore_ascii_case("true"),
+                    b"NextContinuationToken" => next_token = text.to_string(),
+                    _ => {}
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    let next_continuation = if is_truncated && !next_token.is_empty() {
+        Some(next_token)
+    } else {
+        None
+    };
+
+    (results, next_continuation)
+}
+
 fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
     // Gregorian cycle calculation
     let z = days_since_epoch + 719468;
@@ -448,4 +462,163 @@ fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn test_s3_put_object_storage_class_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = Vec::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                headers.push(line.trim().to_string());
+                line.clear();
+            }
+
+            // Send HTTP 200 response
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            headers
+        });
+
+        let signer = SigV4Signer::new("TESTKEY", "TESTSECRET", "us-east-1");
+        let store = S3RemoteStore::new(
+            "mybucket",
+            "us-east-1",
+            Some(format!("http://{}", addr)),
+            "test_prefix",
+            Some(signer),
+            true,
+            Some("INTELLIGENT_TIERING".to_string()),
+        );
+
+        let data = b"storage class payload";
+        store
+            .put_object("gen1.log", &mut &data[..], data.len() as u64, None)
+            .unwrap();
+
+        let headers = handle.join().unwrap();
+        let has_storage_class = headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case("x-amz-storage-class: INTELLIGENT_TIERING"));
+        assert!(
+            has_storage_class,
+            "Headers must contain 'x-amz-storage-class: INTELLIGENT_TIERING'. Received: {:?}",
+            headers
+        );
+
+        let auth_header = headers
+            .iter()
+            .find(|h| h.to_ascii_lowercase().starts_with("authorization:"))
+            .expect("Authorization header must be present");
+        assert!(
+            auth_header.contains("x-amz-storage-class"),
+            "SigV4 SignedHeaders must include x-amz-storage-class: {}",
+            auth_header
+        );
+    }
+
+    #[test]
+    fn test_s3_put_object_no_storage_class_default() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = Vec::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                headers.push(line.trim().to_string());
+                line.clear();
+            }
+
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            headers
+        });
+
+        let signer = SigV4Signer::new("TESTKEY", "TESTSECRET", "us-east-1");
+        let store = S3RemoteStore::new(
+            "mybucket",
+            "us-east-1",
+            Some(format!("http://{}", addr)),
+            "test_prefix",
+            Some(signer),
+            true,
+            None,
+        );
+
+        let data = b"payload";
+        store
+            .put_object("gen1.log", &mut &data[..], data.len() as u64, None)
+            .unwrap();
+
+        let headers = handle.join().unwrap();
+        let has_storage_class = headers
+            .iter()
+            .any(|h| h.to_ascii_lowercase().starts_with("x-amz-storage-class"));
+        assert!(
+            !has_storage_class,
+            "Headers must NOT contain 'x-amz-storage-class' when none configured. Received: {:?}",
+            headers
+        );
+    }
+
+    #[test]
+    fn test_parse_list_objects_v2_page() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>mybucket</Name>
+    <Prefix>vol1/</Prefix>
+    <KeyCount>2</KeyCount>
+    <MaxKeys>2</MaxKeys>
+    <IsTruncated>true</IsTruncated>
+    <NextContinuationToken>token12345</NextContinuationToken>
+    <Contents>
+        <Key>vol1/000001.log</Key>
+        <Size>1048576</Size>
+        <ETag>"abc123etag"</ETag>
+        <StorageClass>INTELLIGENT_TIERING</StorageClass>
+    </Contents>
+    <Contents>
+        <Key>vol1/000001.summary</Key>
+        <Size>512</Size>
+        <ETag>"def456etag"</ETag>
+    </Contents>
+</ListBucketResult>"#;
+
+        let (objects, next_token) = parse_list_objects_v2_page(xml, "vol1/");
+        assert_eq!(next_token.as_deref(), Some("token12345"));
+        assert_eq!(objects.len(), 2);
+
+        assert_eq!(objects[0].key, "000001.log");
+        assert_eq!(objects[0].size, 1048576);
+        assert_eq!(objects[0].etag.as_deref(), Some("abc123etag"));
+        assert_eq!(objects[0].storage_class.as_deref(), Some("INTELLIGENT_TIERING"));
+
+        assert_eq!(objects[1].key, "000001.summary");
+        assert_eq!(objects[1].size, 512);
+        assert_eq!(objects[1].etag.as_deref(), Some("def456etag"));
+        assert_eq!(objects[1].storage_class, None);
+    }
 }

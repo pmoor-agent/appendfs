@@ -780,6 +780,7 @@ fn cmd_remote_add(add_args: RemoteAddArgs) {
     cfg.secret_access_key_env = add_args.secret_access_key_env;
     cfg.credentials_file = add_args.credentials_file;
     cfg.force_path_style = add_args.path_style;
+    cfg.storage_class = add_args.storage_class;
     if add_args.no_upload_partial_logs && add_args.upload_partial_logs.is_some() {
         eprintln!("Error: Cannot specify both --upload-partial-logs and --no-upload-partial-logs.");
         std::process::exit(1);
@@ -837,8 +838,13 @@ fn cmd_remote_list(list_args: RemoteListArgs) {
                     if cfg.upload_partial_logs { "Enabled" } else { "Disabled" },
                 );
             } else {
+                let sc_str = cfg
+                    .storage_class
+                    .as_deref()
+                    .map(|sc| format!(", storage_class='{}'", sc))
+                    .unwrap_or_default();
                 println!(
-                    "  - {}: type='s3', bucket='{}', priority={}, region='{}', mode='{}', partial_logs={}, endpoint={:?}, prefix='{}'",
+                    "  - {}: type='s3', bucket='{}', priority={}, region='{}', mode='{}', partial_logs={}, endpoint={:?}, prefix='{}'{}",
                     name,
                     cfg.bucket.as_deref().unwrap_or(""),
                     cfg.read_priority,
@@ -846,7 +852,8 @@ fn cmd_remote_list(list_args: RemoteListArgs) {
                     if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
                     if cfg.upload_partial_logs { "Enabled" } else { "Disabled" },
                     cfg.endpoint,
-                    cfg.prefix
+                    cfg.prefix,
+                    sc_str
                 );
             }
         }

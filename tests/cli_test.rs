@@ -164,7 +164,7 @@ fn test_cli_remote_add_and_list_upload_partial_logs() {
         String::from_utf8_lossy(&nfs_out.stderr)
     );
 
-    // 2. Add S3 remote with --no-upload-partial-logs
+    // 2. Add S3 remote with --no-upload-partial-logs and --storage-class
     let s3_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
         .args([
             "remote",
@@ -174,6 +174,8 @@ fn test_cli_remote_add_and_list_upload_partial_logs() {
             "--bucket",
             "my-appendfs-bucket",
             "--no-upload-partial-logs",
+            "--storage-class",
+            "INTELLIGENT_TIERING",
         ])
         .output()
         .expect("failed to run remote add s3_backup");
@@ -183,7 +185,7 @@ fn test_cli_remote_add_and_list_upload_partial_logs() {
         String::from_utf8_lossy(&s3_out.stderr)
     );
 
-    // 3. Verify `remote list` output shows partial_logs status
+    // 3. Verify `remote list` output shows partial_logs status and storage_class
     let list_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
         .args(["remote", "list", temp_dir.path().to_str().unwrap()])
         .output()
@@ -194,12 +196,18 @@ fn test_cli_remote_add_and_list_upload_partial_logs() {
     assert!(stdout.contains("partial_logs=Enabled"));
     assert!(stdout.contains("s3_backup: type='s3'"));
     assert!(stdout.contains("partial_logs=Disabled"));
+    assert!(stdout.contains("storage_class='INTELLIGENT_TIERING'"));
 
     // 4. Verify remotes.toml was written correctly
     let storage = appendfs::storage::OsStorage::new(temp_dir.path());
     let registry = appendfs::remote::RemoteRegistry::load_from_storage(&storage).unwrap();
     assert!(registry.remotes["nfs"].upload_partial_logs);
+    assert_eq!(registry.remotes["nfs"].storage_class, None);
     assert!(!registry.remotes["s3_backup"].upload_partial_logs);
+    assert_eq!(
+        registry.remotes["s3_backup"].storage_class.as_deref(),
+        Some("INTELLIGENT_TIERING")
+    );
 
     // 5. Verify passing both --upload-partial-logs and --no-upload-partial-logs fails
     let conflict_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
