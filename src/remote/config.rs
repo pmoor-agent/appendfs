@@ -43,6 +43,9 @@ pub struct RemoteTargetConfig {
     /// Whether to upload incremental active log parts to this remote before generation seals (default: true).
     #[serde(default = "default_upload_partial_logs")]
     pub upload_partial_logs: bool,
+    /// S3 storage class for uploaded objects (e.g. "INTELLIGENT_TIERING", "STANDARD_IA", "GLACIER_IR").
+    #[serde(default)]
+    pub storage_class: Option<String>,
 }
 
 fn default_region() -> String {
@@ -76,6 +79,7 @@ impl RemoteTargetConfig {
             credentials_file: None,
             force_path_style: None,
             upload_partial_logs: default_upload_partial_logs(),
+            storage_class: None,
         }
     }
 
@@ -97,7 +101,13 @@ impl RemoteTargetConfig {
             credentials_file: None,
             force_path_style: None,
             upload_partial_logs: default_upload_partial_logs(),
+            storage_class: None,
         }
+    }
+
+    pub fn with_storage_class(mut self, storage_class: impl Into<String>) -> Self {
+        self.storage_class = Some(storage_class.into());
+        self
     }
 
     pub fn with_read_priority(mut self, priority: u32) -> Self {
@@ -192,6 +202,7 @@ impl RemoteTargetConfig {
             &self.prefix,
             signer,
             force_path,
+            self.storage_class.clone(),
         ))
     }
 }
@@ -429,6 +440,7 @@ mod tests {
         r1.prefix = "vol1".to_string();
         r1.access_key_id = Some("AKIA123".to_string());
         r1.secret_access_key = Some("SECRET123".to_string());
+        r1.storage_class = Some("INTELLIGENT_TIERING".to_string());
         registry.add_remote("aws", r1);
 
         let mut r2 = RemoteTargetConfig::new("my-b2-bucket");
@@ -448,6 +460,11 @@ mod tests {
 
         assert_eq!(loaded.remotes.len(), 3);
         assert_eq!(loaded.remotes["aws"].bucket.as_deref(), Some("my-aws-bucket"));
+        assert_eq!(
+            loaded.remotes["aws"].storage_class.as_deref(),
+            Some("INTELLIGENT_TIERING")
+        );
+        assert_eq!(loaded.remotes["b2"].storage_class, None);
         assert!(!loaded.remotes["aws"].read_only);
         assert!(loaded.remotes["b2"].read_only);
         assert_eq!(loaded.remotes["nas"].read_priority, 10);

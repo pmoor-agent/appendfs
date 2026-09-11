@@ -162,6 +162,10 @@ pub struct RemoteAddArgs {
     /// Disable uploading incremental active log parts to this remote (useful for write-only/append-only S3 targets)
     #[arg(long = "no-upload-partial-logs", conflicts_with = "upload_partial_logs")]
     pub no_upload_partial_logs: bool,
+
+    /// S3 storage class for uploaded objects (e.g. "INTELLIGENT_TIERING", "STANDARD_IA", "GLACIER_IR")
+    #[arg(long = "storage-class")]
+    pub storage_class: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

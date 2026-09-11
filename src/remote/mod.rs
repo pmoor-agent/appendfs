@@ -140,6 +140,8 @@ pub struct RemoteObject {
     pub etag: Option<String>,
     /// Last modification timestamp from remote store.
     pub last_modified: Option<SystemTime>,
+    /// S3 storage class (e.g. "STANDARD", "INTELLIGENT_TIERING", "STANDARD_IA").
+    pub storage_class: Option<String>,
 }
 
 impl RemoteObject {
@@ -149,7 +151,13 @@ impl RemoteObject {
             size,
             etag,
             last_modified,
+            storage_class: None,
         }
+    }
+
+    pub fn with_storage_class(mut self, sc: impl Into<String>) -> Self {
+        self.storage_class = Some(sc.into());
+        self
     }
 
     /// Returns the raw MD5 byte array parsed from the ETag (if valid 32-character hex).

@@ -46,6 +46,7 @@ impl RemoteStore for MockRemoteStore {
                     size: obj.data.len() as u64,
                     etag: Some(obj.etag.clone()),
                     last_modified: Some(obj.last_modified),
+                    storage_class: None,
                 });
             }
         }
@@ -59,6 +60,7 @@ impl RemoteStore for MockRemoteStore {
             size: obj.data.len() as u64,
             etag: Some(obj.etag.clone()),
             last_modified: Some(obj.last_modified),
+            storage_class: None,
         }))
     }
 
