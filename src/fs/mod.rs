@@ -12,6 +12,7 @@
 
 pub mod arena;
 mod flush;
+mod flusher;
 mod handles;
 mod layers;
 mod overlay;
@@ -23,7 +24,7 @@ pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};
-use crate::log::{BackgroundFlusher, LogFileCache, LogManifest, LogWriter};
+use crate::log::{LogFileCache, LogManifest, LogWriter};
 use crate::node::{EntryDelta, Node};
 use crate::storage::Storage;
 use crate::sync::{ActionGuard, ActionMutex, OpTag, PostUnlockQueue};
@@ -323,6 +324,18 @@ impl FsInner {
         self.staged_ops += 1;
     }
 
+    /// Whether the `flushing` queue has reached any of its depth, byte, or op limits.
+    pub fn flushing_at_capacity(
+        &self,
+        max_flush_queue_depth: usize,
+        max_flush_queue_bytes: usize,
+        max_flush_queue_ops: usize,
+    ) -> bool {
+        self.flushing.len() >= max_flush_queue_depth
+            || self.flushing_bytes >= max_flush_queue_bytes
+            || self.flushing_ops >= max_flush_queue_ops
+    }
+
     /// Freezes `live` into the `flushing` queue and transfers staged byte/op counts,
     /// provided that the `flushing` queue depth does not exceed `max_flush_queue_depth`,
     /// `flushing_bytes` does not exceed `max_flush_queue_bytes`, and
@@ -337,10 +350,7 @@ impl FsInner {
         max_flush_queue_bytes: usize,
         max_flush_queue_ops: usize,
     ) -> bool {
-        if self.flushing.len() >= max_flush_queue_depth
-            || self.flushing_bytes >= max_flush_queue_bytes
-            || self.flushing_ops >= max_flush_queue_ops
-        {
+        if self.flushing_at_capacity(max_flush_queue_depth, max_flush_queue_bytes, max_flush_queue_ops) {
             return false;
         }
         if !self.live.is_empty() {
@@ -526,9 +536,7 @@ impl<'a> Drop for FsInnerGuard<'a> {
         let froze = self.fs.freeze_now_locked(&mut self.guard);
         if froze || !self.guard.flushing.is_empty() {
             let fs = self.fs;
-            self.guard.defer(move || {
-                fs.notify_flush_trigger(true);
-            });
+            self.guard.defer(move || fs.wake_flusher());
         }
     }
 }
@@ -558,8 +566,7 @@ pub struct InMemoryFS {
     /// Maximum total mutating operations across all frozen flush batches allowed to queue up before auto-freezing is bounded.
     pub max_flush_queue_ops: usize,
     pub flush_interval: AtomicU64,
-    pub(crate) flusher: Mutex<Option<BackgroundFlusher>>,
-    pub flush_lock: Mutex<()>,
+    pub(crate) flusher: flusher::Flusher,
     /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to true.
     pub track_atime: bool,
     /// When true, filesystem is mounted strictly read-only (EROFS).
@@ -678,8 +685,7 @@ impl InMemoryFS {
             max_flush_queue_bytes: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_BYTES,
             max_flush_queue_ops: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_OPS,
             flush_interval: AtomicU64::new(0),
-            flusher: Mutex::new(None),
-            flush_lock: Mutex::new(()),
+            flusher: flusher::Flusher::new(),
             track_atime: true,
             read_only: std::sync::atomic::AtomicBool::new(false),
             volume_key,

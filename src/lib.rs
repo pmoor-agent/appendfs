@@ -39,8 +39,8 @@ pub use dump::{dump_file, dump_log_file, dump_log_reader, dump_summary_file, dum
 pub use extent_map::{Extent, ExtentEntry, ExtentMap};
 pub use fs::{BatchCompletion, InMemoryFS};
 pub use log::{
-    BackgroundFlusher, ExtentState, LogFileCache, LogReader, LogRecord, LogWriter, RecoveryTarget, SharedExtentState,
-    SummaryFooter, SummaryHeader, SummaryReader, export_summary, init_volume, init_volume_with_clock, recover_fs,
+    ExtentState, LogFileCache, LogReader, LogRecord, LogWriter, RecoveryTarget, SharedExtentState, SummaryFooter,
+    SummaryHeader, SummaryReader, export_summary, init_volume, init_volume_with_clock, recover_fs,
 };
 pub use node::{InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta};
 pub use remote::{

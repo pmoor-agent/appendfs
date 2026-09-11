@@ -708,7 +708,7 @@ fn run_concurrent_stress(seed: u64) {
         let count = Arc::clone(&flush_count);
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                fs.flush_log()
+                fs.quiesce()
                     .unwrap_or_else(|e| panic!("concurrent flush failed: {}", e));
                 count.fetch_add(1, Ordering::Relaxed);
                 thread::sleep(Duration::from_micros(100));

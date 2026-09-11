@@ -967,16 +967,16 @@ mod tests {
         let data4 = vec![0x44u8; 200];
 
         crate::operations::read_write::write_core(&fs, attr.ino, &data1, 0).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         crate::operations::read_write::write_core(&fs, attr.ino, &data2, 200).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         crate::operations::read_write::write_core(&fs, attr.ino, &data3, 400).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         crate::operations::read_write::write_core(&fs, attr.ino, &data4, 600).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Clear decrypted record cache to force actual cold disk decoding in parallel
         fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
@@ -1140,7 +1140,7 @@ mod tests {
         let attr = crate::operations::read_write::create_core(&fs, 1, "single_cold.bin", 0o644, 0, 1000, 1000).unwrap();
         let payload = vec![0xEFu8; 1024];
         crate::operations::read_write::write_core(&fs, attr.ino, &payload, 0).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Evict from decrypted cache to force single cold disk direct read
         fs.log_cache.as_ref().unwrap().decrypted_cache.clear();

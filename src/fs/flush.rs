@@ -7,7 +7,7 @@
 
 use super::{FlushBatch, FsInner, InMemoryFS};
 use crate::extent_map::Extent;
-use crate::log::{BackgroundFlusher, GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE};
+use crate::log::{GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE};
 use crate::node::{EntryDelta, NodeDelta, NodeKind};
 use crate::storage::Storage;
 use crate::sync::OpTag;
@@ -77,12 +77,17 @@ impl InMemoryFS {
                     let completion = inner.flushing.back().map(|b| b.completion.clone());
                     return Ok(completion);
                 }
-                // Flushing queue is saturated. Wait on capacity_cvar.
-                if !self.trigger_flusher() {
-                    drop(inner);
-                    let _ = self.flush_log();
-                    inner = self.inner.lock(OpTag::Flush).unwrap();
-                } else {
+                // Flushing queue is saturated: ask the flusher to make room, then retry.
+                // `wake_flusher` drains the queue here in inline mode, so re-check before
+                // blocking - otherwise there would be nothing left to notify us.
+                drop(inner);
+                self.wake_flusher();
+                inner = self.inner.lock(OpTag::Flush).unwrap();
+                if inner.flushing_at_capacity(
+                    self.max_flush_queue_depth,
+                    self.max_flush_queue_bytes,
+                    self.max_flush_queue_ops,
+                ) {
                     let cvar = inner.capacity_cvar.clone();
                     let (guard, _) = inner.wait_timeout(&cvar, Duration::from_millis(50));
                     inner = guard;
@@ -100,15 +105,10 @@ impl InMemoryFS {
         }
     }
 
-    /// Merges a flushed batch into `base`.
+    /// Merges a flushed batch into `base`. Used by recovery to replay committed log records;
+    /// during normal operation only the flusher folds.
     pub fn fold_flushed_batch(&self, flushed: FlushBatch) {
-        let mut inner = self.inner.lock(OpTag::Fold).unwrap();
-        self.fold_flushed_batch_locked(&mut inner, flushed);
-    }
-
-    /// Merges a flushed batch into `base` with the inner lock already held.
-    pub fn fold_flushed_batch_locked(&self, inner: &mut FsInner, flushed: FlushBatch) {
-        inner.fold_flushed_batch(flushed);
+        self.inner.lock(OpTag::Fold).unwrap().fold_flushed_batch(flushed);
     }
 
     /// Writes pending data extents and serialized `LogEntryDelta` records for a frozen batch,
@@ -296,64 +296,125 @@ impl InMemoryFS {
         Ok(())
     }
 
-    pub fn flush_log(&self) -> std::io::Result<()> {
-        let _flush_guard = self.flush_lock.lock().unwrap();
+    /// Writes every queued flush batch to the log and folds it into `base`.
+    ///
+    /// The one authoritative flush body: nothing else writes batches to `LogWriter` or
+    /// mutates `base`. The background thread calls this, or - in inline mode - whichever
+    /// thread asked for a cycle. `Flusher::run_locked` keeps the two from overlapping.
+    pub(crate) fn run_flush_cycle(&self) -> std::io::Result<()> {
         let Some(ref writer) = self.log_writer else {
             return Ok(());
         };
-        self.drain_locked(writer)
-    }
-
-    /// Freezes whatever is in `live` and writes every queued batch. Caller must hold `flush_lock`.
-    fn drain_locked(&self, writer: &LogWriter) -> std::io::Result<()> {
-        self.freeze_now();
-        self.flush_log_locked(writer)
-    }
-
-    /// Internal flush implementation called while holding `flush_lock`.
-    fn flush_log_locked(&self, writer: &LogWriter) -> std::io::Result<()> {
-        // Drain flushing batches from the queue, freezing active live mutations if room allows
-        // and staged mutation thresholds are reached.
-        loop {
-            let mut batch = {
-                let mut inner = self.inner.lock(OpTag::Flush).unwrap();
-                self.freeze_if_staged_locked(&mut inner);
-                match inner.flushing.front() {
-                    Some(b) => {
-                        assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
-                        b.clone()
+        self.flusher.run_locked(|| {
+            // Everything in `live` joins the queue, so an idle cycle flushes it too.
+            self.freeze_now();
+            loop {
+                let mut batch = {
+                    let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+                    // Mutations that landed while the previous batch was being written keep
+                    // one cycle draining under sustained load.
+                    self.freeze_if_staged_locked(&mut inner);
+                    match inner.flushing.front() {
+                        Some(b) => {
+                            assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
+                            b.clone()
+                        }
+                        None => break,
                     }
-                    None => break,
+                };
+
+                self.synthesize_and_write_flushing_layer(&mut batch.entries, writer)?;
+
+                // Committed and durable: pop it and fold its effects into `base`.
+                let popped = {
+                    let mut inner = self.inner.lock(OpTag::Fold).unwrap();
+                    let popped = inner.pop_flushed_batch(&batch);
+                    inner.fold_flushed_batch(batch);
+                    popped
+                };
+                popped.completion.complete(Ok(()));
+            }
+            Ok(())
+        })
+    }
+
+    /// Asks for a flush cycle: wakes the background thread, or runs one here in inline mode.
+    ///
+    /// Returns without waiting for the cycle to finish. Callers that need the queue drained
+    /// want [`InMemoryFS::quiesce`].
+    pub(crate) fn wake_flusher(&self) {
+        if self.flusher.is_background() {
+            self.flusher.notify();
+        } else if let Err(e) = self.run_flush_cycle() {
+            log::error!("Inline flush cycle failed: {}", e);
+        }
+    }
+
+    /// Returns once everything staged or queued when this was called is on disk and synced.
+    ///
+    /// A batch is completed only after its records have been written and the log file
+    /// synced, so anything folded into `base` is durable by the time this returns.
+    pub fn quiesce(&self) -> std::io::Result<()> {
+        if self.log_writer.is_none() {
+            return Ok(());
+        }
+        if !self.flusher.is_background() {
+            return self.run_flush_cycle();
+        }
+
+        // The background thread owns the writer, so wait for it to get past whatever is
+        // queued. Capacity limits can refuse the freeze, so retry until `live` is in hand.
+        loop {
+            let (target, live_pending) = {
+                let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+                if !inner.live.is_empty() {
+                    self.freeze_now_locked(&mut inner);
+                }
+                match inner.flushing.back() {
+                    Some(b) => (b.id, !inner.live.is_empty()),
+                    None => return Ok(()),
                 }
             };
 
-            // Attempt to write and commit this batch
-            self.synthesize_and_write_flushing_layer(&mut batch.entries, writer)?;
-
-            // On success: pop from flushing queue (asserting matching ID) and fold into base
-            let popped = {
-                let mut inner = self.inner.lock(OpTag::Fold).unwrap();
-                let popped = inner.pop_flushed_batch(&batch);
-                self.fold_flushed_batch_locked(&mut inner, batch);
-                popped
-            };
-            popped.completion.complete(Ok(()));
+            self.flusher.notify();
+            self.wait_past_batch(target)?;
+            if !live_pending {
+                return Ok(());
+            }
         }
-
-        Ok(())
     }
 
-    /// Safely rolls the active log generation under the flush lock, draining pending batches first.
+    /// Blocks until the flusher has popped every batch up to and including `target`.
+    fn wait_past_batch(&self, target: u64) -> std::io::Result<()> {
+        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+        loop {
+            // Batches are popped in order, so the target is gone once the front passes it.
+            match inner.flushing.front() {
+                Some(front) if front.id <= target => {}
+                _ => return Ok(()),
+            }
+            if let Some(e) = self.flusher.take_error() {
+                return Err(e);
+            }
+            let cvar = inner.capacity_cvar.clone();
+            let (guard, _) = inner.wait_timeout(&cvar, Duration::from_millis(50));
+            inner = guard;
+        }
+    }
+
+    /// Rolls the active log generation, draining pending batches first.
     pub fn force_roll_active_log(&self) -> std::io::Result<Option<(u64, [u8; 16])>> {
-        let _flush_guard = self.flush_lock.lock().unwrap();
         let Some(ref writer) = self.log_writer else {
             return Ok(None);
         };
+        self.quiesce()?;
 
-        // Drain pending batches first so the current generation is cleanly flushed
-        self.drain_locked(writer)?;
-
-        if let Some((next_gen, sealed_md5)) = writer.force_roll(&*self.clock)? {
+        // Excludes the flusher for the roll itself. C3 moves age-based rolling into the
+        // flusher's idle tick, at which point this exclusion goes away with it.
+        self.flusher.run_locked(|| {
+            let Some((next_gen, sealed_md5)) = writer.force_roll(&*self.clock)? else {
+                return Ok(None);
+            };
             let sealed_gen = next_gen - 1;
             {
                 let mut manifest = self.manifest.write().unwrap();
@@ -362,9 +423,7 @@ impl InMemoryFS {
             }
             self.notify_replication();
             Ok(Some((next_gen, sealed_md5)))
-        } else {
-            Ok(None)
-        }
+        })
     }
 
     /// Number of frozen batches currently waiting to be written to the log.
@@ -373,71 +432,32 @@ impl InMemoryFS {
         self.inner.lock(OpTag::Stats).unwrap().flushing.len()
     }
 
-    /// Wakes up the background periodic flusher immediately to drain pending batches.
-    /// Returns true if a background flusher is active and was notified, false otherwise.
-    pub fn trigger_flusher(&self) -> bool {
-        if let Some(ref flusher) = *self.flusher.lock().unwrap() {
-            flusher.trigger();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Wakes up the background periodic flusher or flushes inline if thresholds were reached.
-    pub fn notify_flush_trigger(&self, should_trigger: bool) {
-        if should_trigger && !self.trigger_flusher() {
-            let _ = self.flush_log();
-        }
-    }
-
-    /// Initializes background services (e.g. periodic flusher) upon FUSE mount.
+    /// Starts the background flusher thread upon FUSE mount.
     pub fn init(self: &Arc<Self>) {
         if self.is_read_only() {
             return;
         }
-        let interval_secs = self.flush_interval.load(Ordering::SeqCst);
-        if interval_secs > 0 {
-            let self_clone = Arc::clone(self);
-            let mut flusher = self.flusher.lock().unwrap();
-            *flusher = Some(BackgroundFlusher::start(
-                move || self_clone.flush_log(),
-                Duration::from_secs(interval_secs),
-            ));
-            log::info!(
-                "Started background periodic log flusher (interval: {} seconds)",
-                interval_secs
-            );
-        }
+        let secs = self.flush_interval.load(Ordering::SeqCst);
+        self.flusher.start(self, (secs > 0).then(|| Duration::from_secs(secs)));
     }
 
-    /// Cleanly stops background services and drains in-flight async operations upon FUSE unmount.
+    /// Cleanly stops the flusher and drains in-flight async operations upon FUSE unmount.
     pub fn destroy(&self) {
-        if !self.is_read_only() {
-            let mut flusher = self.flusher.lock().unwrap();
-            if let Some(mut f) = flusher.take() {
-                f.stop();
-                let completions: Vec<_> = {
-                    let inner = self.inner.lock(OpTag::Flush).unwrap();
-                    inner.flushing.iter().map(|b| b.completion.clone()).collect()
-                };
-                for completion in completions {
-                    completion.complete(Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "filesystem destroyed",
-                    )));
-                }
+        // Only a filesystem that had a thread writing for it can strand queued batches;
+        // an inline one still has whatever thread is tearing it down.
+        if !self.is_read_only() && self.flusher.stop() {
+            let completions: Vec<_> = {
+                let inner = self.inner.lock(OpTag::Flush).unwrap();
+                inner.flushing.iter().map(|b| b.completion.clone()).collect()
+            };
+            for completion in completions {
+                completion.complete(Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "filesystem destroyed",
+                )));
             }
         }
         self.drain_async_ops();
-    }
-
-    pub fn sync_log(&self) -> std::io::Result<()> {
-        self.flush_log()?;
-        if let Some(ref writer) = self.log_writer {
-            writer.sync()?;
-        }
-        Ok(())
     }
 
     /// Dynamically calculates live extent statistics across all active files and log generations.
@@ -523,7 +543,7 @@ impl InMemoryFS {
         storage: &dyn Storage,
         explicit_iv: Option<[u8; 12]>,
     ) -> std::io::Result<String> {
-        self.sync_log()?;
+        self.quiesce()?;
         let snapshot = self.inner.lock(OpTag::Flush).unwrap().snapshot_all();
         let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
         let last_tx_id = self
@@ -620,7 +640,7 @@ impl InMemoryFS {
     }
 
     pub fn sync_and_export_summary_with_iv(&self, explicit_iv: Option<[u8; 12]>) -> std::io::Result<Option<String>> {
-        self.sync_log()?;
+        self.quiesce()?;
         if let Some(ref writer) = self.log_writer {
             if !writer.is_open() {
                 // Read-only session where no log records were ever flushed or written
@@ -742,7 +762,7 @@ mod tests {
         }
 
         // Flush to disk and fold into base
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Verify that base has exactly 1 consolidated extent of length 50
         {
@@ -831,7 +851,7 @@ mod tests {
             // A single contiguous write many times larger than the cap.
             let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
             write_core(&fs, ino, &payload, 0).unwrap();
-            fs.sync_log().unwrap();
+            fs.quiesce().unwrap();
 
             {
                 let inner = fs.inner.lock_for_tests().unwrap();
@@ -921,7 +941,7 @@ mod tests {
 
         // Flush first, so the data is a durable `Disk` extent in `base` and the punch below
         // lands in a fresh, higher layer - the case that actually needs masking.
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
         assert_eq!(fs.read_file_data(ino, 0, 1000).unwrap(), payload);
 
         crate::operations::read_write::punch_hole_core(&fs, ino, 200, 300).unwrap();
@@ -944,7 +964,7 @@ mod tests {
 
         // Fold the punch into base, then confirm it did not become a data record: the only
         // payload ever written was the original 1000 bytes.
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
         expect_holed(&fs.read_file_data(ino, 0, 1000).unwrap());
 
         let stats = fs.calculate_generation_live_stats();
@@ -1007,7 +1027,7 @@ mod tests {
 
         // Flush so the data is durable in `base` and the truncates below land in a layer
         // above it - the case where masking actually has to do something.
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         let truncate_to = |size: u64| {
             let now = fs.clock.now();
@@ -1039,7 +1059,7 @@ mod tests {
         );
 
         // And it must still hold once flushed and replayed.
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
         let recovered = crate::log::recover_fs(
             storage,
             crate::RecoveryTarget::Latest,
@@ -1151,7 +1171,7 @@ mod tests {
         // Write 100 bytes to file1 in gen 1
         let data1 = vec![0xAA; 100];
         crate::operations::read_write::write_core(&fs, ino1, &data1, 0).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Check manifest and stats after gen 1 write
         let stats = fs.calculate_generation_live_stats();
@@ -1166,7 +1186,7 @@ mod tests {
         // Overwrite 40 bytes of file1 (offset 0..40)
         let overwrite_data = vec![0xBB; 40];
         crate::operations::read_write::write_core(&fs, ino1, &overwrite_data, 0).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Now gen 1 only has 60 live bytes (offset 40..100) and gen 1 total data is 140 bytes
         let stats = fs.calculate_generation_live_stats();
@@ -1232,7 +1252,7 @@ mod tests {
         crate::operations::read_write::write_core(&fs, file3_attr.ino, &[9, 10, 11, 12], 0).unwrap();
 
         // Flush creation to disk
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Verify live stats show 3 files and 12 live bytes
         let stats_before = fs.calculate_generation_live_stats();
@@ -1247,7 +1267,7 @@ mod tests {
         crate::operations::dir::rmdir_core(&fs, 1, "Gletscher").unwrap();
 
         // Flush deletion to disk
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Check live stats in memory
         let stats_after = fs.calculate_generation_live_stats();
@@ -1307,7 +1327,7 @@ mod tests {
         assert_eq!(link_attr.nlink, 2);
 
         // Commit everything to disk
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         let stats1 = fs.calculate_generation_live_stats();
         assert_eq!(stats1[0].live_bytes, 25);
@@ -1322,7 +1342,7 @@ mod tests {
         assert_eq!(keep_file_attr.nlink, 1);
 
         // Commit deletion to disk
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Check in-memory live stats: data is STILL alive because /keep/shared.txt exists!
         let stats2 = fs.calculate_generation_live_stats();
@@ -1406,7 +1426,7 @@ mod tests {
         let f = crate::operations::read_write::create_core(&fs, 1, "unlinked.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = f.ino;
         crate::operations::read_write::write_core(&fs, ino, b"unlinked content", 0).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Open the file so open_counts > 0
         let fh = crate::operations::read_write::open_core(&fs, ino, libc::O_RDWR as u32).unwrap();
@@ -1416,11 +1436,11 @@ mod tests {
 
         // Write more data while unlinked, then sync log
         crate::operations::read_write::write_core(&fs, ino, b" more content", 16).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Close the handle: drops open_count to 0 and tombstones the node in live
         crate::operations::read_write::release_core(&fs, ino, fh).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Recover filesystem from log
         let recovered = crate::log::recover_fs(
@@ -1479,7 +1499,7 @@ mod tests {
         .unwrap();
 
         // Flush down-truncation to disk (so base layer now holds the 20-byte state)
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Extend file size to 100 bytes in a NEW live delta layer without writing bytes
         crate::operations::read_write::setattr_core(
@@ -1506,7 +1526,7 @@ mod tests {
         );
 
         // Flush and verify reading again from base
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
         let read_data_after_flush = fs.read_file_data(ino, 0, 100).unwrap();
         assert_eq!(&read_data_after_flush[0..20], &[0xAA; 20]);
         assert_eq!(&read_data_after_flush[20..100], &[0x00; 80]);
@@ -1598,7 +1618,7 @@ mod tests {
         // 1. First batch: write data to file1 and flush (populates gen 1 past header size)
         let f1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f1.ino, b"initial payload", 0).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         // 2. Second batch: write data to file2
         let f2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -1608,7 +1628,7 @@ mod tests {
         fault_storage.fail_on_file("000002.log", std::io::ErrorKind::PermissionDenied);
 
         // 4. Attempt flush - should fail with I/O error on roll creation
-        let flush_res = fs.flush_log();
+        let flush_res = fs.quiesce();
         assert!(flush_res.is_err(), "Expected flush_log to fail on simulated I/O error");
 
         // Verify filesystem is NOT wedged: flushing queue still retains the batch, live mutations still work!
@@ -1626,7 +1646,7 @@ mod tests {
         fault_storage.clear_fail_on_file("000002.log");
 
         // 6. Retry flush - must succeed and drain ALL batches
-        let retry_res = fs.flush_log();
+        let retry_res = fs.quiesce();
         assert!(
             retry_res.is_ok(),
             "Retried flush must succeed once I/O is restored: {:?}",
@@ -1692,7 +1712,7 @@ mod tests {
             crate::operations::read_write::write_core(&fs, f.ino, b"initial payload", 0).unwrap();
             initial_inos.push(f.ino);
         }
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         let initial_offset = storage.file_len("000001.log").unwrap();
 
@@ -1710,7 +1730,7 @@ mod tests {
         fault_storage.fail_writes_after_bytes(initial_offset + 300, true);
 
         // 4. Attempt flush - MUST fail with simulated mid-record write error
-        let flush_res = fs.flush_log();
+        let flush_res = fs.quiesce();
         assert!(
             flush_res.is_err(),
             "Expected flush to fail with simulated mid-record write error"
@@ -1727,7 +1747,7 @@ mod tests {
         fault_storage.clear_write_limit();
 
         // 7. Retry flush - MUST succeed cleanly
-        let retry_res = fs.flush_log();
+        let retry_res = fs.quiesce();
         assert!(retry_res.is_ok(), "Retried flush must succeed: {:?}", retry_res);
         assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 0);
 
@@ -1809,7 +1829,7 @@ mod tests {
         );
 
         // Flush delta to log
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Verify recovery from .log replay
         let from_log = crate::log::recover_fs(
@@ -2208,7 +2228,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_log_dedicated_fold_tag_and_threshold_drain() {
+    fn test_quiesce_folds_batches_and_mid_drain_freeze_is_threshold_gated() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
@@ -2230,7 +2250,7 @@ mod tests {
         crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 50], 0).unwrap();
 
         // Perform flush
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Verify OpTag::Fold metric was recorded
         let stats = fs.inner.op_stats();
@@ -2245,8 +2265,11 @@ mod tests {
         assert_eq!(fs.staged_bytes(), 20);
         assert_eq!(fs.staged_ops(), 1);
 
-        // Direct call to flush_log_locked: should NOT freeze live because thresholds are not met
-        fs.flush_log_locked(&writer).unwrap();
+        // The mid-drain re-freeze is threshold-gated: below it, `live` is left alone.
+        {
+            let mut inner = fs.inner.lock_for_tests().unwrap();
+            assert!(!fs.freeze_if_staged_locked(&mut inner));
+        }
         assert_eq!(fs.staged_bytes(), 20, "Mutations below threshold should remain in live");
         assert_eq!(fs.staged_ops(), 1);
         assert_eq!(fs.flush_queue_depth(), 0);
@@ -2255,12 +2278,13 @@ mod tests {
         {
             let mut inner = fs.inner.lock_for_tests().unwrap();
             inner.record_mutation(90); // 20 + 90 = 110 >= 100
+            assert!(fs.freeze_if_staged_locked(&mut inner));
         }
-        assert_eq!(fs.staged_bytes(), 110);
-        assert_eq!(fs.flush_queue_depth(), 0);
+        assert_eq!(fs.staged_bytes(), 0);
+        assert_eq!(fs.flush_queue_depth(), 1);
 
-        // flush_log_locked will detect the threshold is met, freeze it via begin_flush_locked, and drain it
-        fs.flush_log_locked(&writer).unwrap();
+        // quiesce drains whatever is queued, thresholds or not
+        fs.quiesce().unwrap();
         assert_eq!(fs.staged_bytes(), 0);
         assert_eq!(fs.flush_queue_depth(), 0);
     }
@@ -2309,7 +2333,7 @@ mod tests {
         );
 
         // Execute flush - commits batch and completes BatchCompletion
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         assert_eq!(
             unblocked.load(Ordering::SeqCst),
@@ -2338,11 +2362,9 @@ mod tests {
         fs_inst.max_flush_queue_depth = 2;
         let fs = Arc::new(fs_inst);
 
-        // Install a background flusher handle so trigger_flusher returns true
-        {
-            let mut flusher = fs.flusher.lock().unwrap();
-            *flusher = Some(BackgroundFlusher::start(|| Ok(()), Duration::from_secs(60)));
-        }
+        // Pose as a mounted filesystem so the saturation path waits for the flusher to make
+        // room instead of draining the queue itself.
+        fs.flusher.set_background_for_tests(true);
 
         let file = crate::operations::read_write::create_core(&fs, 1, "saturate.bin", 0o644, 0, 1000, 1000).unwrap();
 
@@ -2396,7 +2418,8 @@ mod tests {
             res.unwrap();
             completed_clone.store(true, Ordering::SeqCst);
         }));
-        fs.flush_log().unwrap();
+        fs.flusher.set_background_for_tests(false);
+        fs.quiesce().unwrap();
         assert!(completed.load(Ordering::SeqCst));
         assert!(completion.is_completed());
         assert_eq!(fs.flush_queue_depth(), 0);

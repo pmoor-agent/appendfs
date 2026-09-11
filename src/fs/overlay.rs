@@ -384,7 +384,7 @@ mod tests {
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
         assert!(fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino));
 
         crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
@@ -423,7 +423,7 @@ mod tests {
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         // Fold it into `base`, so the lower layers still describe the inode after deletion.
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
         crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
         assert!(fs.get_attr(attr.ino).is_none(), "unlinked file must be gone");
 

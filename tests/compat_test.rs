@@ -87,7 +87,7 @@ pub fn verify_recovery_with_latest_summary_missing(fixture_dir: &Path) {
     let new_file = create_core(&fs, 1, "new_after_reconstruction.txt", 0o644, 0, 1000, 1000)
         .expect("create file after reconstruction");
     write_core(&fs, new_file.ino, b"reconstruction test forward write works!", 0).expect("write after reconstruction");
-    fs.flush_log().expect("flush after reconstruction");
+    fs.quiesce().expect("flush after reconstruction");
 
     let read_back = read_test(&fs, new_file.ino, 40, 0);
     assert_eq!(read_back, b"reconstruction test forward write works!");
@@ -140,7 +140,7 @@ pub fn verify_recovery_from_latest_summary_snapshot(fixture_dir: &Path) {
     let new_file =
         create_core(&fs, 1, "new_after_summary.txt", 0o644, 0, 1000, 1000).expect("create file after summary");
     write_core(&fs, new_file.ino, b"summary test forward write works!", 0).expect("write after summary");
-    fs.flush_log().expect("flush after summary");
+    fs.quiesce().expect("flush after summary");
 
     let read_back = read_test(&fs, new_file.ino, 33, 0);
     assert_eq!(read_back, b"summary test forward write works!");

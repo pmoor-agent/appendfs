@@ -196,7 +196,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     setxattr_core(fs, hello_file.ino, "user.test_attr", b"compat_v1", 0)?;
 
     // Commit Batch 1 to log
-    fs.flush_log().map_err(|_| libc::EIO)?;
+    fs.quiesce().map_err(|_| libc::EIO)?;
 
     // --- BATCH 2: Subdirectories, empty file, binary payload, multi-extent part 1 ---
     clock.set_offset(60);
@@ -278,7 +278,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     compat_write(fs, multi_extent.ino, &p1, 0)?;
 
     // Commit Batch 2 to log
-    fs.flush_log().map_err(|_| libc::EIO)?;
+    fs.quiesce().map_err(|_| libc::EIO)?;
 
     // --- BATCH 3: Multi-extent part 2, sparse file, hardlink, symlinks, special files, and attrs ---
     clock.set_offset(170);
@@ -487,7 +487,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     )?;
 
     // Commit Batch 3 to log
-    fs.flush_log().map_err(|_| libc::EIO)?;
+    fs.quiesce().map_err(|_| libc::EIO)?;
 
     Ok(())
 }
