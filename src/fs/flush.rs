@@ -56,6 +56,19 @@ impl InMemoryFS {
         self.inner.lock(OpTag::Flush).unwrap().pop_flushing_batch()
     }
 
+    /// Folds every queued batch straight into `base`, bypassing the log entirely.
+    ///
+    /// For tests that exercise layer resolution or queue accounting on a filesystem with no
+    /// log writer, where `quiesce` has nothing to write to. Real flushing goes through
+    /// `run_flush_cycle`, which folds a batch only once its records are on disk.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fold_flushing_into_base(&self) {
+        let mut inner = self.inner.lock(OpTag::Fold).unwrap();
+        while let Some(batch) = inner.pop_flushing_batch() {
+            inner.fold_flushed_batch(batch);
+        }
+    }
+
     /// Freezes active `live` mutations into a `FlushBatch` under the inner lock, or retrieves
     /// the completion handle of the latest in-flight batch if `live` is empty.
     ///
@@ -1142,9 +1155,7 @@ mod tests {
 
         // Fold live to base
         fs.freeze_now();
-        while let Some(batch) = fs.pop_flushing_batch() {
-            fs.fold_flushed_batch(batch);
-        }
+        fs.fold_flushing_into_base();
 
         // Verify parent relations are preserved in base after fold
         assert_eq!(fs.get_parent_dir_inode(1), Some(1));
@@ -1593,9 +1604,7 @@ mod tests {
         assert_eq!(&data[30..40], &[0x11; 10]);
 
         // Drain flushing batches into base
-        while let Some(batch) = fs.pop_flushing_batch() {
-            fs.fold_flushed_batch(batch);
-        }
+        fs.fold_flushing_into_base();
         assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 0);
 
         // Read again after folding
@@ -2044,9 +2053,7 @@ mod tests {
         assert_eq!(fs.flushing_ops(), 1);
 
         // Now drain flushing batches
-        while let Some(batch) = fs.pop_flushing_batch() {
-            fs.fold_flushed_batch(batch);
-        }
+        fs.fold_flushing_into_base();
 
         // Live staged data is preserved and flushing counters are drained to 0
         assert_eq!(fs.staged_bytes(), 40);
@@ -2102,9 +2109,7 @@ mod tests {
         assert_eq!(fs.staged_ops(), 0);
 
         // Drain remaining batches
-        while let Some(batch) = fs.pop_flushing_batch() {
-            fs.fold_flushed_batch(batch);
-        }
+        fs.fold_flushing_into_base();
         assert_eq!(fs.flush_queue_depth(), 0);
         let read_final = fs.read_file_data(file.ino, 0, 120).unwrap();
         assert_eq!(&read_final[0..30], &[0x11; 30]);
@@ -2171,9 +2176,7 @@ mod tests {
         assert_eq!(fs.staged_ops(), 0);
 
         // Drain remaining batches
-        while let Some(batch) = fs.pop_flushing_batch() {
-            fs.fold_flushed_batch(batch);
-        }
+        fs.fold_flushing_into_base();
         assert_eq!(fs.flush_queue_depth(), 0);
         assert_eq!(fs.flushing_bytes(), 0);
         let read_final = fs.read_file_data(file.ino, 0, 130).unwrap();
@@ -2233,9 +2236,7 @@ mod tests {
         assert_eq!(fs.staged_ops(), 0);
 
         // Drain remaining batches
-        while let Some(batch) = fs.pop_flushing_batch() {
-            fs.fold_flushed_batch(batch);
-        }
+        fs.fold_flushing_into_base();
         assert_eq!(fs.flush_queue_depth(), 0);
         assert_eq!(fs.flushing_ops(), 0);
         let read_final = fs.read_file_data(file.ino, 0, 30).unwrap();
