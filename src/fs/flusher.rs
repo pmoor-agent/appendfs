@@ -42,6 +42,9 @@ pub(crate) struct Flusher {
     /// Error from the most recent failed cycle, for `quiesce` callers that cannot observe
     /// the cycle's return value because a background thread ran it.
     last_error: Mutex<Option<std::io::Error>>,
+    /// Whether a cycle is running, so debug builds can assert that nothing writes to the
+    /// log from outside one.
+    in_cycle: AtomicBool,
 }
 
 impl Default for Flusher {
@@ -58,6 +61,7 @@ impl Flusher {
             background: AtomicBool::new(false),
             cycle_lock: Mutex::new(()),
             last_error: Mutex::new(None),
+            in_cycle: AtomicBool::new(false),
         }
     }
 
@@ -135,13 +139,20 @@ impl Flusher {
         F: FnOnce() -> std::io::Result<T>,
     {
         let _guard = self.cycle_lock.lock().unwrap();
+        self.in_cycle.store(true, Ordering::SeqCst);
         let result = cycle();
+        self.in_cycle.store(false, Ordering::SeqCst);
         let mut last = self.last_error.lock().unwrap();
         match &result {
             Ok(_) => *last = None,
             Err(e) => *last = Some(std::io::Error::new(e.kind(), e.to_string())),
         }
         result
+    }
+
+    /// Whether a flush cycle is currently running on some thread.
+    pub(crate) fn in_cycle(&self) -> bool {
+        self.in_cycle.load(Ordering::SeqCst)
     }
 
     /// Takes the error from the most recent failed cycle, if it has not been observed yet.
@@ -274,6 +285,48 @@ mod tests {
         assert_eq!(fs.flush_queue_depth(), 0);
         assert_eq!(fs.staged_bytes(), 0);
         fs.destroy();
+    }
+
+    #[test]
+    fn test_idle_cycle_rolls_the_generation_once_it_ages_out() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = crate::clock::AdvancingClock::new(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap()
+            .with_max_log_age(Some(Duration::from_secs(3600))),
+        );
+        let fs = InMemoryFS::with_clock_and_log(Arc::new(clock.clone()), Some(writer.clone()));
+
+        // A batch's worth of data, well under `max_log_size`: only age can roll this.
+        stage_a_write(&fs, "aged.bin");
+        fs.quiesce().unwrap();
+        assert_eq!(writer.generation(), 1);
+
+        // Still inside the age limit.
+        clock.advance(Duration::from_secs(3599));
+        fs.quiesce().unwrap();
+        assert_eq!(writer.generation(), 1);
+
+        // Past it: an idle cycle with nothing to write still seals the generation.
+        clock.advance(Duration::from_secs(2));
+        fs.quiesce().unwrap();
+        assert_eq!(
+            writer.generation(),
+            2,
+            "an aged-out generation must roll on an idle cycle"
+        );
+        assert!(
+            fs.manifest.read().unwrap().logs.iter().any(|l| l.generation == 1),
+            "the sealed generation must be recorded in the manifest"
+        );
     }
 
     #[test]

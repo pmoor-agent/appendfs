@@ -427,7 +427,12 @@ fn cmd_mount(args: MountArgs) {
     // The volume header decides how writes are compressed; it was read back during
     // recovery, so a mount never has to be told separately.
     let compression = volume_header.compression;
-    let max_log_age = appendfs::cli::parse_duration(&args.max_log_age).ok();
+    // The flusher checks `max_log_age` at the end of every cycle, so this one limit covers
+    // both the CLI flag and the remote policy's `max_log_age_secs`; the tighter wins.
+    let registry = load_remote_registry(storage.as_ref());
+    let max_log_age = appendfs::cli::parse_duration(&args.max_log_age)
+        .ok()
+        .map(|cli| cli.min(std::time::Duration::from_secs(registry.policy.max_log_age_secs)));
     let writer = match LogWriter::create_lazy(storage.clone(), next_gen, args.max_log_size, start_tx, volume_key) {
         Ok(w) => Arc::new(w.with_compression(compression).with_max_log_age(max_log_age)),
         Err(e) => {
@@ -446,7 +451,6 @@ fn cmd_mount(args: MountArgs) {
     fs_instance.flush_interval.store(args.flush_interval, Ordering::SeqCst);
     fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
 
-    let registry = load_remote_registry(storage.as_ref());
     let remote_stores = registry.build_read_stores();
 
     let cache_dir = log_dir.join(".cache");

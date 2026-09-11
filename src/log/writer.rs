@@ -26,6 +26,30 @@ enum ActiveLogState {
     Open(ActiveLogFile),
 }
 
+/// Syncs and seals `active`, then replaces it with a freshly opened next generation.
+///
+/// Shared by the three ways a generation ends - size, age, and an explicit force-roll - so
+/// they cannot drift on how a log file is closed out.
+fn seal_and_open_next(
+    active: &mut ActiveLogFile,
+    storage: &Arc<dyn Storage>,
+    clock: &dyn Clock,
+    reason: &str,
+) -> io::Result<(u64, [u8; 16])> {
+    active.writer.sync()?;
+    let sealed_md5 = active.md5_hasher.clone().compute().0;
+    let next_gen = active.generation + 1;
+    let next_active = open_generation_file(storage, next_gen, clock.now())?;
+    log::info!(
+        "{} log file to generation {} ({})",
+        reason,
+        next_gen,
+        next_active.filename
+    );
+    *active = next_active;
+    Ok((next_gen, sealed_md5))
+}
+
 fn open_generation_file(
     storage: &Arc<dyn Storage>,
     generation: u64,
@@ -194,16 +218,37 @@ impl LogWriter {
                     return Ok(None);
                 }
 
-                active.writer.sync()?;
-
-                let sealed_md5 = active.md5_hasher.clone().compute().0;
-                let next_gen = active.generation + 1;
-                let next_active = open_generation_file(&self.storage, next_gen, clock.now())?;
-
-                log::info!("Rolled log file to generation {} ({})", next_gen, next_active.filename);
-
-                *active = next_active;
+                let (next_gen, sealed_md5) = seal_and_open_next(active, &self.storage, clock, "Rolled")?;
                 Ok(Some((next_gen, Some(sealed_md5))))
+            }
+        }
+    }
+
+    /// Rolls the active generation if it has been open longer than `max_log_age`, ignoring
+    /// its size.
+    ///
+    /// The flusher runs this at the end of every cycle, including the idle ones, so an
+    /// untouched filesystem still seals its generation on schedule. Size-based rolling stays
+    /// in `roll_if_needed`, where it can see how much the batch about to be written will add.
+    pub fn roll_if_aged(&self, clock: &dyn Clock) -> io::Result<Option<(u64, [u8; 16])>> {
+        let Some(max_age) = self.max_log_age else {
+            return Ok(None);
+        };
+        let mut state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+
+        match &mut *state {
+            // Nothing written yet, so there is nothing to seal.
+            ActiveLogState::Unopened { .. } => Ok(None),
+            ActiveLogState::Open(active) => {
+                if active.current_offset <= FILE_HEADER_SIZE as u64
+                    || clock.now().duration_since(active.created_at).unwrap_or_default() < max_age
+                {
+                    return Ok(None);
+                }
+                Ok(Some(seal_and_open_next(active, &self.storage, clock, "Age-rolled")?))
             }
         }
     }
@@ -223,17 +268,7 @@ impl LogWriter {
                     return Ok(None);
                 }
 
-                active.writer.sync()?;
-                let sealed_md5 = active.md5_hasher.clone().compute().0;
-                let next_gen = active.generation + 1;
-                let next_active = open_generation_file(&self.storage, next_gen, clock.now())?;
-                log::info!(
-                    "Force-rolled log file to generation {} ({})",
-                    next_gen,
-                    next_active.filename
-                );
-                *active = next_active;
-                Ok(Some((next_gen, sealed_md5)))
+                Ok(Some(seal_and_open_next(active, &self.storage, clock, "Force-rolled")?))
             }
         }
     }
