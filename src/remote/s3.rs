@@ -249,10 +249,10 @@ impl RemoteStore for S3RemoteStore {
             let mut xml_str = String::new();
             reader.read_to_string(&mut xml_str)?;
 
-            let next_token = parse_list_objects_v2_xml(&xml_str, &self.prefix, &mut results);
-            if let Some(token) = next_token {
-                continuation_token = Some(token);
-            } else {
+            let (page_objects, next_token) = parse_list_objects_v2_page(&xml_str, &self.prefix);
+            results.extend(page_objects);
+            continuation_token = next_token;
+            if continuation_token.is_none() {
                 break;
             }
         }
@@ -378,45 +378,38 @@ impl RemoteStore for S3RemoteStore {
     }
 }
 
-fn parse_list_objects_v2_xml(xml_str: &str, global_prefix: &str, results: &mut Vec<RemoteObject>) -> Option<String> {
+fn parse_list_objects_v2_page(xml_str: &str, global_prefix: &str) -> (Vec<RemoteObject>, Option<String>) {
     let mut xml = XmlReader::from_str(xml_str);
     let mut buf = Vec::new();
+    let mut results = Vec::new();
 
+    let mut current_tag = Vec::new();
     let mut in_contents = false;
-    let mut in_key = false;
-    let mut in_size = false;
-    let mut in_etag = false;
-    let mut in_is_trunc = false;
-    let mut in_next_token = false;
-    let mut in_storage_class = false;
 
     let mut cur_key = String::new();
     let mut cur_size = 0u64;
     let mut cur_etag = String::new();
-    let mut cur_storage_class: Option<String> = None;
+    let mut cur_storage_class = None;
     let mut is_truncated = false;
     let mut next_token = String::new();
 
     while let Ok(event) = xml.read_event_into(&mut buf) {
         match event {
-            Event::Start(e) => match e.name().as_ref() {
-                b"Contents" => {
+            Event::Start(e) => {
+                let qname = e.name();
+                let name = qname.as_ref();
+                if name == b"Contents" {
                     in_contents = true;
                     cur_key.clear();
                     cur_size = 0;
                     cur_etag.clear();
                     cur_storage_class = None;
                 }
-                b"Key" if in_contents => in_key = true,
-                b"Size" if in_contents => in_size = true,
-                b"ETag" if in_contents => in_etag = true,
-                b"StorageClass" if in_contents => in_storage_class = true,
-                b"IsTruncated" => in_is_trunc = true,
-                b"NextContinuationToken" => in_next_token = true,
-                _ => {}
-            },
-            Event::End(e) => match e.name().as_ref() {
-                b"Contents" => {
+                current_tag.clear();
+                current_tag.extend_from_slice(name);
+            }
+            Event::End(e) => {
+                if e.name().as_ref() == b"Contents" {
                     in_contents = false;
                     let rel_key = cur_key.strip_prefix(global_prefix).unwrap_or(&cur_key).to_string();
                     results.push(RemoteObject {
@@ -427,28 +420,18 @@ fn parse_list_objects_v2_xml(xml_str: &str, global_prefix: &str, results: &mut V
                         storage_class: cur_storage_class.take(),
                     });
                 }
-                b"Key" => in_key = false,
-                b"Size" => in_size = false,
-                b"ETag" => in_etag = false,
-                b"StorageClass" => in_storage_class = false,
-                b"IsTruncated" => in_is_trunc = false,
-                b"NextContinuationToken" => in_next_token = false,
-                _ => {}
-            },
+                current_tag.clear();
+            }
             Event::Text(t) => {
                 let text = t.unescape().unwrap_or_default();
-                if in_key {
-                    cur_key = text.to_string();
-                } else if in_size {
-                    cur_size = text.parse().unwrap_or(0);
-                } else if in_etag {
-                    cur_etag = text.to_string();
-                } else if in_storage_class {
-                    cur_storage_class = Some(text.to_string());
-                } else if in_is_trunc {
-                    is_truncated = text.eq_ignore_ascii_case("true");
-                } else if in_next_token {
-                    next_token = text.to_string();
+                match current_tag.as_slice() {
+                    b"Key" if in_contents => cur_key = text.to_string(),
+                    b"Size" if in_contents => cur_size = text.parse().unwrap_or(0),
+                    b"ETag" if in_contents => cur_etag = text.to_string(),
+                    b"StorageClass" if in_contents => cur_storage_class = Some(text.to_string()),
+                    b"IsTruncated" => is_truncated = text.eq_ignore_ascii_case("true"),
+                    b"NextContinuationToken" => next_token = text.to_string(),
+                    _ => {}
                 }
             }
             Event::Eof => break,
@@ -457,11 +440,13 @@ fn parse_list_objects_v2_xml(xml_str: &str, global_prefix: &str, results: &mut V
         buf.clear();
     }
 
-    if is_truncated && !next_token.is_empty() {
+    let next_continuation = if is_truncated && !next_token.is_empty() {
         Some(next_token)
     } else {
         None
-    }
+    };
+
+    (results, next_continuation)
 }
 
 fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
@@ -597,5 +582,43 @@ mod tests {
             "Headers must NOT contain 'x-amz-storage-class' when none configured. Received: {:?}",
             headers
         );
+    }
+
+    #[test]
+    fn test_parse_list_objects_v2_page() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>mybucket</Name>
+    <Prefix>vol1/</Prefix>
+    <KeyCount>2</KeyCount>
+    <MaxKeys>2</MaxKeys>
+    <IsTruncated>true</IsTruncated>
+    <NextContinuationToken>token12345</NextContinuationToken>
+    <Contents>
+        <Key>vol1/000001.log</Key>
+        <Size>1048576</Size>
+        <ETag>"abc123etag"</ETag>
+        <StorageClass>INTELLIGENT_TIERING</StorageClass>
+    </Contents>
+    <Contents>
+        <Key>vol1/000001.summary</Key>
+        <Size>512</Size>
+        <ETag>"def456etag"</ETag>
+    </Contents>
+</ListBucketResult>"#;
+
+        let (objects, next_token) = parse_list_objects_v2_page(xml, "vol1/");
+        assert_eq!(next_token.as_deref(), Some("token12345"));
+        assert_eq!(objects.len(), 2);
+
+        assert_eq!(objects[0].key, "000001.log");
+        assert_eq!(objects[0].size, 1048576);
+        assert_eq!(objects[0].etag.as_deref(), Some("abc123etag"));
+        assert_eq!(objects[0].storage_class.as_deref(), Some("INTELLIGENT_TIERING"));
+
+        assert_eq!(objects[1].key, "000001.summary");
+        assert_eq!(objects[1].size, 512);
+        assert_eq!(objects[1].etag.as_deref(), Some("def456etag"));
+        assert_eq!(objects[1].storage_class, None);
     }
 }
