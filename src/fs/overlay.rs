@@ -396,7 +396,7 @@ mod tests {
         // Freeze the tombstone out of `live`. From here `live.entry(ino)` sees nothing, so
         // a writer that validated before taking the lock would insert a fresh delta and
         // resurrect the inode at the next fold - this predicate is what stops it.
-        fs.begin_flush();
+        fs.freeze_now();
         assert!(!fs.inner.lock_for_tests().unwrap().live.contains_key(&attr.ino));
         assert!(
             !fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino),

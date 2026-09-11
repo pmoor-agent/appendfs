@@ -20,19 +20,34 @@ use std::time::Duration;
 impl InMemoryFS {
     // --- Flush & Fold Pipelines ---
 
-    /// Freezes `live` into the `flushing` queue if queue depth, bytes, and ops are within capacity limits.
-    pub fn begin_flush(&self) -> bool {
-        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
-        self.begin_flush_locked(&mut inner)
+    /// Whether staged mutations in `live` have reached `max_buffer_size` or `max_staged_ops`.
+    ///
+    /// The sole definition of "`live` is due for a flush"; every automatic freeze consults it.
+    pub(crate) fn staged_threshold_reached(&self, inner: &FsInner) -> bool {
+        inner.staged_bytes >= self.max_buffer_size || inner.staged_ops >= self.max_staged_ops
     }
 
-    /// Freezes `live` into the `flushing` queue with the inner lock already held.
-    pub fn begin_flush_locked(&self, inner: &mut FsInner) -> bool {
+    /// Freezes `live` into the `flushing` queue, subject to the queue capacity limits.
+    ///
+    /// The sole entry point for moving mutations out of `live`: capacity policy lives here and
+    /// nowhere else. Returns `true` if a batch was frozen.
+    pub(crate) fn freeze_now_locked(&self, inner: &mut FsInner) -> bool {
         inner.freeze_live(
             self.max_flush_queue_depth,
             self.max_flush_queue_bytes,
             self.max_flush_queue_ops,
         )
+    }
+
+    /// Freezes `live` only if staged mutations have reached the flush thresholds.
+    pub(crate) fn freeze_if_staged_locked(&self, inner: &mut FsInner) -> bool {
+        self.staged_threshold_reached(inner) && self.freeze_now_locked(inner)
+    }
+
+    /// Freezes `live` into the `flushing` queue, acquiring the inner lock.
+    pub(crate) fn freeze_now(&self) -> bool {
+        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+        self.freeze_now_locked(&mut inner)
     }
 
     /// Pops the front batch from the flushing queue, if any.
@@ -58,7 +73,7 @@ impl InMemoryFS {
                 return Ok(None);
             }
             if !inner.live.is_empty() {
-                if self.begin_flush_locked(&mut inner) {
+                if self.freeze_now_locked(&mut inner) {
                     let completion = inner.flushing.back().map(|b| b.completion.clone());
                     return Ok(completion);
                 }
@@ -286,7 +301,12 @@ impl InMemoryFS {
         let Some(ref writer) = self.log_writer else {
             return Ok(());
         };
-        self.begin_flush();
+        self.drain_locked(writer)
+    }
+
+    /// Freezes whatever is in `live` and writes every queued batch. Caller must hold `flush_lock`.
+    fn drain_locked(&self, writer: &LogWriter) -> std::io::Result<()> {
+        self.freeze_now();
         self.flush_log_locked(writer)
     }
 
@@ -297,9 +317,7 @@ impl InMemoryFS {
         loop {
             let mut batch = {
                 let mut inner = self.inner.lock(OpTag::Flush).unwrap();
-                if inner.staged_bytes >= self.max_buffer_size || inner.staged_ops >= self.max_staged_ops {
-                    self.begin_flush_locked(&mut inner);
-                }
+                self.freeze_if_staged_locked(&mut inner);
                 match inner.flushing.front() {
                     Some(b) => {
                         assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
@@ -333,8 +351,7 @@ impl InMemoryFS {
         };
 
         // Drain pending batches first so the current generation is cleanly flushed
-        self.begin_flush();
-        self.flush_log_locked(writer)?;
+        self.drain_locked(writer)?;
 
         if let Some((next_gen, sealed_md5)) = writer.force_roll(&*self.clock)? {
             let sealed_gen = next_gen - 1;
@@ -1087,7 +1104,7 @@ mod tests {
         assert_eq!(fs.get_parent_dir_inode(dir2), Some(dir3));
 
         // Fold live to base
-        fs.begin_flush();
+        fs.freeze_now();
         while let Some(batch) = fs.pop_flushing_batch() {
             fs.fold_flushed_batch(batch);
         }
@@ -1506,14 +1523,14 @@ mod tests {
         crate::operations::read_write::write_core(&fs, ino, &[0x11; 50], 0).unwrap();
 
         // Freeze into flushing queue (batch 1)
-        fs.begin_flush();
+        fs.freeze_now();
         assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 1);
 
         // 2. Overwrite in batch 2 (live layer)
         crate::operations::read_write::write_core(&fs, ino, &[0x22; 20], 10).unwrap();
 
         // Freeze into flushing queue (batch 2)
-        fs.begin_flush();
+        fs.freeze_now();
         assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 2);
 
         // 3. In live layer, truncate to 40 bytes
@@ -1964,7 +1981,7 @@ mod tests {
         assert_eq!(fs.staged_ops(), 1);
 
         // Freeze batch into queue manually (simulating begin_flush when flusher starts or when threshold hit)
-        fs.begin_flush();
+        fs.freeze_now();
         assert_eq!(fs.flush_queue_depth(), 1);
         // Counters must be reset to 0 upon freezing into flushing queue, and moved to flushing counters
         assert_eq!(fs.staged_bytes(), 0);
@@ -2010,12 +2027,12 @@ mod tests {
 
         // Populate batch 1
         crate::operations::read_write::write_core(&fs, file.ino, &[0x11; 30], 0).unwrap();
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 1);
 
         // Populate batch 2
         crate::operations::read_write::write_core(&fs, file.ino, &[0x22; 40], 30).unwrap();
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
 
         // Queue is now full (len == max_flush_queue_depth == 2).
@@ -2025,7 +2042,7 @@ mod tests {
         assert_eq!(fs.staged_ops(), 1);
 
         // begin_flush must be a no-op that returns false and leaves live and staged accounting untouched
-        assert!(!fs.begin_flush());
+        assert!(!fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
         assert_eq!(fs.staged_bytes(), 50);
         assert_eq!(fs.staged_ops(), 1);
@@ -2042,7 +2059,7 @@ mod tests {
         assert_eq!(fs.flush_queue_depth(), 1);
 
         // Now begin_flush should succeed in freezing the accumulated live mutations
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
         assert_eq!(fs.staged_bytes(), 0);
         assert_eq!(fs.staged_ops(), 0);
@@ -2066,7 +2083,7 @@ mod tests {
 
         let file =
             crate::operations::read_write::create_core(&fs, 1, "bytes_bounded.bin", 0o644, 0, 1000, 1000).unwrap();
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         let init = fs.pop_flushing_batch().unwrap();
         fs.fold_flushed_batch(init);
         assert_eq!(fs.flush_queue_depth(), 0);
@@ -2074,13 +2091,13 @@ mod tests {
 
         // Populate batch 1: 60 bytes
         crate::operations::read_write::write_core(&fs, file.ino, &[0x11; 60], 0).unwrap();
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 1);
         assert_eq!(fs.flushing_bytes(), 60);
 
         // Populate batch 2: 40 bytes (total 100 bytes == max_flush_queue_bytes)
         crate::operations::read_write::write_core(&fs, file.ino, &[0x22; 40], 60).unwrap();
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
         assert_eq!(fs.flushing_bytes(), 100);
 
@@ -2091,7 +2108,7 @@ mod tests {
         assert_eq!(fs.staged_ops(), 1);
 
         // begin_flush must return false because flushing_bytes >= max_flush_queue_bytes
-        assert!(!fs.begin_flush());
+        assert!(!fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
         assert_eq!(fs.flushing_bytes(), 100);
         assert_eq!(fs.staged_bytes(), 30);
@@ -2110,7 +2127,7 @@ mod tests {
         assert_eq!(fs.flushing_bytes(), 40);
 
         // Now begin_flush should succeed
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
         assert_eq!(fs.flushing_bytes(), 70);
         assert_eq!(fs.staged_bytes(), 0);
@@ -2135,7 +2152,7 @@ mod tests {
         fs.max_flush_queue_ops = 2;
 
         let file = crate::operations::read_write::create_core(&fs, 1, "ops_bounded.bin", 0o644, 0, 1000, 1000).unwrap();
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         let init = fs.pop_flushing_batch().unwrap();
         fs.fold_flushed_batch(init);
         assert_eq!(fs.flush_queue_depth(), 0);
@@ -2144,14 +2161,14 @@ mod tests {
         // Populate batch 1: 1 op
         crate::operations::read_write::write_core(&fs, file.ino, &[0x11; 10], 0).unwrap();
         assert_eq!(fs.staged_ops(), 1);
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 1);
         assert_eq!(fs.flushing_ops(), 1);
 
         // Populate batch 2: 1 op -> total 2 ops == max_flush_queue_ops
         crate::operations::read_write::write_core(&fs, file.ino, &[0x22; 10], 10).unwrap();
         assert_eq!(fs.staged_ops(), 1);
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
         assert_eq!(fs.flushing_ops(), 2);
 
@@ -2161,7 +2178,7 @@ mod tests {
         assert_eq!(fs.staged_ops(), 1);
 
         // begin_flush must return false because flushing_ops >= max_flush_queue_ops
-        assert!(!fs.begin_flush());
+        assert!(!fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
         assert_eq!(fs.flushing_ops(), 2);
         assert_eq!(fs.staged_ops(), 1);
@@ -2173,7 +2190,7 @@ mod tests {
         assert_eq!(fs.flushing_ops(), 1);
 
         // Now begin_flush should succeed
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
         assert_eq!(fs.flushing_ops(), 2);
         assert_eq!(fs.staged_ops(), 0);
@@ -2331,11 +2348,11 @@ mod tests {
 
         // Batch 1
         crate::operations::read_write::write_core(&fs, file.ino, b"batch 1", 0).unwrap();
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
 
         // Batch 2
         crate::operations::read_write::write_core(&fs, file.ino, b"batch 2", 7).unwrap();
-        assert!(fs.begin_flush());
+        assert!(fs.freeze_now());
 
         // Queue is now saturated at max depth 2
         assert_eq!(fs.flush_queue_depth(), 2);

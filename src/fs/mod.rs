@@ -520,23 +520,15 @@ impl<'a> DerefMut for FsInnerGuard<'a> {
 
 impl<'a> Drop for FsInnerGuard<'a> {
     fn drop(&mut self) {
-        if self.mutation_occurred {
-            let max_buffer_size = self.fs.max_buffer_size;
-            let max_staged_ops = self.fs.max_staged_ops;
-            let max_flush_queue_depth = self.fs.max_flush_queue_depth;
-            let max_flush_queue_bytes = self.fs.max_flush_queue_bytes;
-            let max_flush_queue_ops = self.fs.max_flush_queue_ops;
-            if self.guard.staged_bytes >= max_buffer_size || self.guard.staged_ops >= max_staged_ops {
-                let froze = self
-                    .guard
-                    .freeze_live(max_flush_queue_depth, max_flush_queue_bytes, max_flush_queue_ops);
-                if froze || !self.guard.flushing.is_empty() {
-                    let fs = self.fs;
-                    self.guard.defer(move || {
-                        fs.notify_flush_trigger(true);
-                    });
-                }
-            }
+        if !self.mutation_occurred || !self.fs.staged_threshold_reached(&self.guard) {
+            return;
+        }
+        let froze = self.fs.freeze_now_locked(&mut self.guard);
+        if froze || !self.guard.flushing.is_empty() {
+            let fs = self.fs;
+            self.guard.defer(move || {
+                fs.notify_flush_trigger(true);
+            });
         }
     }
 }
