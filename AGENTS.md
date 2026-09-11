@@ -48,7 +48,7 @@ All code contributions follow a standard fork-and-pull-request workflow:
        }
      '
      ```
-   - Devise a concrete action plan, implement the requested adjustments on the feature branch, and verify (`cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`).
+   - Devise a concrete action plan, implement the requested adjustments on the feature branch, and verify (`cargo fmt --check`, `cargo clippy --all-targets`, `timeout 5m cargo test`).
    - Push updated commits to `origin` (or amend and force-push with `git push origin <branch> --force-with-lease`).
    - Keep the Pull Request description updated: Always run `gh pr edit <pr> --body-file <file>` (or `--body "..."`) whenever review adjustments modify scope, rationale, or behavior so the PR text stays synchronized with the latest commits.
    - Respond to comment threads explaining the resolution (`gh api repos/pmoor/appendfs/pulls/<pr>/comments -X POST -F in_reply_to=<comment-id> -f body="..."`).
@@ -80,9 +80,10 @@ All code contributions follow a standard fork-and-pull-request workflow:
 - `cargo clippy --all-targets`
 
 ### Standard Testing
-- Run all tests (debug): `cargo test`
-- Run all tests (release): `cargo test --release`
-- Run specific test file: `cargo test --test <name>` (e.g. `cargo test --test integration_test`)
+To prevent test runs from hanging indefinitely due to deadlocks or lock contention, always wrap `cargo test` invocations with an overall timeout using GNU `timeout` (e.g. `timeout 5m` or `timeout -k 10s 5m`):
+- Run all tests (debug): `timeout 5m cargo test`
+- Run all tests (release): `timeout 5m cargo test --release`
+- Run specific test file: `timeout 5m cargo test --test <name>` (e.g. `timeout 5m cargo test --test integration_test`)
 
 ## Extended & Stress Testing
 
@@ -100,21 +101,21 @@ Certain test suites (differential fuzzing and concurrent stress testing) support
 - **Recommended Extended Sanity / Soak Check (~1 minute each in release mode)**:
   - Concurrent stress soak (~90s):
     ```bash
-    FUZZ_SEEDS=300 FUZZ_STEPS=8000 cargo test --release --test concurrency_test -- --nocapture
+    FUZZ_SEEDS=300 FUZZ_STEPS=8000 timeout 5m cargo test --release --test concurrency_test -- --nocapture
     ```
   - Fuzzing & crash recovery soak (~85s):
     ```bash
-    FUZZ_SEEDS=300 FUZZ_STEPS=10000 cargo test --release --test fuzz_test -- --nocapture
+    FUZZ_SEEDS=300 FUZZ_STEPS=10000 timeout 5m cargo test --release --test fuzz_test -- --nocapture
     ```
 
 - **Quick 10× Sanity Sweep (~5s total)**:
   ```bash
-  FUZZ_SEEDS=50 FUZZ_STEPS=2000 cargo test --release
+  FUZZ_SEEDS=50 FUZZ_STEPS=2000 timeout 5m cargo test --release
   ```
 
 - **Custom sweeps**:
   ```bash
-  FUZZ_STEPS=500 FUZZ_SEEDS=20 cargo test --release --test fuzz_test -- --nocapture
+  FUZZ_STEPS=500 FUZZ_SEEDS=20 timeout 5m cargo test --release --test fuzz_test -- --nocapture
   ```
 
 ## On-Disk Format Compatibility & Golden Fixtures
@@ -123,7 +124,7 @@ AppendFS maintains a suite of checked-in golden fixture files in `tests/fixtures
 
 ### Running Compatibility Tests
 ```bash
-cargo test --test compat_test
+timeout 5m cargo test --test compat_test
 ```
 `tests/compat_test.rs` automatically discovers and runs full recovery checks against all `tests/fixtures/v*` directories.
 
