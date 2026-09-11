@@ -4,6 +4,7 @@
 #include <fuse3/fuse_opt.h>
 
 #include <atomic>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -516,6 +517,7 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   struct fuse_lowlevel_ops ll_ops = {};
   struct fuse_session *se = nullptr;
   int ret = -1;
+  bool signals_installed = false;
 
   ShimContext ctx;
   if (ops) {
@@ -595,17 +597,29 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
     goto err_out1;
   }
 
+  signals_installed = (fuse_set_signal_handlers(se) == 0);
+
   if (fuse_session_mount(se, opts.mountpoint) != 0) {
+    if (signals_installed) {
+      fuse_remove_signal_handlers(se);
+    }
     goto err_out2;
   }
 
   fuse_daemonize(opts.foreground);
 
   ret = fuse_session_loop(se);
+  if (signals_installed && (ret == SIGINT || ret == SIGTERM || ret == SIGHUP)) {
+    ret = 0;
+  }
 
   // Drain in-flight asynchronous operations and clean up filesystem state
   // before unmounting and destroying the FUSE session.
   ll_destroy(&ctx);
+
+  if (signals_installed) {
+    fuse_remove_signal_handlers(se);
+  }
 
   fuse_session_unmount(se);
 err_out2:

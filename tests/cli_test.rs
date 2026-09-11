@@ -266,3 +266,228 @@ fn test_cli_mount_args_flush_queue_bounds_defaults_and_overrides() {
         _ => panic!("expected Commands::Mount"),
     }
 }
+
+#[test]
+fn test_cli_mount_foreground_unmounts_on_sigint() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::thread;
+    use std::time::Duration;
+
+    let log_dir = TempDir::new().unwrap();
+    let mount_dir = TempDir::new().unwrap();
+    std::fs::set_permissions(mount_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["init", log_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to init volume");
+    assert!(init_out.status.success());
+
+    let initial_dev = std::fs::metadata(mount_dir.path()).unwrap().dev();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "mount",
+            log_dir.path().to_str().unwrap(),
+            mount_dir.path().to_str().unwrap(),
+            "-f",
+        ])
+        .spawn()
+        .expect("failed to spawn appendfs mount");
+
+    // Wait for FUSE mount to become ready
+    let mut mounted = false;
+    for _ in 0..200 {
+        if let Ok(meta) = std::fs::metadata(mount_dir.path())
+            && meta.dev() != initial_dev
+        {
+            mounted = true;
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("appendfs mount exited prematurely with: {:?}", status);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(mounted, "timed out waiting for FUSE filesystem to mount");
+
+    // Write a file to verify operational filesystem and persistent flush on unmount
+    let test_file = mount_dir.path().join("before_interrupt.txt");
+    std::fs::write(&test_file, b"data persisted across sigint").unwrap();
+    assert_eq!(std::fs::read(&test_file).unwrap(), b"data persisted across sigint");
+
+    // Send SIGINT (Ctrl+C) to foreground appendfs process
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+
+    // Wait for child to exit cleanly
+    let mut exited = false;
+    let mut exit_status = None;
+    for _ in 0..100 {
+        if let Ok(Some(status)) = child.try_wait() {
+            exited = true;
+            exit_status = Some(status);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child failed to exit after SIGINT");
+    }
+
+    let status = exit_status.unwrap();
+    assert!(
+        status.success(),
+        "appendfs should exit successfully (0) on SIGINT unmount, got {:?}",
+        status
+    );
+
+    // Verify mount point is cleanly unmounted and restored to underlying directory
+    let after_dev = std::fs::metadata(mount_dir.path()).unwrap().dev();
+    assert_eq!(
+        after_dev, initial_dev,
+        "mount point device ID should be restored to initial underlying directory"
+    );
+    assert!(
+        std::fs::read_dir(mount_dir.path()).unwrap().next().is_none(),
+        "underlying directory should now be empty"
+    );
+
+    // Verify volume integrity and that written data was synced/exported
+    let fsck_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["fsck", log_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run appendfs fsck");
+    assert!(
+        fsck_out.status.success(),
+        "volume fsck failed: {}",
+        String::from_utf8_lossy(&fsck_out.stderr)
+    );
+
+    // Remount to verify volume recovers and the file is accessible
+    let mut remount_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "mount",
+            log_dir.path().to_str().unwrap(),
+            mount_dir.path().to_str().unwrap(),
+            "-f",
+        ])
+        .spawn()
+        .expect("failed to spawn remount child");
+
+    let mut remounted = false;
+    for _ in 0..200 {
+        if let Ok(meta) = std::fs::metadata(mount_dir.path())
+            && meta.dev() != initial_dev
+        {
+            remounted = true;
+            break;
+        }
+        if let Ok(Some(status)) = remount_child.try_wait() {
+            panic!("remount child exited prematurely: {:?}", status);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(remounted, "timed out waiting for remount");
+
+    let read_back = std::fs::read(mount_dir.path().join("before_interrupt.txt")).unwrap();
+    assert_eq!(read_back, b"data persisted across sigint");
+
+    unsafe {
+        libc::kill(remount_child.id() as libc::pid_t, libc::SIGINT);
+    }
+    assert!(remount_child.wait().unwrap().success());
+}
+
+#[test]
+fn test_cli_mount_foreground_unmounts_on_sigint_when_busy() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::thread;
+    use std::time::Duration;
+
+    let log_dir = TempDir::new().unwrap();
+    let mount_dir = TempDir::new().unwrap();
+    std::fs::set_permissions(mount_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["init", log_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to init volume");
+    assert!(init_out.status.success());
+
+    let initial_dev = std::fs::metadata(mount_dir.path()).unwrap().dev();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "mount",
+            log_dir.path().to_str().unwrap(),
+            mount_dir.path().to_str().unwrap(),
+            "-f",
+        ])
+        .spawn()
+        .expect("failed to spawn appendfs mount");
+
+    // Wait for FUSE mount to become ready
+    let mut mounted = false;
+    for _ in 0..200 {
+        if let Ok(meta) = std::fs::metadata(mount_dir.path())
+            && meta.dev() != initial_dev
+        {
+            mounted = true;
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("appendfs mount exited prematurely with: {:?}", status);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(mounted, "timed out waiting for FUSE filesystem to mount");
+
+    let test_file = mount_dir.path().join("busy_file.txt");
+    std::fs::write(&test_file, b"held open by external fd").unwrap();
+
+    // Keep an open file descriptor in this test process to make the filesystem busy
+    let open_file = std::fs::File::open(&test_file).unwrap();
+
+    // Send SIGINT (Ctrl+C) to foreground appendfs process while filesystem is busy
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+
+    // Wait for child to exit cleanly (lazy detach ensures unmount succeeds without blocking)
+    let mut exited = false;
+    let mut exit_status = None;
+    for _ in 0..100 {
+        if let Ok(Some(status)) = child.try_wait() {
+            exited = true;
+            exit_status = Some(status);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child failed to exit after SIGINT while busy");
+    }
+
+    let status = exit_status.unwrap();
+    assert!(
+        status.success(),
+        "appendfs should exit successfully (0) on SIGINT unmount even when busy, got {:?}",
+        status
+    );
+
+    // Verify mount point is cleanly unmounted from VFS hierarchy
+    let after_dev = std::fs::metadata(mount_dir.path()).unwrap().dev();
+    assert_eq!(
+        after_dev, initial_dev,
+        "mount point device ID should be detached and restored to underlying directory"
+    );
+
+    // Close the file descriptor now that unmount completed
+    drop(open_file);
+}
