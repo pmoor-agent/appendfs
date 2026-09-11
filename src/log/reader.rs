@@ -157,7 +157,7 @@ mod tests {
 
         writer.append_record(OpCode::Data, 2, b"payload1").unwrap();
         writer.append_record(OpCode::InodeDelta, 3, b"payload22").unwrap();
-        writer.sync().unwrap();
+        writer.flush().unwrap();
 
         let reader = LogReader::open(&storage, &writer.filename(), VolumeKey::plaintext_arc()).unwrap();
         assert_eq!(reader.file_header().generation, 1);

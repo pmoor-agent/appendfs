@@ -306,7 +306,7 @@ mod tests {
             VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        writer.sync().unwrap();
+        writer.flush().unwrap();
 
         let cache = LogFileCache::with_storage(storage);
 
@@ -337,7 +337,7 @@ mod tests {
         let (_, gen_num, offset, rec_size) = writer
             .append_record(crate::log::record::OpCode::Data, 10, payload)
             .unwrap();
-        writer.sync().unwrap();
+        writer.flush().unwrap();
 
         let cache = LogFileCache::with_storage(storage);
 

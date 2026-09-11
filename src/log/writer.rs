@@ -391,7 +391,10 @@ impl LogWriter {
         Ok(tx)
     }
 
-    /// Flushes unwritten internal buffers to persistent media.
+    /// Flushes unwritten internal buffers through to persistent media.
+    ///
+    /// This is a physical sync, not a buffer hand-off: the flusher calls it on every batch,
+    /// which is what makes a completed batch durable.
     pub fn flush(&self) -> io::Result<()> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
@@ -402,11 +405,6 @@ impl LogWriter {
         } else {
             Ok(())
         }
-    }
-
-    /// Performs a physical sync.
-    pub fn sync(&self) -> io::Result<()> {
-        self.flush()
     }
 
     /// Returns the active generation sequence number.

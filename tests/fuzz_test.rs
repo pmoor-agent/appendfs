@@ -1228,7 +1228,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     writer.append_record(OpCode::InodeDelta, 1, &bytes).unwrap();
     // Deliberately no emit_flush_commit() call here - this is the crash point.
 
-    writer.sync().unwrap();
+    writer.flush().unwrap();
     drop(writer);
 
     let recovered = recover_fs(
@@ -1292,7 +1292,7 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
     // Claim 2 records preceded this trailer, when only 1 actually did.
     writer.emit_flush_commit(2, &clock).unwrap();
-    writer.sync().unwrap();
+    writer.flush().unwrap();
     drop(writer);
 
     let result = recover_fs(
@@ -1337,7 +1337,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     let bytes = appendfs::wire::serialize(&file_delta).unwrap();
     writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
     writer.emit_flush_commit(1, &clock).unwrap();
-    writer.sync().unwrap();
+    writer.flush().unwrap();
     let filename = writer.filename();
     drop(writer);
 

@@ -569,15 +569,9 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
 
 #[cfg(any(test, feature = "testing"))]
 pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
-    let completion = fs.rollover_for_fsync(ino, fh)?;
-    let Some(completion) = completion else {
-        if let Some(ref writer) = fs.log_writer {
-            let writer_clone = Arc::clone(writer);
-            tokio::task::spawn_blocking(move || writer_clone.sync())
-                .await
-                .map_err(|_| libc::EIO)?
-                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-        }
+    // Nothing staged and nothing in flight: the flusher syncs the log before it completes a
+    // batch, so everything already folded into `base` is on disk. There is nothing to wait for.
+    let Some(completion) = fs.rollover_for_fsync(ino, fh)? else {
         return Ok(());
     };
 
@@ -598,21 +592,8 @@ pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
         }
     };
 
+    // See `fsync_core`: with nothing staged or in flight, the log is already synced.
     let Some(completion) = completion else {
-        if let Some(ref writer) = fs.log_writer {
-            let guard = fs.begin_async_op();
-            let writer_clone = Arc::clone(writer);
-            crate::async_runtime::spawn(async move {
-                let _guard = guard;
-                let res = tokio::task::spawn_blocking(move || writer_clone.sync()).await;
-                match res {
-                    Ok(Ok(())) => req.reply_err(0),
-                    Ok(Err(e)) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
-                    Err(_) => req.reply_err(libc::EIO),
-                }
-            });
-            return;
-        }
         req.reply_err(0);
         return;
     };
