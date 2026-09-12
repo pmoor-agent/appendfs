@@ -827,6 +827,7 @@ mod tests {
             WriteArena::new(),
             0,
             0,
+            crate::fs::BatchCompletion::new(),
         ));
 
         // 3. Live layer: Staged extent at 30..50

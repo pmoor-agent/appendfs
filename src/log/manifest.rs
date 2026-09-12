@@ -161,6 +161,27 @@ impl LogManifest {
     /// Sets the MD5 digest for a specific sealed generation.
     pub fn set_generation_md5(&mut self, generation: u64, md5: [u8; 16]) {
         if let Some(entry) = self.get_mut_by_generation(generation) {
+            // A generation is sealed once, so a second digest that disagrees means the file
+            // changed under us or two sealers raced. Recording it silently would hand the
+            // integrity checker a digest matching whichever write landed last.
+            debug_assert!(
+                entry.md5.is_none_or(|existing| existing == md5),
+                "generation {} already sealed with a different md5",
+                generation
+            );
+            if let Some(existing) = entry.md5
+                && existing != md5
+            {
+                {
+                    log::error!(
+                        "Refusing to overwrite md5 of sealed generation {}: recorded {:x?}, got {:x?}",
+                        generation,
+                        existing,
+                        md5
+                    );
+                    return;
+                }
+            }
             entry.md5 = Some(md5);
         }
     }

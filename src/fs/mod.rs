@@ -227,6 +227,29 @@ impl BatchCompletion {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Interrupted, "batch cancelled"))?
     }
 
+    /// Blocks until the batch completes and yields its result.
+    ///
+    /// The async `wait` is what FUSE's fsync uses; this is for synchronous callers like
+    /// `quiesce` and unmount, which have no runtime to await on.
+    pub fn wait_blocking(&self) -> std::io::Result<()> {
+        let signal = Arc::new((Mutex::new(None::<std::io::Result<()>>), Condvar::new()));
+        let signal_clone = Arc::clone(&signal);
+        self.add_callback(Box::new(move |res| {
+            let (lock, cvar) = &*signal_clone;
+            *lock.lock().unwrap() = Some(res);
+            cvar.notify_all();
+        }));
+
+        let (lock, cvar) = &*signal;
+        let mut guard = lock.lock().unwrap();
+        loop {
+            if let Some(res) = guard.take() {
+                return res;
+            }
+            guard = cvar.wait(guard).unwrap();
+        }
+    }
+
     /// Returns true if this batch has already completed.
     pub fn is_completed(&self) -> bool {
         self.state.lock().unwrap().result.is_some()
@@ -246,7 +269,16 @@ pub struct FlushBatch {
 }
 
 impl FlushBatch {
-    pub fn new(id: u64, entries: HashMap<u64, EntryDelta>, arena: WriteArena, bytes: usize, ops: usize) -> Self {
+    /// `completion` comes from the `live` layer these entries were frozen out of, so anyone
+    /// who registered interest while they were still live is carried into this batch.
+    pub fn new(
+        id: u64,
+        entries: HashMap<u64, EntryDelta>,
+        arena: WriteArena,
+        bytes: usize,
+        ops: usize,
+        completion: BatchCompletion,
+    ) -> Self {
         assert!(!entries.is_empty(), "FlushBatch must contain at least one entry");
         Self {
             id,
@@ -254,7 +286,7 @@ impl FlushBatch {
             arena,
             bytes,
             ops,
-            completion: BatchCompletion::new(),
+            completion,
         }
     }
 }
@@ -271,6 +303,12 @@ pub struct FsInner {
     pub live: HashMap<u64, EntryDelta>,
     /// Active write arena staging extent payload allocations for `live`.
     pub live_arena: WriteArena,
+    /// Completion handle for whatever is currently in `live`, travelling with the data when
+    /// it is frozen. Lets a waiter register before the batch it will belong to exists.
+    pub live_completion: BatchCompletion,
+    /// Set when someone needs `live` flushed regardless of how little is staged - an fsync, a
+    /// `quiesce`, or the flusher's own inactivity tick. Cleared by the freeze that honors it.
+    pub freeze_requested: bool,
     /// Active open handles (regular files, virtual files, and directories) keyed by allocated handle ID (`fh`).
     pub handles: HandleMap,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
@@ -288,13 +326,10 @@ pub struct FsInner {
     pub flushing_bytes: usize,
     /// Total mutating operations across all frozen batches in `flushing`.
     pub flushing_ops: usize,
-    /// Condition variable notified whenever capacity opens up in the `flushing` queue.
-    pub capacity_cvar: Arc<Condvar>,
 }
 
 impl FsInner {
-    /// Pops the committed batch from the front of the flushing queue, asserting its ID matches `batch.id`,
-    /// and notifies `capacity_cvar` with lock held.
+    /// Pops the committed batch from the front of the flushing queue, asserting its ID matches `batch.id`.
     pub fn pop_flushed_batch(&mut self, batch: &FlushBatch) -> FlushBatch {
         let front = self.flushing.front().expect("flushing queue must not be empty");
         assert_eq!(
@@ -304,17 +339,15 @@ impl FsInner {
         let popped = self.flushing.pop_front().unwrap();
         self.flushing_bytes -= popped.bytes;
         self.flushing_ops -= popped.ops;
-        self.capacity_cvar.notify_all();
         popped
     }
 
-    /// Pops the front batch from the flushing queue and notifies `capacity_cvar` with lock held.
+    /// Pops the front batch from the flushing queue.
     #[cfg(any(test, feature = "testing"))]
     pub fn pop_flushing_batch(&mut self) -> Option<FlushBatch> {
         let batch = self.flushing.pop_front()?;
         self.flushing_bytes -= batch.bytes;
         self.flushing_ops -= batch.ops;
-        self.capacity_cvar.notify_all();
         Some(batch)
     }
 
@@ -365,7 +398,12 @@ impl FsInner {
             self.flushing_ops += ops;
             let id = self.next_batch_id;
             self.next_batch_id += 1;
-            self.flushing.push_back(FlushBatch::new(id, entries, arena, bytes, ops));
+            // Whoever registered on `live` while these entries were staged now waits on the
+            // batch that carries them; `live` starts over with a fresh handle.
+            let completion = std::mem::take(&mut self.live_completion);
+            self.freeze_requested = false;
+            self.flushing
+                .push_back(FlushBatch::new(id, entries, arena, bytes, ops, completion));
             true
         } else {
             false
@@ -658,6 +696,8 @@ impl InMemoryFS {
             next_batch_id: 1,
             live: HashMap::new(),
             live_arena: WriteArena::new(),
+            live_completion: BatchCompletion::new(),
+            freeze_requested: false,
             handles: HashMap::new(),
             open_counts: HashMap::new(),
             next_fh: 1,
@@ -666,7 +706,6 @@ impl InMemoryFS {
             staged_ops: 0,
             flushing_bytes: 0,
             flushing_ops: 0,
-            capacity_cvar: Arc::new(Condvar::new()),
         };
 
         let fs = Self {

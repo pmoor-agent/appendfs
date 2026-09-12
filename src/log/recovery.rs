@@ -265,7 +265,14 @@ pub fn recover_fs(
                 }
 
                 if !current_batch.is_empty() {
-                    fs_instance.fold_flushed_batch(FlushBatch::new(0, current_batch, WriteArena::new(), 0, 0));
+                    fs_instance.fold_flushed_batch(FlushBatch::new(
+                        0,
+                        current_batch,
+                        WriteArena::new(),
+                        0,
+                        0,
+                        crate::fs::BatchCompletion::new(),
+                    ));
                 }
 
                 if target_cutoff_reached {

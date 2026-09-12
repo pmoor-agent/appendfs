@@ -39,9 +39,6 @@ pub(crate) struct Flusher {
     /// Serializes flush cycles. Uncontended in background mode, where only one thread runs
     /// them; in inline mode it keeps concurrent callers from writing to the log at once.
     cycle_lock: Mutex<()>,
-    /// Error from the most recent failed cycle, for `quiesce` callers that cannot observe
-    /// the cycle's return value because a background thread ran it.
-    last_error: Mutex<Option<std::io::Error>>,
     /// Whether a cycle is running, so debug builds can assert that nothing writes to the
     /// log from outside one.
     in_cycle: AtomicBool,
@@ -60,7 +57,6 @@ impl Flusher {
             thread: Mutex::new(None),
             background: AtomicBool::new(false),
             cycle_lock: Mutex::new(()),
-            last_error: Mutex::new(None),
             in_cycle: AtomicBool::new(false),
         }
     }
@@ -132,8 +128,7 @@ impl Flusher {
         was_running
     }
 
-    /// Runs `cycle` with the cycle lock held, recording its outcome for `quiesce` callers
-    /// that cannot see the return value directly.
+    /// Runs `cycle` with the cycle lock held, so only one runs at a time.
     pub(crate) fn run_locked<T, F>(&self, cycle: F) -> std::io::Result<T>
     where
         F: FnOnce() -> std::io::Result<T>,
@@ -142,22 +137,12 @@ impl Flusher {
         self.in_cycle.store(true, Ordering::SeqCst);
         let result = cycle();
         self.in_cycle.store(false, Ordering::SeqCst);
-        let mut last = self.last_error.lock().unwrap();
-        match &result {
-            Ok(_) => *last = None,
-            Err(e) => *last = Some(std::io::Error::new(e.kind(), e.to_string())),
-        }
         result
     }
 
     /// Whether a flush cycle is currently running on some thread.
     pub(crate) fn in_cycle(&self) -> bool {
         self.in_cycle.load(Ordering::SeqCst)
-    }
-
-    /// Takes the error from the most recent failed cycle, if it has not been observed yet.
-    pub(crate) fn take_error(&self) -> Option<std::io::Error> {
-        self.last_error.lock().unwrap().take()
     }
 }
 
@@ -171,6 +156,7 @@ fn run_background(weak: &Weak<InMemoryFS>, wakeup: &Arc<(Mutex<Wakeup>, Condvar)
     let (lock, cvar) = &**wakeup;
     let mut delay = interval;
     loop {
+        let mut idle = false;
         {
             let mut state = lock.lock().unwrap();
             while !state.stop && !state.wake {
@@ -179,6 +165,7 @@ fn run_background(weak: &Weak<InMemoryFS>, wakeup: &Arc<(Mutex<Wakeup>, Condvar)
                         let (guard, timeout) = cvar.wait_timeout(state, d).unwrap();
                         state = guard;
                         if timeout.timed_out() {
+                            idle = true;
                             break;
                         }
                     }
@@ -193,6 +180,11 @@ fn run_background(weak: &Weak<InMemoryFS>, wakeup: &Arc<(Mutex<Wakeup>, Condvar)
 
         // Dropped between the wake-up and here: nothing left to flush into.
         let Some(fs) = weak.upgrade() else { return };
+        // Nobody asked for this cycle, so nobody has frozen `live`. Ask on their behalf -
+        // this is the inactivity flush.
+        if idle {
+            fs.request_freeze();
+        }
         // Back off briefly rather than sitting out the whole interval, so a transient
         // failure does not strand committed mutations in the queue.
         delay = match fs.run_flush_cycle() {
@@ -310,14 +302,15 @@ mod tests {
         fs.quiesce().unwrap();
         assert_eq!(writer.generation(), 1);
 
-        // Still inside the age limit.
+        // Still inside the age limit. `quiesce` short-circuits with nothing pending, so drive
+        // the cycle directly - this is what the inactivity tick does with an empty queue.
         clock.advance(Duration::from_secs(3599));
-        fs.quiesce().unwrap();
+        fs.run_flush_cycle().unwrap();
         assert_eq!(writer.generation(), 1);
 
         // Past it: an idle cycle with nothing to write still seals the generation.
         clock.advance(Duration::from_secs(2));
-        fs.quiesce().unwrap();
+        fs.run_flush_cycle().unwrap();
         assert_eq!(
             writer.generation(),
             2,
