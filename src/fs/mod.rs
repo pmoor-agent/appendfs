@@ -319,11 +319,10 @@ pub const FLUSH_HISTORY_CAPACITY: usize = 16;
 
 /// What one completed flush cost.
 ///
-/// `started_at` comes from the injected clock, like every other timestamp reported by
-/// `.status`. `duration` is measured with `Instant`, because it is an elapsed time rather
-/// than a point in time: a `SystemTime` delta can run backwards across an NTP step, and
-/// under a mocked clock it would always be zero. Nothing here is persisted, so the
-/// determinism the injected clock exists to protect is unaffected.
+/// Both come from the injected clock: `started_at` from `Clock::now`, and `duration` from
+/// `Clock::monotonic`, which measures elapsed time without the backwards steps a wall clock
+/// can take. A mocked clock therefore reports reproducible durations - zero for a fixed
+/// clock, exactly what was advanced for an advancing one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushRecord {
     /// Identifier of the batch this records.

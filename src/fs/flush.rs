@@ -339,7 +339,7 @@ impl InMemoryFS {
         self.flusher.run_locked(|| {
             loop {
                 let started_at = self.clock.now();
-                let timer = std::time::Instant::now();
+                let started_monotonic = self.clock.monotonic();
                 let batch = {
                     let mut inner = self.inner.lock(OpTag::Flush).unwrap();
                     // The freeze belongs to whoever decided one was needed - an fsync, a
@@ -377,7 +377,7 @@ impl InMemoryFS {
                     bytes: popped.bytes,
                     ops: popped.ops,
                     started_at,
-                    duration: timer.elapsed(),
+                    duration: self.clock.elapsed_since(started_monotonic),
                 };
                 log::debug!(
                     "Flushed batch {} ({}): {} bytes, {} ops in {:?}",

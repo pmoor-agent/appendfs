@@ -401,6 +401,39 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_timings_come_from_the_injected_clock() {
+        let fixed = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let clock = crate::clock::MockClock(fixed);
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(Arc::new(clock), Some(writer));
+
+        stage_a_write(&fs, "timed.bin");
+        fs.quiesce().unwrap();
+
+        let stats = fs.flush_stats();
+        let record = stats.recent.first().expect("one batch");
+        assert_eq!(record.started_at, fixed, "timestamps come from `Clock::now`");
+        // The point of routing through `Clock::monotonic`: a fixed clock yields a
+        // reproducible zero, where an `Instant` would report whatever the wall clock did.
+        assert_eq!(
+            record.duration,
+            Duration::ZERO,
+            "durations come from `Clock::monotonic`, not a real timer"
+        );
+    }
+
+    #[test]
     fn test_flush_history_is_capped_and_evicts_the_oldest() {
         let fs = test_fs();
         let total = crate::fs::FLUSH_HISTORY_CAPACITY + 4;
