@@ -38,7 +38,7 @@ pub use clock::{
 };
 pub use dump::{dump_file, dump_log_file, dump_log_reader, dump_summary_file, dump_summary_reader};
 pub use extent_map::{Extent, ExtentEntry, ExtentMap};
-pub use fs::{BatchCompletion, FlushReason, InMemoryFS};
+pub use fs::{BatchCompletion, FLUSH_HISTORY_CAPACITY, FlushReason, FlushRecord, FlushStats, InMemoryFS};
 pub use log::{
     ExtentState, LogFileCache, LogReader, LogRecord, LogWriter, RecoveryTarget, SharedExtentState, SummaryFooter,
     SummaryHeader, SummaryReader, export_summary, init_volume, init_volume_with_clock, recover_fs,

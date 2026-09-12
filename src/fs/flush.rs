@@ -338,6 +338,8 @@ impl InMemoryFS {
         };
         self.flusher.run_locked(|| {
             loop {
+                let started_at = self.clock.now();
+                let timer = std::time::Instant::now();
                 let batch = {
                     let mut inner = self.inner.lock(OpTag::Flush).unwrap();
                     // The freeze belongs to whoever decided one was needed - an fsync, a
@@ -369,13 +371,23 @@ impl InMemoryFS {
                     inner.fold_entries(entries);
                     popped
                 };
+                let record = super::FlushRecord {
+                    id: popped.id,
+                    reason: popped.reason,
+                    bytes: popped.bytes,
+                    ops: popped.ops,
+                    started_at,
+                    duration: timer.elapsed(),
+                };
                 log::debug!(
-                    "Flushed batch {} ({}): {} bytes, {} ops",
-                    popped.id,
-                    popped.reason,
-                    popped.bytes,
-                    popped.ops
+                    "Flushed batch {} ({}): {} bytes, {} ops in {:?}",
+                    record.id,
+                    record.reason,
+                    record.bytes,
+                    record.ops,
+                    record.duration
                 );
+                self.flusher.record_flush(record);
                 popped.completion.complete(Ok(()));
             }
 
@@ -460,6 +472,11 @@ impl InMemoryFS {
             self.notify_replication();
             Ok(Some((next_gen, sealed_md5)))
         })
+    }
+
+    /// Flush counters and recent history, for `.status` and diagnostics.
+    pub fn flush_stats(&self) -> super::FlushStats {
+        self.flusher.stats()
     }
 
     /// Number of frozen batches currently waiting to be written to the log.

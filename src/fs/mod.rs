@@ -34,7 +34,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 pub type DirSnapshot = Arc<Vec<(String, u64)>>;
 
@@ -276,6 +276,26 @@ pub enum FlushReason {
 }
 
 impl FlushReason {
+    /// Every reason, in the order they are reported.
+    pub const ALL: [FlushReason; 5] = [
+        FlushReason::Fsync,
+        FlushReason::Fsyncdir,
+        FlushReason::Quiesce,
+        FlushReason::Inactivity,
+        FlushReason::Threshold,
+    ];
+
+    /// Position in [`FlushReason::ALL`], for indexing per-reason counters.
+    pub fn index(&self) -> usize {
+        match self {
+            FlushReason::Fsync => 0,
+            FlushReason::Fsyncdir => 1,
+            FlushReason::Quiesce => 2,
+            FlushReason::Inactivity => 3,
+            FlushReason::Threshold => 4,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             FlushReason::Fsync => "fsync",
@@ -290,6 +310,59 @@ impl FlushReason {
 impl fmt::Display for FlushReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// How many recent flushes `.status` keeps. Enough to show a pattern, small enough that the
+/// history costs nothing to hold or copy.
+pub const FLUSH_HISTORY_CAPACITY: usize = 16;
+
+/// What one completed flush cost.
+///
+/// `started_at` comes from the injected clock, like every other timestamp reported by
+/// `.status`. `duration` is measured with `Instant`, because it is an elapsed time rather
+/// than a point in time: a `SystemTime` delta can run backwards across an NTP step, and
+/// under a mocked clock it would always be zero. Nothing here is persisted, so the
+/// determinism the injected clock exists to protect is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlushRecord {
+    /// Identifier of the batch this records.
+    pub id: u64,
+    /// Why the batch was frozen.
+    pub reason: FlushReason,
+    /// Staged data bytes the batch carried.
+    pub bytes: usize,
+    /// Mutating operations the batch carried.
+    pub ops: usize,
+    /// When the flusher started writing the batch.
+    pub started_at: SystemTime,
+    /// How long writing, syncing, and folding it took.
+    pub duration: Duration,
+}
+
+/// Point-in-time copy of the flusher's counters and its recent history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlushStats {
+    /// Whether a background thread is running cycles.
+    pub background: bool,
+    /// Inactivity interval, or `None` when only explicit wake-ups drive the flusher.
+    pub interval: Option<Duration>,
+    /// Batches completed since mount.
+    pub total_batches: u64,
+    /// Staged data bytes flushed since mount.
+    pub total_bytes: u64,
+    /// Mutating operations flushed since mount.
+    pub total_ops: u64,
+    /// Batches completed per reason, indexed by [`FlushReason::index`].
+    pub by_reason: [u64; 5],
+    /// The most recent completions, oldest first, capped at [`FLUSH_HISTORY_CAPACITY`].
+    pub recent: Vec<FlushRecord>,
+}
+
+impl FlushStats {
+    /// Batches completed for `reason` since mount.
+    pub fn count_for(&self, reason: FlushReason) -> u64 {
+        self.by_reason[reason.index()]
     }
 }
 

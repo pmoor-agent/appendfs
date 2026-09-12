@@ -10,7 +10,8 @@
 //! on the thread that asked for it. Both modes go through the same `wake` / `quiesce` calls,
 //! so no caller has to know which one it is talking to.
 
-use super::InMemoryFS;
+use super::{FLUSH_HISTORY_CAPACITY, FlushRecord, FlushStats, InMemoryFS};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
@@ -19,6 +20,16 @@ use std::time::Duration;
 /// How long the background thread waits before retrying a cycle that failed, rather than
 /// sitting out the full inactivity interval while a transient error keeps the queue stalled.
 const RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Counters and recent history, updated once per completed batch.
+#[derive(Default)]
+struct Telemetry {
+    total_batches: u64,
+    total_bytes: u64,
+    total_ops: u64,
+    by_reason: [u64; 5],
+    recent: VecDeque<FlushRecord>,
+}
 
 #[derive(Default)]
 struct Wakeup {
@@ -39,6 +50,10 @@ pub(crate) struct Flusher {
     /// Serializes flush cycles. Uncontended in background mode, where only one thread runs
     /// them; in inline mode it keeps concurrent callers from writing to the log at once.
     cycle_lock: Mutex<()>,
+    /// Inactivity interval the thread was started with, kept for reporting.
+    interval: Mutex<Option<Duration>>,
+    /// Flush counters and history. Touched once per batch, never on a read path.
+    telemetry: Mutex<Telemetry>,
     /// Whether a cycle is running, so debug builds can assert that nothing writes to the
     /// log from outside one.
     in_cycle: AtomicBool,
@@ -58,6 +73,8 @@ impl Flusher {
             background: AtomicBool::new(false),
             cycle_lock: Mutex::new(()),
             in_cycle: AtomicBool::new(false),
+            interval: Mutex::new(None),
+            telemetry: Mutex::new(Telemetry::default()),
         }
     }
 
@@ -85,6 +102,7 @@ impl Flusher {
             .expect("failed to spawn flusher thread");
 
         *thread = Some(handle);
+        *self.interval.lock().unwrap() = interval;
         self.background.store(true, Ordering::SeqCst);
         log::info!(
             "Started flusher thread (inactivity interval: {})",
@@ -126,6 +144,33 @@ impl Flusher {
         }
         self.background.store(false, Ordering::SeqCst);
         was_running
+    }
+
+    /// Records a completed batch, evicting the oldest history entry once full.
+    pub(crate) fn record_flush(&self, record: FlushRecord) {
+        let mut telemetry = self.telemetry.lock().unwrap();
+        telemetry.total_batches += 1;
+        telemetry.total_bytes += record.bytes as u64;
+        telemetry.total_ops += record.ops as u64;
+        telemetry.by_reason[record.reason.index()] += 1;
+        if telemetry.recent.len() == FLUSH_HISTORY_CAPACITY {
+            telemetry.recent.pop_front();
+        }
+        telemetry.recent.push_back(record);
+    }
+
+    /// Copies out the counters and history for reporting.
+    pub(crate) fn stats(&self) -> FlushStats {
+        let telemetry = self.telemetry.lock().unwrap();
+        FlushStats {
+            background: self.is_background(),
+            interval: *self.interval.lock().unwrap(),
+            total_batches: telemetry.total_batches,
+            total_bytes: telemetry.total_bytes,
+            total_ops: telemetry.total_ops,
+            by_reason: telemetry.by_reason,
+            recent: telemetry.recent.iter().cloned().collect(),
+        }
     }
 
     /// Runs `cycle` with the cycle lock held, so only one runs at a time.
@@ -319,6 +364,87 @@ mod tests {
         assert!(
             fs.manifest.read().unwrap().logs.iter().any(|l| l.generation == 1),
             "the sealed generation must be recorded in the manifest"
+        );
+    }
+
+    #[test]
+    fn test_flush_stats_count_batches_bytes_and_reasons() {
+        let fs = test_fs();
+
+        // Fsync: freezes `live` itself, so the following quiesce finds nothing new to name.
+        stage_a_write(&fs, "a.bin");
+        fs.rollover_for_fsync(1, 0, crate::fs::FlushReason::Fsync).unwrap();
+        fs.quiesce().unwrap();
+
+        // Quiesce: nothing has frozen this one yet, so it names the batch.
+        stage_a_write(&fs, "b.bin");
+        fs.quiesce().unwrap();
+
+        let stats = fs.flush_stats();
+        assert_eq!(stats.total_batches, 2);
+        assert_eq!(stats.count_for(crate::fs::FlushReason::Fsync), 1);
+        assert_eq!(stats.count_for(crate::fs::FlushReason::Quiesce), 1);
+        assert_eq!(stats.count_for(crate::fs::FlushReason::Threshold), 0);
+        assert!(stats.total_bytes > 0);
+        assert_eq!(
+            stats.total_ops as usize,
+            stats.recent.iter().map(|r| r.ops).sum::<usize>()
+        );
+        assert!(!stats.background, "an unstarted flusher reports inline");
+
+        // The history agrees with the counters, oldest first.
+        let reasons: Vec<_> = stats.recent.iter().map(|r| r.reason).collect();
+        assert_eq!(
+            reasons,
+            vec![crate::fs::FlushReason::Fsync, crate::fs::FlushReason::Quiesce]
+        );
+    }
+
+    #[test]
+    fn test_flush_history_is_capped_and_evicts_the_oldest() {
+        let fs = test_fs();
+        let total = crate::fs::FLUSH_HISTORY_CAPACITY + 4;
+        for i in 0..total {
+            stage_a_write(&fs, &format!("f{}.bin", i));
+            fs.quiesce().unwrap();
+        }
+
+        let stats = fs.flush_stats();
+        assert_eq!(
+            stats.total_batches as usize, total,
+            "counters keep counting past the cap"
+        );
+        assert_eq!(stats.recent.len(), crate::fs::FLUSH_HISTORY_CAPACITY);
+
+        // What survives is the newest window, still in order.
+        let ids: Vec<u64> = stats.recent.iter().map(|r| r.id).collect();
+        let newest = *ids.last().unwrap();
+        let expected: Vec<u64> = ((newest - (crate::fs::FLUSH_HISTORY_CAPACITY as u64 - 1))..=newest).collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn test_status_reports_the_flusher_section() {
+        let fs = test_fs();
+        let empty = crate::stats::format_runtime_status(&fs);
+        assert!(empty.contains("[Flusher]"));
+        assert!(empty.contains("Recent Flushes:     None"));
+        assert!(empty.contains("By Reason:          None"));
+
+        stage_a_write(&fs, "status.bin");
+        fs.quiesce().unwrap();
+
+        let status = crate::stats::format_runtime_status(&fs);
+        assert!(status.contains("Batches Flushed:    1"));
+        assert!(
+            status.contains("quiesce 1"),
+            "per-reason counts must be reported: {}",
+            status
+        );
+        assert!(
+            status.contains("inline (runs on the calling thread)"),
+            "mode must be reported: {}",
+            status
         );
     }
 
