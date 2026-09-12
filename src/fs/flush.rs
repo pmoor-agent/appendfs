@@ -5,7 +5,7 @@
 //! trailing `FlushCommit` confirming atomic persistence. Recovery replays `LogEntryDelta`
 //! records directly onto `base`, guaranteeing identical state transitions across crash recovery.
 
-use super::{FlushBatch, FlushReason, FsInner, InMemoryFS};
+use super::{FlushReason, FsInner, InMemoryFS};
 use crate::extent_map::Extent;
 use crate::log::{GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE};
 use crate::node::{EntryDelta, NodeDelta, NodeKind};
@@ -57,7 +57,7 @@ impl InMemoryFS {
 
     /// Pops the front batch from the flushing queue, if any.
     #[cfg(any(test, feature = "testing"))]
-    pub fn pop_flushing_batch(&self) -> Option<FlushBatch> {
+    pub fn pop_flushing_batch(&self) -> Option<super::FlushBatch> {
         self.inner.lock(OpTag::Flush).unwrap().pop_flushing_batch()
     }
 
