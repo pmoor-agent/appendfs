@@ -183,7 +183,7 @@ fn run_background(weak: &Weak<InMemoryFS>, wakeup: &Arc<(Mutex<Wakeup>, Condvar)
         // Nobody asked for this cycle, so nobody has frozen `live`. Ask on their behalf -
         // this is the inactivity flush.
         if idle {
-            fs.request_freeze();
+            fs.request_freeze(crate::fs::FlushReason::Inactivity);
         }
         // Back off briefly rather than sitting out the whole interval, so a transient
         // failure does not strand committed mutations in the queue.

@@ -364,12 +364,12 @@ pub fn releasedir(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
 
 #[cfg(any(test, feature = "testing"))]
 pub async fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), i32> {
-    crate::operations::read_write::fsync_core(fs, 0, 0).await
+    crate::operations::read_write::fsync_core_with_reason(fs, 0, 0, crate::fs::FlushReason::Fsyncdir).await
 }
 
 pub fn fsyncdir(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool) {
     log::trace!("fsyncdir(ino={}, datasync={})", ino, datasync);
-    crate::operations::read_write::fsync(fs, req, 0, datasync, 0);
+    crate::operations::read_write::fsync_with_reason(fs, req, 0, 0, crate::fs::FlushReason::Fsyncdir);
 }
 
 #[cfg(test)]

@@ -256,6 +256,43 @@ impl BatchCompletion {
     }
 }
 
+/// Why a batch was frozen out of `live`.
+///
+/// Decided by whoever asked for the freeze, carried on the batch through to completion, so
+/// a flush can always account for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushReason {
+    /// Explicit POSIX file sync (`fsync`).
+    Fsync,
+    /// Explicit POSIX directory sync (`fsyncdir`).
+    Fsyncdir,
+    /// An explicit sync point: `quiesce`, and through it unmount, summary export, and the
+    /// one-shot CLI tools.
+    Quiesce,
+    /// The flusher's inactivity tick, with nobody waiting.
+    Inactivity,
+    /// Staged bytes or ops in `live` reached the configured flush thresholds.
+    Threshold,
+}
+
+impl FlushReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FlushReason::Fsync => "fsync",
+            FlushReason::Fsyncdir => "fsyncdir",
+            FlushReason::Quiesce => "quiesce",
+            FlushReason::Inactivity => "inactivity",
+            FlushReason::Threshold => "threshold",
+        }
+    }
+}
+
+impl fmt::Display for FlushReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// An immutable frozen batch of mutations being written to the log, holding its
 /// corresponding write arena chunk buffers and batch statistics.
 #[derive(Debug, Clone)]
@@ -266,6 +303,8 @@ pub struct FlushBatch {
     pub bytes: usize,
     pub ops: usize,
     pub completion: BatchCompletion,
+    /// Why this batch was frozen.
+    pub reason: FlushReason,
 }
 
 impl FlushBatch {
@@ -278,6 +317,7 @@ impl FlushBatch {
         bytes: usize,
         ops: usize,
         completion: BatchCompletion,
+        reason: FlushReason,
     ) -> Self {
         assert!(!entries.is_empty(), "FlushBatch must contain at least one entry");
         Self {
@@ -287,6 +327,7 @@ impl FlushBatch {
             bytes,
             ops,
             completion,
+            reason,
         }
     }
 }
@@ -306,9 +347,12 @@ pub struct FsInner {
     /// Completion handle for whatever is currently in `live`, travelling with the data when
     /// it is frozen. Lets a waiter register before the batch it will belong to exists.
     pub live_completion: BatchCompletion,
-    /// Set when someone needs `live` flushed regardless of how little is staged - an fsync, a
-    /// `quiesce`, or the flusher's own inactivity tick. Cleared by the freeze that honors it.
-    pub freeze_requested: bool,
+    /// Set when someone needs `live` flushed regardless of how little is staged, recording
+    /// why. Taken by the freeze that honors it, which stamps the reason onto the batch.
+    ///
+    /// First request wins: a second one arriving before the freeze does not relabel a
+    /// caller that has already been waiting.
+    pub freeze_requested: Option<FlushReason>,
     /// Active open handles (regular files, virtual files, and directories) keyed by allocated handle ID (`fh`).
     pub handles: HandleMap,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
@@ -401,18 +445,20 @@ impl FsInner {
             // Whoever registered on `live` while these entries were staged now waits on the
             // batch that carries them; `live` starts over with a fresh handle.
             let completion = std::mem::take(&mut self.live_completion);
-            self.freeze_requested = false;
+            // An outstanding request names this batch even when a threshold is what finally
+            // tripped the freeze - the requester's data is in here either way.
+            let reason = self.freeze_requested.take().unwrap_or(FlushReason::Threshold);
             self.flushing
-                .push_back(FlushBatch::new(id, entries, arena, bytes, ops, completion));
+                .push_back(FlushBatch::new(id, entries, arena, bytes, ops, completion, reason));
             true
         } else {
             false
         }
     }
 
-    /// Merges a flushed batch into `base`.
-    pub fn fold_flushed_batch(&mut self, flushed: FlushBatch) {
-        for (ino, entry) in flushed.entries {
+    /// Merges a set of committed deltas into `base`.
+    pub fn fold_entries(&mut self, entries: HashMap<u64, EntryDelta>) {
+        for (ino, entry) in entries {
             match entry {
                 EntryDelta::Tombstone => {
                     self.base.remove(&ino);
@@ -697,7 +743,7 @@ impl InMemoryFS {
             live: HashMap::new(),
             live_arena: WriteArena::new(),
             live_completion: BatchCompletion::new(),
-            freeze_requested: false,
+            freeze_requested: None,
             handles: HashMap::new(),
             open_counts: HashMap::new(),
             next_fh: 1,

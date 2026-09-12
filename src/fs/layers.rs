@@ -828,6 +828,7 @@ mod tests {
             0,
             0,
             crate::fs::BatchCompletion::new(),
+            crate::fs::FlushReason::Threshold,
         ));
 
         // 3. Live layer: Staged extent at 30..50
