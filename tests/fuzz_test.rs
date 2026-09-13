@@ -678,7 +678,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 fs_remote.remotes[r_idx].fail_next_n_requests(1);
             }
             // 2. Periodic sync cycle (progressing replication and local log pruning)
-            if step % 3 == 0 {
+            if step % 30 == 0 {
                 fs_remote.sync_remotes();
             }
             // 3. Spontaneous deletion with single-survivor invariant:
