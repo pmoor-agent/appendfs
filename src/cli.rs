@@ -319,17 +319,13 @@ pub struct MountCommonArgs {
     #[arg(long = "log-level", default_value = crate::logging::DEFAULT_LOG_LEVEL)]
     pub log_level: String,
 
-    /// Diagnostic log file (default: <log-dir>/logs/appendfs.log)
+    /// Diagnostic log file (default: <log-dir>/logs/appendfs-<date>-<time>-<pid>.log)
     #[arg(long = "log-file")]
     pub log_file: Option<PathBuf>,
 
     /// Log only to stderr. A backgrounded mount has no stderr, so its logs are discarded.
     #[arg(long = "no-log-file", default_value_t = false)]
     pub no_log_file: bool,
-
-    /// Size at which the diagnostic log rotates; one previous file is kept (default: 16 MiB)
-    #[arg(long = "log-max-size", default_value_t = crate::logging::DEFAULT_LOG_MAX_BYTES)]
-    pub log_max_size: u64,
 
     /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
     #[arg(long = "key-file")]

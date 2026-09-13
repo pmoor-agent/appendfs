@@ -289,7 +289,6 @@ fn init_mount_logging(args: &appendfs::cli::MountCommonArgs) {
     match appendfs::logging::init_for_mount(
         &args.log_dir,
         args.log_file.as_deref(),
-        args.log_max_size,
         &args.log_level,
         args.foreground,
     ) {

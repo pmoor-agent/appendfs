@@ -538,7 +538,7 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
     // The operator is told where the logs went, since a daemonized mount leaves no other clue.
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("Logging to") && stdout.contains("logs/appendfs.log"),
+        stdout.contains("Logging to") && stdout.contains("logs/appendfs-"),
         "startup must report the log location, got: {}",
         stdout
     );
@@ -566,15 +566,27 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
     );
     assert!(unmounted, "failed to unmount");
 
-    let log_file = log_dir.path().join("logs").join("appendfs.log");
+    // One file for this run, named for when it started and which process it was.
+    let logs_dir = log_dir.path().join("logs");
     assert!(
         appendfs::wait_until(
-            || log_file.metadata().map(|m| m.len() > 0).unwrap_or(false),
+            || {
+                std::fs::read_dir(&logs_dir)
+                    .map(|entries| {
+                        entries.flatten().any(|e| {
+                            e.file_name().to_string_lossy().starts_with("appendfs-")
+                                && e.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            },
             Duration::from_secs(5)
         ),
-        "a backgrounded mount must still leave logs at {}",
-        log_file.display()
+        "a backgrounded mount must still leave logs in {}",
+        logs_dir.display()
     );
+    let written: Vec<_> = std::fs::read_dir(&logs_dir).unwrap().flatten().collect();
+    assert_eq!(written.len(), 1, "one run must leave exactly one log file");
 
     // The volume itself is unaffected: the log lives in a subdirectory, so nothing that
     // scans the log directory for generations or summaries can see it.

@@ -5,7 +5,12 @@
 //! was being discarded. Long-running mounts are exactly the ones worth having logs for, so
 //! they write to a file inside the volume's own log directory instead.
 //!
-//! The file lives in a `logs/` subdirectory rather than beside the `.log` and `.summary`
+//! Each run gets its own file, named for the time it started and its pid. There is no
+//! rotation to reason about, two mounts of the same volume cannot interleave their records,
+//! and a crashed run's log stays exactly as it was left rather than being overwritten by the
+//! restart.
+//!
+//! The files live in a `logs/` subdirectory rather than beside the `.log` and `.summary`
 //! generation files. `Storage::list_files` is non-recursive and returns only files, so
 //! nothing in a subdirectory can be mistaken for a volume file by recovery, replication, or
 //! pruning - the same reasoning that puts the block cache in `.cache/`.
@@ -16,92 +21,69 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Subdirectory of the volume log directory holding diagnostic logs.
 pub const LOG_SUBDIR: &str = "logs";
 
-/// Filename written inside [`LOG_SUBDIR`].
-pub const LOG_FILENAME: &str = "appendfs.log";
-
-/// Default size at which the log rotates. Two files are kept, so this bounds the footprint
-/// at roughly twice this value.
-pub const DEFAULT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
-
 /// Default filter applied when neither `--log-level` nor `RUST_LOG` says otherwise.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
-/// The conventional location of a volume's diagnostic log.
-pub fn default_log_path(log_dir: &Path) -> PathBuf {
-    log_dir.join(LOG_SUBDIR).join(LOG_FILENAME)
+/// The directory a volume's diagnostic logs are written to.
+pub fn log_directory(log_dir: &Path) -> PathBuf {
+    log_dir.join(LOG_SUBDIR)
 }
 
-/// A log file that renames itself out of the way once it grows past `max_bytes`.
+/// Names one run's log file: `appendfs-<YYYYMMDD>-<HHMMSS>-<pid>.log`.
 ///
-/// One previous generation is kept, as `<name>.1`. That is enough to survive the rotation
-/// that happens just as something interesting is being logged, without the bookkeeping of a
-/// full retention policy.
-struct RotatingLog {
-    path: PathBuf,
-    /// `None` once opening has failed; records are dropped rather than propagated.
+/// The timestamp sorts chronologically and the pid disambiguates two mounts started within
+/// the same second, so a name is never reused and no run can clobber another's log.
+pub fn log_file_name(started: SystemTime, pid: u32) -> String {
+    format!("appendfs-{}-{}.log", crate::clock::format_utc_compact(started), pid)
+}
+
+/// The log file for a run starting now.
+pub fn log_file_path(log_dir: &Path, started: SystemTime, pid: u32) -> PathBuf {
+    log_directory(log_dir).join(log_file_name(started, pid))
+}
+
+/// A log file that drops records rather than failing, and optionally echoes to stderr.
+struct LogSink {
+    /// `None` once writing has failed; records are dropped rather than propagated.
     file: Option<File>,
-    written: u64,
-    max_bytes: u64,
     tee_stderr: bool,
 }
 
-impl RotatingLog {
-    fn open(path: PathBuf, max_bytes: u64, tee_stderr: bool) -> io::Result<Self> {
+impl LogSink {
+    fn create(path: &Path, tee_stderr: bool) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        // Appending to an existing log, so rotation has to account for what is already there.
-        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        // `append` rather than truncate: an explicit `--log-file` may name an existing file,
+        // and losing its contents on mount would be a poor surprise.
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
-            path,
             file: Some(file),
-            written,
-            max_bytes,
             tee_stderr,
         })
     }
-
-    fn rotate(&mut self) {
-        // Close before renaming so the reopened handle is the new file, not the old inode.
-        self.file = None;
-        let mut backup = self.path.clone().into_os_string();
-        backup.push(".1");
-        let _ = fs::rename(&self.path, PathBuf::from(backup));
-        self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
-        self.written = 0;
-    }
 }
 
-impl Write for RotatingLog {
+impl Write for LogSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.tee_stderr {
             let _ = io::stderr().write_all(buf);
         }
 
-        // Rotate on the record that would cross the limit, never mid-record, so a rotated
-        // file never ends with half a line.
-        if self.written > 0 && self.written.saturating_add(buf.len() as u64) > self.max_bytes {
-            self.rotate();
-        }
-
         // A logging failure must not surface as a filesystem error, so this reports success
         // either way and simply stops writing.
         match self.file {
-            Some(ref mut file) => match file.write(buf) {
-                Ok(n) => {
-                    self.written += n as u64;
-                    Ok(buf.len())
-                }
-                Err(_) => {
+            Some(ref mut file) => {
+                if file.write_all(buf).is_err() {
                     self.file = None;
-                    Ok(buf.len())
                 }
-            },
+                Ok(buf.len())
+            }
             None => Ok(buf.len()),
         }
     }
@@ -125,27 +107,23 @@ pub fn init_stderr(level: &str) {
     builder(level).init();
 }
 
-/// Initializes logging for a mount: a rotating file under the volume's log directory, plus
-/// stderr while running in the foreground.
+/// Initializes logging for a mount: a file of this run's own under the volume's log
+/// directory, plus stderr while running in the foreground.
 ///
-/// `log_dir` is canonicalized first, because `fuse_daemonize` chdirs to `/` and rotation
-/// reopens the log by path afterwards. Returns the path being written to, or `None` if the
-/// file could not be opened - in which case logging falls back to stderr and the mount
-/// proceeds regardless, since a volume on read-only media is still worth mounting.
-pub fn init_for_mount(
-    log_dir: &Path,
-    explicit_path: Option<&Path>,
-    max_bytes: u64,
-    level: &str,
-    foreground: bool,
-) -> Option<PathBuf> {
+/// `log_dir` is canonicalized first, because `fuse_daemonize` chdirs to `/` shortly after
+/// this returns. Returns the path being written to, or `None` if the file could not be
+/// created - in which case logging falls back to stderr and the mount proceeds regardless,
+/// since a volume on read-only media is still worth mounting.
+pub fn init_for_mount(log_dir: &Path, explicit_path: Option<&Path>, level: &str, foreground: bool) -> Option<PathBuf> {
     let path = match explicit_path {
         Some(p) => p.to_path_buf(),
-        None => default_log_path(&fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf())),
+        None => {
+            let root = fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
+            log_file_path(&root, SystemTime::now(), std::process::id())
+        }
     };
-    let path = fs::canonicalize(&path).unwrap_or(path);
 
-    match RotatingLog::open(path.clone(), max_bytes, foreground) {
+    match LogSink::create(&path, foreground) {
         Ok(sink) => {
             builder(level).target(env_logger::Target::Pipe(Box::new(sink))).init();
             Some(path)
@@ -161,11 +139,23 @@ pub fn init_for_mount(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
-    fn test_default_log_path_is_below_the_volume_directory() {
-        let path = default_log_path(Path::new("/srv/vol"));
-        assert_eq!(path, PathBuf::from("/srv/vol/logs/appendfs.log"));
+    fn test_log_file_name_identifies_the_run() {
+        let started = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
+        assert_eq!(log_file_name(started, 4242), "appendfs-20251217-193320-4242.log");
+    }
+
+    #[test]
+    fn test_concurrent_runs_never_share_a_file() {
+        // Two mounts of the same volume starting in the same second must not interleave
+        // their records, which is what the pid is for.
+        let started = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
+        assert_ne!(log_file_name(started, 1), log_file_name(started, 2));
+
+        // And a later run sorts after an earlier one.
+        assert!(log_file_name(started, 9) < log_file_name(started + Duration::from_secs(1), 1));
     }
 
     #[test]
@@ -174,11 +164,13 @@ mod tests {
         // file: `list_files` is non-recursive and file-only, so a subdirectory is invisible.
         let dir = tempfile::tempdir().unwrap();
         let storage = crate::storage::OsStorage::new(dir.path());
-        let mut sink = RotatingLog::open(default_log_path(dir.path()), 1024, false).unwrap();
+        let path = log_file_path(dir.path(), SystemTime::now(), std::process::id());
+
+        let mut sink = LogSink::create(&path, false).unwrap();
         sink.write_all(b"a log record\n").unwrap();
         sink.flush().unwrap();
 
-        assert!(dir.path().join("logs").join(LOG_FILENAME).exists());
+        assert!(path.exists());
         let listed = crate::storage::Storage::list_files(&storage).unwrap();
         assert!(
             listed.is_empty(),
@@ -188,69 +180,32 @@ mod tests {
     }
 
     #[test]
-    fn test_rotation_keeps_one_previous_generation() {
+    fn test_a_second_run_leaves_the_first_run_intact() {
+        // A crashed run's log has to survive the restart that follows it.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("logs").join(LOG_FILENAME);
-        let mut sink = RotatingLog::open(path.clone(), 64, false).unwrap();
+        let started = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
 
-        for i in 0..40 {
-            sink.write_all(format!("record {:03} padding padding\n", i).as_bytes())
-                .unwrap();
-        }
+        let first = log_file_path(dir.path(), started, 1);
+        let mut sink = LogSink::create(&first, false).unwrap();
+        sink.write_all(b"from the first run\n").unwrap();
+        sink.flush().unwrap();
+        drop(sink);
+
+        let second = log_file_path(dir.path(), started + Duration::from_secs(5), 2);
+        let mut sink = LogSink::create(&second, false).unwrap();
+        sink.write_all(b"from the second run\n").unwrap();
         sink.flush().unwrap();
 
-        let backup = PathBuf::from({
-            let mut b = path.clone().into_os_string();
-            b.push(".1");
-            b
-        });
-        assert!(path.exists(), "the active log must exist after rotating");
-        assert!(backup.exists(), "one previous generation must be kept");
-
-        // Bounded: each file holds at most one record beyond the limit, and nothing else
-        // accumulates alongside them.
-        let entries: Vec<_> = fs::read_dir(dir.path().join("logs")).unwrap().flatten().collect();
-        assert_eq!(entries.len(), 2, "rotation must not accumulate files");
-        for entry in entries {
-            assert!(
-                entry.metadata().unwrap().len() <= 64 + 32,
-                "each generation stays near the limit"
-            );
-        }
-
-        // The newest records survive; rotation drops the oldest, not the newest.
-        let active = fs::read_to_string(&path).unwrap();
-        assert!(active.contains("record 039"), "active log holds the newest record");
-    }
-
-    #[test]
-    fn test_rotation_never_splits_a_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("logs").join(LOG_FILENAME);
-        let mut sink = RotatingLog::open(path.clone(), 32, false).unwrap();
-        for i in 0..10 {
-            sink.write_all(format!("{:02}: a complete record\n", i).as_bytes())
-                .unwrap();
-        }
-        sink.flush().unwrap();
-
-        for file in fs::read_dir(dir.path().join("logs")).unwrap().flatten() {
-            let contents = fs::read_to_string(file.path()).unwrap();
-            for line in contents.lines() {
-                assert!(
-                    line.ends_with("a complete record"),
-                    "rotation split a record: {:?}",
-                    line
-                );
-            }
-        }
+        assert_eq!(fs::read_to_string(&first).unwrap(), "from the first run\n");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "from the second run\n");
     }
 
     #[test]
     fn test_writes_keep_succeeding_after_the_file_is_lost() {
         // A filesystem must not fail because its log file did.
         let dir = tempfile::tempdir().unwrap();
-        let mut sink = RotatingLog::open(default_log_path(dir.path()), 1024, false).unwrap();
+        let path = log_file_path(dir.path(), SystemTime::now(), std::process::id());
+        let mut sink = LogSink::create(&path, false).unwrap();
         sink.write_all(b"before\n").unwrap();
         sink.file = None;
         assert!(sink.write_all(b"after\n").is_ok(), "a lost log file must be survivable");
