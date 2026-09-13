@@ -414,7 +414,68 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push_str(&format!("    Last Summary Gen: {}\n", last_summary_gen));
     out.push('\n');
 
-    // 4. Cache Stats
+    // 4. Flusher
+    let flush = fs.flush_stats();
+    out.push_str("[Flusher]\n");
+    out.push_str(&format!(
+        "  Mode:               {}\n",
+        match (flush.background, flush.interval) {
+            (true, Some(i)) => format!("background (flushes after {} idle)", format_duration(i)),
+            (true, None) => "background (no inactivity flush)".to_string(),
+            (false, _) => "inline (runs on the calling thread)".to_string(),
+        }
+    ));
+    out.push_str(&format!(
+        "  Batches Flushed:    {} ({}, {} ops)\n",
+        flush.total_batches,
+        format_bytes(flush.total_bytes),
+        flush.total_ops
+    ));
+    out.push_str(&format!(
+        "  Time Flushing:      {} to disk, {} folding into base\n",
+        format_duration(flush.total_persist),
+        format_duration(flush.total_fold)
+    ));
+    let reasons: Vec<String> = crate::fs::FlushReason::ALL
+        .iter()
+        .filter(|r| flush.count_for(**r) > 0)
+        .map(|r| format!("{} {}", r, flush.count_for(*r)))
+        .collect();
+    out.push_str(&format!(
+        "  By Reason:          {}\n",
+        if reasons.is_empty() {
+            "None".to_string()
+        } else {
+            reasons.join(", ")
+        }
+    ));
+    if flush.recent.is_empty() {
+        out.push_str("  Recent Flushes:     None\n");
+    } else {
+        out.push_str("  Recent Flushes:\n");
+        out.push_str(&format!(
+            "    {:<7} {:<11} {:>10} {:>7}  {:>10} {:>10} {:>10}  {}\n",
+            "batch", "reason", "bytes", "ops", "disk", "fold", "total", "age"
+        ));
+        let now = fs.clock.now();
+        for record in flush.recent.iter().rev() {
+            let age = now.duration_since(record.started_at).unwrap_or_default().as_secs();
+            out.push_str(&format!(
+                "    #{:<6} {:<11} {:>10} {:>7}  {:>10} {:>10} {:>10}  {}s ago\n",
+                record.id,
+                record.reason,
+                format_bytes(record.bytes as u64),
+                record.ops,
+                format_duration(record.persist),
+                format_duration(record.fold),
+                format_duration(record.duration),
+                age
+            ));
+        }
+    }
+    out.push('\n');
+
+    // 5. Cache Stats
     out.push_str("[Cache]\n");
     if let Some(ref log_cache) = fs.log_cache {
         let cur_bytes = log_cache.decrypted_cache.current_bytes();
@@ -447,7 +508,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     }
     out.push('\n');
 
-    // 5. Handles & Locks
+    // 6. Handles & Locks
     let (file_handles_count, virt_handles_count, dir_handles_count, open_inodes_count) = {
         let inner = fs.inner.lock(OpTag::Stats).unwrap();
         let (reg, virt, dir) = inner.handle_counts();
@@ -505,7 +566,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         }
     }
 
-    // 6. Replication Remotes (if configured)
+    // 7. Replication Remotes (if configured)
     let remotes_count = fs
         .remote_registry
         .read()

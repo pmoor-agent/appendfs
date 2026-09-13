@@ -1,18 +1,65 @@
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Fixed offset added to every default [`Clock::monotonic`] reading.
+///
+/// Measuring straight from the epoch would make each reading equal to wall-clock time, so a
+/// caller could compare one against a timestamp, or assert on its absolute value, and appear
+/// to be right. Offsetting breaks that coupling and leaves every difference between readings
+/// - the only thing that means anything - unchanged.
+///
+/// The value is arbitrary; it happens to be the epoch's distance from 1981-02-05. Adding
+/// rather than subtracting is what keeps it safe: several mocked clocks in this crate start
+/// within seconds of the epoch, and an origin placed after them would floor `duration_since`
+/// at zero, leaving `elapsed_since` reporting nothing while still looking like it worked.
+pub const MONOTONIC_OFFSET: Duration = Duration::from_secs(350_179_200);
 
 /// Trait abstracting system time measurement for testability.
 pub trait Clock: Send + Sync {
     fn now(&self) -> SystemTime;
+
+    /// Reading from a monotonically non-decreasing source, for measuring elapsed time.
+    ///
+    /// The origin is arbitrary and means nothing on its own: only the difference between two
+    /// readings is meaningful, which [`Clock::elapsed_since`] computes. See
+    /// [`MONOTONIC_OFFSET`] for why the default is not simply time since the epoch.
+    ///
+    /// Wall-clock time is the wrong instrument for a duration - `now()` can step backwards
+    /// across an NTP correction, yielding a negative or absurd interval - so measurements
+    /// take this instead. The default derives it from `now()`, which is what a mocked clock
+    /// wants: a fixed clock reports zero elapsed time, and an advancing one reports exactly
+    /// what the test advanced it by. [`SystemClock`] overrides it with a real monotonic
+    /// source.
+    fn monotonic(&self) -> Duration {
+        MONOTONIC_OFFSET + self.now().duration_since(UNIX_EPOCH).unwrap_or_default()
+    }
+
+    /// Time elapsed since an earlier [`Clock::monotonic`] reading.
+    ///
+    /// Saturates at zero rather than panicking, so a clock that does go backwards degrades
+    /// to an understated measurement instead of taking the caller down.
+    fn elapsed_since(&self, earlier: Duration) -> Duration {
+        self.monotonic().saturating_sub(earlier)
+    }
 }
 
 /// Default system clock implementation backed by `std::time::SystemTime::now()`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
+/// Process-wide origin for [`SystemClock::monotonic`], fixed at its first use.
+fn instant_origin() -> Instant {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
 impl Clock for SystemClock {
     fn now(&self) -> SystemTime {
         SystemTime::now()
+    }
+
+    fn monotonic(&self) -> Duration {
+        instant_origin().elapsed()
     }
 }
 
@@ -299,6 +346,72 @@ mod tests {
         let bytes = crate::wire::serialize(&test_obj).unwrap();
         let deserialized: TimestampTestWrapper = crate::wire::deserialize(&bytes).unwrap();
         assert_eq!(test_obj, deserialized);
+    }
+
+    #[test]
+    fn test_system_clock_monotonic_does_not_run_backwards() {
+        let clock = SystemClock;
+        let first = clock.monotonic();
+        let second = clock.monotonic();
+        assert!(second >= first, "monotonic must be non-decreasing");
+        // The origin is fixed at first use, so readings measure from process start rather
+        // than being a fresh zero each call.
+        assert!(clock.elapsed_since(first) < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_monotonic_readings_are_not_timestamps() {
+        // The origin is arbitrary, and this is what keeps it honest: a reading must not be
+        // usable as - or equal to - wall-clock time, or callers will couple to it by accident.
+        let now = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
+        let clock = MockClock(now);
+        let wall = now.duration_since(UNIX_EPOCH).unwrap();
+
+        assert_ne!(clock.monotonic(), wall, "a reading must not equal the unix timestamp");
+        assert_eq!(clock.monotonic(), wall + MONOTONIC_OFFSET);
+    }
+
+    #[test]
+    fn test_clock_near_the_epoch_still_measures_elapsed_time() {
+        // The reason the origin precedes the epoch. Several mocked clocks in this crate
+        // start seconds after it; an origin later than that would floor them at zero and
+        // measure nothing, silently.
+        let clock = AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1));
+        let start = clock.monotonic();
+        assert!(
+            start > Duration::ZERO,
+            "a near-epoch clock must not clamp to the origin"
+        );
+
+        clock.advance(Duration::from_millis(250));
+        assert_eq!(clock.elapsed_since(start), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn test_mock_clock_reports_zero_elapsed() {
+        let clock = MockClock(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let start = clock.monotonic();
+        assert_eq!(
+            clock.elapsed_since(start),
+            Duration::ZERO,
+            "a fixed clock must make durations reproducible, not merely small"
+        );
+    }
+
+    #[test]
+    fn test_advancing_clock_reports_exactly_what_was_advanced() {
+        let clock = AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let start = clock.monotonic();
+        clock.advance(Duration::from_millis(1500));
+        assert_eq!(clock.elapsed_since(start), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn test_elapsed_since_saturates_rather_than_panicking() {
+        let clock = AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(100));
+        // A reading from "later" than the clock, as a backwards step would produce.
+        let future = clock.monotonic() + Duration::from_secs(10);
+        assert_eq!(clock.elapsed_since(future), Duration::ZERO);
     }
 
     #[test]

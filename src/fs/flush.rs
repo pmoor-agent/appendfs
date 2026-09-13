@@ -338,6 +338,8 @@ impl InMemoryFS {
         };
         self.flusher.run_locked(|| {
             loop {
+                let started_at = self.clock.now();
+                let started_monotonic = self.clock.monotonic();
                 let batch = {
                     let mut inner = self.inner.lock(OpTag::Flush).unwrap();
                     // The freeze belongs to whoever decided one was needed - an fsync, a
@@ -359,8 +361,14 @@ impl InMemoryFS {
                 // rather than under the lock every FUSE operation contends for. The queued
                 // batch keeps its staged extents throughout, which is what readers resolve
                 // against until the fold below replaces them.
+                //
+                // Deliberately outside the `persist` window: that measures the storage
+                // device, and this copy shows up in the remainder instead.
                 let mut entries = batch.entries.clone();
+
+                let persist_start = self.clock.monotonic();
                 self.synthesize_and_write_flushing_layer(&mut entries, writer)?;
+                let fold_start = self.clock.monotonic();
 
                 // Committed and durable: pop it and fold its effects into `base`.
                 let popped = {
@@ -369,13 +377,29 @@ impl InMemoryFS {
                     inner.fold_entries(entries);
                     popped
                 };
+                let finished = self.clock.monotonic();
+
+                let record = super::FlushRecord {
+                    id: popped.id,
+                    reason: popped.reason,
+                    bytes: popped.bytes,
+                    ops: popped.ops,
+                    started_at,
+                    persist: fold_start.saturating_sub(persist_start),
+                    fold: finished.saturating_sub(fold_start),
+                    duration: finished.saturating_sub(started_monotonic),
+                };
                 log::debug!(
-                    "Flushed batch {} ({}): {} bytes, {} ops",
-                    popped.id,
-                    popped.reason,
-                    popped.bytes,
-                    popped.ops
+                    "Flushed batch {} ({}): {} bytes, {} ops in {:?} ({:?} disk, {:?} fold)",
+                    record.id,
+                    record.reason,
+                    record.bytes,
+                    record.ops,
+                    record.duration,
+                    record.persist,
+                    record.fold
                 );
+                self.flusher.record_flush(record);
                 popped.completion.complete(Ok(()));
             }
 
@@ -460,6 +484,11 @@ impl InMemoryFS {
             self.notify_replication();
             Ok(Some((next_gen, sealed_md5)))
         })
+    }
+
+    /// Flush counters and recent history, for `.status` and diagnostics.
+    pub fn flush_stats(&self) -> super::FlushStats {
+        self.flusher.stats()
     }
 
     /// Number of frozen batches currently waiting to be written to the log.
