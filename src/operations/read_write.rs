@@ -611,15 +611,15 @@ pub(crate) fn fsync_with_reason(fs: &InMemoryFS, req: Request, ino: u64, fh: u64
         return;
     };
 
+    // Reply from whichever thread ends up completing the batch. A batch completion already
+    // has to notify its waiters, so this is just one more of them - no task to spawn, no
+    // runtime to keep alive, and nothing to track for a safe unmount. If the batch has
+    // already landed, the callback runs right here.
+    completion.add_callback(Box::new(move |result| match result {
+        Ok(()) => req.reply_err(0),
+        Err(e) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
+    }));
     fs.wake_flusher();
-    let guard = fs.begin_async_op();
-    crate::async_runtime::spawn(async move {
-        let _guard = guard;
-        match completion.wait().await {
-            Ok(()) => req.reply_err(0),
-            Err(e) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
-        }
-    });
 }
 
 pub fn release_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
