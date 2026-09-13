@@ -10,6 +10,7 @@ pub mod dump;
 pub mod extent_map;
 pub mod fs;
 pub mod log;
+pub mod logging;
 pub mod node;
 pub mod operations;
 pub mod remote;

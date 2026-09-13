@@ -40,14 +40,34 @@ pub fn default_epoch() -> SystemTime {
     UNIX_EPOCH
 }
 
+/// Which calendar a `SystemTime` is broken down against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Zone {
+    Local,
+    Utc,
+}
+
+/// Breaks a unix timestamp into calendar fields.
+///
+/// The standard library stops at `Duration` since the epoch - it has no civil calendar at
+/// all - so this is either libc or a date library. libc keeps the dependency list as it is,
+/// and confining the `unsafe` here means the three formatters below share one copy of it.
+/// Returns `None` for a timestamp libc cannot represent.
+fn civil_parts(secs: i64, zone: Zone) -> Option<libc::tm> {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time_t = secs as libc::time_t;
+    let res = match zone {
+        Zone::Local => unsafe { libc::localtime_r(&time_t, &mut tm) },
+        Zone::Utc => unsafe { libc::gmtime_r(&time_t, &mut tm) },
+    };
+    if res.is_null() { None } else { Some(tm) }
+}
+
 /// Formats a `SystemTime` as `<unix_secs>.<nanos>s (YYYY-MM-DD HH:MM:SS)` in local civil time.
 pub fn format_local_civil_time(time: SystemTime) -> String {
     let (secs, nsecs) = system_time_to_unix(time);
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let time_t = secs as libc::time_t;
-    let res = unsafe { libc::localtime_r(&time_t, &mut tm) };
-    if !res.is_null() {
-        format!(
+    match civil_parts(secs, Zone::Local) {
+        Some(tm) => format!(
             "{}.{:09}s ({:04}-{:02}-{:02} {:02}:{:02}:{:02})",
             secs,
             nsecs,
@@ -57,20 +77,16 @@ pub fn format_local_civil_time(time: SystemTime) -> String {
             tm.tm_hour,
             tm.tm_min,
             tm.tm_sec
-        )
-    } else {
-        format!("{}.{:09}s (unknown time)", secs, nsecs)
+        ),
+        None => format!("{}.{:09}s (unknown time)", secs, nsecs),
     }
 }
 
 /// Formats a `SystemTime` as `<unix_secs>.<nanos>s (YYYY-MM-DD HH:MM:SS UTC)`.
 pub fn format_utc_civil_time(time: SystemTime) -> String {
     let (secs, nsecs) = system_time_to_unix(time);
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let time_t = secs as libc::time_t;
-    let res = unsafe { libc::gmtime_r(&time_t, &mut tm) };
-    if !res.is_null() {
-        format!(
+    match civil_parts(secs, Zone::Utc) {
+        Some(tm) => format!(
             "{}.{:09}s ({:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC)",
             secs,
             nsecs,
@@ -80,9 +96,28 @@ pub fn format_utc_civil_time(time: SystemTime) -> String {
             tm.tm_hour,
             tm.tm_min,
             tm.tm_sec
-        )
-    } else {
-        format!("{}.{:09}s (unknown time)", secs, nsecs)
+        ),
+        None => format!("{}.{:09}s (unknown time)", secs, nsecs),
+    }
+}
+
+/// Formats a `SystemTime` as a compact, filename-safe `YYYYMMDD-HHMMSS` in UTC.
+///
+/// UTC rather than local time so that names sort chronologically regardless of the
+/// timezone - or daylight saving transition - the process happened to start in.
+pub fn format_utc_compact(time: SystemTime) -> String {
+    let (secs, _) = system_time_to_unix(time);
+    match civil_parts(secs, Zone::Utc) {
+        Some(tm) => format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        ),
+        None => format!("unknown-{}", secs),
     }
 }
 
@@ -280,6 +315,21 @@ mod tests {
         assert_eq!(&civil_part[10..11], " ");
         assert_eq!(&civil_part[13..14], ":");
         assert_eq!(&civil_part[16..17], ":");
+    }
+
+    #[test]
+    fn test_format_utc_compact_is_filename_safe_and_sorts() {
+        let base = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
+        let early = format_utc_compact(base);
+        let later = format_utc_compact(base + Duration::from_secs(3600));
+
+        assert_eq!(early.len(), 15, "fixed width keeps names aligned: {}", early);
+        assert!(
+            early.chars().all(|c| c.is_ascii_digit() || c == '-'),
+            "must be safe in a filename: {}",
+            early
+        );
+        assert!(early < later, "lexical order must follow chronological order");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use appendfs::storage::{OsStorage, Storage};
 use appendfs::{VolumeStats, check_volume, dump_file, init_volume, recover_fs};
 
 use clap::Parser;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use zeroize::Zeroizing;
@@ -252,8 +252,8 @@ fn prompt_master_key(source: KeySource, key_file: Option<&Path>) -> Result<(Mast
 }
 
 fn main() {
-    env_logger::init();
     let cli = Cli::parse();
+    init_logging(&cli);
 
     match cli.command {
         Commands::Init(args) => cmd_init(args),
@@ -264,6 +264,47 @@ fn main() {
         Commands::Fsck(args) => cmd_fsck(args),
         Commands::Remote(subargs) => cmd_remote(subargs),
     }
+}
+
+/// Points logging at a file, and says where, since a backgrounded mount leaves no other
+/// trace of it.
+fn init_logging(cli: &Cli) {
+    let Some(path) = cli.log_file.clone().or_else(|| default_volume_log(&cli.command)) else {
+        return;
+    };
+
+    if let Some(path) = appendfs::logging::init(&path, &cli.log_level) {
+        println!("Logging to '{}' (level: {})", path.display(), cli.log_level);
+    }
+
+    // First record of every run: what this invocation was, credentials redacted. Makes a log
+    // self-identifying without having to correlate it against shell history.
+    log::info!("{}", appendfs::logging::redacted_command_line());
+}
+
+/// Where a command logs by default: a per-run file in the volume it is operating on.
+fn default_volume_log(command: &Commands) -> Option<PathBuf> {
+    let (volume_dir, may_create) = match command {
+        // `init` is the one command entitled to create the directory it was handed.
+        Commands::Init(args) => (args.log_dir.clone(), true),
+        Commands::Mount(args) => (args.log_dir.clone(), false),
+        Commands::MountRo(args) => (args.log_dir.clone(), false),
+        Commands::Stats(args) => (args.log_dir.clone(), false),
+        Commands::Fsck(args) => (args.log_dir.clone(), false),
+        // `dump` names a log file rather than a volume, so log beside it.
+        Commands::Dump(args) => (args.file.parent()?.to_path_buf(), false),
+        Commands::Remote(sub) => match sub.command {
+            appendfs::cli::RemoteCommands::Add(ref a) => (a.log_dir.clone(), false),
+            appendfs::cli::RemoteCommands::Rm(ref a) => (a.log_dir.clone(), false),
+            appendfs::cli::RemoteCommands::List(ref a) => (a.log_dir.clone(), false),
+        },
+    };
+
+    // A mistyped path should not scatter `logs/` directories across the filesystem.
+    if !may_create && !volume_dir.exists() {
+        return None;
+    }
+    Some(appendfs::logging::run_log_path(&volume_dir))
 }
 
 // TODO(too-many-lines): split the --from-remote bootstrap path out of this handler.
