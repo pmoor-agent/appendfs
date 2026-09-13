@@ -361,8 +361,14 @@ impl InMemoryFS {
                 // rather than under the lock every FUSE operation contends for. The queued
                 // batch keeps its staged extents throughout, which is what readers resolve
                 // against until the fold below replaces them.
+                //
+                // Deliberately outside the `persist` window: that measures the storage
+                // device, and this copy shows up in the remainder instead.
                 let mut entries = batch.entries.clone();
+
+                let persist_start = self.clock.monotonic();
                 self.synthesize_and_write_flushing_layer(&mut entries, writer)?;
+                let fold_start = self.clock.monotonic();
 
                 // Committed and durable: pop it and fold its effects into `base`.
                 let popped = {
@@ -371,21 +377,27 @@ impl InMemoryFS {
                     inner.fold_entries(entries);
                     popped
                 };
+                let finished = self.clock.monotonic();
+
                 let record = super::FlushRecord {
                     id: popped.id,
                     reason: popped.reason,
                     bytes: popped.bytes,
                     ops: popped.ops,
                     started_at,
-                    duration: self.clock.elapsed_since(started_monotonic),
+                    persist: fold_start.saturating_sub(persist_start),
+                    fold: finished.saturating_sub(fold_start),
+                    duration: finished.saturating_sub(started_monotonic),
                 };
                 log::debug!(
-                    "Flushed batch {} ({}): {} bytes, {} ops in {:?}",
+                    "Flushed batch {} ({}): {} bytes, {} ops in {:?} ({:?} disk, {:?} fold)",
                     record.id,
                     record.reason,
                     record.bytes,
                     record.ops,
-                    record.duration
+                    record.duration,
+                    record.persist,
+                    record.fold
                 );
                 self.flusher.record_flush(record);
                 popped.completion.complete(Ok(()));

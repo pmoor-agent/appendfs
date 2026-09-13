@@ -309,7 +309,9 @@ impl FlushReason {
 
 impl fmt::Display for FlushReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        // `pad`, not `write_str`: the latter silently ignores width and alignment, which
+        // quietly breaks any `{:<11}` this is formatted into.
+        f.pad(self.as_str())
     }
 }
 
@@ -333,9 +335,18 @@ pub struct FlushRecord {
     pub bytes: usize,
     /// Mutating operations the batch carried.
     pub ops: usize,
-    /// When the flusher started writing the batch.
+    /// When the flusher picked the batch up.
     pub started_at: SystemTime,
-    /// How long writing, syncing, and folding it took.
+    /// Time spent writing the batch's records to the log and syncing the file.
+    ///
+    /// Separated from `fold` because the two say different things when the flusher falls
+    /// behind: this one is the storage device, `fold` is contention on the inner lock and
+    /// the cost of applying deltas to `base`.
+    pub persist: Duration,
+    /// Time spent popping the batch and applying its deltas to `base`.
+    pub fold: Duration,
+    /// Total, end to end. Exceeds `persist + fold` by whatever the freeze and queue check
+    /// at the head of the cycle cost.
     pub duration: Duration,
 }
 
@@ -352,6 +363,10 @@ pub struct FlushStats {
     pub total_bytes: u64,
     /// Mutating operations flushed since mount.
     pub total_ops: u64,
+    /// Cumulative time spent writing and syncing batches since mount.
+    pub total_persist: Duration,
+    /// Cumulative time spent folding batches into `base` since mount.
+    pub total_fold: Duration,
     /// Batches completed per reason, indexed by [`FlushReason::index`].
     pub by_reason: [u64; 5],
     /// The most recent completions, oldest first, capped at [`FLUSH_HISTORY_CAPACITY`].
@@ -1105,6 +1120,16 @@ pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_flush_reason_display_honors_width() {
+        // `.status` formats these into fixed-width columns. A `Display` impl written with
+        // `write_str` compiles and reads fine but silently ignores the width, shifting every
+        // column after it.
+        assert_eq!(format!("{:<11}|", FlushReason::Fsync), "fsync      |");
+        assert_eq!(format!("{:>11}|", FlushReason::Quiesce), "    quiesce|");
+        assert_eq!(format!("{}", FlushReason::Inactivity), "inactivity");
+    }
 
     #[test]
     fn test_fs_inner_guard_mutation_tracking() {

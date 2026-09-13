@@ -27,6 +27,8 @@ struct Telemetry {
     total_batches: u64,
     total_bytes: u64,
     total_ops: u64,
+    total_persist: Duration,
+    total_fold: Duration,
     by_reason: [u64; 5],
     recent: VecDeque<FlushRecord>,
 }
@@ -152,6 +154,8 @@ impl Flusher {
         telemetry.total_batches += 1;
         telemetry.total_bytes += record.bytes as u64;
         telemetry.total_ops += record.ops as u64;
+        telemetry.total_persist += record.persist;
+        telemetry.total_fold += record.fold;
         telemetry.by_reason[record.reason.index()] += 1;
         if telemetry.recent.len() == FLUSH_HISTORY_CAPACITY {
             telemetry.recent.pop_front();
@@ -168,6 +172,8 @@ impl Flusher {
             total_batches: telemetry.total_batches,
             total_bytes: telemetry.total_bytes,
             total_ops: telemetry.total_ops,
+            total_persist: telemetry.total_persist,
+            total_fold: telemetry.total_fold,
             by_reason: telemetry.by_reason,
             recent: telemetry.recent.iter().cloned().collect(),
         }
@@ -426,10 +432,53 @@ mod tests {
         assert_eq!(record.started_at, fixed, "timestamps come from `Clock::now`");
         // The point of routing through `Clock::monotonic`: a fixed clock yields a
         // reproducible zero, where an `Instant` would report whatever the wall clock did.
+        for (label, measured) in [
+            ("total", record.duration),
+            ("disk", record.persist),
+            ("fold", record.fold),
+        ] {
+            assert_eq!(
+                measured,
+                Duration::ZERO,
+                "{} comes from `Clock::monotonic`, not a real timer",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn test_flush_records_split_disk_time_from_fold_time() {
+        let fs = test_fs();
+        stage_a_write(&fs, "one.bin");
+        fs.quiesce().unwrap();
+        stage_a_write(&fs, "two.bin");
+        fs.quiesce().unwrap();
+
+        let stats = fs.flush_stats();
+        assert_eq!(stats.recent.len(), 2);
+        for record in &stats.recent {
+            assert!(
+                record.persist > Duration::ZERO,
+                "writing and syncing the batch must be measured"
+            );
+            assert!(
+                record.duration >= record.persist + record.fold,
+                "the total must cover both phases: {:?} < {:?} + {:?}",
+                record.duration,
+                record.persist,
+                record.fold
+            );
+        }
+
         assert_eq!(
-            record.duration,
-            Duration::ZERO,
-            "durations come from `Clock::monotonic`, not a real timer"
+            stats.total_persist,
+            stats.recent.iter().map(|r| r.persist).sum::<Duration>(),
+            "cumulative disk time must agree with the history"
+        );
+        assert_eq!(
+            stats.total_fold,
+            stats.recent.iter().map(|r| r.fold).sum::<Duration>(),
+            "cumulative fold time must agree with the history"
         );
     }
 
@@ -469,6 +518,16 @@ mod tests {
 
         let status = crate::stats::format_runtime_status(&fs);
         assert!(status.contains("Batches Flushed:    1"));
+        assert!(
+            status.contains("Time Flushing:"),
+            "phase totals must be reported: {}",
+            status
+        );
+        assert!(
+            status.contains("disk") && status.contains("fold"),
+            "recent flushes must break out disk and fold time: {}",
+            status
+        );
         assert!(
             status.contains("quiesce 1"),
             "per-reason counts must be reported: {}",
