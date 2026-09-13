@@ -252,17 +252,49 @@ fn prompt_master_key(source: KeySource, key_file: Option<&Path>) -> Result<(Mast
 }
 
 fn main() {
-    env_logger::init();
     let cli = Cli::parse();
 
+    // The mount commands set up their own logging, because only they know the volume
+    // directory to write into and whether they are about to daemonize away from stderr.
     match cli.command {
-        Commands::Init(args) => cmd_init(args),
-        Commands::Mount(args) => cmd_mount(args),
-        Commands::MountRo(args) => cmd_mount_ro(args),
-        Commands::Stats(args) => cmd_stats(args),
-        Commands::Dump(args) => cmd_dump(args),
-        Commands::Fsck(args) => cmd_fsck(args),
-        Commands::Remote(subargs) => cmd_remote(subargs),
+        Commands::Mount(args) => {
+            init_mount_logging(&args.common);
+            cmd_mount(args)
+        }
+        Commands::MountRo(args) => {
+            init_mount_logging(&args.common);
+            cmd_mount_ro(args)
+        }
+        other => {
+            appendfs::logging::init_stderr(appendfs::logging::DEFAULT_LOG_LEVEL);
+            match other {
+                Commands::Init(args) => cmd_init(args),
+                Commands::Stats(args) => cmd_stats(args),
+                Commands::Dump(args) => cmd_dump(args),
+                Commands::Fsck(args) => cmd_fsck(args),
+                Commands::Remote(subargs) => cmd_remote(subargs),
+                Commands::Mount(_) | Commands::MountRo(_) => unreachable!("handled above"),
+            }
+        }
+    }
+}
+
+/// Points logging at the volume's log directory, and says where, since a backgrounded mount
+/// leaves no other trace of it.
+fn init_mount_logging(args: &appendfs::cli::MountCommonArgs) {
+    if args.no_log_file {
+        appendfs::logging::init_stderr(&args.log_level);
+        return;
+    }
+    match appendfs::logging::init_for_mount(
+        &args.log_dir,
+        args.log_file.as_deref(),
+        args.log_max_size,
+        &args.log_level,
+        args.foreground,
+    ) {
+        Some(path) => println!("Logging to '{}' (level: {})", path.display(), args.log_level),
+        None => eprintln!("Warning: could not open a log file; logging to stderr"),
     }
 }
 

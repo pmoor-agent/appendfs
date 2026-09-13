@@ -499,3 +499,92 @@ fn test_cli_mount_foreground_unmounts_on_sigint_when_busy() {
     // Close the file descriptor now that unmount completed
     drop(open_file);
 }
+
+/// A backgrounded mount is the case that used to lose every log record: libfuse redirects
+/// stderr to /dev/null when it daemonizes, and stderr was the only place logs went.
+#[test]
+fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::thread;
+    use std::time::Duration;
+
+    let log_dir = TempDir::new().unwrap();
+    let mount_dir = TempDir::new().unwrap();
+    std::fs::set_permissions(mount_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["init", log_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to init volume");
+    assert!(init_out.status.success());
+
+    let initial_dev = std::fs::metadata(mount_dir.path()).unwrap().dev();
+
+    // No `-f`: the process daemonizes and the parent exits straight away.
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "mount",
+            log_dir.path().to_str().unwrap(),
+            mount_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn appendfs mount");
+    assert!(
+        out.status.success(),
+        "mount failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The operator is told where the logs went, since a daemonized mount leaves no other clue.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Logging to") && stdout.contains("logs/appendfs.log"),
+        "startup must report the log location, got: {}",
+        stdout
+    );
+
+    let mut mounted = false;
+    for _ in 0..200 {
+        if let Ok(meta) = std::fs::metadata(mount_dir.path())
+            && meta.dev() != initial_dev
+        {
+            mounted = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(mounted, "timed out waiting for FUSE filesystem to mount");
+
+    std::fs::write(mount_dir.path().join("payload.txt"), b"logged activity").unwrap();
+
+    let unmounted = appendfs::wait_until(
+        || {
+            matches!(Command::new("fusermount3").arg("-u").arg(mount_dir.path()).status(),
+                     Ok(s) if s.success())
+        },
+        Duration::from_secs(5),
+    );
+    assert!(unmounted, "failed to unmount");
+
+    let log_file = log_dir.path().join("logs").join("appendfs.log");
+    assert!(
+        appendfs::wait_until(
+            || log_file.metadata().map(|m| m.len() > 0).unwrap_or(false),
+            Duration::from_secs(5)
+        ),
+        "a backgrounded mount must still leave logs at {}",
+        log_file.display()
+    );
+
+    // The volume itself is unaffected: the log lives in a subdirectory, so nothing that
+    // scans the log directory for generations or summaries can see it.
+    let fsck = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["fsck", log_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run fsck");
+    assert!(
+        fsck.status.success(),
+        "fsck must not be confused by the log directory: {}",
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
