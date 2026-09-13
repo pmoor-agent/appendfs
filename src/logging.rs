@@ -15,6 +15,10 @@
 //! anyway via `/dev/stderr`, or discards via `/dev/null`, which is why there is no separate
 //! flag for either.
 //!
+//! Every run opens with its own command line, so a log identifies what it was for without
+//! being cross-referenced against anything. Credential values are redacted first: several
+//! flags take a secret key as an argument, and a log file is not the place for one.
+//!
 //! The files live in a `logs/` subdirectory rather than beside the `.log` and `.summary`
 //! generation files. `Storage::list_files` is non-recursive and returns only files, so
 //! nothing in a subdirectory can be mistaken for a volume file by recovery, replication, or
@@ -116,16 +120,53 @@ pub fn init(path: &Path, level: &str) -> Option<PathBuf> {
     }
 }
 
-/// The default log destination for a command, or `None` for one that should not write logs.
+/// The log file for this run under `log_dir`.
 ///
-/// Only the mount commands get one. They daemonize away from the terminal and run for weeks,
-/// which is what a log file is for; a one-shot command prints what its caller needs to see
-/// and has no business leaving a file behind in the volume.
-pub fn default_path_for(log_dir: Option<&Path>) -> Option<PathBuf> {
-    let log_dir = log_dir?;
-    // Canonicalized because `fuse_daemonize` chdirs to `/` shortly after this.
+/// Canonicalized because `fuse_daemonize` chdirs to `/` shortly after a mount sets this up.
+pub fn run_log_path(log_dir: &Path) -> PathBuf {
     let root = fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
-    Some(log_file_path(&root, SystemTime::now(), std::process::id()))
+    log_file_path(&root, SystemTime::now(), std::process::id())
+}
+
+/// Whether a flag's value is a credential that must not reach a log file.
+///
+/// `--secret-access-key` and friends take the secret itself as an argument. The `-env` and
+/// `-file` variants only name where to look, but they match too: over-redacting costs a log
+/// line some detail, while under-redacting writes a key to disk.
+fn is_secret_flag(arg: &str) -> bool {
+    let name = arg.trim_start_matches('-');
+    name.contains("secret") || name.contains("access-key")
+}
+
+/// This run's command line, with credential values replaced by `<redacted>`.
+pub fn redacted_command_line() -> String {
+    redact_args(std::env::args())
+}
+
+fn redact_args<I: IntoIterator<Item = String>>(args: I) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut redact_value = false;
+
+    for arg in args {
+        if redact_value {
+            out.push("<redacted>".to_string());
+            redact_value = false;
+            continue;
+        }
+        // `--flag=value` hides the secret inside a single argument.
+        if arg.starts_with('-')
+            && let Some((flag, _)) = arg.split_once('=')
+            && is_secret_flag(flag)
+        {
+            out.push(format!("{}=<redacted>", flag));
+            continue;
+        }
+        if arg.starts_with('-') && is_secret_flag(&arg) {
+            redact_value = true;
+        }
+        out.push(arg);
+    }
+    out.join(" ")
 }
 
 #[cfg(test)]
@@ -148,6 +189,62 @@ mod tests {
 
         // And a later run sorts after an earlier one.
         assert!(log_file_name(started, 9) < log_file_name(started + Duration::from_secs(1), 1));
+    }
+
+    #[test]
+    fn test_command_line_redacts_credentials() {
+        let args = [
+            "appendfs",
+            "remote",
+            "add",
+            "/srv/vol",
+            "aws",
+            "--bucket",
+            "backups",
+            "--access-key-id",
+            "AKIAEXAMPLE",
+            "--secret-access-key",
+            "s3cr3t-do-not-log",
+        ];
+        let line = redact_args(args.iter().map(|s| s.to_string()));
+
+        assert!(
+            !line.contains("s3cr3t-do-not-log"),
+            "secret leaked into the log: {}",
+            line
+        );
+        assert!(!line.contains("AKIAEXAMPLE"), "key id leaked into the log: {}", line);
+        assert!(
+            line.contains("--secret-access-key <redacted>") && line.contains("--access-key-id <redacted>"),
+            "the flags themselves should still be visible: {}",
+            line
+        );
+        // Everything else survives, which is the point of logging the command line at all.
+        assert!(line.contains("remote add /srv/vol aws --bucket backups"), "{}", line);
+    }
+
+    #[test]
+    fn test_command_line_redacts_the_inline_form_too() {
+        let args = ["appendfs", "init", "/srv/vol", "--remote-secret-access-key=s3cr3t"];
+        let line = redact_args(args.iter().map(|s| s.to_string()));
+        assert!(!line.contains("s3cr3t"), "inline secret leaked: {}", line);
+        assert_eq!(line, "appendfs init /srv/vol --remote-secret-access-key=<redacted>");
+    }
+
+    #[test]
+    fn test_command_line_keeps_non_secret_arguments() {
+        // A path that merely mentions a key is not a secret, and over-redacting paths would
+        // make the log useless for the case it exists for.
+        let args = [
+            "appendfs",
+            "mount",
+            "/srv/vol",
+            "/mnt",
+            "--key-file",
+            "/etc/appendfs.key",
+        ];
+        let line = redact_args(args.iter().map(|s| s.to_string()));
+        assert_eq!(line, "appendfs mount /srv/vol /mnt --key-file /etc/appendfs.key");
     }
 
     #[test]

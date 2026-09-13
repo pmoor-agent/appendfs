@@ -519,6 +519,7 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
     assert!(init_out.status.success());
 
     let initial_dev = std::fs::metadata(mount_dir.path()).unwrap().dev();
+    let before = log_file_count(log_dir.path());
 
     // No `-f`: the process daemonizes and the parent exits straight away.
     let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
@@ -585,8 +586,11 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
         "a backgrounded mount must still leave logs in {}",
         logs_dir.display()
     );
-    let written: Vec<_> = std::fs::read_dir(&logs_dir).unwrap().flatten().collect();
-    assert_eq!(written.len(), 1, "one run must leave exactly one log file");
+    assert_eq!(
+        log_file_count(log_dir.path()),
+        before + 1,
+        "the mount must leave exactly one log file of its own"
+    );
 
     // The volume itself is unaffected: the log lives in a subdirectory, so nothing that
     // scans the log directory for generations or summaries can see it.
@@ -622,6 +626,7 @@ fn test_cli_log_file_dev_null_leaves_no_log_behind() {
     );
 
     let initial_dev = std::fs::metadata(mount_dir.path()).unwrap().dev();
+    let before = log_file_count(log_dir.path());
     let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
         .args([
             "mount",
@@ -662,17 +667,20 @@ fn test_cli_log_file_dev_null_leaves_no_log_behind() {
         "failed to unmount"
     );
 
-    assert!(
-        !log_dir.path().join("logs").exists(),
-        "/dev/null must leave the volume directory untouched"
+    assert_eq!(
+        log_file_count(log_dir.path()),
+        before,
+        "/dev/null must leave no log of its own behind"
     );
 }
 
-/// A one-shot command has a caller watching its output, so it leaves no log file in the
-/// volume unless one is asked for explicitly.
+/// Every command logs, so a one-shot run leaves its own file in the volume alongside the
+/// mounts, and each run's log says what that run was.
 #[test]
-fn test_cli_one_shot_commands_do_not_write_logs_into_the_volume() {
+fn test_cli_one_shot_commands_log_into_the_volume_with_their_command_line() {
     let log_dir = TempDir::new().unwrap();
+    let logs = log_dir.path().join("logs");
+
     for args in [
         vec!["init", log_dir.path().to_str().unwrap()],
         vec!["stats", log_dir.path().to_str().unwrap()],
@@ -688,28 +696,106 @@ fn test_cli_one_shot_commands_do_not_write_logs_into_the_volume() {
             args,
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(
-            !log_dir.path().join("logs").exists(),
-            "{:?} must not leave a log file in the volume",
-            args
-        );
     }
 
-    // ...but asking explicitly works, for any command.
-    let explicit = log_dir.path().join("explicit.log");
+    // One file per run, including the `init` that created the directory in the first place.
+    let written: Vec<_> = std::fs::read_dir(&logs)
+        .expect("every command must log into the volume")
+        .flatten()
+        .collect();
+    assert_eq!(written.len(), 3, "each run gets its own file, got {:?}", written);
+
+    // Each log opens with the command line that produced it.
+    let mut commands: Vec<String> = written
+        .iter()
+        .map(|e| {
+            std::fs::read_to_string(e.path())
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    commands.sort();
+    assert!(
+        commands.iter().any(|l| l.contains("init")),
+        "a run's log must identify it: {:?}",
+        commands
+    );
+    assert!(commands.iter().any(|l| l.contains("stats")), "{:?}", commands);
+    assert!(commands.iter().any(|l| l.contains("fsck")), "{:?}", commands);
+}
+
+/// Credentials passed on the command line must not reach the log file.
+#[test]
+fn test_cli_does_not_log_credentials() {
+    let log_dir = TempDir::new().unwrap();
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_appendfs"))
+            .args(["init", log_dir.path().to_str().unwrap()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
     let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
         .args([
-            "fsck",
+            "remote",
+            "add",
             log_dir.path().to_str().unwrap(),
-            "--log-file",
-            explicit.to_str().unwrap(),
+            "aws",
+            "--bucket",
+            "backups",
+            "--access-key-id",
+            "AKIAEXAMPLEKEYID",
+            "--secret-access-key",
+            "s3cr3t-must-not-be-logged",
         ])
         .output()
-        .expect("failed to run fsck");
+        .expect("failed to run remote add");
     assert!(
         out.status.success(),
-        "fsck failed: {}",
+        "remote add failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(explicit.exists(), "--log-file must be honored by any command");
+
+    for entry in std::fs::read_dir(log_dir.path().join("logs")).unwrap().flatten() {
+        let contents = std::fs::read_to_string(entry.path()).unwrap();
+        assert!(
+            !contents.contains("s3cr3t-must-not-be-logged"),
+            "secret key leaked into {}",
+            entry.path().display()
+        );
+        assert!(
+            !contents.contains("AKIAEXAMPLEKEYID"),
+            "access key id leaked into {}",
+            entry.path().display()
+        );
+    }
+}
+
+/// A mistyped path must not scatter `logs/` directories across the filesystem.
+#[test]
+fn test_cli_does_not_create_a_volume_directory_that_does_not_exist() {
+    let parent = TempDir::new().unwrap();
+    let missing = parent.path().join("typo");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["stats", missing.to_str().unwrap()])
+        .output()
+        .expect("failed to run stats");
+    assert!(!out.status.success(), "stats on a missing volume must fail");
+    assert!(
+        !missing.exists(),
+        "a mistyped path must not be created just to log into"
+    );
+}
+
+/// Number of log files currently in a volume's `logs/` directory.
+fn log_file_count(log_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(log_dir.join("logs"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0)
 }
