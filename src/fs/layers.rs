@@ -690,13 +690,12 @@ mod tests {
 
         // 1. Create file1 in live -> freeze to flushing -> fold to base
         let attr1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.begin_flush();
-        let batch = fs.pop_flushing_batch().unwrap();
-        fs.fold_flushed_batch(batch);
+        fs.freeze_now();
+        fs.fold_flushing_into_base();
 
         // 2. Create file2 in live -> freeze to flushing (stays in flushing)
         let attr2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.begin_flush();
+        fs.freeze_now();
 
         // 3. Create file3 in live (stays in live)
         let attr3 = crate::operations::read_write::create_core(&fs, 1, "file3.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -822,13 +821,19 @@ mod tests {
         let mut f_delta = FileDelta::default();
         f_delta.extents.insert(20, Extent::new_zero(20));
         flushing_batch.insert(attr.ino, EntryDelta::Node(NodeDelta::File(f_delta)));
-        fs.inner.lock_for_tests().unwrap().flushing.push_back(FlushBatch::new(
-            1,
-            flushing_batch,
-            WriteArena::new(),
-            0,
-            0,
-        ));
+        fs.inner
+            .lock_for_tests()
+            .unwrap()
+            .flushing
+            .push_back(std::sync::Arc::new(FlushBatch::new(
+                1,
+                flushing_batch,
+                WriteArena::new(),
+                0,
+                0,
+                crate::fs::BatchCompletion::new(),
+                crate::fs::FlushReason::Threshold,
+            )));
 
         // 3. Live layer: Staged extent at 30..50
         let mut live_delta = FileDelta::default();
@@ -967,16 +972,16 @@ mod tests {
         let data4 = vec![0x44u8; 200];
 
         crate::operations::read_write::write_core(&fs, attr.ino, &data1, 0).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         crate::operations::read_write::write_core(&fs, attr.ino, &data2, 200).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         crate::operations::read_write::write_core(&fs, attr.ino, &data3, 400).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         crate::operations::read_write::write_core(&fs, attr.ino, &data4, 600).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Clear decrypted record cache to force actual cold disk decoding in parallel
         fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
@@ -1140,7 +1145,7 @@ mod tests {
         let attr = crate::operations::read_write::create_core(&fs, 1, "single_cold.bin", 0o644, 0, 1000, 1000).unwrap();
         let payload = vec![0xEFu8; 1024];
         crate::operations::read_write::write_core(&fs, attr.ino, &payload, 0).unwrap();
-        fs.flush_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Evict from decrypted cache to force single cold disk direct read
         fs.log_cache.as_ref().unwrap().decrypted_cache.clear();

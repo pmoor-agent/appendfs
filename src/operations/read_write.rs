@@ -1,5 +1,5 @@
 use crate::extent_map::{Extent, ExtentMap};
-use crate::fs::{FileHandle, FsInner, InMemoryFS};
+use crate::fs::{FileHandle, FlushReason, FsInner, InMemoryFS};
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
 use crate::shim::{FileAttr, FileType, Request};
 use crate::sync::OpTag;
@@ -569,19 +569,20 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
 
 #[cfg(any(test, feature = "testing"))]
 pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
-    let completion = fs.rollover_for_fsync(ino, fh)?;
-    let Some(completion) = completion else {
-        if let Some(ref writer) = fs.log_writer {
-            let writer_clone = Arc::clone(writer);
-            tokio::task::spawn_blocking(move || writer_clone.sync())
-                .await
-                .map_err(|_| libc::EIO)?
-                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-        }
+    fsync_core_with_reason(fs, ino, fh, FlushReason::Fsync).await
+}
+
+/// Shared body for `fsync` and `fsyncdir`, which differ only in what they report as the
+/// reason for the flush.
+#[cfg(any(test, feature = "testing"))]
+pub async fn fsync_core_with_reason(fs: &InMemoryFS, ino: u64, fh: u64, reason: FlushReason) -> Result<(), i32> {
+    // Nothing staged and nothing in flight: the flusher syncs the log before it completes a
+    // batch, so everything already folded into `base` is on disk. There is nothing to wait for.
+    let Some(completion) = fs.rollover_for_fsync(ino, fh, reason)? else {
         return Ok(());
     };
 
-    fs.notify_flush_trigger(true);
+    fs.wake_flusher();
     completion
         .wait()
         .await
@@ -590,7 +591,13 @@ pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
 
 pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
     log::trace!("fsync(ino={}, datasync={}, fh={})", ino, datasync, fh);
-    let completion = match fs.rollover_for_fsync(ino, fh) {
+    fsync_with_reason(fs, req, ino, fh, FlushReason::Fsync);
+}
+
+/// Shared body for `fsync` and `fsyncdir`, which differ only in what they report as the
+/// reason for the flush.
+pub(crate) fn fsync_with_reason(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, reason: FlushReason) {
+    let completion = match fs.rollover_for_fsync(ino, fh, reason) {
         Ok(c) => c,
         Err(e) => {
             req.reply_err(e);
@@ -598,34 +605,21 @@ pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
         }
     };
 
+    // See `fsync_core`: with nothing staged or in flight, the log is already synced.
     let Some(completion) = completion else {
-        if let Some(ref writer) = fs.log_writer {
-            let guard = fs.begin_async_op();
-            let writer_clone = Arc::clone(writer);
-            crate::async_runtime::spawn(async move {
-                let _guard = guard;
-                let res = tokio::task::spawn_blocking(move || writer_clone.sync()).await;
-                match res {
-                    Ok(Ok(())) => req.reply_err(0),
-                    Ok(Err(e)) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
-                    Err(_) => req.reply_err(libc::EIO),
-                }
-            });
-            return;
-        }
         req.reply_err(0);
         return;
     };
 
-    fs.notify_flush_trigger(true);
-    let guard = fs.begin_async_op();
-    crate::async_runtime::spawn(async move {
-        let _guard = guard;
-        match completion.wait().await {
-            Ok(()) => req.reply_err(0),
-            Err(e) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
-        }
-    });
+    // Reply from whichever thread ends up completing the batch. A batch completion already
+    // has to notify its waiters, so this is just one more of them - no task to spawn, no
+    // runtime to keep alive, and nothing to track for a safe unmount. If the batch has
+    // already landed, the callback runs right here.
+    completion.add_callback(Box::new(move |result| match result {
+        Ok(()) => req.reply_err(0),
+        Err(e) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
+    }));
+    fs.wake_flusher();
 }
 
 pub fn release_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
@@ -825,7 +819,7 @@ mod tests {
         let pre_flush = pre_stats.iter().find(|s| s.tag == OpTag::Flush).unwrap().count;
 
         // Call fsync_core rollover with open file handle fh
-        let res = fs.rollover_for_fsync(file.ino, fh);
+        let res = fs.rollover_for_fsync(file.ino, fh, FlushReason::Fsync);
         assert!(res.is_ok());
 
         let post_total = fs.inner.lock_count();

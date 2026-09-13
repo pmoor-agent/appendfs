@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use crate::crypto::VolumeKey;
-use crate::fs::{FlushBatch, InMemoryFS, WriteArena};
+use crate::fs::InMemoryFS;
 use crate::log::manifest::{parse_log_filename, parse_summary_filename};
 use crate::log::reader::{LogReader, LogRecord};
 use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode};
@@ -265,7 +265,7 @@ pub fn recover_fs(
                 }
 
                 if !current_batch.is_empty() {
-                    fs_instance.fold_flushed_batch(FlushBatch::new(0, current_batch, WriteArena::new(), 0, 0));
+                    fs_instance.fold_entries(current_batch);
                 }
 
                 if target_cutoff_reached {
@@ -382,19 +382,19 @@ mod tests {
 
         // Tx 1-3: Create dir "step1"
         let d1 = crate::operations::dir::mkdir_core(&fs, 1, "step1", 0o755, 1000, 1000).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
         let tx_after_step1 = fs.log_writer.as_ref().unwrap().last_tx_id();
 
         // Tx 4-7: Create file "file1.txt" inside "step1"
         let f1 = crate::operations::read_write::create_core(&fs, d1.ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f1.ino, b"version 1", 0).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
         let tx_after_file1 = fs.log_writer.as_ref().unwrap().last_tx_id();
 
         // Tx 8-11: Create file "file2.txt" inside "step1"
         let f2 = crate::operations::read_write::create_core(&fs, d1.ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f2.ino, b"version 2", 0).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // 1. Recover to Latest -> step1, file1.txt, file2.txt all exist
         let fs_latest = recover_fs(
@@ -470,12 +470,12 @@ mod tests {
 
         // T = 1000: Create "early_dir"
         crate::operations::dir::mkdir_core(&fs, 1, "early_dir", 0o755, 1000, 1000).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Advance clock to T = 2000
         clock.advance(Duration::from_secs(1000));
         crate::operations::dir::mkdir_core(&fs, 1, "late_dir", 0o755, 1000, 1000).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Recover at T = 1500 -> early_dir exists, late_dir does not
         let fs_t1500 = recover_fs(

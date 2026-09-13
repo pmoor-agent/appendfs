@@ -749,7 +749,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 if let Some(fault) = fs_crash.fault.clone() {
                     let offset = fs_crash.fs.log_writer.as_ref().map_or(0, |w| w.current_offset());
                     fault.fail_writes_after_bytes(offset + 200, true);
-                    if fs_crash.fs.flush_log().is_err() {
+                    if fs_crash.fs.quiesce().is_err() {
                         observed_flush_failures += 1;
                     }
                     fault.clear_write_limit();
@@ -759,7 +759,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 fs_crash = fs_crash.unclean_crash();
 
                 // Quiesce and heal fs_remote
-                let _ = fs_remote.fs.flush_log();
+                let _ = fs_remote.fs.quiesce();
                 for r in &fs_remote.remotes {
                     r.clear_faults();
                 }
@@ -1228,7 +1228,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     writer.append_record(OpCode::InodeDelta, 1, &bytes).unwrap();
     // Deliberately no emit_flush_commit() call here - this is the crash point.
 
-    writer.sync().unwrap();
+    writer.flush().unwrap();
     drop(writer);
 
     let recovered = recover_fs(
@@ -1292,7 +1292,7 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
     // Claim 2 records preceded this trailer, when only 1 actually did.
     writer.emit_flush_commit(2, &clock).unwrap();
-    writer.sync().unwrap();
+    writer.flush().unwrap();
     drop(writer);
 
     let result = recover_fs(
@@ -1337,7 +1337,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     let bytes = appendfs::wire::serialize(&file_delta).unwrap();
     writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
     writer.emit_flush_commit(1, &clock).unwrap();
-    writer.sync().unwrap();
+    writer.flush().unwrap();
     let filename = writer.filename();
     drop(writer);
 
@@ -1383,7 +1383,7 @@ fn test_truncate_shrink_then_grow_within_one_batch_survives_crash_recovery() {
     let fs = TestFS::new_temp(None);
     let ino = fs.create(1, "f.bin", 0o644).unwrap();
     fs.write(ino, 0, &[0xAA; 6]).unwrap();
-    fs.fs.flush_log().unwrap();
+    fs.fs.quiesce().unwrap();
 
     // Both of these land in one batch, whose final size (6) is above the shrink point (3).
     fs.setattr(ino, None, None, None, Some(3), None, None).unwrap();
@@ -1416,7 +1416,7 @@ fn test_rename_onto_own_hardlink_is_a_noop_and_survives_recovery() {
     fs.write(ino, 0, b"payload").unwrap();
     fs.link(ino, 1, "f1").unwrap();
     // Flush so both names are in `base` when the rename resolves them.
-    fs.fs.flush_log().unwrap();
+    fs.fs.quiesce().unwrap();
 
     fs.rename(1, "f0", 1, "f1").unwrap();
 
@@ -1449,7 +1449,7 @@ fn test_rename_into_a_name_freed_by_another_rename_in_the_same_batch() {
     let b = fs.mkdir(1, "B", 0o755).unwrap();
     let f = fs.create(b, "payload.txt", 0o644).unwrap();
     fs.write(f, 0, b"important").unwrap();
-    fs.fs.flush_log().unwrap();
+    fs.fs.quiesce().unwrap();
 
     // One batch: free the name "B" first, then move "A" into it.
     fs.rename(1, "B", 1, "C").unwrap();
@@ -1476,7 +1476,7 @@ fn test_rename_away_and_back_within_one_batch_does_not_duplicate_the_entry() {
     let fs = TestFS::new_temp(None);
     let d = fs.mkdir(1, "d", 0o755).unwrap();
     let f = fs.create(d, "f", 0o644).unwrap();
-    fs.fs.flush_log().unwrap();
+    fs.fs.quiesce().unwrap();
 
     fs.rename(d, "f", 1, "moved").unwrap();
     fs.rename(1, "moved", d, "f").unwrap();

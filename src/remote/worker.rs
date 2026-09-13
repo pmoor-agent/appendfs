@@ -460,8 +460,8 @@ impl RemoteReplicationWorker {
             None => return Ok(()),
         };
 
-        let (active_gen, active_offset, active_created) = match fs.log_writer {
-            Some(ref w) => (w.generation(), w.current_offset(), w.created_at()),
+        let (active_gen, active_offset) = match fs.log_writer {
+            Some(ref w) => (w.generation(), w.current_offset()),
             None => return Ok(()),
         };
 
@@ -475,22 +475,11 @@ impl RemoteReplicationWorker {
             confirmed_summaries.clear();
         }
 
-        // 1. Time-based rolling check
-        if let Some(created) = active_created {
-            let age = now.duration_since(created).unwrap_or_default();
-            if age.as_secs() >= policy.max_log_age_secs && active_offset > crate::log::record::FILE_HEADER_SIZE as u64 {
-                log::info!(
-                    "Active generation {} reached age threshold ({}s >= {}s); rolling for durability...",
-                    active_gen,
-                    age.as_secs(),
-                    policy.max_log_age_secs
-                );
-                let _ = fs.force_roll_active_log();
-                let _ = fs.sync_and_export_summary();
-            }
-        }
+        // Age-based rolling belongs to the flusher, which owns the log writer and checks
+        // `max_log_age` at the end of every cycle - including the idle ones. `max_log_age_secs`
+        // reaches it as the writer's own limit, set at mount.
 
-        // 2. Sync sealed generations to all writable remotes
+        // Sync sealed generations to all writable remotes
         let manifest = fs.manifest.read().unwrap().clone();
         for log_entry in &manifest.logs {
             let gen_num = log_entry.generation;

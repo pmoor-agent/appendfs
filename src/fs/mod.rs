@@ -12,6 +12,7 @@
 
 pub mod arena;
 mod flush;
+mod flusher;
 mod handles;
 mod layers;
 mod overlay;
@@ -23,7 +24,7 @@ pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};
-use crate::log::{BackgroundFlusher, LogFileCache, LogManifest, LogWriter};
+use crate::log::{LogFileCache, LogManifest, LogWriter};
 use crate::node::{EntryDelta, Node};
 use crate::storage::Storage;
 use crate::sync::{ActionGuard, ActionMutex, OpTag, PostUnlockQueue};
@@ -226,15 +227,83 @@ impl BatchCompletion {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Interrupted, "batch cancelled"))?
     }
 
+    /// Blocks until the batch completes and yields its result.
+    ///
+    /// The async `wait` is what FUSE's fsync uses; this is for synchronous callers like
+    /// `quiesce` and unmount, which have no runtime to await on.
+    pub fn wait_blocking(&self) -> std::io::Result<()> {
+        let signal = Arc::new((Mutex::new(None::<std::io::Result<()>>), Condvar::new()));
+        let signal_clone = Arc::clone(&signal);
+        self.add_callback(Box::new(move |res| {
+            let (lock, cvar) = &*signal_clone;
+            *lock.lock().unwrap() = Some(res);
+            cvar.notify_all();
+        }));
+
+        let (lock, cvar) = &*signal;
+        let mut guard = lock.lock().unwrap();
+        loop {
+            if let Some(res) = guard.take() {
+                return res;
+            }
+            guard = cvar.wait(guard).unwrap();
+        }
+    }
+
     /// Returns true if this batch has already completed.
     pub fn is_completed(&self) -> bool {
         self.state.lock().unwrap().result.is_some()
     }
 }
 
+/// Why a batch was frozen out of `live`.
+///
+/// Decided by whoever asked for the freeze, carried on the batch through to completion, so
+/// a flush can always account for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushReason {
+    /// Explicit POSIX file sync (`fsync`).
+    Fsync,
+    /// Explicit POSIX directory sync (`fsyncdir`).
+    Fsyncdir,
+    /// An explicit sync point: `quiesce`, and through it unmount, summary export, and the
+    /// one-shot CLI tools.
+    Quiesce,
+    /// The flusher's inactivity tick, with nobody waiting.
+    Inactivity,
+    /// Staged bytes or ops in `live` reached the configured flush thresholds.
+    Threshold,
+}
+
+impl FlushReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FlushReason::Fsync => "fsync",
+            FlushReason::Fsyncdir => "fsyncdir",
+            FlushReason::Quiesce => "quiesce",
+            FlushReason::Inactivity => "inactivity",
+            FlushReason::Threshold => "threshold",
+        }
+    }
+}
+
+impl fmt::Display for FlushReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// An immutable frozen batch of mutations being written to the log, holding its
 /// corresponding write arena chunk buffers and batch statistics.
-#[derive(Debug, Clone)]
+///
+/// Deliberately not `Clone`, and shared as `Arc<FlushBatch>`: once `live` has been frozen
+/// into one, nothing may change it. The flusher rewrites staged extents into disk extents on
+/// a copy of `entries` alone, which it then folds into `base`, so a reader resolving against
+/// the queue always sees the staged form until the batch is popped.
+///
+/// `arena` and the `Extent::Staged` handles inside `entries` are `Arc`s to the same buffers;
+/// the field is what keeps those chunks alive for as long as the batch is queued.
+#[derive(Debug)]
 pub struct FlushBatch {
     pub id: u64,
     pub entries: HashMap<u64, EntryDelta>,
@@ -242,10 +311,22 @@ pub struct FlushBatch {
     pub bytes: usize,
     pub ops: usize,
     pub completion: BatchCompletion,
+    /// Why this batch was frozen.
+    pub reason: FlushReason,
 }
 
 impl FlushBatch {
-    pub fn new(id: u64, entries: HashMap<u64, EntryDelta>, arena: WriteArena, bytes: usize, ops: usize) -> Self {
+    /// `completion` comes from the `live` layer these entries were frozen out of, so anyone
+    /// who registered interest while they were still live is carried into this batch.
+    pub fn new(
+        id: u64,
+        entries: HashMap<u64, EntryDelta>,
+        arena: WriteArena,
+        bytes: usize,
+        ops: usize,
+        completion: BatchCompletion,
+        reason: FlushReason,
+    ) -> Self {
         assert!(!entries.is_empty(), "FlushBatch must contain at least one entry");
         Self {
             id,
@@ -253,7 +334,8 @@ impl FlushBatch {
             arena,
             bytes,
             ops,
-            completion: BatchCompletion::new(),
+            completion,
+            reason,
         }
     }
 }
@@ -263,13 +345,25 @@ pub struct FsInner {
     /// Resting consolidated state loaded from `.summary` at mount, folded forward over generations.
     pub base: HashMap<u64, Arc<Node>>,
     /// Ordered queue of immutable frozen snapshots waiting to be written/flushed to disk.
-    pub flushing: VecDeque<FlushBatch>,
+    ///
+    /// `Arc` so the flusher can take the front batch out of the critical section in constant
+    /// time and copy what it needs without holding the lock.
+    pub flushing: VecDeque<Arc<FlushBatch>>,
     /// Monotonically increasing ID generator for flushing batches.
     pub next_batch_id: u64,
     /// Current generation's active mutable delta layer receiving live operations.
     pub live: HashMap<u64, EntryDelta>,
     /// Active write arena staging extent payload allocations for `live`.
     pub live_arena: WriteArena,
+    /// Completion handle for whatever is currently in `live`, travelling with the data when
+    /// it is frozen. Lets a waiter register before the batch it will belong to exists.
+    pub live_completion: BatchCompletion,
+    /// Set when someone needs `live` flushed regardless of how little is staged, recording
+    /// why. Taken by the freeze that honors it, which stamps the reason onto the batch.
+    ///
+    /// First request wins: a second one arriving before the freeze does not relabel a
+    /// caller that has already been waiting.
+    pub freeze_requested: Option<FlushReason>,
     /// Active open handles (regular files, virtual files, and directories) keyed by allocated handle ID (`fh`).
     pub handles: HandleMap,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
@@ -287,33 +381,28 @@ pub struct FsInner {
     pub flushing_bytes: usize,
     /// Total mutating operations across all frozen batches in `flushing`.
     pub flushing_ops: usize,
-    /// Condition variable notified whenever capacity opens up in the `flushing` queue.
-    pub capacity_cvar: Arc<Condvar>,
 }
 
 impl FsInner {
-    /// Pops the committed batch from the front of the flushing queue, asserting its ID matches `batch.id`,
-    /// and notifies `capacity_cvar` with lock held.
-    pub fn pop_flushed_batch(&mut self, batch: &FlushBatch) -> FlushBatch {
+    /// Pops the committed batch from the front of the flushing queue, asserting its ID matches `batch.id`.
+    pub fn pop_flushed_batch(&mut self, batch_id: u64) -> Arc<FlushBatch> {
         let front = self.flushing.front().expect("flushing queue must not be empty");
         assert_eq!(
-            front.id, batch.id,
+            front.id, batch_id,
             "front of flushing queue must match committed batch ID"
         );
         let popped = self.flushing.pop_front().unwrap();
         self.flushing_bytes -= popped.bytes;
         self.flushing_ops -= popped.ops;
-        self.capacity_cvar.notify_all();
         popped
     }
 
-    /// Pops the front batch from the flushing queue and notifies `capacity_cvar` with lock held.
+    /// Pops the front batch from the flushing queue.
     #[cfg(any(test, feature = "testing"))]
-    pub fn pop_flushing_batch(&mut self) -> Option<FlushBatch> {
+    pub fn pop_flushing_batch(&mut self) -> Option<Arc<FlushBatch>> {
         let batch = self.flushing.pop_front()?;
         self.flushing_bytes -= batch.bytes;
         self.flushing_ops -= batch.ops;
-        self.capacity_cvar.notify_all();
         Some(batch)
     }
 
@@ -321,6 +410,18 @@ impl FsInner {
     pub fn record_mutation(&mut self, additional_bytes: usize) {
         self.staged_bytes += additional_bytes;
         self.staged_ops += 1;
+    }
+
+    /// Whether the `flushing` queue has reached any of its depth, byte, or op limits.
+    pub fn flushing_at_capacity(
+        &self,
+        max_flush_queue_depth: usize,
+        max_flush_queue_bytes: usize,
+        max_flush_queue_ops: usize,
+    ) -> bool {
+        self.flushing.len() >= max_flush_queue_depth
+            || self.flushing_bytes >= max_flush_queue_bytes
+            || self.flushing_ops >= max_flush_queue_ops
     }
 
     /// Freezes `live` into the `flushing` queue and transfers staged byte/op counts,
@@ -337,10 +438,7 @@ impl FsInner {
         max_flush_queue_bytes: usize,
         max_flush_queue_ops: usize,
     ) -> bool {
-        if self.flushing.len() >= max_flush_queue_depth
-            || self.flushing_bytes >= max_flush_queue_bytes
-            || self.flushing_ops >= max_flush_queue_ops
-        {
+        if self.flushing_at_capacity(max_flush_queue_depth, max_flush_queue_bytes, max_flush_queue_ops) {
             return false;
         }
         if !self.live.is_empty() {
@@ -355,16 +453,24 @@ impl FsInner {
             self.flushing_ops += ops;
             let id = self.next_batch_id;
             self.next_batch_id += 1;
-            self.flushing.push_back(FlushBatch::new(id, entries, arena, bytes, ops));
+            // Whoever registered on `live` while these entries were staged now waits on the
+            // batch that carries them; `live` starts over with a fresh handle.
+            let completion = std::mem::take(&mut self.live_completion);
+            // An outstanding request names this batch even when a threshold is what finally
+            // tripped the freeze - the requester's data is in here either way.
+            let reason = self.freeze_requested.take().unwrap_or(FlushReason::Threshold);
+            self.flushing.push_back(Arc::new(FlushBatch::new(
+                id, entries, arena, bytes, ops, completion, reason,
+            )));
             true
         } else {
             false
         }
     }
 
-    /// Merges a flushed batch into `base`.
-    pub fn fold_flushed_batch(&mut self, flushed: FlushBatch) {
-        for (ino, entry) in flushed.entries {
+    /// Merges a set of committed deltas into `base`.
+    pub fn fold_entries(&mut self, entries: HashMap<u64, EntryDelta>) {
+        for (ino, entry) in entries {
             match entry {
                 EntryDelta::Tombstone => {
                     self.base.remove(&ino);
@@ -520,23 +626,13 @@ impl<'a> DerefMut for FsInnerGuard<'a> {
 
 impl<'a> Drop for FsInnerGuard<'a> {
     fn drop(&mut self) {
-        if self.mutation_occurred {
-            let max_buffer_size = self.fs.max_buffer_size;
-            let max_staged_ops = self.fs.max_staged_ops;
-            let max_flush_queue_depth = self.fs.max_flush_queue_depth;
-            let max_flush_queue_bytes = self.fs.max_flush_queue_bytes;
-            let max_flush_queue_ops = self.fs.max_flush_queue_ops;
-            if self.guard.staged_bytes >= max_buffer_size || self.guard.staged_ops >= max_staged_ops {
-                let froze = self
-                    .guard
-                    .freeze_live(max_flush_queue_depth, max_flush_queue_bytes, max_flush_queue_ops);
-                if froze || !self.guard.flushing.is_empty() {
-                    let fs = self.fs;
-                    self.guard.defer(move || {
-                        fs.notify_flush_trigger(true);
-                    });
-                }
-            }
+        if !self.mutation_occurred || !self.fs.staged_threshold_reached(&self.guard) {
+            return;
+        }
+        let froze = self.fs.freeze_now_locked(&mut self.guard);
+        if froze || !self.guard.flushing.is_empty() {
+            let fs = self.fs;
+            self.guard.defer(move || fs.wake_flusher());
         }
     }
 }
@@ -566,8 +662,7 @@ pub struct InMemoryFS {
     /// Maximum total mutating operations across all frozen flush batches allowed to queue up before auto-freezing is bounded.
     pub max_flush_queue_ops: usize,
     pub flush_interval: AtomicU64,
-    pub(crate) flusher: Mutex<Option<BackgroundFlusher>>,
-    pub flush_lock: Mutex<()>,
+    pub(crate) flusher: flusher::Flusher,
     /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to true.
     pub track_atime: bool,
     /// When true, filesystem is mounted strictly read-only (EROFS).
@@ -659,6 +754,8 @@ impl InMemoryFS {
             next_batch_id: 1,
             live: HashMap::new(),
             live_arena: WriteArena::new(),
+            live_completion: BatchCompletion::new(),
+            freeze_requested: None,
             handles: HashMap::new(),
             open_counts: HashMap::new(),
             next_fh: 1,
@@ -667,7 +764,6 @@ impl InMemoryFS {
             staged_ops: 0,
             flushing_bytes: 0,
             flushing_ops: 0,
-            capacity_cvar: Arc::new(Condvar::new()),
         };
 
         let fs = Self {
@@ -686,8 +782,7 @@ impl InMemoryFS {
             max_flush_queue_bytes: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_BYTES,
             max_flush_queue_ops: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_OPS,
             flush_interval: AtomicU64::new(0),
-            flusher: Mutex::new(None),
-            flush_lock: Mutex::new(()),
+            flusher: flusher::Flusher::new(),
             track_atime: true,
             read_only: std::sync::atomic::AtomicBool::new(false),
             volume_key,

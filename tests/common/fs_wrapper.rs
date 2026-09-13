@@ -638,7 +638,7 @@ impl TestFS {
         let fault = self.fault.clone();
         let next_inode = self.fs.next_inode.load(Ordering::SeqCst);
         let max_extent_size = self.fs.max_extent_size;
-        let _ = self.fs.sync_log();
+        let _ = self.fs.quiesce();
         self.fs.log_writer = None;
         drop(self);
         let mut rec = Self::recover_into(&log_dir, temp_dir, clock, fault, storage);

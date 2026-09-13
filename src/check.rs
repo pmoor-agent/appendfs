@@ -892,7 +892,7 @@ mod tests {
         let _s = crate::operations::links::symlink_core(&fs, 1, "link_to_file", "mydir/file.txt", 1000, 1000).unwrap();
         let _h = crate::operations::links::link_core(&fs, f.ino, 1, "hardlink.txt").unwrap();
 
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         let report = check_volume(storage, true, VolumeKey::plaintext_arc()).unwrap();
         assert!(report.is_clean(), "Report must be clean: {:?}", report.issues);
@@ -975,7 +975,7 @@ mod tests {
         fs.set_storage(storage);
 
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // Corrupt nlink on test.txt in base (set nlink to 5 instead of 1)
         {
@@ -1169,7 +1169,7 @@ mod tests {
 
         let f = crate::operations::read_write::create_core(&fs, 1, "data.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f.ino, b"original clean payload bytes", 0).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
 
         // 1. Initial check must be clean
         let record_offset = {

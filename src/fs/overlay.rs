@@ -280,7 +280,7 @@ impl InMemoryFS {
     pub fn with_layers<R>(
         &self,
         tag: OpTag,
-        f: impl FnOnce(&HashMap<u64, EntryDelta>, &VecDeque<FlushBatch>, &HashMap<u64, Arc<Node>>) -> R,
+        f: impl FnOnce(&HashMap<u64, EntryDelta>, &VecDeque<Arc<FlushBatch>>, &HashMap<u64, Arc<Node>>) -> R,
     ) -> R {
         let inner = self.inner.lock(tag).unwrap();
         f(&inner.live, &inner.flushing, &inner.base)
@@ -384,7 +384,7 @@ mod tests {
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
         assert!(fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino));
 
         crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
@@ -396,7 +396,7 @@ mod tests {
         // Freeze the tombstone out of `live`. From here `live.entry(ino)` sees nothing, so
         // a writer that validated before taking the lock would insert a fresh delta and
         // resurrect the inode at the next fold - this predicate is what stops it.
-        fs.begin_flush();
+        fs.freeze_now();
         assert!(!fs.inner.lock_for_tests().unwrap().live.contains_key(&attr.ino));
         assert!(
             !fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino),
@@ -423,7 +423,7 @@ mod tests {
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         // Fold it into `base`, so the lower layers still describe the inode after deletion.
-        fs.sync_log().unwrap();
+        fs.quiesce().unwrap();
         crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
         assert!(fs.get_attr(attr.ino).is_none(), "unlinked file must be gone");
 
