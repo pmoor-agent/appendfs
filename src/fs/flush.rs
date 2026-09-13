@@ -57,7 +57,7 @@ impl InMemoryFS {
 
     /// Pops the front batch from the flushing queue, if any.
     #[cfg(any(test, feature = "testing"))]
-    pub fn pop_flushing_batch(&self) -> Option<super::FlushBatch> {
+    pub fn pop_flushing_batch(&self) -> Option<Arc<super::FlushBatch>> {
         self.inner.lock(OpTag::Flush).unwrap().pop_flushing_batch()
     }
 
@@ -70,7 +70,12 @@ impl InMemoryFS {
     pub fn fold_flushing_into_base(&self) {
         let mut inner = self.inner.lock(OpTag::Fold).unwrap();
         while let Some(batch) = inner.pop_flushing_batch() {
-            inner.fold_entries(batch.entries);
+            // Sole owner once popped, unless a reader is mid-resolve against it.
+            let entries = match Arc::try_unwrap(batch) {
+                Ok(batch) => batch.entries,
+                Err(shared) => shared.entries.clone(),
+            };
+            inner.fold_entries(entries);
         }
     }
 
@@ -333,7 +338,7 @@ impl InMemoryFS {
         };
         self.flusher.run_locked(|| {
             loop {
-                let mut batch = {
+                let batch = {
                     let mut inner = self.inner.lock(OpTag::Flush).unwrap();
                     // The freeze belongs to whoever decided one was needed - an fsync, a
                     // `quiesce`, the inactivity tick, or a mutation crossing the staged
@@ -344,19 +349,24 @@ impl InMemoryFS {
                     match inner.flushing.front() {
                         Some(b) => {
                             assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
-                            b.clone()
+                            Arc::clone(b)
                         }
                         None => break,
                     }
                 };
 
-                self.synthesize_and_write_flushing_layer(&mut batch.entries, writer)?;
+                // Copying the deltas is proportional to the batch, so it happens out here
+                // rather than under the lock every FUSE operation contends for. The queued
+                // batch keeps its staged extents throughout, which is what readers resolve
+                // against until the fold below replaces them.
+                let mut entries = batch.entries.clone();
+                self.synthesize_and_write_flushing_layer(&mut entries, writer)?;
 
                 // Committed and durable: pop it and fold its effects into `base`.
                 let popped = {
                     let mut inner = self.inner.lock(OpTag::Fold).unwrap();
-                    let popped = inner.pop_flushed_batch(&batch);
-                    inner.fold_entries(batch.entries);
+                    let popped = inner.pop_flushed_batch(batch.id);
+                    inner.fold_entries(entries);
                     popped
                 };
                 log::debug!(
@@ -2095,7 +2105,7 @@ mod tests {
 
         // Pop one batch from flushing queue to make room
         let popped = fs.pop_flushing_batch().unwrap();
-        fs.fold_entries(popped.entries);
+        fs.fold_entries(popped.entries.clone());
         assert_eq!(fs.flush_queue_depth(), 1);
 
         // Now begin_flush should succeed in freezing the accumulated live mutations
@@ -2123,7 +2133,7 @@ mod tests {
             crate::operations::read_write::create_core(&fs, 1, "bytes_bounded.bin", 0o644, 0, 1000, 1000).unwrap();
         assert!(fs.freeze_now());
         let init = fs.pop_flushing_batch().unwrap();
-        fs.fold_entries(init.entries);
+        fs.fold_entries(init.entries.clone());
         assert_eq!(fs.flush_queue_depth(), 0);
         assert_eq!(fs.flushing_bytes(), 0);
 
@@ -2160,7 +2170,7 @@ mod tests {
 
         // Pop one batch (60 bytes) to free byte capacity
         let popped = fs.pop_flushing_batch().unwrap();
-        fs.fold_entries(popped.entries);
+        fs.fold_entries(popped.entries.clone());
         assert_eq!(fs.flush_queue_depth(), 1);
         assert_eq!(fs.flushing_bytes(), 40);
 
@@ -2190,7 +2200,7 @@ mod tests {
         let file = crate::operations::read_write::create_core(&fs, 1, "ops_bounded.bin", 0o644, 0, 1000, 1000).unwrap();
         assert!(fs.freeze_now());
         let init = fs.pop_flushing_batch().unwrap();
-        fs.fold_entries(init.entries);
+        fs.fold_entries(init.entries.clone());
         assert_eq!(fs.flush_queue_depth(), 0);
         assert_eq!(fs.flushing_ops(), 0);
 
@@ -2221,7 +2231,7 @@ mod tests {
 
         // Pop one batch (1 op) to free op capacity
         let popped = fs.pop_flushing_batch().unwrap();
-        fs.fold_entries(popped.entries);
+        fs.fold_entries(popped.entries.clone());
         assert_eq!(fs.flush_queue_depth(), 1);
         assert_eq!(fs.flushing_ops(), 1);
 
@@ -2481,7 +2491,7 @@ mod tests {
 
         // Free a slot, as the flusher would by writing a batch out.
         let popped = fs.pop_flushing_batch().unwrap();
-        fs.fold_entries(popped.entries);
+        fs.fold_entries(popped.entries.clone());
 
         // The flusher now picks `live` up on the strength of the outstanding request alone -
         // 9 bytes is far below the staged thresholds - and carries the handle into the batch.

@@ -295,7 +295,15 @@ impl fmt::Display for FlushReason {
 
 /// An immutable frozen batch of mutations being written to the log, holding its
 /// corresponding write arena chunk buffers and batch statistics.
-#[derive(Debug, Clone)]
+///
+/// Deliberately not `Clone`, and shared as `Arc<FlushBatch>`: once `live` has been frozen
+/// into one, nothing may change it. The flusher rewrites staged extents into disk extents on
+/// a copy of `entries` alone, which it then folds into `base`, so a reader resolving against
+/// the queue always sees the staged form until the batch is popped.
+///
+/// `arena` and the `Extent::Staged` handles inside `entries` are `Arc`s to the same buffers;
+/// the field is what keeps those chunks alive for as long as the batch is queued.
+#[derive(Debug)]
 pub struct FlushBatch {
     pub id: u64,
     pub entries: HashMap<u64, EntryDelta>,
@@ -337,7 +345,10 @@ pub struct FsInner {
     /// Resting consolidated state loaded from `.summary` at mount, folded forward over generations.
     pub base: HashMap<u64, Arc<Node>>,
     /// Ordered queue of immutable frozen snapshots waiting to be written/flushed to disk.
-    pub flushing: VecDeque<FlushBatch>,
+    ///
+    /// `Arc` so the flusher can take the front batch out of the critical section in constant
+    /// time and copy what it needs without holding the lock.
+    pub flushing: VecDeque<Arc<FlushBatch>>,
     /// Monotonically increasing ID generator for flushing batches.
     pub next_batch_id: u64,
     /// Current generation's active mutable delta layer receiving live operations.
@@ -374,10 +385,10 @@ pub struct FsInner {
 
 impl FsInner {
     /// Pops the committed batch from the front of the flushing queue, asserting its ID matches `batch.id`.
-    pub fn pop_flushed_batch(&mut self, batch: &FlushBatch) -> FlushBatch {
+    pub fn pop_flushed_batch(&mut self, batch_id: u64) -> Arc<FlushBatch> {
         let front = self.flushing.front().expect("flushing queue must not be empty");
         assert_eq!(
-            front.id, batch.id,
+            front.id, batch_id,
             "front of flushing queue must match committed batch ID"
         );
         let popped = self.flushing.pop_front().unwrap();
@@ -388,7 +399,7 @@ impl FsInner {
 
     /// Pops the front batch from the flushing queue.
     #[cfg(any(test, feature = "testing"))]
-    pub fn pop_flushing_batch(&mut self) -> Option<FlushBatch> {
+    pub fn pop_flushing_batch(&mut self) -> Option<Arc<FlushBatch>> {
         let batch = self.flushing.pop_front()?;
         self.flushing_bytes -= batch.bytes;
         self.flushing_ops -= batch.ops;
@@ -448,8 +459,9 @@ impl FsInner {
             // An outstanding request names this batch even when a threshold is what finally
             // tripped the freeze - the requester's data is in here either way.
             let reason = self.freeze_requested.take().unwrap_or(FlushReason::Threshold);
-            self.flushing
-                .push_back(FlushBatch::new(id, entries, arena, bytes, ops, completion, reason));
+            self.flushing.push_back(Arc::new(FlushBatch::new(
+                id, entries, arena, bytes, ops, completion, reason,
+            )));
             true
         } else {
             false

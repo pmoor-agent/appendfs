@@ -280,7 +280,7 @@ impl InMemoryFS {
     pub fn with_layers<R>(
         &self,
         tag: OpTag,
-        f: impl FnOnce(&HashMap<u64, EntryDelta>, &VecDeque<FlushBatch>, &HashMap<u64, Arc<Node>>) -> R,
+        f: impl FnOnce(&HashMap<u64, EntryDelta>, &VecDeque<Arc<FlushBatch>>, &HashMap<u64, Arc<Node>>) -> R,
     ) -> R {
         let inner = self.inner.lock(tag).unwrap();
         f(&inner.live, &inner.flushing, &inner.base)

@@ -821,15 +821,19 @@ mod tests {
         let mut f_delta = FileDelta::default();
         f_delta.extents.insert(20, Extent::new_zero(20));
         flushing_batch.insert(attr.ino, EntryDelta::Node(NodeDelta::File(f_delta)));
-        fs.inner.lock_for_tests().unwrap().flushing.push_back(FlushBatch::new(
-            1,
-            flushing_batch,
-            WriteArena::new(),
-            0,
-            0,
-            crate::fs::BatchCompletion::new(),
-            crate::fs::FlushReason::Threshold,
-        ));
+        fs.inner
+            .lock_for_tests()
+            .unwrap()
+            .flushing
+            .push_back(std::sync::Arc::new(FlushBatch::new(
+                1,
+                flushing_batch,
+                WriteArena::new(),
+                0,
+                0,
+                crate::fs::BatchCompletion::new(),
+                crate::fs::FlushReason::Threshold,
+            )));
 
         // 3. Live layer: Staged extent at 30..50
         let mut live_delta = FileDelta::default();
