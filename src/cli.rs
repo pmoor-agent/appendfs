@@ -48,6 +48,16 @@ pub const DEFAULT_SUMMARY_INTERVAL_GENERATIONS: u64 = 10;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
+
+    /// Log verbosity: error, warn, info, debug, or trace (RUST_LOG overrides this)
+    #[arg(long = "log-level", global = true, default_value = crate::logging::DEFAULT_LOG_LEVEL)]
+    pub log_level: String,
+
+    /// Where to write diagnostic logs. Mount commands default to
+    /// <log-dir>/logs/appendfs-<date>-<time>-<pid>.log and other commands to nothing;
+    /// `/dev/stderr` follows along on a terminal and `/dev/null` discards.
+    #[arg(long = "log-file", global = true)]
+    pub log_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -314,18 +324,6 @@ pub struct MountCommonArgs {
     /// Additional raw FUSE options passed to libfuse (e.g. -o allow_other)
     #[arg(short = 'o', value_delimiter = ',')]
     pub fuse_options: Vec<String>,
-
-    /// Log verbosity: error, warn, info, debug, or trace (RUST_LOG overrides this)
-    #[arg(long = "log-level", default_value = crate::logging::DEFAULT_LOG_LEVEL)]
-    pub log_level: String,
-
-    /// Diagnostic log file (default: <log-dir>/logs/appendfs-<date>-<time>-<pid>.log)
-    #[arg(long = "log-file")]
-    pub log_file: Option<PathBuf>,
-
-    /// Log only to stderr. A backgrounded mount has no stderr, so its logs are discarded.
-    #[arg(long = "no-log-file", default_value_t = false)]
-    pub no_log_file: bool,
 
     /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
     #[arg(long = "key-file")]

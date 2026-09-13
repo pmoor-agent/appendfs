@@ -600,3 +600,116 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
         String::from_utf8_lossy(&fsck.stderr)
     );
 }
+
+/// `--log-file /dev/null` is how logging is turned off; there is no separate flag for it.
+#[test]
+fn test_cli_log_file_dev_null_leaves_no_log_behind() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::thread;
+    use std::time::Duration;
+
+    let log_dir = TempDir::new().unwrap();
+    let mount_dir = TempDir::new().unwrap();
+    std::fs::set_permissions(mount_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_appendfs"))
+            .args(["init", log_dir.path().to_str().unwrap()])
+            .output()
+            .expect("failed to init volume")
+            .status
+            .success()
+    );
+
+    let initial_dev = std::fs::metadata(mount_dir.path()).unwrap().dev();
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "mount",
+            log_dir.path().to_str().unwrap(),
+            mount_dir.path().to_str().unwrap(),
+            "--log-file",
+            "/dev/null",
+        ])
+        .output()
+        .expect("failed to spawn appendfs mount");
+    assert!(
+        out.status.success(),
+        "mount failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut mounted = false;
+    for _ in 0..200 {
+        if let Ok(meta) = std::fs::metadata(mount_dir.path())
+            && meta.dev() != initial_dev
+        {
+            mounted = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(mounted, "timed out waiting for FUSE filesystem to mount");
+
+    std::fs::write(mount_dir.path().join("payload.txt"), b"no logs wanted").unwrap();
+    assert!(
+        appendfs::wait_until(
+            || {
+                matches!(Command::new("fusermount3").arg("-u").arg(mount_dir.path()).status(),
+                         Ok(s) if s.success())
+            },
+            Duration::from_secs(5),
+        ),
+        "failed to unmount"
+    );
+
+    assert!(
+        !log_dir.path().join("logs").exists(),
+        "/dev/null must leave the volume directory untouched"
+    );
+}
+
+/// A one-shot command has a caller watching its output, so it leaves no log file in the
+/// volume unless one is asked for explicitly.
+#[test]
+fn test_cli_one_shot_commands_do_not_write_logs_into_the_volume() {
+    let log_dir = TempDir::new().unwrap();
+    for args in [
+        vec!["init", log_dir.path().to_str().unwrap()],
+        vec!["stats", log_dir.path().to_str().unwrap()],
+        vec!["fsck", log_dir.path().to_str().unwrap()],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+            .args(&args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {:?}: {}", args, e));
+        assert!(
+            out.status.success(),
+            "{:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !log_dir.path().join("logs").exists(),
+            "{:?} must not leave a log file in the volume",
+            args
+        );
+    }
+
+    // ...but asking explicitly works, for any command.
+    let explicit = log_dir.path().join("explicit.log");
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "fsck",
+            log_dir.path().to_str().unwrap(),
+            "--log-file",
+            explicit.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run fsck");
+    assert!(
+        out.status.success(),
+        "fsck failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(explicit.exists(), "--log-file must be honored by any command");
+}

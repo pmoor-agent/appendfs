@@ -10,6 +10,11 @@
 //! and a crashed run's log stays exactly as it was left rather than being overwritten by the
 //! restart.
 //!
+//! A file is the only destination. Anything a user is meant to read is printed directly, so
+//! logging has no reason to compete for the terminal - and `--log-file` reaches the terminal
+//! anyway via `/dev/stderr`, or discards via `/dev/null`, which is why there is no separate
+//! flag for either.
+//!
 //! The files live in a `logs/` subdirectory rather than beside the `.log` and `.summary`
 //! generation files. `Storage::list_files` is non-recursive and returns only files, so
 //! nothing in a subdirectory can be mistaken for a volume file by recovery, replication, or
@@ -47,34 +52,26 @@ pub fn log_file_path(log_dir: &Path, started: SystemTime, pid: u32) -> PathBuf {
     log_directory(log_dir).join(log_file_name(started, pid))
 }
 
-/// A log file that drops records rather than failing, and optionally echoes to stderr.
+/// A log file that drops records rather than failing.
 struct LogSink {
     /// `None` once writing has failed; records are dropped rather than propagated.
     file: Option<File>,
-    tee_stderr: bool,
 }
 
 impl LogSink {
-    fn create(path: &Path, tee_stderr: bool) -> io::Result<Self> {
+    fn create(path: &Path) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        // `append` rather than truncate: an explicit `--log-file` may name an existing file,
-        // and losing its contents on mount would be a poor surprise.
+        // `append` rather than truncate: an explicit `--log-file` may name an existing file
+        // - or a character device like `/dev/stderr` - and truncating would be wrong for both.
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self {
-            file: Some(file),
-            tee_stderr,
-        })
+        Ok(Self { file: Some(file) })
     }
 }
 
 impl Write for LogSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.tee_stderr {
-            let _ = io::stderr().write_all(buf);
-        }
-
         // A logging failure must not surface as a filesystem error, so this reports success
         // either way and simply stops writing.
         match self.file {
@@ -96,44 +93,39 @@ impl Write for LogSink {
     }
 }
 
-/// Builds the env_logger filter, letting `RUST_LOG` override `level` as usual.
-fn builder(level: &str) -> env_logger::Builder {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
-}
-
-/// Initializes stderr logging, for the one-shot commands that stay in the foreground and
-/// whose output the caller is watching.
-pub fn init_stderr(level: &str) {
-    builder(level).init();
-}
-
-/// Initializes logging for a mount: a file of this run's own under the volume's log
-/// directory, plus stderr while running in the foreground.
+/// Starts logging to `path`, or reports why it could not.
 ///
-/// `log_dir` is canonicalized first, because `fuse_daemonize` chdirs to `/` shortly after
-/// this returns. Returns the path being written to, or `None` if the file could not be
-/// created - in which case logging falls back to stderr and the mount proceeds regardless,
-/// since a volume on read-only media is still worth mounting.
-pub fn init_for_mount(log_dir: &Path, explicit_path: Option<&Path>, level: &str, foreground: bool) -> Option<PathBuf> {
-    let path = match explicit_path {
-        Some(p) => p.to_path_buf(),
-        None => {
-            let root = fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
-            log_file_path(&root, SystemTime::now(), std::process::id())
-        }
-    };
-
-    match LogSink::create(&path, foreground) {
+/// Returns the path in use, or `None` if it could not be opened - in which case records are
+/// discarded and the command proceeds regardless, since a volume on read-only media is still
+/// worth mounting.
+pub fn init(path: &Path, level: &str) -> Option<PathBuf> {
+    let builder = &mut env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level));
+    match LogSink::create(path) {
         Ok(sink) => {
-            builder(level).target(env_logger::Target::Pipe(Box::new(sink))).init();
-            Some(path)
+            builder.target(env_logger::Target::Pipe(Box::new(sink))).init();
+            Some(path.to_path_buf())
         }
         Err(e) => {
-            builder(level).init();
-            log::warn!("Could not open log file {}: {}; logging to stderr", path.display(), e);
+            eprintln!(
+                "Warning: could not open log file {}: {}; logging disabled",
+                path.display(),
+                e
+            );
             None
         }
     }
+}
+
+/// The default log destination for a command, or `None` for one that should not write logs.
+///
+/// Only the mount commands get one. They daemonize away from the terminal and run for weeks,
+/// which is what a log file is for; a one-shot command prints what its caller needs to see
+/// and has no business leaving a file behind in the volume.
+pub fn default_path_for(log_dir: Option<&Path>) -> Option<PathBuf> {
+    let log_dir = log_dir?;
+    // Canonicalized because `fuse_daemonize` chdirs to `/` shortly after this.
+    let root = fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
+    Some(log_file_path(&root, SystemTime::now(), std::process::id()))
 }
 
 #[cfg(test)]
@@ -166,7 +158,7 @@ mod tests {
         let storage = crate::storage::OsStorage::new(dir.path());
         let path = log_file_path(dir.path(), SystemTime::now(), std::process::id());
 
-        let mut sink = LogSink::create(&path, false).unwrap();
+        let mut sink = LogSink::create(&path).unwrap();
         sink.write_all(b"a log record\n").unwrap();
         sink.flush().unwrap();
 
@@ -186,13 +178,13 @@ mod tests {
         let started = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
 
         let first = log_file_path(dir.path(), started, 1);
-        let mut sink = LogSink::create(&first, false).unwrap();
+        let mut sink = LogSink::create(&first).unwrap();
         sink.write_all(b"from the first run\n").unwrap();
         sink.flush().unwrap();
         drop(sink);
 
         let second = log_file_path(dir.path(), started + Duration::from_secs(5), 2);
-        let mut sink = LogSink::create(&second, false).unwrap();
+        let mut sink = LogSink::create(&second).unwrap();
         sink.write_all(b"from the second run\n").unwrap();
         sink.flush().unwrap();
 
@@ -205,7 +197,7 @@ mod tests {
         // A filesystem must not fail because its log file did.
         let dir = tempfile::tempdir().unwrap();
         let path = log_file_path(dir.path(), SystemTime::now(), std::process::id());
-        let mut sink = LogSink::create(&path, false).unwrap();
+        let mut sink = LogSink::create(&path).unwrap();
         sink.write_all(b"before\n").unwrap();
         sink.file = None;
         assert!(sink.write_all(b"after\n").is_ok(), "a lost log file must be survivable");
