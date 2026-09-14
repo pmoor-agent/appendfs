@@ -528,21 +528,23 @@ impl InMemoryFS {
     /// Dynamically calculates live extent statistics across all active files and log generations.
     pub fn calculate_generation_live_stats(&self) -> Vec<GenerationLiveStats> {
         let manifest = self.manifest.read().unwrap().clone();
-        let base = self.inner.lock(OpTag::Stats).unwrap().base.clone();
-
-        let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
-        for node_arc in base.values() {
-            let node = node_arc.as_ref();
-            if let NodeKind::File { extent_map, .. } = &node.kind {
-                for (_, entry) in extent_map.iter() {
-                    if let Extent::Disk { generation, length, .. } = &entry.extent {
-                        let stats = live_map.entry(*generation).or_insert((0, 0));
-                        stats.0 += *length as u64;
-                        stats.1 += 1;
+        let live_map = {
+            let inner = self.inner.lock(OpTag::Stats).unwrap();
+            let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
+            for node_arc in inner.base.values() {
+                let node = node_arc.as_ref();
+                if let NodeKind::File { extent_map, .. } = &node.kind {
+                    for (_, entry) in extent_map.iter() {
+                        if let Extent::Disk { generation, length, .. } = &entry.extent {
+                            let stats = live_map.entry(*generation).or_insert((0, 0));
+                            stats.0 += *length as u64;
+                            stats.1 += 1;
+                        }
                     }
                 }
             }
-        }
+            live_map
+        };
 
         let mut result = Vec::new();
         for log in &manifest.logs {

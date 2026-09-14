@@ -268,9 +268,124 @@ impl FsInner {
 
         result
     }
+
+    /// Computes active inode counts across all overlay layers in a single pass without redundant lookups.
+    pub fn inode_counts(&self) -> InodeCounts {
+        let mut dirs = 0;
+        let mut files = 0;
+        let mut symlinks = 0;
+        let mut special = 0;
+
+        let mut count_ft = |ft: FileType| match ft {
+            FileType::Directory => dirs += 1,
+            FileType::RegularFile => files += 1,
+            FileType::Symlink => symlinks += 1,
+            _ => special += 1,
+        };
+
+        if self.live.is_empty() && self.flushing.is_empty() {
+            for node in self.base.values() {
+                count_ft(node.file_type());
+            }
+        } else {
+            let overlay_cap = self.live.len() + self.flushing.iter().map(|b| b.entries.len()).sum::<usize>();
+            let mut seen_overlay = HashSet::with_capacity(overlay_cap);
+
+            for (&ino, delta) in &self.live {
+                seen_overlay.insert(ino);
+                match delta {
+                    EntryDelta::Node(d) => count_ft(d.file_type()),
+                    EntryDelta::Tombstone => {}
+                }
+            }
+
+            for batch in self.flushing.iter().rev() {
+                for (&ino, delta) in &batch.entries {
+                    if seen_overlay.insert(ino) {
+                        match delta {
+                            EntryDelta::Node(d) => count_ft(d.file_type()),
+                            EntryDelta::Tombstone => {}
+                        }
+                    }
+                }
+            }
+
+            for (&ino, node) in &self.base {
+                if !seen_overlay.contains(&ino) {
+                    count_ft(node.file_type());
+                }
+            }
+        }
+
+        InodeCounts {
+            total_active: dirs + files + symlinks + special,
+            directories: dirs,
+            files,
+            symlinks,
+            special,
+        }
+    }
+
+    /// Captures a point-in-time snapshot of internal metrics while the lock is already held.
+    pub fn stats_snapshot(&self) -> InnerStatsSnapshot {
+        let (file_handles_count, virt_handles_count, dir_handles_count) = self.handle_counts();
+        InnerStatsSnapshot {
+            recovered_time: self.recovered_time,
+            inode_counts: self.inode_counts(),
+            live_len: self.live.len(),
+            flushing_batches: self.flushing.len(),
+            base_len: self.base.len(),
+            staged_bytes: self.staged_bytes,
+            staged_ops: self.staged_ops,
+            flushing_bytes: self.flushing_bytes,
+            flushing_ops: self.flushing_ops,
+            file_handles_count,
+            virt_handles_count,
+            dir_handles_count,
+            open_inodes_count: self.open_counts.len(),
+        }
+    }
+}
+
+/// Category breakdown of active inodes across all overlay layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InodeCounts {
+    pub total_active: usize,
+    pub directories: usize,
+    pub files: usize,
+    pub symlinks: usize,
+    pub special: usize,
+}
+
+/// Point-in-time snapshot of internal mutable filesystem metrics collected under a single lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InnerStatsSnapshot {
+    pub recovered_time: Option<SystemTime>,
+    pub inode_counts: InodeCounts,
+    pub live_len: usize,
+    pub flushing_batches: usize,
+    pub base_len: usize,
+    pub staged_bytes: usize,
+    pub staged_ops: usize,
+    pub flushing_bytes: usize,
+    pub flushing_ops: usize,
+    pub file_handles_count: usize,
+    pub virt_handles_count: usize,
+    pub dir_handles_count: usize,
+    pub open_inodes_count: usize,
 }
 
 impl InMemoryFS {
+    /// Takes a point-in-time snapshot of internal filesystem metrics using a single mutex lock.
+    pub fn stats_snapshot(&self) -> InnerStatsSnapshot {
+        self.inner.lock(OpTag::Stats).unwrap().stats_snapshot()
+    }
+
+    /// Computes active inode counts across the overlay layers using a single mutex lock.
+    pub fn inode_counts(&self) -> InodeCounts {
+        self.inner.lock(OpTag::Stats).unwrap().inode_counts()
+    }
+
     pub fn get_parent_dir_inode(&self, ino: u64) -> Option<u64> {
         self.inner.lock(OpTag::Lookup).unwrap().get_parent_dir_inode(ino)
     }

@@ -29,38 +29,72 @@ impl VolumeStats {
     /// Collects volume statistics from an in-memory filesystem state.
     pub fn collect(fs: &InMemoryFS) -> Self {
         let manifest = fs.manifest.read().unwrap().clone();
-        let inner = fs.inner.lock(OpTag::Stats).unwrap();
-        let base = &inner.base;
-        let total_inodes = base.len();
+        let (total_inodes, directory_count, file_count, symlink_count, total_logical_bytes, live_map) = {
+            let inner = fs.inner.lock(OpTag::Stats).unwrap();
+            let base = &inner.base;
+            let total_inodes = base.len();
 
-        let mut directory_count = 0;
-        let mut file_count = 0;
-        let mut symlink_count = 0;
-        let mut total_logical_bytes = 0;
+            let mut directory_count = 0;
+            let mut file_count = 0;
+            let mut symlink_count = 0;
+            let mut total_logical_bytes = 0;
+            let mut live_map: std::collections::HashMap<u64, (u64, u32)> = std::collections::HashMap::new();
 
-        for node_arc in base.values() {
-            let node = node_arc.as_ref();
-            match &node.kind {
-                NodeKind::Directory { .. } => directory_count += 1,
-                NodeKind::File { size, .. } => {
-                    file_count += 1;
-                    total_logical_bytes += size;
+            for node_arc in base.values() {
+                let node = node_arc.as_ref();
+                match &node.kind {
+                    NodeKind::Directory { .. } => directory_count += 1,
+                    NodeKind::File { size, extent_map } => {
+                        file_count += 1;
+                        total_logical_bytes += size;
+                        for (_, entry) in extent_map.iter() {
+                            if let crate::extent_map::Extent::Disk { generation, length, .. } = &entry.extent {
+                                let stats = live_map.entry(*generation).or_insert((0, 0));
+                                stats.0 += *length as u64;
+                                stats.1 += 1;
+                            }
+                        }
+                    }
+                    NodeKind::Symlink { .. } => symlink_count += 1,
+                    NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
                 }
-                NodeKind::Symlink { .. } => symlink_count += 1,
-                NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
             }
-        }
-        drop(inner);
+            (
+                total_inodes,
+                directory_count,
+                file_count,
+                symlink_count,
+                total_logical_bytes,
+                live_map,
+            )
+        };
 
-        let generations = fs.calculate_generation_live_stats();
+        let mut generations = Vec::new();
         let mut total_disk_bytes = 0;
         let mut total_data_bytes = 0;
         let mut total_live_bytes = 0;
 
-        for g in &generations {
-            total_disk_bytes += g.total_bytes;
-            total_data_bytes += g.total_data_bytes;
-            total_live_bytes += g.live_bytes;
+        for log in &manifest.logs {
+            let (live_bytes, live_extents) = live_map.get(&log.generation).copied().unwrap_or((0, 0));
+            let live_ratio = if log.total_data_bytes > 0 {
+                live_bytes as f64 / log.total_data_bytes as f64
+            } else {
+                0.0
+            };
+            total_disk_bytes += log.total_bytes;
+            total_data_bytes += log.total_data_bytes;
+            total_live_bytes += live_bytes;
+
+            generations.push(GenerationLiveStats {
+                generation: log.generation,
+                filename: log.filename.clone(),
+                record_count: log.record_count,
+                total_bytes: log.total_bytes,
+                total_data_bytes: log.total_data_bytes,
+                live_bytes,
+                live_extents,
+                live_ratio,
+            });
         }
 
         let overall_live_ratio = if total_data_bytes > 0 {
@@ -217,6 +251,7 @@ pub fn format_duration(d: std::time::Duration) -> String {
 pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     use std::sync::atomic::Ordering;
 
+    let snap = fs.stats_snapshot();
     let mut out = String::new();
 
     // 1. Volume & Manifest Info
@@ -238,7 +273,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     let next_ino = fs.next_inode.load(Ordering::SeqCst);
     let last_tx = fs.last_tx_id.load(Ordering::SeqCst);
 
-    let rec_time_str = match fs.recovered_time() {
+    let rec_time_str = match snap.recovered_time {
         Some(t) => {
             let elapsed = fs.clock.now().duration_since(t).unwrap_or_default().as_secs();
             format!("{}s ago", elapsed)
@@ -276,80 +311,21 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push('\n');
 
     // 2. Inodes Across Layers
-    let (total_active, dirs, files, symlinks, special, live_len, flushing_batches, base_len) = {
-        fs.with_layers(OpTag::Stats, |live, flushing, base| {
-            use std::collections::HashSet;
-            let mut seen = HashSet::new();
-            let mut dirs = 0;
-            let mut files = 0;
-            let mut symlinks = 0;
-            let mut special = 0;
-
-            for &ino in live
-                .keys()
-                .chain(flushing.iter().flat_map(|b| b.entries.keys()))
-                .chain(base.keys())
-            {
-                if !seen.insert(ino) {
-                    continue;
-                }
-                let file_type = if let Some(delta) = live.get(&ino) {
-                    match delta {
-                        crate::node::EntryDelta::Tombstone => None,
-                        crate::node::EntryDelta::Node(d) => Some(d.file_type()),
-                    }
-                } else if let Some(delta) = flushing.iter().rev().find_map(|b| b.entries.get(&ino)) {
-                    match delta {
-                        crate::node::EntryDelta::Tombstone => None,
-                        crate::node::EntryDelta::Node(d) => Some(d.file_type()),
-                    }
-                } else {
-                    base.get(&ino).map(|n| n.file_type())
-                };
-
-                if let Some(ft) = file_type {
-                    match ft {
-                        crate::shim::FileType::Directory => dirs += 1,
-                        crate::shim::FileType::RegularFile => files += 1,
-                        crate::shim::FileType::Symlink => symlinks += 1,
-                        _ => special += 1,
-                    }
-                }
-            }
-            let total = dirs + files + symlinks + special;
-            (
-                total,
-                dirs,
-                files,
-                symlinks,
-                special,
-                live.len(),
-                flushing.len(),
-                base.len(),
-            )
-        })
-    };
-
     out.push_str("[Inodes]\n");
     out.push_str(&format!(
         "  Active Inodes:      {} ({} directories, {} files, {} symlinks, {} special)\n",
-        total_active, dirs, files, symlinks, special
+        snap.inode_counts.total_active,
+        snap.inode_counts.directories,
+        snap.inode_counts.files,
+        snap.inode_counts.symlinks,
+        snap.inode_counts.special
     ));
-    out.push_str(&format!("  Live Staged Inodes: {}\n", live_len));
-    out.push_str(&format!("  Flushing Batches:   {}\n", flushing_batches));
-    out.push_str(&format!("  Base Inodes:        {}\n", base_len));
+    out.push_str(&format!("  Live Staged Inodes: {}\n", snap.live_len));
+    out.push_str(&format!("  Flushing Batches:   {}\n", snap.flushing_batches));
+    out.push_str(&format!("  Base Inodes:        {}\n", snap.base_len));
     out.push('\n');
 
     // 3. Flush Layer Stats
-    let (staged_bytes, staged_ops, flushing_bytes, flushing_ops) = {
-        let inner = fs.inner.lock(OpTag::Stats).unwrap();
-        (
-            inner.staged_bytes,
-            inner.staged_ops,
-            inner.flushing_bytes,
-            inner.flushing_ops,
-        )
-    };
     let max_buffer_size = fs.max_buffer_size;
     let max_staged_ops = fs.max_staged_ops;
     let max_extent_size = fs.max_extent_size;
@@ -364,7 +340,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     let last_summary_gen = fs.last_summary_generation.load(Ordering::SeqCst);
 
     let buffer_pct = if max_buffer_size > 0 {
-        (staged_bytes as f64 / max_buffer_size as f64) * 100.0
+        (snap.staged_bytes as f64 / max_buffer_size as f64) * 100.0
     } else {
         0.0
     };
@@ -372,18 +348,21 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push_str("[Flush Layer]\n");
     out.push_str(&format!(
         "  Staged Data:        {} / {} ({:.1}%)\n",
-        format_bytes(staged_bytes as u64),
+        format_bytes(snap.staged_bytes as u64),
         format_bytes(max_buffer_size as u64),
         buffer_pct
     ));
-    out.push_str(&format!("  Staged Operations:  {} / {}\n", staged_ops, max_staged_ops));
+    out.push_str(&format!(
+        "  Staged Operations:  {} / {}\n",
+        snap.staged_ops, max_staged_ops
+    ));
     out.push_str(&format!(
         "  Flushing Queue:     {} / {} batches ({} / {} data, {} / {} ops)\n",
-        flushing_batches,
+        snap.flushing_batches,
         max_flush_queue_depth,
-        format_bytes(flushing_bytes as u64),
+        format_bytes(snap.flushing_bytes as u64),
         format_bytes(max_flush_queue_bytes as u64),
-        flushing_ops,
+        snap.flushing_ops,
         max_flush_queue_ops
     ));
     out.push_str(&format!(
@@ -509,11 +488,6 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push('\n');
 
     // 6. Handles & Locks
-    let (file_handles_count, virt_handles_count, dir_handles_count, open_inodes_count) = {
-        let inner = fs.inner.lock(OpTag::Stats).unwrap();
-        let (reg, virt, dir) = inner.handle_counts();
-        (reg, virt, dir, inner.open_counts.len())
-    };
     let flock_count = fs.locks.flock_count();
     let range_lock_count = fs.locks.range_lock_count();
     let mutex_lock_count = fs.inner.lock_count();
@@ -526,10 +500,10 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     };
 
     out.push_str("[Handles & Locks]\n");
-    out.push_str(&format!("  Open File Handles:  {}\n", file_handles_count));
-    out.push_str(&format!("  Open Virt Handles:  {}\n", virt_handles_count));
-    out.push_str(&format!("  Open Dir Handles:   {}\n", dir_handles_count));
-    out.push_str(&format!("  Open Inodes:        {}\n", open_inodes_count));
+    out.push_str(&format!("  Open File Handles:  {}\n", snap.file_handles_count));
+    out.push_str(&format!("  Open Virt Handles:  {}\n", snap.virt_handles_count));
+    out.push_str(&format!("  Open Dir Handles:   {}\n", snap.dir_handles_count));
+    out.push_str(&format!("  Open Inodes:        {}\n", snap.open_inodes_count));
     out.push_str(&format!("  Active File Locks:  {}\n", flock_count));
     out.push_str(&format!("  Active Range Locks: {}\n", range_lock_count));
     out.push_str(&format!("  Mutex Lock Count:   {}\n", mutex_lock_count));
@@ -765,5 +739,114 @@ mod tests {
         fs.set_read_only(true);
         let ro_status = format_runtime_status(&fs);
         assert!(ro_status.contains("Access Mode:        Read-Only"));
+    }
+
+    #[test]
+    fn test_format_runtime_status_single_lock_acquisition() {
+        let fs = InMemoryFS::new();
+        let before_stats_count = fs
+            .inner
+            .op_stats()
+            .into_iter()
+            .find(|s| s.tag == OpTag::Stats)
+            .map(|s| s.count)
+            .unwrap_or(0);
+
+        let _ = format_runtime_status(&fs);
+
+        let after_stats_count = fs
+            .inner
+            .op_stats()
+            .into_iter()
+            .find(|s| s.tag == OpTag::Stats)
+            .map(|s| s.count)
+            .unwrap_or(0);
+
+        assert_eq!(
+            after_stats_count - before_stats_count,
+            1,
+            "format_runtime_status must acquire the inner lock with OpTag::Stats exactly once"
+        );
+    }
+
+    #[test]
+    fn test_inode_counts_overlay_layers() {
+        use crate::operations::dir::mkdir_core;
+        use crate::operations::links::{symlink_core, unlink_core};
+        use crate::operations::read_write::create_core;
+
+        let fs = InMemoryFS::new();
+        // Base state: 1 root directory
+        let counts = fs.inode_counts();
+        assert_eq!(counts.total_active, 1);
+        assert_eq!(counts.directories, 1);
+
+        // Add 2 files, 1 dir, 1 symlink in live
+        let d1 = mkdir_core(&fs, 1, "d1", 0o755, 1000, 1000).unwrap();
+        let _f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
+        let _f2 = create_core(&fs, d1.ino, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
+        symlink_core(&fs, 1, "s1.lnk", "f1.txt", 1000, 1000).unwrap();
+
+        let counts_live = fs.inode_counts();
+        assert_eq!(counts_live.directories, 2);
+        assert_eq!(counts_live.files, 2);
+        assert_eq!(counts_live.symlinks, 1);
+        assert_eq!(counts_live.total_active, 5);
+
+        // Freeze live to flushing
+        fs.freeze_now();
+        let counts_flushing = fs.inode_counts();
+        assert_eq!(counts_flushing.total_active, 5);
+        assert_eq!(counts_flushing.directories, 2);
+        assert_eq!(counts_flushing.files, 2);
+        assert_eq!(counts_flushing.symlinks, 1);
+
+        // In live, unlink f2 and add f3
+        unlink_core(&fs, d1.ino, "f2.txt").unwrap();
+        let _f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
+
+        let counts_mixed = fs.inode_counts();
+        assert_eq!(counts_mixed.directories, 2);
+        assert_eq!(counts_mixed.files, 2); // f1 + f3 (f2 deleted)
+        assert_eq!(counts_mixed.symlinks, 1);
+        assert_eq!(counts_mixed.total_active, 5);
+
+        // Unlink f1 as well
+        unlink_core(&fs, 1, "f1.txt").unwrap();
+        let counts_after_del = fs.inode_counts();
+        assert_eq!(counts_after_del.files, 1); // f3 only
+        assert_eq!(counts_after_del.total_active, 4);
+    }
+
+    #[test]
+    fn test_format_runtime_status_many_inodes_performance() {
+        use crate::operations::read_write::create_core;
+
+        let fs = InMemoryFS::new();
+        for i in 0..1_000 {
+            let name = format!("file_{}.dat", i);
+            create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
+        }
+
+        let before_stats_count = fs
+            .inner
+            .op_stats()
+            .into_iter()
+            .find(|s| s.tag == OpTag::Stats)
+            .map(|s| s.count)
+            .unwrap_or(0);
+
+        let status = format_runtime_status(&fs);
+
+        let after_stats_count = fs
+            .inner
+            .op_stats()
+            .into_iter()
+            .find(|s| s.tag == OpTag::Stats)
+            .map(|s| s.count)
+            .unwrap_or(0);
+
+        assert_eq!(after_stats_count - before_stats_count, 1);
+        assert!(status.contains("Active Inodes:      1001 (1 directories, 1000 files, 0 symlinks, 0 special)"));
     }
 }
