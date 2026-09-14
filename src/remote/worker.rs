@@ -475,6 +475,29 @@ impl RemoteReplicationWorker {
             confirmed_summaries.clear();
         }
 
+        // Pre-fetch object listings from each remote store once per cycle: O(1) listing requests per remote.
+        let mut store_listings: Vec<Option<HashMap<String, RemoteObject>>> = Vec::with_capacity(stores.len());
+        for r in &stores {
+            match r.store.list_objects("") {
+                Ok(objs) => {
+                    let map: HashMap<String, RemoteObject> = objs.into_iter().map(|o| (o.key.clone(), o)).collect();
+                    store_listings.push(Some(map));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "list_objects failed on remote '{}': {}. Remote will be skipped for this cycle",
+                        r.name,
+                        e
+                    );
+                    fs.replication_telemetry
+                        .write()
+                        .unwrap()
+                        .record_error(&r.name, &e.to_string());
+                    store_listings.push(None);
+                }
+            }
+        }
+
         // Age-based rolling belongs to the flusher, which owns the log writer and checks
         // `max_log_age` at the end of every cycle - including the idle ones. `max_log_age_secs`
         // reaches it as the writer's own limit, set at mount.
@@ -493,7 +516,7 @@ impl RemoteReplicationWorker {
             let expected_len = log_entry.total_bytes;
             let expected_md5 = log_entry.md5.as_ref();
 
-            for r in &stores {
+            for (r_idx, r) in stores.iter().enumerate() {
                 if r.read_only {
                     continue;
                 }
@@ -507,20 +530,12 @@ impl RemoteReplicationWorker {
                     continue;
                 }
 
-                let remote_head = match r.store.head_object(filename) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        log::warn!("head_object {} on remote '{}' failed: {}", filename, r.name, e);
-                        fs.replication_telemetry
-                            .write()
-                            .unwrap()
-                            .record_error(&r.name, &e.to_string());
-                        continue;
-                    }
+                let Some(ref map) = store_listings[r_idx] else {
+                    continue;
                 };
 
-                let needs_upload = match remote_head {
-                    Some(ref obj) => obj.size != expected_len,
+                let needs_upload = match map.get(filename) {
+                    Some(obj) => obj.size != expected_len,
                     None => true,
                 };
 
@@ -545,11 +560,12 @@ impl RemoteReplicationWorker {
                         }
                     } else {
                         // Cross-copy from another remote holding this generation
-                        for src in &stores {
+                        for (src_idx, src) in stores.iter().enumerate() {
                             if src.name == r.name {
                                 continue;
                             }
-                            if let Ok(Some(src_obj)) = src.store.head_object(filename)
+                            if let Some(Some(src_map)) = store_listings.get(src_idx)
+                                && let Some(src_obj) = src_map.get(filename)
                                 && src_obj.size == expected_len
                             {
                                 log::info!(
@@ -587,21 +603,41 @@ impl RemoteReplicationWorker {
                     upload_succeeded = true;
                 }
 
-                let verified_on_remote = upload_succeeded
-                    || r.store
-                        .head_object(filename)
-                        .is_ok_and(|h| h.is_some_and(|o| o.size == expected_len));
+                let verified_on_remote = if needs_upload {
+                    if upload_succeeded {
+                        match r.store.head_object(filename) {
+                            Ok(Some(obj)) if obj.size == expected_len => {
+                                if let Some(Some(map)) = store_listings.get_mut(r_idx) {
+                                    map.insert(filename.clone(), obj);
+                                }
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+
                 if verified_on_remote {
                     // Clean up any obsolete transient parts on this remote once consolidated log is verified,
                     // but ONLY if partial logs were enabled for this remote (avoiding unnecessary DELETE calls
                     // for append-only / write-only remotes).
                     if r.upload_partial_logs {
-                        let parts = r
-                            .store
-                            .list_objects(&format!("{:06}.part", gen_num))
-                            .unwrap_or_default();
-                        for part in parts {
-                            let _ = r.store.delete_object(&part.key);
+                        let prefix = format!("{:06}.part", gen_num);
+                        let part_keys: Vec<String> = if let Some(Some(map)) = store_listings.get(r_idx) {
+                            map.keys().filter(|k| k.starts_with(&prefix)).cloned().collect()
+                        } else {
+                            Vec::new()
+                        };
+                        for part_key in part_keys {
+                            if r.store.delete_object(&part_key).is_ok()
+                                && let Some(Some(map)) = store_listings.get_mut(r_idx)
+                            {
+                                map.remove(&part_key);
+                            }
                         }
                     }
 
@@ -624,12 +660,10 @@ impl RemoteReplicationWorker {
             .collect();
         // Also check if any remotes have summary files not in local storage (during full audit)
         if is_audit {
-            for r in &stores {
-                if let Ok(objs) = r.store.list_objects("") {
-                    for obj in objs {
-                        if obj.key.ends_with(".summary") {
-                            summary_files.insert(obj.key);
-                        }
+            for listing in store_listings.iter().flatten() {
+                for key in listing.keys() {
+                    if key.ends_with(".summary") {
+                        summary_files.insert(key.clone());
                     }
                 }
             }
@@ -643,7 +677,7 @@ impl RemoteReplicationWorker {
                 0
             };
 
-            for r in &stores {
+            for (r_idx, r) in stores.iter().enumerate() {
                 if r.read_only {
                     continue;
                 }
@@ -657,18 +691,11 @@ impl RemoteReplicationWorker {
                     continue;
                 }
 
-                let head = match r.store.head_object(sum_file) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        log::warn!("head_object summary {} on remote '{}' failed: {}", sum_file, r.name, e);
-                        fs.replication_telemetry
-                            .write()
-                            .unwrap()
-                            .record_error(&r.name, &e.to_string());
-                        continue;
-                    }
+                let Some(ref map) = store_listings[r_idx] else {
+                    continue;
                 };
-                let needs_sync = match head {
+
+                let needs_sync = match map.get(sum_file) {
                     None => true,
                     Some(h) if local_exists => h.size != local_len,
                     _ => false,
@@ -690,11 +717,13 @@ impl RemoteReplicationWorker {
                         }
                     } else {
                         // Find a peer remote that has this summary
-                        for src in &stores {
+                        for (src_idx, src) in stores.iter().enumerate() {
                             if src.name == r.name {
                                 continue;
                             }
-                            if let Ok(Some(src_head)) = src.store.head_object(sum_file) {
+                            if let Some(Some(src_map)) = store_listings.get(src_idx)
+                                && let Some(src_head) = src_map.get(sum_file)
+                            {
                                 log::info!(
                                     "Cross-copying summary {} ({} bytes) from remote '{}' to '{}'...",
                                     sum_file,
@@ -724,11 +753,25 @@ impl RemoteReplicationWorker {
                     sync_succeeded = true;
                 }
 
-                if sync_succeeded
-                    || r.store
-                        .head_object(sum_file)
-                        .is_ok_and(|h| h.is_some_and(|o| if local_exists { o.size == local_len } else { true }))
-                {
+                let verified_on_remote = if needs_sync {
+                    if sync_succeeded {
+                        match r.store.head_object(sum_file) {
+                            Ok(Some(obj)) if (if local_exists { obj.size == local_len } else { true }) => {
+                                if let Some(Some(map)) = store_listings.get_mut(r_idx) {
+                                    map.insert(sum_file.clone(), obj);
+                                }
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+
+                if verified_on_remote {
                     confirmed_summaries
                         .entry(r.name.clone())
                         .or_default()
@@ -807,7 +850,7 @@ impl RemoteReplicationWorker {
         }
 
         // 5. Tiered storage local eviction / pruning
-        Self::prune_eligible_local_logs(fs, &storage, &manifest, active_gen, &policy, &stores);
+        Self::prune_eligible_local_logs(fs, &storage, &manifest, active_gen, &policy, &stores, &store_listings);
 
         Ok(())
     }
@@ -819,6 +862,7 @@ impl RemoteReplicationWorker {
         active_gen: u64,
         policy: &crate::remote::config::ReplicationPolicy,
         stores: &[ConfiguredRemote],
+        store_listings: &[Option<HashMap<String, RemoteObject>>],
     ) {
         let now = fs.clock.now();
         let retention_dur = policy
@@ -862,26 +906,6 @@ impl RemoteReplicationWorker {
 
         if candidates.is_empty() {
             return;
-        }
-
-        // Batch-list remote objects across each remote store to compare sizes and ETags (MD5)
-        // in O(1) listing requests rather than issuing individual head_object requests per log.
-        let mut store_listings: Vec<Option<HashMap<String, RemoteObject>>> = Vec::with_capacity(stores.len());
-        for r in stores {
-            match r.store.list_objects("") {
-                Ok(objs) => {
-                    let map: HashMap<String, RemoteObject> = objs.into_iter().map(|o| (o.key.clone(), o)).collect();
-                    store_listings.push(Some(map));
-                }
-                Err(e) => {
-                    log::warn!(
-                        "list_objects failed on remote '{}' during pruning: {}. Remote will be skipped for this pruning cycle",
-                        r.name,
-                        e
-                    );
-                    store_listings.push(None);
-                }
-            }
         }
 
         for (log_entry, age) in candidates {

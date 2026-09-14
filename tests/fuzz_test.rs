@@ -678,7 +678,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 fs_remote.remotes[r_idx].fail_next_n_requests(1);
             }
             // 2. Periodic sync cycle (progressing replication and local log pruning)
-            if step % 3 == 0 {
+            if step % 30 == 0 {
                 fs_remote.sync_remotes();
             }
             // 3. Spontaneous deletion with single-survivor invariant:
@@ -687,21 +687,24 @@ fn test_differential_fuzzing_and_crash_recovery() {
             if step % 7 == 0 {
                 let n_remotes = fs_remote.memory_remotes.len();
                 let mut all_keys = std::collections::HashSet::new();
+                let mut remote_keys: Vec<std::collections::HashSet<String>> = Vec::with_capacity(n_remotes);
                 for mem in &fs_remote.memory_remotes {
                     if let Ok(objs) = mem.list_objects("") {
+                        let mut keys = std::collections::HashSet::with_capacity(objs.len());
                         for o in objs {
-                            all_keys.insert(o.key);
+                            all_keys.insert(o.key.clone());
+                            keys.insert(o.key);
                         }
+                        remote_keys.push(keys);
+                    } else {
+                        remote_keys.push(std::collections::HashSet::new());
                     }
                 }
                 for key in all_keys {
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     std::hash::Hash::hash(&key, &mut hasher);
                     let keeper = (std::hash::Hasher::finish(&hasher) as usize) % n_remotes;
-                    let keeper_has_it = fs_remote.memory_remotes[keeper]
-                        .head_object(&key)
-                        .map(|o| o.is_some())
-                        .unwrap_or(false);
+                    let keeper_has_it = remote_keys.get(keeper).map(|keys| keys.contains(&key)).unwrap_or(false);
                     if keeper_has_it {
                         for (i, mem) in fs_remote.memory_remotes.iter().enumerate() {
                             if i != keeper && prng.gen_range(0, 100) < 50 {

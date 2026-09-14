@@ -1210,7 +1210,7 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     );
 
     // 3. Full audit cycle (force_audit = true, simulating 4-hour elapsed audit):
-    // Must re-probe head_object on all sealed files!
+    // Audits via batch listing without O(N) head_object probes!
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
@@ -1224,9 +1224,15 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     )
     .unwrap();
 
-    assert!(
-        counting_store.heads() > head_calls_initial,
-        "Full audit cycle must re-probe head_object for remote integrity check"
+    assert_eq!(
+        counting_store.heads(),
+        head_calls_initial,
+        "Full audit cycle must verify remote integrity via batch listing without O(N) head_object calls!"
+    );
+    assert_eq!(
+        counting_store.lists(),
+        3,
+        "Full audit cycle issues batch list_objects rather than individual head_object queries"
     );
 }
 
@@ -1743,8 +1749,8 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     failing_counting.metrics().reset();
 
     // First cycle with list_objects failing:
-    // Replicates 000004.log and summary (which use head/put for initial upload),
-    // but pruning cannot verify remote quorum because list_objects fails.
+    // With pure listing-based verification, replication and pruning are skipped when listing fails,
+    // avoiding any uncoordinated O(N) head_object probes.
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
@@ -1763,10 +1769,14 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         storage.exists("000004.log"),
         "000004.log must NOT be pruned when remote listing fails"
     );
+    assert_eq!(failing_counting.lists(), 1, "Attempted 1 list_objects call");
+    assert_eq!(
+        failing_counting.heads(),
+        0,
+        "No head_object fallback calls should be issued when listing fails"
+    );
 
     // Reset metrics and run another cycle while list_objects is still failing:
-    // Files are now confirmed in confirmed_gens/confirmed_sums, so Step 2 and 3 do 0 heads.
-    // Pruning must attempt list_objects and do 0 head_object calls!
     failing_counting.metrics().reset();
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
@@ -1809,7 +1819,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     )
     .unwrap();
 
-    // 000004.log should now be cleanly pruned via batch listing
+    // 000004.log should now be cleanly replicated and pruned via batch listing
     assert!(
         !storage.exists("000004.log"),
         "000004.log must be pruned once remote listing succeeds"
@@ -1817,9 +1827,35 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     assert_eq!(
         failing_counting.lists(),
         1,
-        "Pruning quorum check used 1 list_objects request"
+        "Replication and pruning used 1 list_objects request"
     );
-    assert_eq!(failing_counting.heads(), 0, "No head_object calls were issued");
+    // 1 head_object call per newly uploaded file (000004.log and 000001.summary)
+    assert_eq!(
+        failing_counting.heads(),
+        2,
+        "Post-upload verification issued 1 head_object call per uploaded file (log + summary)"
+    );
+
+    // On subsequent cycles without new uploads, exactly 0 head_object calls are made
+    failing_counting.metrics().reset();
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        false,
+    )
+    .unwrap();
+    assert_eq!(failing_counting.lists(), 1, "1 batch listing for the cycle");
+    assert_eq!(
+        failing_counting.heads(),
+        0,
+        "No head_object calls when no uploads are needed"
+    );
 }
 
 #[test]
