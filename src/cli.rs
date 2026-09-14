@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-/// Default maximum log file size before rolling to next generation (1 GiB).
-pub const DEFAULT_MAX_LOG_SIZE: u64 = 1024 * 1024 * 1024;
+/// Default maximum log file size before rolling to next generation (2 GiB).
+pub const DEFAULT_MAX_LOG_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Default maximum staged write data in memory before triggering a flush (128 MiB).
 pub const DEFAULT_MAX_BUFFER_SIZE: usize = 128 * 1024 * 1024;
@@ -17,8 +17,8 @@ pub const DEFAULT_MAX_BUFFER_SIZE: usize = 128 * 1024 * 1024;
 /// chunk and one more entry in the file's extent map.
 pub const DEFAULT_MAX_EXTENT_SIZE: usize = 4 * 1024 * 1024;
 
-/// Default maximum staged mutation operations before triggering an automatic flush (10,000 ops).
-pub const DEFAULT_MAX_BUFFER_OPS: usize = 10_000;
+/// Default maximum staged mutation operations before triggering an automatic flush (16,384 ops / 2^14).
+pub const DEFAULT_MAX_BUFFER_OPS: usize = 1 << 14;
 
 /// Default maximum number of frozen flush batches allowed to queue up in memory before
 /// auto-freezing is bounded (16 batches).
@@ -27,7 +27,7 @@ pub const DEFAULT_MAX_FLUSH_QUEUE_DEPTH: usize = 16;
 /// Default maximum total bytes across all frozen flush batches queued in memory (256 MiB).
 pub const DEFAULT_MAX_FLUSH_QUEUE_BYTES: usize = 2 * DEFAULT_MAX_BUFFER_SIZE;
 
-/// Default maximum total mutating operations across all frozen flush batches queued in memory (20,000 ops).
+/// Default maximum total mutating operations across all frozen flush batches queued in memory (32,768 ops).
 pub const DEFAULT_MAX_FLUSH_QUEUE_OPS: usize = 2 * DEFAULT_MAX_BUFFER_OPS;
 
 pub use crate::remote::block_cache::DEFAULT_DECRYPTED_CACHE_SIZE;
@@ -366,11 +366,11 @@ pub struct MountArgs {
     #[arg(short = 't', long = "flush-threshold", default_value_t = DEFAULT_MAX_BUFFER_SIZE)]
     pub flush_threshold: usize,
 
-    /// Threshold of staged dirty mutations (create/unlink/mkdir/etc) before triggering an automatic flush (default: 10000)
+    /// Threshold of staged dirty mutations (create/unlink/mkdir/etc) before triggering an automatic flush (default: 16384)
     #[arg(long = "flush-threshold-ops", default_value_t = DEFAULT_MAX_BUFFER_OPS)]
     pub flush_threshold_ops: usize,
 
-    /// Maximum log file size in bytes before rolling to next generation (default: 1 GiB)
+    /// Maximum log file size in bytes before rolling to next generation (default: 2 GiB)
     #[arg(short = 's', long = "max-log-size", default_value_t = DEFAULT_MAX_LOG_SIZE)]
     pub max_log_size: u64,
 
@@ -382,8 +382,8 @@ pub struct MountArgs {
     #[arg(long = "no-sync", default_value_t = false)]
     pub no_sync: bool,
 
-    /// Maximum age of active log file before rolling for cloud durability (e.g. "2h", "30m", default: "2h")
-    #[arg(long = "max-log-age", default_value = "2h")]
+    /// Maximum age of active log file before rolling for cloud durability (e.g. "24h", "2h", default: "24h")
+    #[arg(long = "max-log-age", default_value = "24h")]
     pub max_log_age: String,
 
     /// Interval in bytes of committed log data before generating a new .summary snapshot file during log rolls (default: 10 GiB, 0 to disable byte-based trigger)
@@ -402,9 +402,13 @@ pub struct MountArgs {
     #[arg(long = "max-flush-queue-bytes", default_value_t = DEFAULT_MAX_FLUSH_QUEUE_BYTES)]
     pub max_flush_queue_bytes: usize,
 
-    /// Maximum total mutating operations across all frozen flush batches queued in memory before freezing is blocked (default: 20000)
+    /// Maximum total mutating operations across all frozen flush batches queued in memory (default: 32768)
     #[arg(long = "max-flush-queue-ops", default_value_t = DEFAULT_MAX_FLUSH_QUEUE_OPS)]
     pub max_flush_queue_ops: usize,
+
+    /// Track access time (atime) on reads (default: false, like noatime)
+    #[arg(long = "track-atime", default_value_t = false)]
+    pub track_atime: bool,
 }
 
 impl std::ops::Deref for MountArgs {
@@ -536,4 +540,29 @@ pub fn find_latest_generation_in_storage(storage: &dyn crate::storage::Storage) 
 pub fn find_latest_generation(log_dir: impl AsRef<Path>) -> u64 {
     let storage = crate::storage::OsStorage::new(log_dir);
     find_latest_generation_in_storage(&storage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_default_constants() {
+        assert_eq!(DEFAULT_MAX_LOG_SIZE, 2 * 1024 * 1024 * 1024);
+        assert_eq!(DEFAULT_MAX_BUFFER_OPS, 16_384);
+        assert_eq!(DEFAULT_MAX_FLUSH_QUEUE_OPS, 32_768);
+    }
+
+    #[test]
+    fn test_mount_args_defaults() {
+        let cli = Cli::parse_from(["appendfs", "mount", "/path/to/log", "/path/to/mnt"]);
+        let Commands::Mount(args) = cli.command else {
+            panic!("expected Mount command");
+        };
+        assert_eq!(args.max_log_size, 2 * 1024 * 1024 * 1024);
+        assert_eq!(args.flush_threshold_ops, 16_384);
+        assert_eq!(args.max_flush_queue_ops, 32_768);
+        assert_eq!(args.max_log_age, "24h");
+        assert!(!args.track_atime);
+    }
 }

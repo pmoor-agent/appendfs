@@ -219,16 +219,16 @@ pub struct ReplicationPolicy {
     /// Optional fine-grained local retention duration in seconds (overrides local_retention_days if set).
     #[serde(default)]
     pub local_retention_secs: Option<u64>,
-    /// Maximum disk footprint in GB of the local volume before LRU pruning.
+    /// Maximum disk footprint in GB of the local volume before LRU pruning (default: 16 GB).
     #[serde(default = "default_cache_max_gb")]
     pub local_cache_max_gb: u64,
-    /// Maximum time an active log can stay open before rolling (default: 7200s / 2 hours).
+    /// Maximum time an active log can stay open before rolling (default: 86400s / 24 hours).
     #[serde(default = "default_max_log_age")]
     pub max_log_age_secs: u64,
-    /// Frequency of intermediate active log part uploads (default: 1800s / 30 minutes).
+    /// Frequency of intermediate active log part uploads (default: 3600s / 1 hour).
     #[serde(default = "default_active_sync_interval")]
     pub active_sync_interval_secs: u64,
-    /// Frequency of full remote consistency and healing audits (default: 14400s / 4 hours).
+    /// Frequency of full remote consistency and healing audits (default: 21600s / 6 hours).
     #[serde(default = "default_audit_interval")]
     pub audit_interval_secs: u64,
 }
@@ -240,16 +240,16 @@ fn default_retention_days() -> u64 {
     30
 }
 fn default_cache_max_gb() -> u64 {
-    50
+    16
 }
 fn default_max_log_age() -> u64 {
-    7200
+    86400 // 24 hours
 }
 fn default_active_sync_interval() -> u64 {
-    1800
+    3600 // 1 hour
 }
 fn default_audit_interval() -> u64 {
-    14400 // 4 hours
+    21600 // 6 hours
 }
 
 impl Default for ReplicationPolicy {
@@ -519,5 +519,17 @@ bucket = "legacy-bucket"
         assert!(nfs_store.upload_partial_logs);
         let leg_store = stores.iter().find(|r| r.name == "legacy").unwrap();
         assert!(leg_store.upload_partial_logs);
+    }
+
+    #[test]
+    fn test_replication_policy_defaults() {
+        let policy = ReplicationPolicy::default();
+        assert_eq!(policy.local_cache_max_gb, 16);
+        assert_eq!(policy.max_log_age_secs, 86400);
+        assert_eq!(policy.active_sync_interval_secs, 3600);
+        assert_eq!(policy.audit_interval_secs, 21600);
+        assert_eq!(policy.min_synced_remotes, 1);
+        assert_eq!(policy.local_retention_days, 30);
+        assert_eq!(policy.local_retention_secs, None);
     }
 }
