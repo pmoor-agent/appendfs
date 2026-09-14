@@ -4,9 +4,9 @@ Generation:          0
 Format Version:      1
 Last Transaction ID: 0
 Next Inode:          2
-File Size:           293 B
+File Size:           256 B
 Encryption:          Plaintext (None)
-Checksum (BLAKE3):   e5a4eaab02b36aa0d414afa66a8536a5b05e58176ae0dd3d16611812e7bca522 (VERIFIED)
+Checksum (BLAKE3):   6061e6229bab7c526521b2a3664140e9daee0be6ab2941e700dd4cb7b8982184 (VERIFIED)
 
 --- Inode Breakdown ---
 Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)

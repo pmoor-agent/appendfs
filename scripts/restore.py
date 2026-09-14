@@ -294,10 +294,12 @@ def read_volume_header_from_summary(summary_path: Path) -> Tuple[bytes, bytes, b
     if not summary_path.is_file():
         raise FileNotFoundError(f"Summary file not found: '{summary_path}'")
     with open(summary_path, "rb") as f:
-        hdr = f.read(64)
-        if len(hdr) < 64:
+        hdr = f.read(72)
+        if len(hdr) < 72:
             raise ValueError(f"Corrupt or truncated summary header in '{summary_path}'")
-        magic, ver, gen, rev, tx, next_ino, sec, nsec, iv, vh_len = struct.unpack(">4sIQIQQqI12sI", hdr)
+        magic, ver, gen, rev, tx, next_ino, sec, nsec, iv, vh_len, uncompressed_len = struct.unpack(
+            ">4sIQIQQqI12sIQ", hdr
+        )
         if magic != b"APPS":
             raise ValueError(f"Invalid magic {magic} in '{summary_path}'")
         if vh_len < 72:
@@ -305,7 +307,9 @@ def read_volume_header_from_summary(summary_path: Path) -> Tuple[bytes, bytes, b
         vh_bytes = f.read(72)
         if len(vh_bytes) < 72:
             raise ValueError(f"Truncated VolumeHeader in '{summary_path}'")
-        cipher, key_source, compression, volume_id, kdf_salt, kcv_iv, kcv_tag = struct.unpack(">III16s16s12s16s", vh_bytes)
+        cipher, key_source, compression, volume_id, kdf_salt, kcv_iv, kcv_tag = struct.unpack(
+            ">III16s16s12s16s", vh_bytes
+        )
         return (volume_id, kdf_salt, kcv_iv, kcv_tag)
 
 

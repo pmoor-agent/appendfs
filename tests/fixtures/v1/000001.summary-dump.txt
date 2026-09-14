@@ -4,9 +4,9 @@ Generation:          1
 Format Version:      1
 Last Transaction ID: 38
 Next Inode:          19
-File Size:           2.54 KiB
+File Size:           958 B
 Encryption:          Plaintext (None)
-Checksum (BLAKE3):   89be97c0f42e0b1bca7d20e1d66b3489c9958cb46d6de535f717af58cd533815 (VERIFIED)
+Checksum (BLAKE3):   36b8e18c5b9b10f345dc63e4d17dbeb6590893fce45e46caa258acedc1982a1b (VERIFIED)
 
 --- Inode Breakdown ---
 Total Inodes:        18 (6 directories, 5 regular files, 3 symlinks)
