@@ -13,7 +13,7 @@ use std::sync::Arc;
 pub const SUMMARY_FOOTER_SIZE: usize = 52;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
 pub const CURRENT_SUMMARY_VERSION: u32 = 1;
-pub const SUMMARY_HEADER_SIZE: usize = 64;
+pub const SUMMARY_HEADER_SIZE: usize = 72;
 
 /// Fixed-size header written at offset 0 of `{:06}.summary` (or `{:06}_r{}.summary`),
 /// exactly `SUMMARY_HEADER_SIZE` bytes - readers seek past it by that constant, so the two must agree.
@@ -31,6 +31,8 @@ pub struct SummaryHeader {
     pub iv: [u8; 12],
     /// Length of the plaintext VolumeHeader blob that follows this header.
     pub volume_header_len: u32,
+    /// Length of the uncompressed summary body in bytes.
+    pub uncompressed_len: u64,
 }
 
 impl SummaryHeader {
@@ -41,6 +43,7 @@ impl SummaryHeader {
         created_at: std::time::SystemTime,
         iv: [u8; 12],
         volume_header_len: u32,
+        uncompressed_len: u64,
     ) -> Self {
         Self {
             magic: *SUMMARY_MAGIC,
@@ -52,6 +55,7 @@ impl SummaryHeader {
             created_at,
             iv,
             volume_header_len,
+            uncompressed_len,
         }
     }
 
@@ -82,8 +86,9 @@ impl SummaryHeader {
 
 /// Footer written at EOF (last `SUMMARY_FOOTER_SIZE` bytes) of `{:06}.summary`.
 ///
+/// `manifest_offset` is the byte offset of the manifest within the uncompressed summary body.
 /// `checksum` is a full (untruncated) BLAKE3 hash of everything in the file *before*
-/// the footer - the header, every inode record, and the manifest.
+/// the footer - the header, volume header, and compressed/encrypted body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryFooter {
     pub manifest_offset: u64,
@@ -111,57 +116,11 @@ impl SummaryFooter {
     }
 }
 
-/// Where a summary body accumulates while it is being built.
-///
-/// The two cases differ only in destination, not in content. An unencrypted body streams
-/// straight to the file; an encrypted one has to be buffered, because ChaCha20-Poly1305
-/// authenticates the body as a single message and its tag is not known until the last byte
-/// is in. Reads do not gain from streaming that: `SummaryReader` materialises the whole
-/// decrypted body anyway, since `read_inode` seeks into it by offset.
-enum BodySink<'a> {
-    /// Streams to the file, hashing as it goes. Offsets are absolute file positions, which
-    /// is what the unencrypted reader seeks by.
-    Direct {
-        writer: &'a mut Box<dyn crate::storage::StorageWriter>,
-        hasher: &'a mut blake3::Hasher,
-        offset: u64,
-    },
-    /// Accumulates in memory to be sealed in one go. Offsets are relative to the body start,
-    /// which is what the encrypted reader indexes the decrypted buffer by.
-    Buffered(&'a mut Vec<u8>),
-}
-
-impl BodySink<'_> {
-    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        match self {
-            BodySink::Direct { writer, hasher, offset } => {
-                writer.append(bytes)?;
-                hasher.update(bytes);
-                *offset += bytes.len() as u64;
-                Ok(())
-            }
-            BodySink::Buffered(buf) => {
-                buf.extend_from_slice(bytes);
-                Ok(())
-            }
-        }
-    }
-
-    /// The offset the next byte will occupy, in whichever coordinate space this sink's
-    /// reader will later use.
-    fn offset(&self) -> u64 {
-        match self {
-            BodySink::Direct { offset, .. } => *offset,
-            BodySink::Buffered(buf) => buf.len() as u64,
-        }
-    }
-}
-
-/// Serializes every inode, then the manifest, into `sink`.
+/// Serializes every inode, then the manifest, into `buf`.
 ///
 /// Returns `(manifest_offset, entry_count)` for the footer.
 fn write_summary_body(
-    sink: &mut BodySink<'_>,
+    buf: &mut Vec<u8>,
     inodes: &[(u64, Arc<Node>)],
     manifest: &crate::log::LogManifest,
 ) -> io::Result<(u64, u64)> {
@@ -176,15 +135,15 @@ fn write_summary_body(
         let payload =
             crate::wire::serialize(&node_to_serialize).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        sink.append(&inode.to_be_bytes())?;
-        sink.append(&(payload.len() as u32).to_be_bytes())?;
-        sink.append(&payload)?;
+        buf.extend_from_slice(&inode.to_be_bytes());
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&payload);
     }
 
-    let manifest_offset = sink.offset();
+    let manifest_offset = buf.len() as u64;
     let manifest_bytes = crate::wire::serialize(manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    sink.append(&(manifest_bytes.len() as u32).to_be_bytes())?;
-    sink.append(&manifest_bytes)?;
+    buf.extend_from_slice(&(manifest_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&manifest_bytes);
 
     Ok((manifest_offset, inodes.len() as u64))
 }
@@ -276,6 +235,13 @@ pub fn export_summary_with_iv(
     let volume_header_bytes =
         crate::wire::serialize(volume_header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+    let mut manifest_with_md5 = manifest.clone();
+    manifest_with_md5.populate_sealed_md5s(storage, generation);
+
+    let mut uncompressed_body = Vec::new();
+    let (manifest_offset, entry_count) =
+        write_summary_body(&mut uncompressed_body, &inodes_snapshot, &manifest_with_md5)?;
+
     let header = SummaryHeader::new(
         generation,
         last_tx_id,
@@ -283,6 +249,7 @@ pub fn export_summary_with_iv(
         created_at,
         iv,
         volume_header_bytes.len() as u32,
+        uncompressed_body.len() as u64,
     );
     let header_bytes = header.to_bytes();
     writer.append(&header_bytes)?;
@@ -293,36 +260,18 @@ pub fn export_summary_with_iv(
         hasher.update(&volume_header_bytes);
     }
 
-    // One pass builds the body; where those bytes land is the only difference between an
-    // encrypted and an unencrypted summary. Previously each case had its own copy of this
-    // loop - 84% identical, including the whole extent-coalescing walk - so a fix to the
-    // subtle part had to be made twice or silently applied to only one kind of volume.
-    let mut buffered = is_encrypted.then(Vec::new);
-    let body_base = (header_bytes.len() + volume_header_bytes.len()) as u64;
+    let compressed_body = crate::compress::compress_zstd_unconditional(&uncompressed_body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("summary compression failed: {}", e)))?;
 
-    let mut manifest_with_md5 = manifest.clone();
-    manifest_with_md5.populate_sealed_md5s(storage, generation);
-
-    let (manifest_offset, entry_count) = {
-        let mut sink = match buffered {
-            Some(ref mut buf) => BodySink::Buffered(buf),
-            None => BodySink::Direct {
-                writer: &mut writer,
-                hasher: &mut hasher,
-                offset: body_base,
-            },
-        };
-        write_summary_body(&mut sink, &inodes_snapshot, &manifest_with_md5)?
-    };
-
-    // An encrypted body is sealed as a single AEAD message, so it can only be written once
-    // the last byte is known.
-    if let Some(body) = buffered {
+    if is_encrypted {
         let ciphertext = volume_key
-            .encrypt_summary(&iv, &header_bytes, &body)
+            .encrypt_summary(&iv, &header_bytes, &compressed_body)
             .map_err(io::Error::other)?;
         writer.append(&ciphertext)?;
         hasher.update(&ciphertext);
+    } else {
+        writer.append(&compressed_body)?;
+        hasher.update(&compressed_body);
     }
 
     let checksum: [u8; 32] = *hasher.finalize().as_bytes();
@@ -436,7 +385,7 @@ pub struct SummaryReader {
     pub manifest: crate::log::LogManifest,
     /// Parsed from the plaintext blob, so callers get volume identity without a second read.
     pub volume_header: crate::crypto::VolumeHeader,
-    decrypted_body: Option<Vec<u8>>,
+    decompressed_body: Vec<u8>,
     pub volume_key: Arc<VolumeKey>,
 }
 
@@ -500,6 +449,74 @@ fn parse_volume_header_blob(
     crate::wire::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Verifies that the BLAKE3 checksum of bytes 0..content_len matches expected_checksum.
+fn verify_summary_checksum(
+    reader: &dyn StorageReader,
+    content_len: u64,
+    expected_checksum: &[u8; 32],
+    filename: &str,
+) -> io::Result<()> {
+    let mut hasher = blake3::Hasher::new();
+    let mut offset = 0u64;
+    let mut buf = [0u8; 8192];
+    while offset < content_len {
+        let chunk = std::cmp::min(content_len - offset, buf.len() as u64) as usize;
+        reader.read_exact_at(offset, &mut buf[..chunk])?;
+        hasher.update(&buf[..chunk]);
+        offset += chunk as u64;
+    }
+
+    if hasher.finalize().as_bytes() != expected_checksum {
+        panic!(
+            "summary checksum mismatch in {}: this data has been corrupted (possible bitrot)",
+            filename
+        );
+    }
+    Ok(())
+}
+
+/// Reads, decrypts (if encrypted), and decompresses the summary body from disk.
+fn read_and_decompress_summary_body(
+    reader: &dyn StorageReader,
+    header: &SummaryHeader,
+    header_buf: &[u8; SUMMARY_HEADER_SIZE],
+    footer_offset: u64,
+    volume_key: &VolumeKey,
+    filename: &str,
+) -> io::Result<Vec<u8>> {
+    let body_offset = SUMMARY_HEADER_SIZE as u64 + header.volume_header_len as u64;
+    let body_len = footer_offset.checked_sub(body_offset).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "summary file {} declares a {}-byte volume header, which overruns the file",
+                filename, header.volume_header_len
+            ),
+        )
+    })? as usize;
+    let mut body_bytes = vec![0u8; body_len];
+    reader.read_exact_at(body_offset, &mut body_bytes)?;
+
+    let compressed_bytes = if volume_key.cipher().is_encrypted() {
+        volume_key
+            .decrypt_summary(&header.iv, header_buf, &body_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+    } else {
+        body_bytes
+    };
+
+    let uncompressed_len = usize::try_from(header.uncompressed_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "summary uncompressed length {} exceeds platform address space",
+                header.uncompressed_len
+            ),
+        )
+    })?;
+    crate::compress::decompress_zstd_exact(&compressed_bytes, uncompressed_len)
+}
+
 impl SummaryReader {
     /// Reads the VolumeHeader metadata from a summary file without requiring full body decryption.
     pub fn read_volume_header(storage: &dyn Storage, filename: &str) -> io::Result<crate::crypto::VolumeHeader> {
@@ -519,8 +536,6 @@ impl SummaryReader {
     }
 
     /// Opens a `.summary` file from a `Storage` instance.
-    // TODO(too-many-lines): extract this into smaller units.
-    #[allow(clippy::too_many_lines)]
     pub fn open(storage: &dyn Storage, filename: &str, volume_key: Arc<VolumeKey>) -> io::Result<Self> {
         let reader = storage.open_reader(filename)?;
         let file_len = reader.len()?;
@@ -565,127 +580,64 @@ impl SummaryReader {
 
         // 3. Verify the whole-file checksum before trusting anything in this summary
         let content_len = file_len.saturating_sub(SUMMARY_FOOTER_SIZE as u64);
-        let mut hasher = blake3::Hasher::new();
-        let mut offset = 0u64;
-        let mut buf = [0u8; 8192];
-        while offset < content_len {
-            let chunk = std::cmp::min(content_len - offset, buf.len() as u64) as usize;
-            reader.read_exact_at(offset, &mut buf[..chunk])?;
-            hasher.update(&buf[..chunk]);
-            offset += chunk as u64;
-        }
+        verify_summary_checksum(reader.as_ref(), content_len, &footer.checksum, filename)?;
 
-        if hasher.finalize().as_bytes() != &footer.checksum {
-            panic!(
-                "summary checksum mismatch in {}: this data has been corrupted (possible bitrot)",
-                filename
-            );
-        }
+        let decompressed_body = read_and_decompress_summary_body(
+            reader.as_ref(),
+            &header,
+            &header_buf,
+            footer_offset,
+            &volume_key,
+            filename,
+        )?;
 
-        // `entry_count` also comes from the rewritable footer, and it sizes allocations on
-        // both paths. Bound it by what the file could possibly hold before trusting it, or a
+        // `entry_count` also comes from the rewritable footer, and it sizes allocations.
+        // Bound it by what the decompressed body could possibly hold before trusting it, or a
         // forged count aborts the process on an oversized allocation.
         footer
             .entry_count
             .checked_mul(12)
-            .filter(|bytes| *bytes <= content_len)
+            .filter(|bytes| *bytes <= decompressed_body.len() as u64)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "summary file {} claims {} entries, more than its {} bytes can hold",
-                        filename, footer.entry_count, content_len
+                        "summary file {} claims {} entries, more than its {} decompressed bytes can hold",
+                        filename,
+                        footer.entry_count,
+                        decompressed_body.len()
                     ),
                 )
             })?;
 
-        // Which branch to take is decided by the key we hold, not by the summary's own
-        // `cipher` byte. That byte is covered only by the footer's BLAKE3 checksum, which
-        // carries no key and can simply be recomputed after an edit; the key's cipher comes
-        // from the verified key check value. Trusting the file here would let a cleared
-        // byte route an encrypted body down the plaintext path, skipping the AEAD.
-        if !volume_key.cipher().is_encrypted() {
-            let body_base = SUMMARY_HEADER_SIZE as u64 + header.volume_header_len as u64;
-            if footer.manifest_offset < body_base || footer.manifest_offset > footer_offset {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "summary file {} has invalid manifest_offset {} (body_base={}, footer_offset={})",
-                        filename, footer.manifest_offset, body_base, footer_offset
-                    ),
-                ));
-            }
-
-            // 4. Read LogManifest from manifest_offset
-            let mut manifest_len_buf = [0u8; 4];
-            reader.read_exact_at(footer.manifest_offset, &mut manifest_len_buf)?;
-            let manifest_len = u32::from_be_bytes(manifest_len_buf) as usize;
-            let mut manifest_buf = vec![0u8; manifest_len];
-            reader.read_exact_at(footer.manifest_offset + 4, &mut manifest_buf)?;
-            let manifest: crate::log::LogManifest =
-                crate::wire::deserialize(&manifest_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            Ok(Self {
-                reader,
-                header,
-                footer,
-                manifest,
-                volume_header,
-                decrypted_body: None,
-                volume_key,
-            })
-        } else {
-            // Encrypted summary body
-            //
-            // `volume_header_len` is read from the file, so an oversized value would push
-            // `ciphertext_offset` past the footer and underflow this subtraction - a panic in
-            // debug, and in release a wrapped length that requests a multi-terabyte
-            // allocation.
-            let ciphertext_offset = SUMMARY_HEADER_SIZE as u64 + header.volume_header_len as u64;
-            let ciphertext_len = footer_offset.checked_sub(ciphertext_offset).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "summary file {} declares a {}-byte volume header, which overruns the file",
-                        filename, header.volume_header_len
-                    ),
-                )
-            })? as usize;
-            let mut ciphertext = vec![0u8; ciphertext_len];
-            reader.read_exact_at(ciphertext_offset, &mut ciphertext)?;
-
-            let decrypted = volume_key
-                .decrypt_summary(&header.iv, &header_buf, &ciphertext)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            if footer.manifest_offset > decrypted.len() as u64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "summary file {} has manifest_offset {} beyond decrypted body length {}",
-                        filename,
-                        footer.manifest_offset,
-                        decrypted.len()
-                    ),
-                ));
-            }
-
-            let len_bytes = body_slice(&decrypted, footer.manifest_offset, 4, "manifest length")?;
-            let manifest_len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as u64;
-            let manifest_bytes = body_slice(&decrypted, footer.manifest_offset + 4, manifest_len, "manifest")?;
-            let manifest: crate::log::LogManifest =
-                crate::wire::deserialize(manifest_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            Ok(Self {
-                reader,
-                header,
-                footer,
-                manifest,
-                volume_header,
-                decrypted_body: Some(decrypted),
-                volume_key,
-            })
+        if footer.manifest_offset > decompressed_body.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "summary file {} has manifest_offset {} beyond decompressed body length {}",
+                    filename,
+                    footer.manifest_offset,
+                    decompressed_body.len()
+                ),
+            ));
         }
+
+        // 4. Read LogManifest from manifest_offset
+        let len_bytes = body_slice(&decompressed_body, footer.manifest_offset, 4, "manifest length")?;
+        let manifest_len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as u64;
+        let manifest_bytes = body_slice(&decompressed_body, footer.manifest_offset + 4, manifest_len, "manifest")?;
+        let manifest: crate::log::LogManifest =
+            crate::wire::deserialize(manifest_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        Ok(Self {
+            reader,
+            header,
+            footer,
+            manifest,
+            volume_header,
+            decompressed_body,
+            volume_key,
+        })
     }
 
     /// Returns the underlying storage reader.
@@ -695,20 +647,8 @@ impl SummaryReader {
 
     /// Reads and deserializes all inodes sequentially from this summary file into an in-memory HashMap.
     pub fn read_all_inodes(&self) -> io::Result<HashMap<u64, Arc<Node>>> {
-        if let Some(ref decrypted) = self.decrypted_body {
-            let slice = body_slice(decrypted, 0, self.footer.manifest_offset, "inode records")?;
-            parse_inodes_slice(slice, self.footer.entry_count)
-        } else {
-            let body_base = SUMMARY_HEADER_SIZE as u64 + self.header.volume_header_len as u64;
-            let inodes_len = self.footer.manifest_offset.checked_sub(body_base).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "manifest_offset is before volume header in summary",
-                )
-            })? as usize;
-            let inodes_bytes = self.reader.read_vec(body_base, inodes_len)?;
-            parse_inodes_slice(&inodes_bytes, self.footer.entry_count)
-        }
+        let slice = body_slice(&self.decompressed_body, 0, self.footer.manifest_offset, "inode records")?;
+        parse_inodes_slice(slice, self.footer.entry_count)
     }
 
     /// Reads and deserializes a single `Node` for `inode` from this summary file.
@@ -941,7 +881,7 @@ mod tests {
         // Readers seek past the header by SUMMARY_HEADER_SIZE to reach the volume header
         // blob, so a field added or removed without updating the constant would silently
         // misalign every subsequent offset rather than fail loudly.
-        let header = SummaryHeader::new(1, 2, 3, SystemTime::UNIX_EPOCH, [0u8; 12], 0);
+        let header = SummaryHeader::new(1, 2, 3, SystemTime::UNIX_EPOCH, [0u8; 12], 0, 0);
         assert_eq!(header.to_bytes().len(), SUMMARY_HEADER_SIZE);
     }
 
@@ -1005,7 +945,7 @@ mod tests {
     #[test]
     fn test_zero_volume_header_len_fails_with_invalid_data() {
         let storage = Arc::new(MemoryStorage::new());
-        let header = SummaryHeader::new(0, 0, 2, std::time::SystemTime::UNIX_EPOCH, [0u8; 12], 0);
+        let header = SummaryHeader::new(0, 0, 2, std::time::SystemTime::UNIX_EPOCH, [0u8; 12], 0, 0);
         let header_bytes = header.to_bytes();
         let mut writer = storage.open_writer("000000.summary", WriteMode::CreateNew).unwrap();
         writer.append(&header_bytes).unwrap();
@@ -1103,5 +1043,147 @@ mod tests {
             NodeKind::Directory { entries, .. } => assert_eq!(entries[0].0, "a.txt"),
             _ => panic!("expected directory root"),
         }
+    }
+
+    #[test]
+    fn test_summary_body_is_zstd_compressed_on_disk() {
+        let storage = Arc::new(MemoryStorage::new());
+        init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let bytes = storage.get_file_bytes("000000.summary").unwrap();
+        let header = SummaryHeader::from_bytes(&bytes[..SUMMARY_HEADER_SIZE]).unwrap();
+        let body_offset = SUMMARY_HEADER_SIZE + header.volume_header_len as usize;
+
+        // Check for zstd magic number (0xFD2FB528 in little-endian) at body_offset
+        assert_eq!(
+            &bytes[body_offset..body_offset + 4],
+            &[0x28, 0xb5, 0x2f, 0xfd],
+            "Unencrypted summary body must start with zstd magic"
+        );
+
+        let reader = SummaryReader::open(storage.as_ref(), "000000.summary", VolumeKey::plaintext_arc()).unwrap();
+        assert_eq!(reader.footer.entry_count, 1);
+        let root = reader.read_inode(1).unwrap().unwrap();
+        assert!(root.is_dir());
+    }
+
+    #[test]
+    fn test_encrypted_summary_body_compression_round_trip() {
+        let storage = Arc::new(MemoryStorage::new());
+        let master = crate::crypto::MasterKey::new([0x42u8; 32]);
+        let (header, key) = crate::crypto::VolumeHeader::new_encrypted(
+            &master,
+            [0x88u8; 16],
+            crate::crypto::KeySource::KeyFile,
+            crate::compress::Compression::None,
+        )
+        .unwrap();
+
+        init_volume(storage.clone(), &key, header).unwrap();
+
+        let reader = SummaryReader::open(storage.as_ref(), "000000.summary", Arc::new(key)).unwrap();
+        assert_eq!(reader.footer.entry_count, 1);
+        let root = reader.read_inode(1).unwrap().unwrap();
+        assert!(root.is_dir());
+    }
+
+    #[test]
+    fn test_corrupted_compressed_summary_body_returns_error() {
+        let storage = Arc::new(MemoryStorage::new());
+        init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        // Overwrite the compressed body with garbage, but recompute the BLAKE3 checksum
+        // so that the checksum verification passes and the zstd decompressor is exercised.
+        let mut bytes = storage.get_file_bytes("000000.summary").unwrap();
+        let header = SummaryHeader::from_bytes(&bytes[..SUMMARY_HEADER_SIZE]).unwrap();
+        let body_offset = SUMMARY_HEADER_SIZE + header.volume_header_len as usize;
+        let footer_offset = bytes.len() - SUMMARY_FOOTER_SIZE;
+
+        // Corrupt the body bytes with non-zstd garbage
+        for b in &mut bytes[body_offset..footer_offset] {
+            *b = 0xFF;
+        }
+
+        // Recompute BLAKE3 checksum over content before footer
+        let new_checksum = *blake3::hash(&bytes[..footer_offset]).as_bytes();
+        let len = bytes.len();
+        bytes[len - 32..].copy_from_slice(&new_checksum);
+        storage.insert_file("000000.summary", bytes);
+
+        let Err(err) = SummaryReader::open(storage.as_ref(), "000000.summary", VolumeKey::plaintext_arc()) else {
+            panic!("expected error on corrupted body");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_uncompressed_len_tampering_fails_aead() {
+        let storage = Arc::new(MemoryStorage::new());
+        let master = crate::crypto::MasterKey::new([0x42u8; 32]);
+        let (header, key) = crate::crypto::VolumeHeader::new_encrypted(
+            &master,
+            [0x88u8; 16],
+            crate::crypto::KeySource::KeyFile,
+            crate::compress::Compression::None,
+        )
+        .unwrap();
+
+        init_volume(storage.clone(), &key, header).unwrap();
+
+        // Tamper with uncompressed_len (bytes 64..72 in SummaryHeader)
+        let mut bytes = storage.get_file_bytes("000000.summary").unwrap();
+        bytes[64..72].copy_from_slice(&999999u64.to_be_bytes());
+
+        // Recompute whole-file BLAKE3 checksum so footer verification passes
+        let footer_offset = bytes.len() - SUMMARY_FOOTER_SIZE;
+        let new_checksum = *blake3::hash(&bytes[..footer_offset]).as_bytes();
+        let len = bytes.len();
+        bytes[len - 32..].copy_from_slice(&new_checksum);
+        storage.insert_file("000000.summary", bytes);
+
+        // AEAD verification must fail because uncompressed_len is part of the AAD
+        let Err(err) = SummaryReader::open(storage.as_ref(), "000000.summary", Arc::new(key)) else {
+            panic!("expected AEAD authentication error when uncompressed_len is modified");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_uncompressed_len_mismatch_fails_plaintext() {
+        let storage = Arc::new(MemoryStorage::new());
+        init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        // Tamper with uncompressed_len (bytes 64..72 in SummaryHeader)
+        let mut bytes = storage.get_file_bytes("000000.summary").unwrap();
+        bytes[64..72].copy_from_slice(&999999u64.to_be_bytes());
+
+        // Recompute whole-file BLAKE3 checksum so footer verification passes
+        let footer_offset = bytes.len() - SUMMARY_FOOTER_SIZE;
+        let new_checksum = *blake3::hash(&bytes[..footer_offset]).as_bytes();
+        let len = bytes.len();
+        bytes[len - 32..].copy_from_slice(&new_checksum);
+        storage.insert_file("000000.summary", bytes);
+
+        // Decompression verification must fail due to uncompressed length mismatch
+        let Err(err) = SummaryReader::open(storage.as_ref(), "000000.summary", VolumeKey::plaintext_arc()) else {
+            panic!("expected decompression error on length mismatch");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("mismatch"));
     }
 }

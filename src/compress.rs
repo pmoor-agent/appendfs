@@ -23,7 +23,7 @@ pub const MAX_DECOMPRESSED_RECORD: usize = 256 * 1024 * 1024;
 /// zstd level. Measured across source text, logs, sparse binary and incompressible data,
 /// level 3 sits at near-peak ratio while compressing at 170-690 MB/s; level 6 buys a few
 /// percent more for a collapse to 55 MB/s, which would throttle flushing.
-const ZSTD_LEVEL: i32 = 3;
+pub const ZSTD_LEVEL: i32 = 3;
 
 /// Minimum saving for a compressed record to be kept, as a fraction of the original.
 ///
@@ -59,9 +59,14 @@ impl std::fmt::Display for Compression {
     }
 }
 
+/// Compresses `payload` unconditionally using zstd.
+pub fn compress_zstd_unconditional(payload: &[u8]) -> io::Result<Vec<u8>> {
+    zstd::bulk::compress(payload, ZSTD_LEVEL)
+}
+
 /// Compresses `payload` using zstd if compression is beneficial.
 pub fn compress_zstd(payload: &[u8]) -> Option<Vec<u8>> {
-    if let Ok(compressed) = zstd::bulk::compress(payload, ZSTD_LEVEL) {
+    if let Ok(compressed) = compress_zstd_unconditional(payload) {
         let saved = payload.len().saturating_sub(compressed.len());
         if saved >= payload.len() / MIN_SAVING_DENOMINATOR * MIN_SAVING_NUMERATOR && !compressed.is_empty() {
             return Some(compressed);
@@ -70,29 +75,74 @@ pub fn compress_zstd(payload: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Decompresses a raw zstd frame.
-pub fn decompress_zstd(compressed: &[u8]) -> io::Result<Vec<u8>> {
+/// Decompresses a raw zstd frame verifying that its decompressed size matches `expected_len`.
+pub fn decompress_zstd_exact(compressed: &[u8], expected_len: usize) -> io::Result<Vec<u8>> {
+    if expected_len > MAX_DECOMPRESSED_RECORD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compressed payload claims to expand to {} bytes, beyond the {} byte limit",
+                expected_len, MAX_DECOMPRESSED_RECORD
+            ),
+        ));
+    }
+
+    let frame_size = zstd::zstd_safe::get_frame_content_size(compressed)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zstd frame error: {}", e)))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed frame missing content size"))?
+        as usize;
+
+    if frame_size != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "zstd frame content size mismatch: expected {} bytes, frame declares {}",
+                expected_len, frame_size
+            ),
+        ));
+    }
+
+    let decompressed = zstd::bulk::decompress(compressed, expected_len)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decompression failed: {}", e)))?;
+
+    if decompressed.len() != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "decompressed size mismatch: expected {} bytes, got {}",
+                expected_len,
+                decompressed.len()
+            ),
+        ));
+    }
+
+    Ok(decompressed)
+}
+
+/// Decompresses a raw zstd frame with a maximum decompressed size limit.
+pub fn decompress_zstd_with_limit(compressed: &[u8], max_len: usize) -> io::Result<Vec<u8>> {
     let original_len = zstd::zstd_safe::get_frame_content_size(compressed)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zstd frame error: {}", e)))?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed frame missing content size"))?
         as usize;
 
-    if original_len > MAX_DECOMPRESSED_RECORD {
+    if original_len > max_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "compressed record claims to expand to {} bytes, beyond the {} byte limit",
-                original_len, MAX_DECOMPRESSED_RECORD
+                "compressed payload claims to expand to {} bytes, beyond the {} byte limit",
+                original_len, max_len
             ),
         ));
     }
 
-    zstd::bulk::decompress(compressed, original_len).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("record decompression failed: {}", e),
-        )
-    })
+    zstd::bulk::decompress(compressed, original_len)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decompression failed: {}", e)))
+}
+
+/// Decompresses a raw zstd frame.
+pub fn decompress_zstd(compressed: &[u8]) -> io::Result<Vec<u8>> {
+    decompress_zstd_with_limit(compressed, MAX_DECOMPRESSED_RECORD)
 }
 
 #[cfg(test)]
@@ -125,5 +175,53 @@ mod tests {
             decompress_zstd(&[0x28, 0xb5, 0x2f, 0xfd, 0x00]).is_err(),
             "truncated frame"
         );
+    }
+
+    #[test]
+    fn test_unconditional_compression_and_limits() {
+        // Incompressible data is compressed anyway when using unconditional compression
+        let mut rnd = vec![0u8; 4096];
+        let mut x: u64 = 0x123456789ABCDEF;
+        for b in rnd.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        let compressed = compress_zstd_unconditional(&rnd).expect("unconditional compress should succeed");
+        assert_eq!(decompress_zstd_with_limit(&compressed, 4096).unwrap(), rnd);
+
+        // Limit rejection
+        let err = decompress_zstd_with_limit(&compressed, 4095).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("beyond the 4095 byte limit"));
+
+        // Empty payload
+        let compressed_empty = compress_zstd_unconditional(&[]).expect("empty payload compresses");
+        assert_eq!(decompress_zstd(&compressed_empty).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_decompress_zstd_exact() {
+        let text = b"test payload for exact decompression";
+        let compressed = compress_zstd_unconditional(text).unwrap();
+
+        // Exact match
+        assert_eq!(decompress_zstd_exact(&compressed, text.len()).unwrap(), text);
+
+        // Mismatched expected length (smaller)
+        let err = decompress_zstd_exact(&compressed, text.len() - 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("size mismatch"));
+
+        // Mismatched expected length (larger)
+        let err = decompress_zstd_exact(&compressed, text.len() + 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("size mismatch"));
+
+        // Exceeding MAX_DECOMPRESSED_RECORD
+        let err = decompress_zstd_exact(&compressed, MAX_DECOMPRESSED_RECORD + 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("beyond the"));
     }
 }

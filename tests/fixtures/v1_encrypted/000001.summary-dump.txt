@@ -4,10 +4,10 @@ Generation:          1
 Format Version:      1
 Last Transaction ID: 38
 Next Inode:          19
-File Size:           2.55 KiB
+File Size:           974 B
 Encryption:          ChaCha20-Poly1305
 Unlocked by:         Passphrase
-Checksum (BLAKE3):   be06f38be2ab59701ecd658bca4f2bec33fa6a0ca170babffd5a7c0da0ff6893 (VERIFIED)
+Checksum (BLAKE3):   f792031a321137c5b4067cf88389070d569f002a6dc4f365d256b9d423714a6b (VERIFIED)
 
 --- Inode Breakdown ---
 Total Inodes:        18 (6 directories, 5 regular files, 3 symlinks)
