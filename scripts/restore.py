@@ -379,6 +379,8 @@ class Restorer:
         self.dir_entries: Dict[int, Dict[str, int]] = {1: {}}
         self.parent_map: Dict[int, Set[Tuple[int, str]]] = {}
         self.inode_types: Dict[int, str] = {1: "dir"}
+        self.inode_modes: Dict[int, int] = {}
+        self.inode_times: Dict[int, Tuple[Optional[Tuple[int, int]], Tuple[int, int]]] = {}
         self.expected_tx_id: Optional[int] = None
         self.last_committed_tx_id: Optional[int] = None
         self.tombstoned_inodes: Set[int] = set()
@@ -582,6 +584,13 @@ class Restorer:
                 existing = [p for p in paths if p.exists() and not p.is_symlink()]
                 primary = existing[0] if existing else paths[0]
                 primary.parent.mkdir(parents=True, exist_ok=True)
+                if primary.exists():
+                    try:
+                        cur_mode = primary.stat().st_mode
+                        if not (cur_mode & 0o200):
+                            os.chmod(primary, cur_mode | 0o200)
+                    except Exception:
+                        pass
                 open_mode = "r+b" if primary.exists() else "w+b"
                 with open(primary, open_mode) as f:
                     for file_off, rec_log_off, _rec_size, length in extents:
@@ -626,6 +635,16 @@ class Restorer:
                 attrs = delta[3]
 
             if attrs:
+                if attrs.get("mode") is not None:
+                    self.inode_modes[ino] = attrs["mode"] & 0o7777
+
+                if attrs.get("mtime") is not None or attrs.get("atime") is not None:
+                    prev_atime, prev_mtime = self.inode_times.get(ino, (None, None))
+                    new_atime = attrs.get("atime") if attrs.get("atime") is not None else prev_atime
+                    new_mtime = attrs.get("mtime") if attrs.get("mtime") is not None else prev_mtime
+                    if new_mtime is not None:
+                        self.inode_times[ino] = (new_atime, new_mtime)
+
                 for p in self.resolve_paths(ino):
                     if not p.exists() and not p.is_symlink():
                         continue
@@ -637,22 +656,6 @@ class Restorer:
                                     os.setxattr(p, k, v, follow_symlinks=False)
                                 except Exception:
                                     pass
-                    # mode
-                    if attrs.get("mode") is not None and not p.is_symlink():
-                        try:
-                            os.chmod(p, attrs["mode"] & 0o7777)
-                        except Exception:
-                            pass
-                    # timestamps
-                    if attrs.get("mtime") is not None:
-                        sec, nsec = attrs["mtime"]
-                        m_ts = sec + nsec / 1e9
-                        atime = attrs.get("atime")
-                        a_ts = (atime[0] + atime[1] / 1e9) if atime else m_ts
-                        try:
-                            os.utime(p, (a_ts, m_ts), follow_symlinks=False)
-                        except Exception:
-                            pass
 
         # 6. Tombstones
         for ino, delta in batch_deltas.items():
@@ -668,7 +671,56 @@ class Restorer:
                 self.inode_types.pop(ino, None)
                 self.dir_entries.pop(ino, None)
                 self.parent_map.pop(ino, None)
+                self.inode_modes.pop(ino, None)
+                self.inode_times.pop(ino, None)
                 self.tombstoned_inodes.add(ino)
+
+    def finalize(self):
+        """Applies final POSIX timestamps and permissions in post-order (deepest paths first)."""
+        if self.dry_run:
+            return
+
+        all_targets: List[Tuple[Path, int]] = []
+        for ino in self.inode_types:
+            for p in self.resolve_paths(ino):
+                all_targets.append((p, ino))
+
+        # Sort by path depth descending: deepest paths first (children before parents, root last)
+        all_targets.sort(key=lambda x: len(x[0].parts), reverse=True)
+
+        if self.verbose:
+            print(f"Finalizing POSIX permissions and timestamps across {len(all_targets)} path(s) in post-order...")
+
+        applied_modes = 0
+        applied_times = 0
+        for p, ino in all_targets:
+            if not p.exists() and not p.is_symlink():
+                continue
+
+            # 1. Apply timestamps (utime before chmod, so restrictive chmod does not block utime)
+            times = self.inode_times.get(ino)
+            if times is not None:
+                atime, mtime = times
+                sec, nsec = mtime
+                m_ts = sec + nsec / 1e9
+                a_ts = (atime[0] + atime[1] / 1e9) if atime else m_ts
+                try:
+                    os.utime(p, (a_ts, m_ts), follow_symlinks=False)
+                    applied_times += 1
+                except Exception:
+                    pass
+
+            # 2. Apply permissions (mode)
+            mode = self.inode_modes.get(ino)
+            if mode is not None and not p.is_symlink():
+                try:
+                    os.chmod(p, mode & 0o7777)
+                    applied_modes += 1
+                except Exception:
+                    pass
+
+        if self.verbose:
+            print(f"Completed attribute finalization (applied {applied_modes} mode(s), {applied_times} timestamp(s)).")
 
 
 def main():
@@ -718,6 +770,8 @@ def main():
 
     for gen, rev, log_path in log_files:
         restorer.replay_log_file(log_path)
+
+    restorer.finalize()
 
     print(f"Restoration completed successfully into '{dest_path}'.")
 
