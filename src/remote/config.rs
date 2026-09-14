@@ -213,51 +213,54 @@ pub struct ReplicationPolicy {
     /// Number of remotes $k$ that must confirm an immutable log generation before local eviction is permitted.
     #[serde(default = "default_min_synced")]
     pub min_synced_remotes: usize,
-    /// Keep sealed log files locally for at least this many days before eviction.
-    #[serde(default = "default_retention_days")]
-    pub local_retention_days: u64,
-    /// Optional fine-grained local retention duration in seconds (overrides local_retention_days if set).
-    #[serde(default)]
-    pub local_retention_secs: Option<u64>,
-    /// Maximum disk footprint in GB of the local volume before LRU pruning.
+    /// Keep sealed log files locally for at least this duration before eviction (e.g. "30d", "24h", "3600s", default: "30d").
+    #[serde(default = "default_local_retention")]
+    pub local_retention: String,
+    /// Maximum disk footprint in GB of the local volume before LRU pruning (default: 16 GB).
     #[serde(default = "default_cache_max_gb")]
     pub local_cache_max_gb: u64,
-    /// Maximum time an active log can stay open before rolling (default: 7200s / 2 hours).
+    /// Maximum time an active log can stay open before rolling (default: 86400s / 24 hours).
     #[serde(default = "default_max_log_age")]
     pub max_log_age_secs: u64,
-    /// Frequency of intermediate active log part uploads (default: 1800s / 30 minutes).
+    /// Frequency of intermediate active log part uploads (default: 3600s / 1 hour).
     #[serde(default = "default_active_sync_interval")]
     pub active_sync_interval_secs: u64,
-    /// Frequency of full remote consistency and healing audits (default: 14400s / 4 hours).
+    /// Frequency of full remote consistency and healing audits (default: 21600s / 6 hours).
     #[serde(default = "default_audit_interval")]
     pub audit_interval_secs: u64,
+}
+
+impl ReplicationPolicy {
+    /// Returns the parsed local retention duration.
+    pub fn local_retention_duration(&self) -> std::time::Duration {
+        crate::cli::parse_duration(&self.local_retention).unwrap_or_else(|_| std::time::Duration::from_secs(30 * 86400))
+    }
 }
 
 fn default_min_synced() -> usize {
     1
 }
-fn default_retention_days() -> u64 {
-    30
+fn default_local_retention() -> String {
+    "30d".to_string()
 }
 fn default_cache_max_gb() -> u64 {
-    50
+    16
 }
 fn default_max_log_age() -> u64 {
-    7200
+    86400 // 24 hours
 }
 fn default_active_sync_interval() -> u64 {
-    1800
+    3600 // 1 hour
 }
 fn default_audit_interval() -> u64 {
-    14400 // 4 hours
+    21600 // 6 hours
 }
 
 impl Default for ReplicationPolicy {
     fn default() -> Self {
         Self {
             min_synced_remotes: default_min_synced(),
-            local_retention_days: default_retention_days(),
-            local_retention_secs: None,
+            local_retention: default_local_retention(),
             local_cache_max_gb: default_cache_max_gb(),
             max_log_age_secs: default_max_log_age(),
             active_sync_interval_secs: default_active_sync_interval(),
@@ -433,7 +436,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = RemoteRegistry::new();
         registry.policy.min_synced_remotes = 2;
-        registry.policy.local_retention_days = 60;
+        registry.policy.local_retention = "60d".to_string();
 
         let mut r1 = RemoteTargetConfig::new("my-aws-bucket");
         r1.region = "us-west-2".to_string();
@@ -519,5 +522,20 @@ bucket = "legacy-bucket"
         assert!(nfs_store.upload_partial_logs);
         let leg_store = stores.iter().find(|r| r.name == "legacy").unwrap();
         assert!(leg_store.upload_partial_logs);
+    }
+
+    #[test]
+    fn test_replication_policy_defaults() {
+        let policy = ReplicationPolicy::default();
+        assert_eq!(policy.local_cache_max_gb, 16);
+        assert_eq!(policy.max_log_age_secs, 86400);
+        assert_eq!(policy.active_sync_interval_secs, 3600);
+        assert_eq!(policy.audit_interval_secs, 21600);
+        assert_eq!(policy.min_synced_remotes, 1);
+        assert_eq!(policy.local_retention, "30d");
+        assert_eq!(
+            policy.local_retention_duration(),
+            std::time::Duration::from_secs(30 * 86400)
+        );
     }
 }

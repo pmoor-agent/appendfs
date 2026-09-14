@@ -491,6 +491,7 @@ fn cmd_mount(args: MountArgs) {
     fs_instance.max_flush_queue_ops = args.max_flush_queue_ops;
     fs_instance.flush_interval.store(args.flush_interval, Ordering::SeqCst);
     fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
+    fs_instance.track_atime = args.track_atime;
 
     let remote_stores = registry.build_read_stores();
 

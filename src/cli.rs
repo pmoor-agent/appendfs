@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-/// Default maximum log file size before rolling to next generation (1 GiB).
-pub const DEFAULT_MAX_LOG_SIZE: u64 = 1024 * 1024 * 1024;
+/// Default maximum log file size before rolling to next generation (2 GiB).
+pub const DEFAULT_MAX_LOG_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Default maximum staged write data in memory before triggering a flush (128 MiB).
 pub const DEFAULT_MAX_BUFFER_SIZE: usize = 128 * 1024 * 1024;
@@ -17,8 +17,8 @@ pub const DEFAULT_MAX_BUFFER_SIZE: usize = 128 * 1024 * 1024;
 /// chunk and one more entry in the file's extent map.
 pub const DEFAULT_MAX_EXTENT_SIZE: usize = 4 * 1024 * 1024;
 
-/// Default maximum staged mutation operations before triggering an automatic flush (10,000 ops).
-pub const DEFAULT_MAX_BUFFER_OPS: usize = 10_000;
+/// Default maximum staged mutation operations before triggering an automatic flush (16,384 ops / 2^14).
+pub const DEFAULT_MAX_BUFFER_OPS: usize = 1 << 14;
 
 /// Default maximum number of frozen flush batches allowed to queue up in memory before
 /// auto-freezing is bounded (16 batches).
@@ -27,7 +27,7 @@ pub const DEFAULT_MAX_FLUSH_QUEUE_DEPTH: usize = 16;
 /// Default maximum total bytes across all frozen flush batches queued in memory (256 MiB).
 pub const DEFAULT_MAX_FLUSH_QUEUE_BYTES: usize = 2 * DEFAULT_MAX_BUFFER_SIZE;
 
-/// Default maximum total mutating operations across all frozen flush batches queued in memory (20,000 ops).
+/// Default maximum total mutating operations across all frozen flush batches queued in memory (32,768 ops).
 pub const DEFAULT_MAX_FLUSH_QUEUE_OPS: usize = 2 * DEFAULT_MAX_BUFFER_OPS;
 
 pub use crate::remote::block_cache::DEFAULT_DECRYPTED_CACHE_SIZE;
@@ -235,14 +235,23 @@ pub struct InitArgs {
     #[arg(long = "passphrase", default_value_t = false)]
     pub passphrase: bool,
 
-    /// Compress record payloads with zstd before storing them
+    /// Compress record payloads with zstd before storing them (default: true)
     ///
     /// Records that do not compress by at least an eighth are stored as-is, so
     /// already-compressed data costs only the check. Fixed for the life of the volume.
     /// Note that compressed sizes reveal roughly how compressible each record was, which
     /// plain encryption does not.
-    #[arg(long = "compress", default_value_t = false)]
-    pub compress: bool,
+    #[arg(
+        long = "compress",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        conflicts_with = "no_compress"
+    )]
+    pub compress: Option<bool>,
+
+    /// Disable zstd compression for record payloads
+    #[arg(long = "no-compress", conflicts_with = "compress")]
+    pub no_compress: bool,
 
     /// Bootstrap local volume by downloading latest checkpoint from this remote (e.g. "aws", "upstream")
     #[arg(long = "from-remote")]
@@ -300,10 +309,10 @@ impl InitArgs {
 
     /// The compression policy to record in the volume header. Also fixed at init.
     pub fn compression(&self) -> crate::compress::Compression {
-        if self.compress {
-            crate::compress::Compression::Zstd
-        } else {
+        if self.no_compress || self.compress == Some(false) {
             crate::compress::Compression::None
+        } else {
+            crate::compress::Compression::Zstd
         }
     }
 }
@@ -366,11 +375,11 @@ pub struct MountArgs {
     #[arg(short = 't', long = "flush-threshold", default_value_t = DEFAULT_MAX_BUFFER_SIZE)]
     pub flush_threshold: usize,
 
-    /// Threshold of staged dirty mutations (create/unlink/mkdir/etc) before triggering an automatic flush (default: 10000)
+    /// Threshold of staged dirty mutations (create/unlink/mkdir/etc) before triggering an automatic flush (default: 16384)
     #[arg(long = "flush-threshold-ops", default_value_t = DEFAULT_MAX_BUFFER_OPS)]
     pub flush_threshold_ops: usize,
 
-    /// Maximum log file size in bytes before rolling to next generation (default: 1 GiB)
+    /// Maximum log file size in bytes before rolling to next generation (default: 2 GiB)
     #[arg(short = 's', long = "max-log-size", default_value_t = DEFAULT_MAX_LOG_SIZE)]
     pub max_log_size: u64,
 
@@ -382,8 +391,8 @@ pub struct MountArgs {
     #[arg(long = "no-sync", default_value_t = false)]
     pub no_sync: bool,
 
-    /// Maximum age of active log file before rolling for cloud durability (e.g. "2h", "30m", default: "2h")
-    #[arg(long = "max-log-age", default_value = "2h")]
+    /// Maximum age of active log file before rolling for cloud durability (e.g. "24h", "2h", default: "24h")
+    #[arg(long = "max-log-age", default_value = "24h")]
     pub max_log_age: String,
 
     /// Interval in bytes of committed log data before generating a new .summary snapshot file during log rolls (default: 10 GiB, 0 to disable byte-based trigger)
@@ -402,9 +411,13 @@ pub struct MountArgs {
     #[arg(long = "max-flush-queue-bytes", default_value_t = DEFAULT_MAX_FLUSH_QUEUE_BYTES)]
     pub max_flush_queue_bytes: usize,
 
-    /// Maximum total mutating operations across all frozen flush batches queued in memory before freezing is blocked (default: 20000)
+    /// Maximum total mutating operations across all frozen flush batches queued in memory (default: 32768)
     #[arg(long = "max-flush-queue-ops", default_value_t = DEFAULT_MAX_FLUSH_QUEUE_OPS)]
     pub max_flush_queue_ops: usize,
+
+    /// Track access time (atime) on reads (default: false, like noatime)
+    #[arg(long = "track-atime", default_value_t = false)]
+    pub track_atime: bool,
 }
 
 impl std::ops::Deref for MountArgs {
@@ -474,8 +487,8 @@ pub struct FsckArgs {
     /// Directory path where the appendfs volume log and summary files are stored
     pub log_dir: PathBuf,
 
-    /// Deep verify physical extent payloads and BLAKE3 checksums in .log files on disk
-    #[arg(long = "verify-data", default_value_t = true, action = clap::ArgAction::Set)]
+    /// Deep verify physical extent payloads and BLAKE3 checksums in .log files on disk (default: false)
+    #[arg(long = "verify-data", default_value_t = false)]
     pub verify_data: bool,
 
     /// Verbosity level (-v for detailed integrity check report)
@@ -495,11 +508,15 @@ pub struct FsckArgs {
     pub remote: Option<String>,
 }
 
-/// Helper parsing duration strings such as "2h", "30m", "120s".
+/// Helper parsing duration strings such as "30d", "2h", "30m", "120s".
 pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty duration".to_string());
+    }
+    if let Some(rest) = s.strip_suffix('d') {
+        let days: u64 = rest.parse().map_err(|e| format!("{}", e))?;
+        return Ok(std::time::Duration::from_secs(days * 86400));
     }
     if let Some(rest) = s.strip_suffix('h') {
         let hours: u64 = rest.parse().map_err(|e| format!("{}", e))?;
@@ -536,4 +553,79 @@ pub fn find_latest_generation_in_storage(storage: &dyn crate::storage::Storage) 
 pub fn find_latest_generation(log_dir: impl AsRef<Path>) -> u64 {
     let storage = crate::storage::OsStorage::new(log_dir);
     find_latest_generation_in_storage(&storage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_default_constants() {
+        assert_eq!(DEFAULT_MAX_LOG_SIZE, 2 * 1024 * 1024 * 1024);
+        assert_eq!(DEFAULT_MAX_BUFFER_OPS, 16_384);
+        assert_eq!(DEFAULT_MAX_FLUSH_QUEUE_OPS, 32_768);
+    }
+
+    #[test]
+    fn test_mount_args_defaults() {
+        let cli = Cli::parse_from(["appendfs", "mount", "/path/to/log", "/path/to/mnt"]);
+        let Commands::Mount(args) = cli.command else {
+            panic!("expected Mount command");
+        };
+        assert_eq!(args.max_log_size, 2 * 1024 * 1024 * 1024);
+        assert_eq!(args.flush_threshold_ops, 16_384);
+        assert_eq!(args.max_flush_queue_ops, 32_768);
+        assert_eq!(args.max_log_age, "24h");
+        assert!(!args.track_atime);
+    }
+
+    #[test]
+    fn test_parse_duration() {
+        assert_eq!(
+            parse_duration("30d").unwrap(),
+            std::time::Duration::from_secs(30 * 86400)
+        );
+        assert_eq!(parse_duration("1d").unwrap(), std::time::Duration::from_secs(86400));
+        assert_eq!(parse_duration("24h").unwrap(), std::time::Duration::from_secs(86400));
+        assert_eq!(parse_duration("60m").unwrap(), std::time::Duration::from_secs(3600));
+        assert_eq!(parse_duration("120s").unwrap(), std::time::Duration::from_secs(120));
+        assert_eq!(parse_duration("0s").unwrap(), std::time::Duration::from_secs(0));
+        assert_eq!(parse_duration("42").unwrap(), std::time::Duration::from_secs(42));
+    }
+
+    #[test]
+    fn test_init_args_compression_default_on() {
+        let cli_default = Cli::parse_from(["appendfs", "init", "/path/to/log"]);
+        let Commands::Init(args_default) = cli_default.command else {
+            panic!("expected Init command");
+        };
+        assert_eq!(args_default.compression(), crate::compress::Compression::Zstd);
+
+        let cli_no_comp = Cli::parse_from(["appendfs", "init", "--no-compress", "/path/to/log"]);
+        let Commands::Init(args_no_comp) = cli_no_comp.command else {
+            panic!("expected Init command");
+        };
+        assert_eq!(args_no_comp.compression(), crate::compress::Compression::None);
+
+        let cli_comp_false = Cli::parse_from(["appendfs", "init", "--compress=false", "/path/to/log"]);
+        let Commands::Init(args_comp_false) = cli_comp_false.command else {
+            panic!("expected Init command");
+        };
+        assert_eq!(args_comp_false.compression(), crate::compress::Compression::None);
+    }
+
+    #[test]
+    fn test_fsck_args_verify_data_default_off() {
+        let cli_default = Cli::parse_from(["appendfs", "fsck", "/path/to/log"]);
+        let Commands::Fsck(args_default) = cli_default.command else {
+            panic!("expected Fsck command");
+        };
+        assert!(!args_default.verify_data);
+
+        let cli_verified = Cli::parse_from(["appendfs", "fsck", "--verify-data", "/path/to/log"]);
+        let Commands::Fsck(args_verified) = cli_verified.command else {
+            panic!("expected Fsck command");
+        };
+        assert!(args_verified.verify_data);
+    }
 }

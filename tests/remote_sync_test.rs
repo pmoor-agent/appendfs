@@ -1306,7 +1306,7 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     let nas_cfg = RemoteTargetConfig::new_path(nfs_dir.path());
     registry.add_remote("nas", nas_cfg);
     registry.policy.min_synced_remotes = 1;
-    registry.policy.local_retention_secs = Some(0);
+    registry.policy.local_retention = "0s".to_string();
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
 
     let fs_arc = Arc::new(recovered_fs);
@@ -1610,7 +1610,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     registry.set_store_override("counting", counting_store.clone());
     registry.policy.min_synced_remotes = 1;
     // Set high retention so first cycle only replicates, does not prune
-    registry.policy.local_retention_secs = Some(3600);
+    registry.policy.local_retention = "1h".to_string();
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
 
     let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
@@ -1683,7 +1683,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     // Configure 0 retention so all sealed generations 1, 2, 3 are eligible for local pruning
     {
         let mut reg = registry_arc.write().unwrap();
-        reg.policy.local_retention_secs = Some(0);
+        reg.policy.local_retention = "0s".to_string();
     }
 
     // Ensure all 3 local log files exist before pruning
