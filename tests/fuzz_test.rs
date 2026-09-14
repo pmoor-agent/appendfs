@@ -31,7 +31,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
         // that seam and was invisible to a fuzzer that only ever saw a healthy disk.
         let mut fs_crash = TestFS::new_temp_with_fault_injection(None, Arc::new(clock.clone()));
         // The remote instance is backed by N=3 in-memory remotes with latency injection,
-        // fault injection, aggressive local log pruning (local_retention_secs = 0), and
+        // fault injection, aggressive local log pruning (local_retention = "0s"), and
         // spontaneous file deletion with single-survivor invariants.
         let mut fs_remote = TestFS::new_temp_with_remotes(Some(256), Arc::new(clock.clone()), 3);
 

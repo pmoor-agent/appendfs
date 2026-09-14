@@ -235,14 +235,23 @@ pub struct InitArgs {
     #[arg(long = "passphrase", default_value_t = false)]
     pub passphrase: bool,
 
-    /// Compress record payloads with zstd before storing them
+    /// Compress record payloads with zstd before storing them (default: true)
     ///
     /// Records that do not compress by at least an eighth are stored as-is, so
     /// already-compressed data costs only the check. Fixed for the life of the volume.
     /// Note that compressed sizes reveal roughly how compressible each record was, which
     /// plain encryption does not.
-    #[arg(long = "compress", default_value_t = false)]
-    pub compress: bool,
+    #[arg(
+        long = "compress",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        conflicts_with = "no_compress"
+    )]
+    pub compress: Option<bool>,
+
+    /// Disable zstd compression for record payloads
+    #[arg(long = "no-compress", conflicts_with = "compress")]
+    pub no_compress: bool,
 
     /// Bootstrap local volume by downloading latest checkpoint from this remote (e.g. "aws", "upstream")
     #[arg(long = "from-remote")]
@@ -300,10 +309,10 @@ impl InitArgs {
 
     /// The compression policy to record in the volume header. Also fixed at init.
     pub fn compression(&self) -> crate::compress::Compression {
-        if self.compress {
-            crate::compress::Compression::Zstd
-        } else {
+        if self.no_compress || self.compress == Some(false) {
             crate::compress::Compression::None
+        } else {
+            crate::compress::Compression::Zstd
         }
     }
 }
@@ -478,8 +487,8 @@ pub struct FsckArgs {
     /// Directory path where the appendfs volume log and summary files are stored
     pub log_dir: PathBuf,
 
-    /// Deep verify physical extent payloads and BLAKE3 checksums in .log files on disk
-    #[arg(long = "verify-data", default_value_t = true, action = clap::ArgAction::Set)]
+    /// Deep verify physical extent payloads and BLAKE3 checksums in .log files on disk (default: false)
+    #[arg(long = "verify-data", default_value_t = false)]
     pub verify_data: bool,
 
     /// Verbosity level (-v for detailed integrity check report)
@@ -499,11 +508,15 @@ pub struct FsckArgs {
     pub remote: Option<String>,
 }
 
-/// Helper parsing duration strings such as "2h", "30m", "120s".
+/// Helper parsing duration strings such as "30d", "2h", "30m", "120s".
 pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty duration".to_string());
+    }
+    if let Some(rest) = s.strip_suffix('d') {
+        let days: u64 = rest.parse().map_err(|e| format!("{}", e))?;
+        return Ok(std::time::Duration::from_secs(days * 86400));
     }
     if let Some(rest) = s.strip_suffix('h') {
         let hours: u64 = rest.parse().map_err(|e| format!("{}", e))?;
@@ -564,5 +577,55 @@ mod tests {
         assert_eq!(args.max_flush_queue_ops, 32_768);
         assert_eq!(args.max_log_age, "24h");
         assert!(!args.track_atime);
+    }
+
+    #[test]
+    fn test_parse_duration() {
+        assert_eq!(
+            parse_duration("30d").unwrap(),
+            std::time::Duration::from_secs(30 * 86400)
+        );
+        assert_eq!(parse_duration("1d").unwrap(), std::time::Duration::from_secs(86400));
+        assert_eq!(parse_duration("24h").unwrap(), std::time::Duration::from_secs(86400));
+        assert_eq!(parse_duration("60m").unwrap(), std::time::Duration::from_secs(3600));
+        assert_eq!(parse_duration("120s").unwrap(), std::time::Duration::from_secs(120));
+        assert_eq!(parse_duration("0s").unwrap(), std::time::Duration::from_secs(0));
+        assert_eq!(parse_duration("42").unwrap(), std::time::Duration::from_secs(42));
+    }
+
+    #[test]
+    fn test_init_args_compression_default_on() {
+        let cli_default = Cli::parse_from(["appendfs", "init", "/path/to/log"]);
+        let Commands::Init(args_default) = cli_default.command else {
+            panic!("expected Init command");
+        };
+        assert_eq!(args_default.compression(), crate::compress::Compression::Zstd);
+
+        let cli_no_comp = Cli::parse_from(["appendfs", "init", "--no-compress", "/path/to/log"]);
+        let Commands::Init(args_no_comp) = cli_no_comp.command else {
+            panic!("expected Init command");
+        };
+        assert_eq!(args_no_comp.compression(), crate::compress::Compression::None);
+
+        let cli_comp_false = Cli::parse_from(["appendfs", "init", "--compress=false", "/path/to/log"]);
+        let Commands::Init(args_comp_false) = cli_comp_false.command else {
+            panic!("expected Init command");
+        };
+        assert_eq!(args_comp_false.compression(), crate::compress::Compression::None);
+    }
+
+    #[test]
+    fn test_fsck_args_verify_data_default_off() {
+        let cli_default = Cli::parse_from(["appendfs", "fsck", "/path/to/log"]);
+        let Commands::Fsck(args_default) = cli_default.command else {
+            panic!("expected Fsck command");
+        };
+        assert!(!args_default.verify_data);
+
+        let cli_verified = Cli::parse_from(["appendfs", "fsck", "--verify-data", "/path/to/log"]);
+        let Commands::Fsck(args_verified) = cli_verified.command else {
+            panic!("expected Fsck command");
+        };
+        assert!(args_verified.verify_data);
     }
 }

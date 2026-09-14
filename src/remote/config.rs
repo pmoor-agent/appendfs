@@ -213,12 +213,9 @@ pub struct ReplicationPolicy {
     /// Number of remotes $k$ that must confirm an immutable log generation before local eviction is permitted.
     #[serde(default = "default_min_synced")]
     pub min_synced_remotes: usize,
-    /// Keep sealed log files locally for at least this many days before eviction.
-    #[serde(default = "default_retention_days")]
-    pub local_retention_days: u64,
-    /// Optional fine-grained local retention duration in seconds (overrides local_retention_days if set).
-    #[serde(default)]
-    pub local_retention_secs: Option<u64>,
+    /// Keep sealed log files locally for at least this duration before eviction (e.g. "30d", "24h", "3600s", default: "30d").
+    #[serde(default = "default_local_retention")]
+    pub local_retention: String,
     /// Maximum disk footprint in GB of the local volume before LRU pruning (default: 16 GB).
     #[serde(default = "default_cache_max_gb")]
     pub local_cache_max_gb: u64,
@@ -233,11 +230,18 @@ pub struct ReplicationPolicy {
     pub audit_interval_secs: u64,
 }
 
+impl ReplicationPolicy {
+    /// Returns the parsed local retention duration.
+    pub fn local_retention_duration(&self) -> std::time::Duration {
+        crate::cli::parse_duration(&self.local_retention).unwrap_or_else(|_| std::time::Duration::from_secs(30 * 86400))
+    }
+}
+
 fn default_min_synced() -> usize {
     1
 }
-fn default_retention_days() -> u64 {
-    30
+fn default_local_retention() -> String {
+    "30d".to_string()
 }
 fn default_cache_max_gb() -> u64 {
     16
@@ -256,8 +260,7 @@ impl Default for ReplicationPolicy {
     fn default() -> Self {
         Self {
             min_synced_remotes: default_min_synced(),
-            local_retention_days: default_retention_days(),
-            local_retention_secs: None,
+            local_retention: default_local_retention(),
             local_cache_max_gb: default_cache_max_gb(),
             max_log_age_secs: default_max_log_age(),
             active_sync_interval_secs: default_active_sync_interval(),
@@ -433,7 +436,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = RemoteRegistry::new();
         registry.policy.min_synced_remotes = 2;
-        registry.policy.local_retention_days = 60;
+        registry.policy.local_retention = "60d".to_string();
 
         let mut r1 = RemoteTargetConfig::new("my-aws-bucket");
         r1.region = "us-west-2".to_string();
@@ -529,7 +532,10 @@ bucket = "legacy-bucket"
         assert_eq!(policy.active_sync_interval_secs, 3600);
         assert_eq!(policy.audit_interval_secs, 21600);
         assert_eq!(policy.min_synced_remotes, 1);
-        assert_eq!(policy.local_retention_days, 30);
-        assert_eq!(policy.local_retention_secs, None);
+        assert_eq!(policy.local_retention, "30d");
+        assert_eq!(
+            policy.local_retention_duration(),
+            std::time::Duration::from_secs(30 * 86400)
+        );
     }
 }

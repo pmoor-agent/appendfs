@@ -865,10 +865,7 @@ impl RemoteReplicationWorker {
         store_listings: &[Option<HashMap<String, RemoteObject>>],
     ) {
         let now = fs.clock.now();
-        let retention_dur = policy
-            .local_retention_secs
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(policy.local_retention_days * 86400));
+        let retention_dur = policy.local_retention_duration();
 
         let last_summary_gen = fs.last_summary_generation.load(Ordering::SeqCst);
 
