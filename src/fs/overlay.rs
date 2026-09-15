@@ -6,7 +6,9 @@
 
 use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, ReadPlan};
 use crate::extent_map::ExtentMap;
-use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SpecialDelta, SymlinkDelta};
+use crate::node::{
+    AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, NodeKind, SpecialDelta, SymlinkDelta,
+};
 use crate::shim::{FileAttr, FileType};
 use crate::sync::OpTag;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -269,7 +271,7 @@ impl FsInner {
         result
     }
 
-    /// Computes active inode counts across all overlay layers in a single pass without redundant lookups.
+    /// Computes active inode counts and total logical byte size across all overlay layers in a single pass.
     pub fn inode_counts(&self) -> InodeCounts {
         let mut dirs = 0;
         let mut files = 0;
@@ -278,6 +280,7 @@ impl FsInner {
         let mut char_devices = 0;
         let mut block_devices = 0;
         let mut sockets = 0;
+        let mut total_logical_bytes = 0;
 
         let mut count_ft = |ft: FileType| match ft {
             FileType::Directory => dirs += 1,
@@ -292,10 +295,22 @@ impl FsInner {
         let overlay_cap = self.live.len() + self.flushing.iter().map(|b| b.entries.len()).sum::<usize>();
         let mut seen_overlay = HashSet::with_capacity(overlay_cap);
 
+        let mut process_node_delta = |ino: u64, d: &NodeDelta| {
+            count_ft(d.file_type());
+            if let NodeDelta::File(f) = d {
+                let size = if let Some(s) = f.size {
+                    s
+                } else {
+                    self.with_inode_layers(ino, |layers| layers.attr().map(|a| a.size as u64).unwrap_or(0))
+                };
+                total_logical_bytes += size;
+            }
+        };
+
         for (&ino, delta) in &self.live {
             seen_overlay.insert(ino);
             match delta {
-                EntryDelta::Node(d) => count_ft(d.file_type()),
+                EntryDelta::Node(d) => process_node_delta(ino, d),
                 EntryDelta::Tombstone => {}
             }
         }
@@ -304,7 +319,7 @@ impl FsInner {
             for (&ino, delta) in &batch.entries {
                 if seen_overlay.insert(ino) {
                     match delta {
-                        EntryDelta::Node(d) => count_ft(d.file_type()),
+                        EntryDelta::Node(d) => process_node_delta(ino, d),
                         EntryDelta::Tombstone => {}
                     }
                 }
@@ -314,11 +329,13 @@ impl FsInner {
         for (&ino, node) in &self.base {
             if !seen_overlay.contains(&ino) {
                 count_ft(node.file_type());
+                if let NodeKind::File { size, .. } = &node.kind {
+                    total_logical_bytes += size;
+                }
             }
         }
 
         InodeCounts {
-            total_active: dirs + files + symlinks + named_pipes + char_devices + block_devices + sockets,
             directories: dirs,
             files,
             symlinks,
@@ -326,6 +343,7 @@ impl FsInner {
             char_devices,
             block_devices,
             sockets,
+            total_logical_bytes,
         }
     }
 
@@ -353,7 +371,6 @@ impl FsInner {
 /// Category breakdown of active inodes across all overlay layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InodeCounts {
-    pub total_active: usize,
     pub directories: usize,
     pub files: usize,
     pub symlinks: usize,
@@ -361,9 +378,15 @@ pub struct InodeCounts {
     pub char_devices: usize,
     pub block_devices: usize,
     pub sockets: usize,
+    pub total_logical_bytes: u64,
 }
 
 impl InodeCounts {
+    /// Total number of active inodes across all types.
+    pub fn total_active(&self) -> usize {
+        self.directories + self.files + self.symlinks + self.special()
+    }
+
     /// Total number of special files (named pipes, char devices, block devices, and sockets).
     pub fn special(&self) -> usize {
         self.named_pipes + self.char_devices + self.block_devices + self.sockets

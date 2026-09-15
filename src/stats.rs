@@ -1,7 +1,5 @@
 use crate::fs::InMemoryFS;
 use crate::log::manifest::GenerationLiveStats;
-use crate::node::NodeKind;
-use crate::sync::OpTag;
 use std::fmt::Write as FmtWrite;
 
 /// Aggregate statistics and fragmentation status for an appendfs volume.
@@ -29,28 +27,7 @@ impl VolumeStats {
     /// Collects volume statistics from an in-memory filesystem state.
     pub fn collect(fs: &InMemoryFS) -> Self {
         let manifest = fs.manifest.read().unwrap().clone();
-        let inner = fs.inner.lock(OpTag::Stats).unwrap();
-        let base = &inner.base;
-        let total_inodes = base.len();
-
-        let mut directory_count = 0;
-        let mut file_count = 0;
-        let mut symlink_count = 0;
-        let mut total_logical_bytes = 0;
-
-        for node_arc in base.values() {
-            let node = node_arc.as_ref();
-            match &node.kind {
-                NodeKind::Directory { .. } => directory_count += 1,
-                NodeKind::File { size, .. } => {
-                    file_count += 1;
-                    total_logical_bytes += size;
-                }
-                NodeKind::Symlink { .. } => symlink_count += 1,
-                NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
-            }
-        }
-        drop(inner);
+        let counts = fs.inode_counts();
 
         let generations = fs.calculate_generation_live_stats();
         let mut total_disk_bytes = 0;
@@ -73,11 +50,11 @@ impl VolumeStats {
 
         Self {
             next_generation: manifest.next_generation,
-            total_inodes,
-            directory_count,
-            file_count,
-            symlink_count,
-            total_logical_bytes,
+            total_inodes: counts.total_active(),
+            directory_count: counts.directories,
+            file_count: counts.files,
+            symlink_count: counts.symlinks,
+            total_logical_bytes: counts.total_logical_bytes,
             total_disk_bytes,
             total_data_bytes,
             total_live_bytes,
@@ -280,7 +257,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push_str("[Inodes]\n");
     out.push_str(&format!(
         "  Active Inodes:      {} ({} directories, {} files, {} symlinks, {} special)\n",
-        snap.inode_counts.total_active,
+        snap.inode_counts.total_active(),
         snap.inode_counts.directories,
         snap.inode_counts.files,
         snap.inode_counts.symlinks,
@@ -529,6 +506,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::OpTag;
 
     #[test]
     fn test_volume_stats_formatting() {
@@ -739,49 +717,57 @@ mod tests {
     fn test_inode_counts_overlay_layers() {
         use crate::operations::dir::mkdir_core;
         use crate::operations::links::{symlink_core, unlink_core};
-        use crate::operations::read_write::create_core;
+        use crate::operations::read_write::{create_core, write_core};
 
         let fs = InMemoryFS::new();
         // Base state: 1 root directory
         let counts = fs.inode_counts();
-        assert_eq!(counts.total_active, 1);
+        assert_eq!(counts.total_active(), 1);
         assert_eq!(counts.directories, 1);
+        assert_eq!(counts.total_logical_bytes, 0);
 
         // Add 2 files, 1 dir, 1 symlink in live
         let d1 = mkdir_core(&fs, 1, "d1", 0o755, 1000, 1000).unwrap();
-        let _f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-        let _f2 = create_core(&fs, d1.ino, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
+        let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
+        let f2 = create_core(&fs, d1.ino, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
+        write_core(&fs, f1.ino, &[0u8; 100], 0).unwrap();
+        write_core(&fs, f2.ino, &[0u8; 50], 0).unwrap();
         symlink_core(&fs, 1, "s1.lnk", "f1.txt", 1000, 1000).unwrap();
 
         let counts_live = fs.inode_counts();
         assert_eq!(counts_live.directories, 2);
         assert_eq!(counts_live.files, 2);
         assert_eq!(counts_live.symlinks, 1);
-        assert_eq!(counts_live.total_active, 5);
+        assert_eq!(counts_live.total_active(), 5);
+        assert_eq!(counts_live.total_logical_bytes, 150);
 
         // Freeze live to flushing
         fs.freeze_now();
         let counts_flushing = fs.inode_counts();
-        assert_eq!(counts_flushing.total_active, 5);
+        assert_eq!(counts_flushing.total_active(), 5);
         assert_eq!(counts_flushing.directories, 2);
         assert_eq!(counts_flushing.files, 2);
         assert_eq!(counts_flushing.symlinks, 1);
+        assert_eq!(counts_flushing.total_logical_bytes, 150);
 
         // In live, unlink f2 and add f3
         unlink_core(&fs, d1.ino, "f2.txt").unwrap();
-        let _f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
+        let f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
+        write_core(&fs, f3.ino, &[0u8; 30], 0).unwrap();
 
         let counts_mixed = fs.inode_counts();
         assert_eq!(counts_mixed.directories, 2);
         assert_eq!(counts_mixed.files, 2); // f1 + f3 (f2 deleted)
         assert_eq!(counts_mixed.symlinks, 1);
-        assert_eq!(counts_mixed.total_active, 5);
+        assert_eq!(counts_mixed.total_active(), 5);
+        assert_eq!(counts_mixed.total_logical_bytes, 130);
 
         // Unlink f1 as well
         unlink_core(&fs, 1, "f1.txt").unwrap();
         let counts_after_del = fs.inode_counts();
         assert_eq!(counts_after_del.files, 1); // f3 only
-        assert_eq!(counts_after_del.total_active, 4);
+        assert_eq!(counts_after_del.total_active(), 4);
+        assert_eq!(counts_after_del.total_logical_bytes, 30);
 
         // Add special file types: FIFO, CharDevice, BlockDevice, Socket
         crate::operations::special::mknod_core(&fs, 1, "fifo", libc::S_IFIFO | 0o644, 0, 1000, 1000).unwrap();
@@ -795,7 +781,8 @@ mod tests {
         assert_eq!(counts_special.block_devices, 1);
         assert_eq!(counts_special.sockets, 1);
         assert_eq!(counts_special.special(), 4);
-        assert_eq!(counts_special.total_active, 8);
+        assert_eq!(counts_special.total_active(), 8);
+        assert_eq!(counts_special.total_logical_bytes, 30);
     }
 
     #[test]
