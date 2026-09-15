@@ -274,55 +274,58 @@ impl FsInner {
         let mut dirs = 0;
         let mut files = 0;
         let mut symlinks = 0;
-        let mut special = 0;
+        let mut named_pipes = 0;
+        let mut char_devices = 0;
+        let mut block_devices = 0;
+        let mut sockets = 0;
 
         let mut count_ft = |ft: FileType| match ft {
             FileType::Directory => dirs += 1,
             FileType::RegularFile => files += 1,
             FileType::Symlink => symlinks += 1,
-            _ => special += 1,
+            FileType::NamedPipe => named_pipes += 1,
+            FileType::CharDevice => char_devices += 1,
+            FileType::BlockDevice => block_devices += 1,
+            FileType::Socket => sockets += 1,
         };
 
-        if self.live.is_empty() && self.flushing.is_empty() {
-            for node in self.base.values() {
-                count_ft(node.file_type());
-            }
-        } else {
-            let overlay_cap = self.live.len() + self.flushing.iter().map(|b| b.entries.len()).sum::<usize>();
-            let mut seen_overlay = HashSet::with_capacity(overlay_cap);
+        let overlay_cap = self.live.len() + self.flushing.iter().map(|b| b.entries.len()).sum::<usize>();
+        let mut seen_overlay = HashSet::with_capacity(overlay_cap);
 
-            for (&ino, delta) in &self.live {
-                seen_overlay.insert(ino);
-                match delta {
-                    EntryDelta::Node(d) => count_ft(d.file_type()),
-                    EntryDelta::Tombstone => {}
-                }
+        for (&ino, delta) in &self.live {
+            seen_overlay.insert(ino);
+            match delta {
+                EntryDelta::Node(d) => count_ft(d.file_type()),
+                EntryDelta::Tombstone => {}
             }
+        }
 
-            for batch in self.flushing.iter().rev() {
-                for (&ino, delta) in &batch.entries {
-                    if seen_overlay.insert(ino) {
-                        match delta {
-                            EntryDelta::Node(d) => count_ft(d.file_type()),
-                            EntryDelta::Tombstone => {}
-                        }
+        for batch in self.flushing.iter().rev() {
+            for (&ino, delta) in &batch.entries {
+                if seen_overlay.insert(ino) {
+                    match delta {
+                        EntryDelta::Node(d) => count_ft(d.file_type()),
+                        EntryDelta::Tombstone => {}
                     }
-                }
-            }
-
-            for (&ino, node) in &self.base {
-                if !seen_overlay.contains(&ino) {
-                    count_ft(node.file_type());
                 }
             }
         }
 
+        for (&ino, node) in &self.base {
+            if !seen_overlay.contains(&ino) {
+                count_ft(node.file_type());
+            }
+        }
+
         InodeCounts {
-            total_active: dirs + files + symlinks + special,
+            total_active: dirs + files + symlinks + named_pipes + char_devices + block_devices + sockets,
             directories: dirs,
             files,
             symlinks,
-            special,
+            named_pipes,
+            char_devices,
+            block_devices,
+            sockets,
         }
     }
 
@@ -354,7 +357,17 @@ pub struct InodeCounts {
     pub directories: usize,
     pub files: usize,
     pub symlinks: usize,
-    pub special: usize,
+    pub named_pipes: usize,
+    pub char_devices: usize,
+    pub block_devices: usize,
+    pub sockets: usize,
+}
+
+impl InodeCounts {
+    /// Total number of special files (named pipes, char devices, block devices, and sockets).
+    pub fn special(&self) -> usize {
+        self.named_pipes + self.char_devices + self.block_devices + self.sockets
+    }
 }
 
 /// Point-in-time snapshot of internal mutable filesystem metrics collected under a single lock.

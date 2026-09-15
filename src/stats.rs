@@ -29,72 +29,38 @@ impl VolumeStats {
     /// Collects volume statistics from an in-memory filesystem state.
     pub fn collect(fs: &InMemoryFS) -> Self {
         let manifest = fs.manifest.read().unwrap().clone();
-        let (total_inodes, directory_count, file_count, symlink_count, total_logical_bytes, live_map) = {
-            let inner = fs.inner.lock(OpTag::Stats).unwrap();
-            let base = &inner.base;
-            let total_inodes = base.len();
+        let inner = fs.inner.lock(OpTag::Stats).unwrap();
+        let base = &inner.base;
+        let total_inodes = base.len();
 
-            let mut directory_count = 0;
-            let mut file_count = 0;
-            let mut symlink_count = 0;
-            let mut total_logical_bytes = 0;
-            let mut live_map: std::collections::HashMap<u64, (u64, u32)> = std::collections::HashMap::new();
+        let mut directory_count = 0;
+        let mut file_count = 0;
+        let mut symlink_count = 0;
+        let mut total_logical_bytes = 0;
 
-            for node_arc in base.values() {
-                let node = node_arc.as_ref();
-                match &node.kind {
-                    NodeKind::Directory { .. } => directory_count += 1,
-                    NodeKind::File { size, extent_map } => {
-                        file_count += 1;
-                        total_logical_bytes += size;
-                        for (_, entry) in extent_map.iter() {
-                            if let crate::extent_map::Extent::Disk { generation, length, .. } = &entry.extent {
-                                let stats = live_map.entry(*generation).or_insert((0, 0));
-                                stats.0 += *length as u64;
-                                stats.1 += 1;
-                            }
-                        }
-                    }
-                    NodeKind::Symlink { .. } => symlink_count += 1,
-                    NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
+        for node_arc in base.values() {
+            let node = node_arc.as_ref();
+            match &node.kind {
+                NodeKind::Directory { .. } => directory_count += 1,
+                NodeKind::File { size, .. } => {
+                    file_count += 1;
+                    total_logical_bytes += size;
                 }
+                NodeKind::Symlink { .. } => symlink_count += 1,
+                NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
             }
-            (
-                total_inodes,
-                directory_count,
-                file_count,
-                symlink_count,
-                total_logical_bytes,
-                live_map,
-            )
-        };
+        }
+        drop(inner);
 
-        let mut generations = Vec::new();
+        let generations = fs.calculate_generation_live_stats();
         let mut total_disk_bytes = 0;
         let mut total_data_bytes = 0;
         let mut total_live_bytes = 0;
 
-        for log in &manifest.logs {
-            let (live_bytes, live_extents) = live_map.get(&log.generation).copied().unwrap_or((0, 0));
-            let live_ratio = if log.total_data_bytes > 0 {
-                live_bytes as f64 / log.total_data_bytes as f64
-            } else {
-                0.0
-            };
-            total_disk_bytes += log.total_bytes;
-            total_data_bytes += log.total_data_bytes;
-            total_live_bytes += live_bytes;
-
-            generations.push(GenerationLiveStats {
-                generation: log.generation,
-                filename: log.filename.clone(),
-                record_count: log.record_count,
-                total_bytes: log.total_bytes,
-                total_data_bytes: log.total_data_bytes,
-                live_bytes,
-                live_extents,
-                live_ratio,
-            });
+        for g in &generations {
+            total_disk_bytes += g.total_bytes;
+            total_data_bytes += g.total_data_bytes;
+            total_live_bytes += g.live_bytes;
         }
 
         let overall_live_ratio = if total_data_bytes > 0 {
@@ -318,7 +284,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         snap.inode_counts.directories,
         snap.inode_counts.files,
         snap.inode_counts.symlinks,
-        snap.inode_counts.special
+        snap.inode_counts.special()
     ));
     out.push_str(&format!("  Live Staged Inodes: {}\n", snap.live_len));
     out.push_str(&format!("  Flushing Batches:   {}\n", snap.flushing_batches));
@@ -816,6 +782,20 @@ mod tests {
         let counts_after_del = fs.inode_counts();
         assert_eq!(counts_after_del.files, 1); // f3 only
         assert_eq!(counts_after_del.total_active, 4);
+
+        // Add special file types: FIFO, CharDevice, BlockDevice, Socket
+        crate::operations::special::mknod_core(&fs, 1, "fifo", libc::S_IFIFO | 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::special::mknod_core(&fs, 1, "chr", libc::S_IFCHR | 0o660, 0x1234, 1000, 1000).unwrap();
+        crate::operations::special::mknod_core(&fs, 1, "blk", libc::S_IFBLK | 0o660, 0x5678, 1000, 1000).unwrap();
+        crate::operations::special::mknod_core(&fs, 1, "sock", libc::S_IFSOCK | 0o755, 0, 1000, 1000).unwrap();
+
+        let counts_special = fs.inode_counts();
+        assert_eq!(counts_special.named_pipes, 1);
+        assert_eq!(counts_special.char_devices, 1);
+        assert_eq!(counts_special.block_devices, 1);
+        assert_eq!(counts_special.sockets, 1);
+        assert_eq!(counts_special.special(), 4);
+        assert_eq!(counts_special.total_active, 8);
     }
 
     #[test]
