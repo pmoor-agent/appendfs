@@ -6,7 +6,9 @@
 
 use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, ReadPlan};
 use crate::extent_map::ExtentMap;
-use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SpecialDelta, SymlinkDelta};
+use crate::node::{
+    AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, NodeKind, SpecialDelta, SymlinkDelta,
+};
 use crate::shim::{FileAttr, FileType};
 use crate::sync::OpTag;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -268,9 +270,158 @@ impl FsInner {
 
         result
     }
+
+    /// Computes active inode counts and total logical byte size across all overlay layers in a single pass.
+    pub fn inode_counts(&self) -> InodeCounts {
+        let mut dirs = 0;
+        let mut files = 0;
+        let mut symlinks = 0;
+        let mut named_pipes = 0;
+        let mut char_devices = 0;
+        let mut block_devices = 0;
+        let mut sockets = 0;
+        let mut total_logical_bytes = 0;
+
+        let mut count_ft = |ft: FileType| match ft {
+            FileType::Directory => dirs += 1,
+            FileType::RegularFile => files += 1,
+            FileType::Symlink => symlinks += 1,
+            FileType::NamedPipe => named_pipes += 1,
+            FileType::CharDevice => char_devices += 1,
+            FileType::BlockDevice => block_devices += 1,
+            FileType::Socket => sockets += 1,
+        };
+
+        let overlay_cap = self.live.len() + self.flushing.iter().map(|b| b.entries.len()).sum::<usize>();
+        let mut seen_overlay = HashSet::with_capacity(overlay_cap);
+
+        let mut process_node_delta = |ino: u64, d: &NodeDelta| {
+            count_ft(d.file_type());
+            if let NodeDelta::File(f) = d {
+                let size = if let Some(s) = f.size {
+                    s
+                } else {
+                    self.with_inode_layers(ino, |layers| layers.attr().map(|a| a.size as u64).unwrap_or(0))
+                };
+                total_logical_bytes += size;
+            }
+        };
+
+        for (&ino, delta) in &self.live {
+            seen_overlay.insert(ino);
+            match delta {
+                EntryDelta::Node(d) => process_node_delta(ino, d),
+                EntryDelta::Tombstone => {}
+            }
+        }
+
+        for batch in self.flushing.iter().rev() {
+            for (&ino, delta) in &batch.entries {
+                if seen_overlay.insert(ino) {
+                    match delta {
+                        EntryDelta::Node(d) => process_node_delta(ino, d),
+                        EntryDelta::Tombstone => {}
+                    }
+                }
+            }
+        }
+
+        for (&ino, node) in &self.base {
+            if !seen_overlay.contains(&ino) {
+                count_ft(node.file_type());
+                if let NodeKind::File { size, .. } = &node.kind {
+                    total_logical_bytes += size;
+                }
+            }
+        }
+
+        InodeCounts {
+            directories: dirs,
+            files,
+            symlinks,
+            named_pipes,
+            char_devices,
+            block_devices,
+            sockets,
+            total_logical_bytes,
+        }
+    }
+
+    /// Captures a point-in-time snapshot of internal metrics while the lock is already held.
+    pub fn stats_snapshot(&self) -> InnerStatsSnapshot {
+        let (file_handles_count, virt_handles_count, dir_handles_count) = self.handle_counts();
+        InnerStatsSnapshot {
+            recovered_time: self.recovered_time,
+            inode_counts: self.inode_counts(),
+            live_len: self.live.len(),
+            flushing_batches: self.flushing.len(),
+            base_len: self.base.len(),
+            staged_bytes: self.staged_bytes,
+            staged_ops: self.staged_ops,
+            flushing_bytes: self.flushing_bytes,
+            flushing_ops: self.flushing_ops,
+            file_handles_count,
+            virt_handles_count,
+            dir_handles_count,
+            open_inodes_count: self.open_counts.len(),
+        }
+    }
+}
+
+/// Category breakdown of active inodes across all overlay layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InodeCounts {
+    pub directories: usize,
+    pub files: usize,
+    pub symlinks: usize,
+    pub named_pipes: usize,
+    pub char_devices: usize,
+    pub block_devices: usize,
+    pub sockets: usize,
+    pub total_logical_bytes: u64,
+}
+
+impl InodeCounts {
+    /// Total number of active inodes across all types.
+    pub fn total_active(&self) -> usize {
+        self.directories + self.files + self.symlinks + self.special()
+    }
+
+    /// Total number of special files (named pipes, char devices, block devices, and sockets).
+    pub fn special(&self) -> usize {
+        self.named_pipes + self.char_devices + self.block_devices + self.sockets
+    }
+}
+
+/// Point-in-time snapshot of internal mutable filesystem metrics collected under a single lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InnerStatsSnapshot {
+    pub recovered_time: Option<SystemTime>,
+    pub inode_counts: InodeCounts,
+    pub live_len: usize,
+    pub flushing_batches: usize,
+    pub base_len: usize,
+    pub staged_bytes: usize,
+    pub staged_ops: usize,
+    pub flushing_bytes: usize,
+    pub flushing_ops: usize,
+    pub file_handles_count: usize,
+    pub virt_handles_count: usize,
+    pub dir_handles_count: usize,
+    pub open_inodes_count: usize,
 }
 
 impl InMemoryFS {
+    /// Takes a point-in-time snapshot of internal filesystem metrics using a single mutex lock.
+    pub fn stats_snapshot(&self) -> InnerStatsSnapshot {
+        self.inner.lock(OpTag::Stats).unwrap().stats_snapshot()
+    }
+
+    /// Computes active inode counts across the overlay layers using a single mutex lock.
+    pub fn inode_counts(&self) -> InodeCounts {
+        self.inner.lock(OpTag::Stats).unwrap().inode_counts()
+    }
+
     pub fn get_parent_dir_inode(&self, ino: u64) -> Option<u64> {
         self.inner.lock(OpTag::Lookup).unwrap().get_parent_dir_inode(ino)
     }

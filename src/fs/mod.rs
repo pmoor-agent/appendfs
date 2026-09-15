@@ -21,6 +21,7 @@ pub mod virtual_files;
 pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
 pub use arena::WriteArena;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
+pub use overlay::{InnerStatsSnapshot, InodeCounts};
 pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};
