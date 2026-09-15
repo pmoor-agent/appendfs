@@ -104,7 +104,7 @@ impl InMemoryFS {
     }
 
     pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
-        let is_last_handle = self.with_inner(OpTag::Handle, |inner| {
+        self.with_inner(OpTag::Handle, |inner| {
             match inner.handles.get(&fh) {
                 Some(h) if h.ino() == ino && !h.is_dir() => {
                     inner.handles.remove(&fh);
@@ -112,7 +112,7 @@ impl InMemoryFS {
                 _ => return Err(libc::EBADF),
             }
 
-            let remaining = if let Some(count) = inner.open_counts.get_mut(&ino) {
+            let is_last_handle = if let Some(count) = inner.open_counts.get_mut(&ino) {
                 *count = count.saturating_sub(1);
                 let rem = *count;
                 if rem == 0 {
@@ -123,34 +123,26 @@ impl InMemoryFS {
                         inner.tombstone(ino);
                     }
                 }
-                rem
+                rem == 0
             } else {
-                0
+                true
             };
 
-            Ok(remaining == 0)
-        })?;
-
-        // Clean up locks outside inner critical section
-        self.locks.release_flock(ino, fh);
-        if is_last_handle {
-            self.locks.release_range_locks(ino, fh);
-        } else {
-            self.locks.cancel_range_lock_waiters(ino, fh);
-        }
-        Ok(())
+            inner.release_file_handle_locks(is_last_handle, ino, fh);
+            Ok(())
+        })
     }
 
     pub fn release_flock(&self, ino: u64, fh: u64) {
-        self.locks.release_flock(ino, fh);
+        self.with_inner(OpTag::Handle, |inner| inner.release_flock(ino, fh));
     }
 
     pub fn cancel_range_lock_waiters(&self, ino: u64, fh: u64) {
-        self.locks.cancel_range_lock_waiters(ino, fh);
+        self.with_inner(OpTag::Handle, |inner| inner.cancel_range_lock_waiters(ino, fh));
     }
 
     pub fn release_range_locks(&self, ino: u64, fh: u64) {
-        self.locks.release_range_locks(ino, fh);
+        self.with_inner(OpTag::Handle, |inner| inner.release_range_locks(ino, fh));
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {

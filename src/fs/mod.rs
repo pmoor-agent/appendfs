@@ -18,7 +18,9 @@ mod layers;
 mod overlay;
 pub mod virtual_files;
 
-pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
+pub use crate::operations::locks::{
+    FlockState, FlockWaiter, LockManager, LockManagerState, RangeLock, RangeLockWaiter,
+};
 pub use arena::WriteArena;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use overlay::{InnerStatsSnapshot, InodeCounts};
@@ -469,6 +471,8 @@ pub struct FsInner {
     pub flushing_bytes: usize,
     /// Total mutating operations across all frozen batches in `flushing`.
     pub flushing_ops: usize,
+    /// Whole-file BSD flock and POSIX byte-range record lock manager.
+    pub locks: LockManager,
 }
 
 impl FsInner {
@@ -694,6 +698,93 @@ impl<'a> FsInnerGuard<'a> {
     pub fn mutation_occurred(&self) -> bool {
         self.mutation_occurred
     }
+
+    /// Releases the whole-file BSD flock held by `fh` on `ino` and defers notifying canceled/ready waiters.
+    pub fn release_flock(&mut self, ino: u64, fh: u64) {
+        let (canceled, ready) = self.guard.locks.release_flock(ino, fh);
+        if !canceled.is_empty() || !ready.is_empty() {
+            self.guard.defer(move || {
+                for r in canceled {
+                    r.reply_err(libc::EBADF);
+                }
+                for r in ready {
+                    r.reply_err(0);
+                }
+            });
+        }
+    }
+
+    /// Cancels all pending POSIX range lock waiters for `fh` on `ino` and defers replying EBADF.
+    pub fn cancel_range_lock_waiters(&mut self, ino: u64, fh: u64) {
+        let canceled = self.guard.locks.cancel_range_lock_waiters(ino, fh);
+        if !canceled.is_empty() {
+            self.guard.defer(move || {
+                for r in canceled {
+                    r.reply_err(libc::EBADF);
+                }
+            });
+        }
+    }
+
+    /// Releases all POSIX range locks held on `ino` and defers waking pending waiters and replying EBADF to canceled requests for `fh`.
+    pub fn release_range_locks(&mut self, ino: u64, fh: u64) {
+        let (canceled, ready) = self.guard.locks.release_range_locks(ino, fh);
+        if !canceled.is_empty() || !ready.is_empty() {
+            self.guard.defer(move || {
+                for r in canceled {
+                    r.reply_err(libc::EBADF);
+                }
+                for r in ready {
+                    r.reply_err(0);
+                }
+            });
+        }
+    }
+
+    /// Releases locks associated with `fh` on `ino` (canceling waiters, releasing flock, and releasing range locks if `is_last_handle`) and defers replies.
+    pub fn release_file_handle_locks(&mut self, is_last_handle: bool, ino: u64, fh: u64) {
+        let (canceled, ready) = self.guard.locks.release_file_handle(is_last_handle, ino, fh);
+        if !canceled.is_empty() || !ready.is_empty() {
+            self.guard.defer(move || {
+                for r in canceled {
+                    r.reply_err(libc::EBADF);
+                }
+                for r in ready {
+                    r.reply_err(0);
+                }
+            });
+        }
+    }
+
+    /// Unlocks a POSIX byte range on `ino` and defers notifying any ready range lock waiters.
+    pub fn unlock_range(&mut self, ino: u64, lock_owner: u64, start: u64, end: u64) {
+        self.guard.locks.unlock_range(ino, lock_owner, start, end);
+        self.wake_range_lock_waiters(ino);
+    }
+
+    /// Wakes any pending range lock waiters on `ino` and defers replying success.
+    pub fn wake_range_lock_waiters(&mut self, ino: u64) {
+        let ready = self.guard.locks.wake_range_lock_waiters(ino);
+        if !ready.is_empty() {
+            self.guard.defer(move || {
+                for r in ready {
+                    r.reply_err(0);
+                }
+            });
+        }
+    }
+
+    /// Wakes any pending flock waiters on `ino` and defers replying success.
+    pub fn wake_flock_waiters(&mut self, ino: u64) {
+        let ready = self.guard.locks.wake_flock_waiters(ino);
+        if !ready.is_empty() {
+            self.guard.defer(move || {
+                for r in ready {
+                    r.reply_err(0);
+                }
+            });
+        }
+    }
 }
 
 impl<'a> Deref for FsInnerGuard<'a> {
@@ -727,10 +818,8 @@ impl<'a> Drop for FsInnerGuard<'a> {
 
 pub struct InMemoryFS {
     /// Consolidated critical section protecting all in-memory metadata, layer overlay,
-    /// file/dir handles, open counts, and write arena buffers.
+    /// file/dir handles, open counts, write arena buffers, and lock manager state.
     pub inner: ActionMutex<FsInner>,
-    /// Independent whole-file BSD flock and POSIX byte-range record lock manager.
-    pub locks: LockManager,
     /// Authoritative manifest of all active log generations and lineage.
     pub manifest: Arc<RwLock<LogManifest>>,
     pub next_inode: AtomicU64,
@@ -852,11 +941,11 @@ impl InMemoryFS {
             staged_ops: 0,
             flushing_bytes: 0,
             flushing_ops: 0,
+            locks: LockManager::new(),
         };
 
         let fs = Self {
             inner: ActionMutex::new(inner),
-            locks: LockManager::new(),
             manifest,
             next_inode: AtomicU64::new(2),
             last_tx_id: AtomicU64::new(0),

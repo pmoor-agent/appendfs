@@ -259,7 +259,7 @@ fn convert_file_attr(attr: &FileAttr) -> ShimFileAttr {
 }
 
 pub struct Request {
-    req: shim_req_t,
+    pub(crate) req: shim_req_t,
 }
 
 unsafe impl Send for Request {}

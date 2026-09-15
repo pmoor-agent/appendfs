@@ -364,6 +364,8 @@ impl FsInner {
             virt_handles_count,
             dir_handles_count,
             open_inodes_count: self.open_counts.len(),
+            flock_count: self.locks.flock_count(),
+            range_lock_count: self.locks.range_lock_count(),
         }
     }
 }
@@ -409,6 +411,8 @@ pub struct InnerStatsSnapshot {
     pub virt_handles_count: usize,
     pub dir_handles_count: usize,
     pub open_inodes_count: usize,
+    pub flock_count: usize,
+    pub range_lock_count: usize,
 }
 
 impl InMemoryFS {
