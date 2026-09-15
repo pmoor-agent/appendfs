@@ -28,6 +28,7 @@ import struct
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+import uuid
 
 import argon2.low_level
 import blake3
@@ -389,13 +390,31 @@ class Restorer:
         self.last_committed_tx_id: Optional[int] = None
         self.tombstoned_inodes: Set[int] = set()
 
-    def resolve_paths(self, ino: int) -> List[Path]:
+    def _add_dir_entry(self, parent_ino: int, name: str, child_ino: int):
+        prev_child = self.dir_entries.setdefault(parent_ino, {}).get(name)
+        if prev_child is not None and prev_child != child_ino:
+            self.parent_map.get(prev_child, set()).discard((parent_ino, name))
+        self.dir_entries[parent_ino][name] = child_ino
+        self.parent_map.setdefault(child_ino, set()).add((parent_ino, name))
+
+    def _remove_dir_entry(self, parent_ino: int, name: str) -> Optional[int]:
+        child_ino = self.dir_entries.get(parent_ino, {}).pop(name, None)
+        if child_ino is not None:
+            self.parent_map.get(child_ino, set()).discard((parent_ino, name))
+        return child_ino
+
+    def resolve_paths(self, ino: int, visited: Optional[Set[int]] = None) -> List[Path]:
         """Resolves all current filesystem paths associated with an inode."""
         if ino == 1:
             return [self.dest_dir]
+        if visited is None:
+            visited = set()
+        if ino in visited:
+            return []
+        visited.add(ino)
         paths = []
         for parent_ino, name in self.parent_map.get(ino, set()):
-            for ppath in self.resolve_paths(parent_ino):
+            for ppath in self.resolve_paths(parent_ino, visited.copy()):
                 paths.append(ppath / name)
         return paths
 
@@ -513,36 +532,180 @@ class Restorer:
         if self.dry_run:
             return
 
-        # 1. Directory additions and removals
-        for ino, delta in batch_deltas.items():
-            if delta[0] == "dir":
-                _, parent, added, removed, attrs = delta
-                self.inode_types[ino] = "dir"
-                if ino not in self.dir_entries:
-                    self.dir_entries[ino] = {}
+        staging_dir = self.dest_dir / ".appendfs_restore_staging"
 
-                # Removals
+        # 1. Directory additions and removals (handling renames, unlinks, hardlinks)
+        dir_deltas = {ino: delta for ino, delta in batch_deltas.items() if delta[0] == "dir"}
+        for ino, delta in dir_deltas.items():
+            self.inode_types[ino] = "dir"
+            if ino not in self.dir_entries:
+                self.dir_entries[ino] = {}
+
+        if dir_deltas:
+            raw_removals: List[Tuple[int, str, int]] = []
+            for p_ino, delta in dir_deltas.items():
+                _, parent, added, removed, attrs = delta
                 for name in removed:
-                    child_ino = self.dir_entries[ino].pop(name, None)
-                    if child_ino:
-                        self.parent_map.get(child_ino, set()).discard((ino, name))
-                        for ppath in self.resolve_paths(ino):
-                            victim = ppath / name
+                    child_ino = self.dir_entries.get(p_ino, {}).get(name)
+                    if child_ino is not None:
+                        raw_removals.append((p_ino, name, child_ino))
+                    else:
+                        for old_ppath in self.resolve_paths(p_ino):
+                            victim = old_ppath / name
                             if victim.is_symlink() or victim.is_file():
                                 victim.unlink(missing_ok=True)
                             elif victim.is_dir():
                                 shutil.rmtree(victim, ignore_errors=True)
 
-                # Additions
+            raw_additions: List[Tuple[int, str, int]] = []
+            for p_ino, delta in dir_deltas.items():
+                _, parent, added, removed, attrs = delta
                 for name, child_ino in added:
-                    self.dir_entries[ino][name] = child_ino
-                    self.parent_map.setdefault(child_ino, set()).add((ino, name))
-                    if self.inode_types.get(child_ino) == "dir":
-                        for ppath in self.resolve_paths(ino):
-                            (ppath / name).mkdir(parents=True, exist_ok=True)
+                    raw_additions.append((p_ino, name, child_ino))
+
+            # Match renames: an inode removed from (old_p, old_name) and added to (new_p, new_name)
+            additions_by_ino: Dict[int, List[Tuple[int, str]]] = {}
+            for p_ino, name, c_ino in raw_additions:
+                additions_by_ino.setdefault(c_ino, []).append((p_ino, name))
+
+            renames: List[Tuple[int, str, int, str, int]] = []
+            pure_removals: List[Tuple[int, str, int]] = []
+            matched_additions: Set[Tuple[int, str, int]] = set()
+
+            for old_p_ino, old_name, c_ino in raw_removals:
+                targets = additions_by_ino.get(c_ino)
+                if targets:
+                    new_p_ino, new_name = targets.pop(0)
+                    renames.append((old_p_ino, old_name, new_p_ino, new_name, c_ino))
+                    matched_additions.add((new_p_ino, new_name, c_ino))
+                else:
+                    pure_removals.append((old_p_ino, old_name, c_ino))
+
+            unmatched_additions = [
+                (p_ino, name, c_ino)
+                for (p_ino, name, c_ino) in raw_additions
+                if (p_ino, name, c_ino) not in matched_additions
+            ]
+
+            # Categorize unmatched additions into hardlinks vs brand new entries
+            hardlinks: List[Tuple[int, str, int]] = []
+            new_entries: List[Tuple[int, str, int]] = []
+            for p_ino, name, c_ino in unmatched_additions:
+                if c_ino in self.parent_map and bool(self.parent_map[c_ino]):
+                    hardlinks.append((p_ino, name, c_ino))
+                else:
+                    new_entries.append((p_ino, name, c_ino))
+
+            # --- Renames Phase 1: stage sources into staging_dir ---
+            # Sort deepest first so child paths are staged before parent directories
+            renames.sort(
+                key=lambda x: len(self.resolve_paths(x[0])[0].parts) if self.resolve_paths(x[0]) else 0,
+                reverse=True,
+            )
+            staged_renames: List[Tuple[Optional[Path], int, str, int]] = []
+            if renames:
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                for old_p_ino, old_name, new_p_ino, new_name, c_ino in renames:
+                    old_ppaths = self.resolve_paths(old_p_ino)
+                    staged_for_entry = False
+                    for old_ppath in old_ppaths:
+                        src_path = old_ppath / old_name
+                        if src_path.exists() or src_path.is_symlink():
+                            tmp_name = f".tmp_{c_ino}_{uuid.uuid4().hex}"
+                            tmp_path = staging_dir / tmp_name
+                            try:
+                                os.rename(src_path, tmp_path)
+                                staged_renames.append((tmp_path, new_p_ino, new_name, c_ino))
+                                staged_for_entry = True
+                            except Exception:
+                                try:
+                                    shutil.move(src_path, tmp_path)
+                                    staged_renames.append((tmp_path, new_p_ino, new_name, c_ino))
+                                    staged_for_entry = True
+                                except Exception as e:
+                                    print(f"Warning: Failed to stage rename of {src_path}: {e}", file=sys.stderr)
+                    if not staged_for_entry:
+                        staged_renames.append((None, new_p_ino, new_name, c_ino))
+
+                    # Update in-memory hierarchy for this rename
+                    self._remove_dir_entry(old_p_ino, old_name)
+                    self._add_dir_entry(new_p_ino, new_name, c_ino)
+
+            # --- Pure Removals: delete unlinked paths from disk ---
+            for old_p_ino, old_name, c_ino in pure_removals:
+                for old_ppath in self.resolve_paths(old_p_ino):
+                    victim = old_ppath / old_name
+                    if victim.is_symlink() or victim.is_file():
+                        victim.unlink(missing_ok=True)
+                    elif victim.is_dir():
+                        shutil.rmtree(victim, ignore_errors=True)
+                self._remove_dir_entry(old_p_ino, old_name)
+
+            # --- Renames Phase 2: move from staging_dir to dst_path ---
+            # Sort shallowest first so parent directories are placed before children
+            staged_renames.sort(
+                key=lambda x: len(self.resolve_paths(x[1])[0].parts) if self.resolve_paths(x[1]) else 0
+            )
+            for tmp_path, new_p_ino, new_name, c_ino in staged_renames:
+                if tmp_path is not None and (tmp_path.exists() or tmp_path.is_symlink()):
+                    for new_ppath in self.resolve_paths(new_p_ino):
+                        dst_path = new_ppath / new_name
+                        dst_path.parent.mkdir(parents=True, exist_ok=True)
+                        if dst_path.exists() or dst_path.is_symlink():
+                            if dst_path.is_dir() and not dst_path.is_symlink():
+                                shutil.rmtree(dst_path, ignore_errors=True)
+                            else:
+                                dst_path.unlink(missing_ok=True)
+                        try:
+                            os.rename(tmp_path, dst_path)
+                        except Exception:
+                            try:
+                                shutil.move(tmp_path, dst_path)
+                            except Exception as e:
+                                print(f"Warning: Failed to complete rename to {dst_path}: {e}", file=sys.stderr)
+
+            # Cleanup empty staging_dir if present
+            if staging_dir.exists():
+                try:
+                    staging_dir.rmdir()
+                except Exception:
+                    pass
+
+            # --- Hardlinks ---
+            for new_p_ino, new_name, c_ino in hardlinks:
+                self._add_dir_entry(new_p_ino, new_name, c_ino)
+                for new_ppath in self.resolve_paths(new_p_ino):
+                    link_target = new_ppath / new_name
+                    existing = [
+                        p for p in self.resolve_paths(c_ino)
+                        if (p.exists() or p.is_symlink()) and p != link_target
+                    ]
+                    if existing:
+                        primary = existing[0]
+                        link_target.parent.mkdir(parents=True, exist_ok=True)
+                        if link_target.exists() or link_target.is_symlink():
+                            link_target.unlink(missing_ok=True)
+                        try:
+                            os.link(primary, link_target)
+                        except Exception:
+                            try:
+                                shutil.copy2(primary, link_target)
+                            except Exception as e:
+                                print(f"Warning: Cannot link/copy {link_target} from {primary}: {e}", file=sys.stderr)
+
+            # --- Brand New Entries ---
+            for new_p_ino, new_name, c_ino in new_entries:
+                self._add_dir_entry(new_p_ino, new_name, c_ino)
+                if c_ino in batch_deltas:
+                    dtag = batch_deltas[c_ino][0]
+                    if dtag in ("dir", "file", "symlink", "special"):
+                        self.inode_types[c_ino] = dtag
+                if self.inode_types.get(c_ino) == "dir":
+                    for new_ppath in self.resolve_paths(new_p_ino):
+                        (new_ppath / new_name).mkdir(parents=True, exist_ok=True)
 
         # Ensure all existing directories are present on disk
-        for ino, itype in self.inode_types.items():
+        for ino, itype in list(self.inode_types.items()):
             if itype == "dir":
                 for p in self.resolve_paths(ino):
                     p.mkdir(parents=True, exist_ok=True)
@@ -603,6 +766,15 @@ class Restorer:
                             if chunk is not None:
                                 f.seek(file_off)
                                 f.write(chunk[:length])
+                        else:
+                            # Zero extent (hole)
+                            f.seek(file_off)
+                            zero_chunk = b"\0" * min(length, 65536)
+                            rem = length
+                            while rem > 0:
+                                to_write = min(rem, len(zero_chunk))
+                                f.write(zero_chunk[:to_write])
+                                rem -= to_write
                     if size is not None:
                         f.truncate(size)
 
@@ -673,6 +845,8 @@ class Restorer:
                     except Exception:
                         pass
                 self.inode_types.pop(ino, None)
+                for p_ino, name in list(self.parent_map.get(ino, set())):
+                    self.dir_entries.get(p_ino, {}).pop(name, None)
                 self.dir_entries.pop(ino, None)
                 self.parent_map.pop(ino, None)
                 self.inode_modes.pop(ino, None)
@@ -683,6 +857,10 @@ class Restorer:
         """Applies final POSIX timestamps and permissions in post-order (deepest paths first)."""
         if self.dry_run:
             return
+
+        staging_dir = self.dest_dir / ".appendfs_restore_staging"
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
         all_targets: List[Tuple[Path, int]] = []
         for ino in self.inode_types:
