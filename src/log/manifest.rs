@@ -144,11 +144,14 @@ impl LogManifest {
         created_at: SystemTime,
         initial_header_size: u64,
     ) {
-        if self
+        if let Some(entry) = self
             .logs
-            .iter()
-            .any(|l| l.generation == next_gen && l.revision == revision)
+            .iter_mut()
+            .find(|l| l.generation == next_gen && l.revision == revision)
         {
+            if entry.record_count == 0 {
+                entry.created_at = created_at;
+            }
             return;
         }
         let entry = LogFileInfo::new_with_revision(next_gen, revision, created_at, initial_header_size);

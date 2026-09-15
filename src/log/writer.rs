@@ -200,7 +200,7 @@ impl LogWriter {
                 let c_time = created_at.unwrap_or_else(|| clock.now());
                 let active_file = open_generation_file(&self.storage, gen_num, c_time)?;
                 *state = ActiveLogState::Open(active_file);
-                log::info!("Lazily opened initial log file for generation {}", gen_num);
+                log::info!("Lazily opened log file for generation {}", gen_num);
                 Ok(Some((gen_num, None)))
             }
             ActiveLogState::Open(active) => {
@@ -225,11 +225,12 @@ impl LogWriter {
     }
 
     /// Rolls the active generation if it has been open longer than `max_log_age`, ignoring
-    /// its size.
+    /// its size, putting the writer into lazy mode so the new generation file is not opened
+    /// until the next write.
     ///
     /// The flusher runs this at the end of every cycle, including the idle ones, so an
-    /// untouched filesystem still seals its generation on schedule. Size-based rolling stays
-    /// in `roll_if_needed`, where it can see how much the batch about to be written will add.
+    /// untouched filesystem still seals its generation on schedule. Leaving the successor
+    /// unopened (lazy) ensures an idle filesystem does not generate empty log files over time.
     pub fn roll_if_aged(&self, clock: &dyn Clock) -> io::Result<Option<(u64, [u8; 16])>> {
         let Some(max_age) = self.max_log_age else {
             return Ok(None);
@@ -239,18 +240,48 @@ impl LogWriter {
             Err(e) => e.into_inner(),
         };
 
-        match &mut *state {
+        let aged = match &*state {
             // Nothing written yet, so there is nothing to seal.
-            ActiveLogState::Unopened { .. } => Ok(None),
+            ActiveLogState::Unopened { .. } => false,
             ActiveLogState::Open(active) => {
-                if active.current_offset <= FILE_HEADER_SIZE as u64
-                    || clock.now().duration_since(active.created_at).unwrap_or_default() < max_age
-                {
-                    return Ok(None);
-                }
-                Ok(Some(seal_and_open_next(active, &self.storage, clock, "Age-rolled")?))
+                active.current_offset > FILE_HEADER_SIZE as u64
+                    && clock.now().duration_since(active.created_at).unwrap_or_default() >= max_age
             }
+        };
+
+        if !aged {
+            return Ok(None);
         }
+
+        let old_state = std::mem::replace(
+            &mut *state,
+            ActiveLogState::Unopened {
+                generation: 0,
+                created_at: None,
+            },
+        );
+
+        let ActiveLogState::Open(mut active) = old_state else {
+            return Ok(None);
+        };
+
+        if let Err(e) = active.writer.sync() {
+            *state = ActiveLogState::Open(active);
+            return Err(e);
+        }
+
+        let sealed_md5 = active.md5_hasher.clone().compute().0;
+        let next_gen = active.generation + 1;
+        log::info!(
+            "Age-rolled log file: sealed generation {}, next generation {} is lazy (unopened)",
+            active.generation,
+            next_gen
+        );
+        *state = ActiveLogState::Unopened {
+            generation: next_gen,
+            created_at: None,
+        };
+        Ok(Some((next_gen, sealed_md5)))
     }
 
     /// Forcefully rolls the active generation file to `generation + 1` if it has committed data,
@@ -470,9 +501,10 @@ impl LogWriter {
 mod tests {
     use super::*;
     use crate::cli::DEFAULT_MAX_LOG_SIZE;
-    use crate::clock::SystemClock;
+    use crate::clock::{AdvancingClock, SystemClock};
     use crate::log::reader::LogReader;
     use crate::storage::MemoryStorage;
+    use std::time::SystemTime;
 
     #[test]
     fn test_log_writer_create_and_append() {
@@ -598,5 +630,64 @@ mod tests {
             sealed_md5, expected_md5,
             "On-the-fly computed MD5 must match raw disk bytes bit-for-bit!"
         );
+    }
+
+    #[test]
+    fn test_roll_if_aged_puts_writer_in_lazy_mode_and_does_not_open_file() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = AdvancingClock::new(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            &clock,
+            DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap()
+        .with_max_log_age(Some(std::time::Duration::from_secs(3600)));
+
+        assert!(writer.is_open());
+        assert_eq!(writer.generation(), 1);
+        assert!(storage.exists("000001.log"));
+
+        // No user records yet: current_offset <= FILE_HEADER_SIZE, so roll_if_aged does not roll
+        clock.advance(std::time::Duration::from_secs(3601));
+        let rolled = writer.roll_if_aged(&clock).unwrap();
+        assert!(rolled.is_none());
+        assert_eq!(writer.generation(), 1);
+
+        // Write a user record so the log has committed data
+        writer.append_record(OpCode::Data, 10, b"some data").unwrap();
+
+        // Aged out now: rolls, seals generation 1, and leaves generation 2 in lazy mode
+        let rolled = writer.roll_if_aged(&clock).unwrap();
+        assert!(rolled.is_some());
+        let (next_gen, sealed_md5) = rolled.unwrap();
+        assert_eq!(next_gen, 2);
+
+        // Verify sealed generation MD5 matches storage bytes
+        let disk_bytes = storage.get_file_bytes("000001.log").unwrap();
+        assert_eq!(sealed_md5, *md5::compute(&disk_bytes));
+
+        // Writer is now in lazy mode for generation 2
+        assert_eq!(writer.generation(), 2);
+        assert!(!writer.is_open());
+        assert!(!storage.exists("000002.log"));
+
+        // Additional age-checks while lazy must do nothing and not create files
+        clock.advance(std::time::Duration::from_secs(3600 * 24 * 7));
+        assert!(writer.roll_if_aged(&clock).unwrap().is_none());
+        assert!(!writer.is_open());
+        assert!(!storage.exists("000002.log"));
+        assert!(!storage.exists("000003.log"));
+
+        // First write into generation 2 lazily opens 000002.log
+        let (tx, gen_num, offset, _) = writer.append_record(OpCode::Data, 10, b"generation 2 data").unwrap();
+        assert_eq!(tx, 2);
+        assert_eq!(gen_num, 2);
+        assert_eq!(offset, FILE_HEADER_SIZE as u64);
+        assert!(writer.is_open());
+        assert!(storage.exists("000002.log"));
     }
 }

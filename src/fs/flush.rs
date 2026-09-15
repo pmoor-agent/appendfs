@@ -406,6 +406,8 @@ impl InMemoryFS {
             // Age-based rolling. The size check only ever ran ahead of a batch, so on an idle
             // filesystem `max_log_age` never came due; checking it at the end of every cycle
             // means the inactivity tick seals the generation with nothing left to write.
+            // On rollover, `roll_if_aged` leaves the successor generation lazy (unopened) so
+            // that an idle filesystem does not waste empty log files during prolonged inactivity.
             let rolled = writer.roll_if_aged(&*self.clock)?;
             self.apply_roll(rolled.map(|(next_gen, md5)| (next_gen, Some(md5))), writer);
             Ok(())

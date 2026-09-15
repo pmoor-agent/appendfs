@@ -336,7 +336,7 @@ mod tests {
         let clock = crate::clock::AdvancingClock::new(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         let writer = Arc::new(
             LogWriter::create(
-                storage,
+                storage.clone(),
                 1,
                 &clock,
                 crate::cli::DEFAULT_MAX_LOG_SIZE,
@@ -352,6 +352,8 @@ mod tests {
         stage_a_write(&fs, "aged.bin");
         fs.quiesce().unwrap();
         assert_eq!(writer.generation(), 1);
+        assert!(writer.is_open());
+        assert!(storage.exists("000001.log"));
 
         // Still inside the age limit. `quiesce` short-circuits with nothing pending, so drive
         // the cycle directly - this is what the inactivity tick does with an empty queue.
@@ -371,6 +373,31 @@ mod tests {
             fs.manifest.read().unwrap().logs.iter().any(|l| l.generation == 1),
             "the sealed generation must be recorded in the manifest"
         );
+        assert!(
+            !writer.is_open(),
+            "the rolled log writer must be in lazy mode (unopened) on idle roll"
+        );
+        assert!(
+            !storage.exists("000002.log"),
+            "new generation log file must not be opened until new activity arrives"
+        );
+
+        // Filesystem receives no activity for a week: multiple idle cycles must NOT waste empty log files!
+        for _ in 0..7 {
+            clock.advance(Duration::from_secs(86400));
+            fs.run_flush_cycle().unwrap();
+            assert_eq!(writer.generation(), 2);
+            assert!(!writer.is_open());
+            assert!(!storage.exists("000002.log"));
+            assert!(!storage.exists("000003.log"));
+        }
+
+        // New activity arrives: lazy log writer opens 000002.log
+        stage_a_write(&fs, "after_idle.bin");
+        fs.quiesce().unwrap();
+        assert_eq!(writer.generation(), 2);
+        assert!(writer.is_open());
+        assert!(storage.exists("000002.log"));
     }
 
     #[test]
