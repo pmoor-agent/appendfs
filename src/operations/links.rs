@@ -1,6 +1,6 @@
 use crate::fs::InMemoryFS;
 use crate::node::{AttrDelta, NodeDelta, SymlinkDelta};
-use crate::shim::{FileAttr, FileType, Request};
+use crate::shim::{FileAttr, FileType, FuseResponse};
 use crate::sync::OpTag;
 
 pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
@@ -52,11 +52,8 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
     })
 }
 
-pub fn unlink(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
-    match unlink_core(fs, parent, name) {
-        Ok(()) => req.reply_err(0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn unlink_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+    unlink_core(fs, parent, name).map(|()| FuseResponse::ok())
 }
 
 pub fn symlink_core(
@@ -131,13 +128,15 @@ pub fn symlink_core(
     })
 }
 
-pub fn symlink(fs: &InMemoryFS, req: Request, link: &str, parent: u64, name: &str) {
-    let uid = req.uid();
-    let gid = req.gid();
-    match symlink_core(fs, parent, name, link, uid, gid) {
-        Ok(attr) => req.reply_entry(&attr, 1.0, 1.0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn symlink_response(
+    fs: &InMemoryFS,
+    parent: u64,
+    name: &str,
+    link: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<FuseResponse<'static>, i32> {
+    symlink_core(fs, parent, name, link, uid, gid).map(FuseResponse::entry)
 }
 
 pub fn readlink_core(fs: &InMemoryFS, ino: u64) -> Result<String, i32> {
@@ -145,11 +144,8 @@ pub fn readlink_core(fs: &InMemoryFS, ino: u64) -> Result<String, i32> {
     fs.read_link(ino).ok_or(libc::EINVAL)
 }
 
-pub fn readlink(fs: &InMemoryFS, req: Request, ino: u64) {
-    match readlink_core(fs, ino) {
-        Ok(target) => req.reply_readlink(&target),
-        Err(e) => req.reply_err(e),
-    }
+pub fn readlink_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, i32> {
+    readlink_core(fs, ino).map(FuseResponse::readlink)
 }
 
 // TODO(too-many-lines): extract this into smaller units.
@@ -307,11 +303,14 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
     })
 }
 
-pub fn rename(fs: &InMemoryFS, req: Request, parent: u64, name: &str, newparent: u64, newname: &str) {
-    match rename_core(fs, parent, name, newparent, newname) {
-        Ok(()) => req.reply_err(0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn rename_response(
+    fs: &InMemoryFS,
+    parent: u64,
+    name: &str,
+    newparent: u64,
+    newname: &str,
+) -> Result<FuseResponse<'static>, i32> {
+    rename_core(fs, parent, name, newparent, newname).map(|()| FuseResponse::ok())
 }
 
 pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Result<FileAttr, i32> {
@@ -363,9 +362,6 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
     })
 }
 
-pub fn link(fs: &InMemoryFS, req: Request, ino: u64, newparent: u64, newname: &str) {
-    match link_core(fs, ino, newparent, newname) {
-        Ok(attr) => req.reply_entry(&attr, 1.0, 1.0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn link_response(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, i32> {
+    link_core(fs, ino, newparent, newname).map(FuseResponse::entry)
 }

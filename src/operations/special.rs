@@ -1,7 +1,7 @@
 use crate::extent_map::ExtentMap;
 use crate::fs::InMemoryFS;
 use crate::node::{AttrDelta, FileDelta, NodeDelta, SpecialDelta};
-use crate::shim::{FileAttr, FileType, Request};
+use crate::shim::{FileAttr, FileType, FuseResponse};
 use crate::sync::OpTag;
 
 pub fn mknod_core(
@@ -110,13 +110,16 @@ pub fn mknod_core(
     })
 }
 
-pub fn mknod(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32, rdev: u32) {
-    let uid = req.uid();
-    let gid = req.gid();
-    match mknod_core(fs, parent, name, mode, rdev, uid, gid) {
-        Ok(attr) => req.reply_entry(&attr, 1.0, 1.0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn mknod_response(
+    fs: &InMemoryFS,
+    parent: u64,
+    name: &str,
+    mode: u32,
+    rdev: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<FuseResponse<'static>, i32> {
+    mknod_core(fs, parent, name, mode, rdev, uid, gid).map(FuseResponse::entry)
 }
 
 #[cfg(test)]

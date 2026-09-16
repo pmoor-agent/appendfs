@@ -1,6 +1,7 @@
 use crate::clock::system_time_to_unix;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::os::raw::c_void;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 // High-level safe representation of file types
@@ -32,6 +33,7 @@ pub struct FileAttr {
 }
 
 // High-level safe representation of filesystem statistics
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatfsAttr {
     pub blocks: u64,
     pub bfree: u64,
@@ -258,6 +260,7 @@ fn convert_file_attr(attr: &FileAttr) -> ShimFileAttr {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Request {
     pub(crate) req: shim_req_t,
 }
@@ -265,13 +268,26 @@ pub struct Request {
 unsafe impl Send for Request {}
 
 impl Request {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_mock() -> Self {
+        Self {
+            req: std::ptr::null_mut(),
+        }
+    }
+
     pub fn reply_err(self, err: i32) {
+        if self.req.is_null() {
+            return;
+        }
         unsafe {
             shim_reply_err(self.req, err);
         }
     }
 
     pub fn reply_entry(self, attr: &FileAttr, attr_timeout: f64, entry_timeout: f64) {
+        if self.req.is_null() {
+            return;
+        }
         let shim_attr = convert_file_attr(attr);
         unsafe {
             shim_reply_entry(self.req, &shim_attr, attr_timeout, entry_timeout);
@@ -279,6 +295,9 @@ impl Request {
     }
 
     pub fn reply_attr(self, attr: &FileAttr, attr_timeout: f64) {
+        if self.req.is_null() {
+            return;
+        }
         let shim_attr = convert_file_attr(attr);
         unsafe {
             shim_reply_attr(self.req, &shim_attr, attr_timeout);
@@ -286,24 +305,36 @@ impl Request {
     }
 
     pub fn reply_buf(self, buf: &[u8]) {
+        if self.req.is_null() {
+            return;
+        }
         unsafe {
             shim_reply_buf(self.req, buf.as_ptr(), buf.len());
         }
     }
 
     pub fn reply_open(self, fh: u64, direct_io: bool) {
+        if self.req.is_null() {
+            return;
+        }
         unsafe {
             shim_reply_open(self.req, fh, direct_io);
         }
     }
 
     pub fn reply_write(self, count: usize) {
+        if self.req.is_null() {
+            return;
+        }
         unsafe {
             shim_reply_write(self.req, count);
         }
     }
 
     pub fn reply_create(self, attr: &FileAttr, attr_timeout: f64, entry_timeout: f64, fh: u64) {
+        if self.req.is_null() {
+            return;
+        }
         let shim_attr = convert_file_attr(attr);
         unsafe {
             shim_reply_create(self.req, &shim_attr, attr_timeout, entry_timeout, fh);
@@ -311,6 +342,9 @@ impl Request {
     }
 
     pub fn reply_readlink(self, link: &str) {
+        if self.req.is_null() {
+            return;
+        }
         let c_link = match CString::new(link) {
             Ok(c) => c,
             Err(_) => {
@@ -324,6 +358,9 @@ impl Request {
     }
 
     pub fn reply_statfs(self, attr: &StatfsAttr) {
+        if self.req.is_null() {
+            return;
+        }
         let shim_attr = ShimStatfsAttr {
             blocks: attr.blocks,
             bfree: attr.bfree,
@@ -339,18 +376,27 @@ impl Request {
     }
 
     pub fn reply_lock(self, lock: &ShimFlock) {
+        if self.req.is_null() {
+            return;
+        }
         unsafe {
             shim_reply_lock(self.req, lock);
         }
     }
 
     pub fn reply_xattr(self, count: usize) {
+        if self.req.is_null() {
+            return;
+        }
         unsafe {
             shim_reply_xattr(self.req, count);
         }
     }
 
     pub fn uid(&self) -> u32 {
+        if self.req.is_null() {
+            return 1000;
+        }
         unsafe {
             let fuse_req = self.req as *mut c_void;
             let ctx = fuse_req_ctx_shim(fuse_req);
@@ -359,10 +405,477 @@ impl Request {
     }
 
     pub fn gid(&self) -> u32 {
+        if self.req.is_null() {
+            return 1000;
+        }
         unsafe {
             let fuse_req = self.req as *mut c_void;
             let ctx = fuse_req_ctx_shim(fuse_req);
             ctx.gid
+        }
+    }
+
+    pub fn pid(&self) -> u32 {
+        if self.req.is_null() {
+            return 0;
+        }
+        unsafe {
+            let fuse_req = self.req as *mut c_void;
+            let ctx = fuse_req_ctx_shim(fuse_req);
+            ctx.pid as u32
+        }
+    }
+
+    pub fn context(&self) -> RequestContext {
+        RequestContext {
+            uid: self.uid(),
+            gid: self.gid(),
+            pid: self.pid(),
+        }
+    }
+
+    pub fn reply_fuse_response(self, result: Result<FuseResponse<'_>, i32>) {
+        reply_result(self, result);
+    }
+}
+
+/// Caller context extracted from a FUSE request (uid, gid, pid).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestContext {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
+}
+
+impl RequestContext {
+    pub const fn new(uid: u32, gid: u32, pid: u32) -> Self {
+        Self { uid, gid, pid }
+    }
+}
+
+impl Default for RequestContext {
+    fn default() -> Self {
+        Self {
+            uid: 1000,
+            gid: 1000,
+            pid: 0,
+        }
+    }
+}
+
+/// Buffer data payload for a FUSE reply, supporting both zero-copy borrowed slices
+/// and heap-allocated byte vectors.
+#[derive(Debug, Clone, Eq)]
+pub enum ReplyData<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl<'a, 'b> PartialEq<ReplyData<'b>> for ReplyData<'a> {
+    fn eq(&self, other: &ReplyData<'b>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<'a> ReplyData<'a> {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ReplyData::Borrowed(s) => s,
+            ReplyData::Owned(v) => v.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn to_owned(&self) -> ReplyData<'static> {
+        match self {
+            ReplyData::Borrowed(b) => ReplyData::Owned(b.to_vec()),
+            ReplyData::Owned(v) => ReplyData::Owned(v.clone()),
+        }
+    }
+}
+
+impl<'a> From<&'a [u8]> for ReplyData<'a> {
+    #[inline]
+    fn from(s: &'a [u8]) -> Self {
+        ReplyData::Borrowed(s)
+    }
+}
+
+impl<'a> From<Vec<u8>> for ReplyData<'a> {
+    #[inline]
+    fn from(v: Vec<u8>) -> Self {
+        ReplyData::Owned(v)
+    }
+}
+
+impl<'a> std::ops::Deref for ReplyData<'a> {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<'a> AsRef<[u8]> for ReplyData<'a> {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+/// High-level typed representation of a successful response sent back to the FUSE kernel.
+///
+/// Handlers can return `Result<FuseResponse<'a>, i32>` without directly interacting with
+/// `Request` or raw FFI pointers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FuseResponse<'a> {
+    /// Void success (maps to `fuse_reply_err(req, 0)`).
+    Ok,
+    /// Directory entry with attributes, attribute cache timeout, and entry cache timeout (in seconds).
+    Entry(FileAttr, f64, f64),
+    /// File attributes with attribute cache timeout (in seconds).
+    Attr(FileAttr, f64),
+    /// File or directory handle allocation with direct_io flag.
+    Open { fh: u64, direct_io: bool },
+    /// Number of bytes written.
+    Write(usize),
+    /// Atomic create reply: entry attributes, attribute timeout, entry timeout, and allocated file handle.
+    Create {
+        attr: FileAttr,
+        attr_timeout: f64,
+        entry_timeout: f64,
+        fh: u64,
+    },
+    /// Raw buffer payload (e.g. read data, readdir directory stream, xattr value).
+    Buf(ReplyData<'a>),
+    /// Symbolic link target string.
+    Readlink(String),
+    /// Filesystem capacity and allocation statistics.
+    Statfs(StatfsAttr),
+    /// POSIX file lock information.
+    Lock(ShimFlock),
+    /// Extended attribute size query response.
+    XattrSize(usize),
+}
+
+impl<'a> FuseResponse<'a> {
+    pub const DEFAULT_TIMEOUT: f64 = 1.0;
+
+    #[inline]
+    pub fn ok() -> Self {
+        FuseResponse::Ok
+    }
+
+    #[inline]
+    pub fn entry(attr: FileAttr) -> Self {
+        FuseResponse::Entry(attr, Self::DEFAULT_TIMEOUT, Self::DEFAULT_TIMEOUT)
+    }
+
+    #[inline]
+    pub fn entry_with_timeout(attr: FileAttr, attr_timeout: f64, entry_timeout: f64) -> Self {
+        FuseResponse::Entry(attr, attr_timeout, entry_timeout)
+    }
+
+    #[inline]
+    pub fn attr(attr: FileAttr) -> Self {
+        FuseResponse::Attr(attr, Self::DEFAULT_TIMEOUT)
+    }
+
+    #[inline]
+    pub fn attr_with_timeout(attr: FileAttr, attr_timeout: f64) -> Self {
+        FuseResponse::Attr(attr, attr_timeout)
+    }
+
+    #[inline]
+    pub fn open(fh: u64, direct_io: bool) -> Self {
+        FuseResponse::Open { fh, direct_io }
+    }
+
+    #[inline]
+    pub fn write(count: usize) -> Self {
+        FuseResponse::Write(count)
+    }
+
+    #[inline]
+    pub fn create(attr: FileAttr, fh: u64) -> Self {
+        FuseResponse::Create {
+            attr,
+            attr_timeout: Self::DEFAULT_TIMEOUT,
+            entry_timeout: Self::DEFAULT_TIMEOUT,
+            fh,
+        }
+    }
+
+    #[inline]
+    pub fn buf<T: Into<ReplyData<'a>>>(data: T) -> Self {
+        FuseResponse::Buf(data.into())
+    }
+
+    #[inline]
+    pub fn readlink(link: impl Into<String>) -> Self {
+        FuseResponse::Readlink(link.into())
+    }
+
+    #[inline]
+    pub fn statfs(stat: StatfsAttr) -> Self {
+        FuseResponse::Statfs(stat)
+    }
+
+    #[inline]
+    pub fn lock(lock: ShimFlock) -> Self {
+        FuseResponse::Lock(lock)
+    }
+
+    #[inline]
+    pub fn xattr_size(size: usize) -> Self {
+        FuseResponse::XattrSize(size)
+    }
+
+    /// Converts this response into an owned `'static` response that can be safely sent across
+    /// threads or queued in asynchronous runtimes.
+    pub fn to_static(&self) -> FuseResponse<'static> {
+        match self {
+            FuseResponse::Ok => FuseResponse::Ok,
+            FuseResponse::Entry(a, at, et) => FuseResponse::Entry(*a, *at, *et),
+            FuseResponse::Attr(a, at) => FuseResponse::Attr(*a, *at),
+            FuseResponse::Open { fh, direct_io } => FuseResponse::Open {
+                fh: *fh,
+                direct_io: *direct_io,
+            },
+            FuseResponse::Write(c) => FuseResponse::Write(*c),
+            FuseResponse::Create {
+                attr,
+                attr_timeout,
+                entry_timeout,
+                fh,
+            } => FuseResponse::Create {
+                attr: *attr,
+                attr_timeout: *attr_timeout,
+                entry_timeout: *entry_timeout,
+                fh: *fh,
+            },
+            FuseResponse::Buf(b) => FuseResponse::Buf(b.to_owned()),
+            FuseResponse::Readlink(s) => FuseResponse::Readlink(s.clone()),
+            FuseResponse::Statfs(s) => FuseResponse::Statfs(*s),
+            FuseResponse::Lock(l) => FuseResponse::Lock(*l),
+            FuseResponse::XattrSize(s) => FuseResponse::XattrSize(*s),
+        }
+    }
+
+    /// Sends this response over the FUSE request handle.
+    pub fn send(self, req: Request) {
+        match self {
+            FuseResponse::Ok => req.reply_err(0),
+            FuseResponse::Entry(attr, a_to, e_to) => req.reply_entry(&attr, a_to, e_to),
+            FuseResponse::Attr(attr, to) => req.reply_attr(&attr, to),
+            FuseResponse::Open { fh, direct_io } => req.reply_open(fh, direct_io),
+            FuseResponse::Write(count) => req.reply_write(count),
+            FuseResponse::Create {
+                attr,
+                attr_timeout,
+                entry_timeout,
+                fh,
+            } => req.reply_create(&attr, attr_timeout, entry_timeout, fh),
+            FuseResponse::Buf(buf) => req.reply_buf(buf.as_slice()),
+            FuseResponse::Readlink(link) => req.reply_readlink(&link),
+            FuseResponse::Statfs(stat) => req.reply_statfs(&stat),
+            FuseResponse::Lock(lock) => req.reply_lock(&lock),
+            FuseResponse::XattrSize(size) => req.reply_xattr(size),
+        }
+    }
+}
+
+/// Helper to dispatch a `Result<FuseResponse, i32>` to a FUSE request.
+#[inline]
+pub fn reply_result<'a>(req: Request, result: Result<FuseResponse<'a>, i32>) {
+    match result {
+        Ok(resp) => resp.send(req),
+        Err(err) => req.reply_err(err),
+    }
+}
+
+/// Trait implemented by deferred async completions (e.g. batch flushes, lock acquisitions).
+pub type DeferredCallback<T> = Box<dyn FnOnce(Result<T, i32>) + Send + 'static>;
+
+pub trait DeferredCompletion<T>: Send + 'static {
+    fn on_complete(self: Box<Self>, callback: DeferredCallback<T>);
+}
+
+impl<T> std::fmt::Debug for dyn DeferredCompletion<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeferredCompletion")
+    }
+}
+
+/// Rich result type representing an operation that either completed immediately or was deferred.
+pub enum DeferredResult<T = FuseResponse<'static>> {
+    /// The operation completed immediately (e.g. uncontended lock, cached read).
+    Ready(Result<T, i32>),
+    /// The operation is pending an external event (batch disk sync, lock waiter wake).
+    Deferred(Box<dyn DeferredCompletion<T>>),
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for DeferredResult<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeferredResult::Ready(r) => f.debug_tuple("Ready").field(r).finish(),
+            DeferredResult::Deferred(_) => f.debug_tuple("Deferred").finish(),
+        }
+    }
+}
+
+impl<T: Send + 'static> DeferredResult<T> {
+    pub fn ready(res: Result<T, i32>) -> Self {
+        DeferredResult::Ready(res)
+    }
+
+    pub fn ok(val: T) -> Self {
+        DeferredResult::Ready(Ok(val))
+    }
+
+    pub fn err(errno: i32) -> Self {
+        DeferredResult::Ready(Err(errno))
+    }
+
+    pub fn deferred(completion: impl DeferredCompletion<T> + 'static) -> Self {
+        DeferredResult::Deferred(Box::new(completion))
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self, DeferredResult::Ready(_))
+    }
+
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, DeferredResult::Deferred(_))
+    }
+
+    pub fn into_ready(self) -> Option<Result<T, i32>> {
+        match self {
+            DeferredResult::Ready(r) => Some(r),
+            DeferredResult::Deferred(_) => None,
+        }
+    }
+
+    pub fn on_complete(self, callback: impl FnOnce(Result<T, i32>) + Send + 'static) {
+        match self {
+            DeferredResult::Ready(res) => callback(res),
+            DeferredResult::Deferred(completion) => completion.on_complete(Box::new(callback)),
+        }
+    }
+
+    pub fn wait(self) -> Result<T, i32> {
+        match self {
+            DeferredResult::Ready(res) => res,
+            DeferredResult::Deferred(completion) => {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                completion.on_complete(Box::new(move |res| {
+                    let _ = tx.send(res);
+                }));
+                rx.recv().unwrap_or(Err(libc::EIO))
+            }
+        }
+    }
+
+    pub async fn wait_async(self) -> Result<T, i32> {
+        match self {
+            DeferredResult::Ready(res) => res,
+            DeferredResult::Deferred(completion) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                completion.on_complete(Box::new(move |res| {
+                    let _ = tx.send(res);
+                }));
+                rx.await.unwrap_or(Err(libc::EIO))
+            }
+        }
+    }
+}
+
+impl DeferredResult<FuseResponse<'static>> {
+    pub fn ok_void() -> Self {
+        DeferredResult::Ready(Ok(FuseResponse::ok()))
+    }
+}
+
+impl<T> From<Result<T, i32>> for DeferredResult<T> {
+    fn from(res: Result<T, i32>) -> Self {
+        DeferredResult::Ready(res)
+    }
+}
+
+struct DeferredTokenInner<T> {
+    result: Option<Result<T, i32>>,
+    callback: Option<DeferredCallback<T>>,
+}
+
+/// Producer token held by waiter queues to signal completion of an async request.
+pub struct DeferredToken<T> {
+    state: Arc<Mutex<DeferredTokenInner<T>>>,
+}
+
+/// Consumer handle returned to the caller to receive completion of an async request.
+pub struct DeferredReceiver<T> {
+    state: Arc<Mutex<DeferredTokenInner<T>>>,
+}
+
+impl<T: Send + 'static> DeferredToken<T> {
+    pub fn new() -> (Self, DeferredReceiver<T>) {
+        let state = Arc::new(Mutex::new(DeferredTokenInner {
+            result: None,
+            callback: None,
+        }));
+        (Self { state: state.clone() }, DeferredReceiver { state })
+    }
+
+    pub fn complete(self, result: Result<T, i32>) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(cb) = guard.callback.take() {
+            drop(guard);
+            cb(result);
+        } else {
+            guard.result = Some(result);
+        }
+    }
+}
+
+impl<T: Send + 'static> DeferredCompletion<T> for DeferredReceiver<T> {
+    fn on_complete(self: Box<Self>, callback: DeferredCallback<T>) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(res) = guard.result.take() {
+            drop(guard);
+            callback(res);
+        } else {
+            guard.callback = Some(callback);
+        }
+    }
+}
+
+impl<T> Drop for DeferredToken<T> {
+    fn drop(&mut self) {
+        let mut guard = self.state.lock().unwrap();
+        if guard.result.is_none() {
+            guard.result = Some(Err(libc::ECANCELED));
+            if let Some(cb) = guard.callback.take() {
+                drop(guard);
+                cb(Err(libc::ECANCELED));
+            }
+        }
+    }
+}
+
+/// Dispatches a `FuseResponse` result (either immediately or asynchronously) to a FUSE request.
+#[inline]
+pub fn dispatch_reply(req: Request, res: impl Into<DeferredResult<FuseResponse<'static>>>) {
+    let deferred = res.into();
+    match deferred {
+        DeferredResult::Ready(result) => {
+            req.reply_fuse_response(result);
+        }
+        DeferredResult::Deferred(completion) => {
+            completion.on_complete(Box::new(move |result| {
+                req.reply_fuse_response(result);
+            }));
         }
     }
 }
@@ -507,19 +1020,81 @@ impl DirectoryBufferPlus {
     }
 }
 
+/// Single directory entry item yielded by directory enumerations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub ino: u64,
+    pub name: String,
+    pub file_type: FileType,
+    pub offset: i64,
+}
+
+impl DirEntry {
+    pub fn new(ino: u64, name: impl Into<String>, file_type: FileType, offset: i64) -> Self {
+        Self {
+            ino,
+            name: name.into(),
+            file_type,
+            offset,
+        }
+    }
+}
+
+/// Directory entry item with full attributes yielded by `readdirplus`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirEntryPlus {
+    pub ino: u64,
+    pub name: String,
+    pub attr: FileAttr,
+    pub offset: i64,
+    pub attr_timeout: f64,
+    pub entry_timeout: f64,
+}
+
+impl DirEntryPlus {
+    pub fn new(name: impl Into<String>, attr: FileAttr, offset: i64) -> Self {
+        Self {
+            ino: attr.ino,
+            name: name.into(),
+            attr,
+            offset,
+            attr_timeout: 1.0,
+            entry_timeout: 1.0,
+        }
+    }
+
+    pub fn with_timeouts(
+        name: impl Into<String>,
+        attr: FileAttr,
+        offset: i64,
+        attr_timeout: f64,
+        entry_timeout: f64,
+    ) -> Self {
+        Self {
+            ino: attr.ino,
+            name: name.into(),
+            attr,
+            offset,
+            attr_timeout,
+            entry_timeout,
+        }
+    }
+}
+
 pub trait Filesystem {
-    fn lookup(&self, req: Request, parent: u64, name: &str);
-    fn getattr(&self, req: Request, ino: u64);
-    fn opendir(&self, req: Request, ino: u64, flags: u32);
-    fn readdir(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64);
-    fn readdirplus(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64);
-    fn read(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64);
-    fn open(&self, req: Request, ino: u64, flags: u32);
-    fn write(&self, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64);
+    fn init(&self) {}
+    fn destroy(&self) {}
+    fn lookup(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
+    fn getattr(&self, ino: u64) -> Result<FuseResponse<'static>, i32>;
+    fn opendir(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32>;
+    fn readdir(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<Vec<DirEntry>, i32>;
+    fn readdirplus(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<Vec<DirEntryPlus>, i32>;
+    fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
+    fn open(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32>;
+    fn write(&self, ino: u64, buf: &[u8], offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
-        req: Request,
         ino: u64,
         mode: u32,
         uid: u32,
@@ -528,29 +1103,50 @@ pub trait Filesystem {
         atime: SystemTime,
         mtime: SystemTime,
         to_set: u32,
-    );
-    fn create(&self, req: Request, parent: u64, name: &str, mode: u32, flags: u32);
-    fn mknod(&self, req: Request, parent: u64, name: &str, mode: u32, rdev: u32);
-    fn unlink(&self, req: Request, parent: u64, name: &str);
-    fn mkdir(&self, req: Request, parent: u64, name: &str, mode: u32);
-    fn rmdir(&self, req: Request, parent: u64, name: &str);
-    fn symlink(&self, req: Request, link: &str, parent: u64, name: &str);
-    fn readlink(&self, req: Request, ino: u64);
-    fn rename(&self, req: Request, parent: u64, name: &str, newparent: u64, newname: &str);
-    fn link(&self, req: Request, ino: u64, newparent: u64, newname: &str);
-    fn fsync(&self, req: Request, ino: u64, datasync: bool, fh: u64);
-    fn fallocate(&self, req: Request, ino: u64, mode: i32, offset: i64, length: i64, fh: u64);
-    fn release(&self, req: Request, ino: u64, fh: u64);
-    fn releasedir(&self, req: Request, ino: u64, fh: u64);
-    fn fsyncdir(&self, req: Request, ino: u64, datasync: bool);
-    fn statfs(&self, req: Request, ino: u64);
-    fn flock(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32);
-    fn getlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock);
-    fn setlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool);
-    fn getxattr(&self, req: Request, ino: u64, name: &str, size: usize);
-    fn setxattr(&self, req: Request, ino: u64, name: &str, value: &[u8], flags: i32);
-    fn listxattr(&self, req: Request, ino: u64, size: usize);
-    fn removexattr(&self, req: Request, ino: u64, name: &str);
+    ) -> Result<FuseResponse<'static>, i32>;
+    fn create(
+        &self,
+        ctx: RequestContext,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        flags: u32,
+    ) -> Result<FuseResponse<'static>, i32>;
+    fn mknod(
+        &self,
+        ctx: RequestContext,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        rdev: u32,
+    ) -> Result<FuseResponse<'static>, i32>;
+    fn unlink(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
+    fn mkdir(&self, ctx: RequestContext, parent: u64, name: &str, mode: u32) -> Result<FuseResponse<'static>, i32>;
+    fn rmdir(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
+    fn symlink(&self, ctx: RequestContext, link: &str, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
+    fn readlink(&self, ino: u64) -> Result<FuseResponse<'static>, i32>;
+    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, i32>;
+    fn link(&self, ino: u64, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, i32>;
+    fn fsync(&self, ino: u64, datasync: bool, fh: u64) -> DeferredResult<FuseResponse<'static>>;
+    fn fallocate(&self, ino: u64, mode: i32, offset: i64, length: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
+    fn release(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32>;
+    fn releasedir(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32>;
+    fn fsyncdir(&self, ino: u64, datasync: bool) -> DeferredResult<FuseResponse<'static>>;
+    fn statfs(&self, ino: u64) -> Result<FuseResponse<'static>, i32>;
+    fn flock(&self, ino: u64, fh: u64, lock_owner: u64, op: i32) -> DeferredResult<FuseResponse<'static>>;
+    fn getlk(&self, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<FuseResponse<'static>, i32>;
+    fn setlk(
+        &self,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        lock: ShimFlock,
+        sleep: bool,
+    ) -> DeferredResult<FuseResponse<'static>>;
+    fn getxattr(&self, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, i32>;
+    fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<FuseResponse<'static>, i32>;
+    fn listxattr(&self, ino: u64, size: usize) -> Result<FuseResponse<'static>, i32>;
+    fn removexattr(&self, ino: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
 }
 
 // Lowlevel C callback bridges
@@ -563,37 +1159,67 @@ extern "C" fn lookup_bridge(req: shim_req_t, parent: u64, name: *const c_char, u
             return;
         }
     };
-    fs.lookup(Request { req }, parent, name_str);
+    dispatch_reply(Request { req }, fs.lookup(parent, name_str));
 }
 
 extern "C" fn getattr_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.getattr(Request { req }, ino);
+    dispatch_reply(Request { req }, fs.getattr(ino));
 }
 
 extern "C" fn opendir_bridge(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.opendir(Request { req }, ino, flags);
+    dispatch_reply(Request { req }, fs.opendir(ino, flags));
 }
 
 extern "C" fn readdir_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.readdir(Request { req }, ino, size, off, fh);
+    let req = Request { req };
+    match fs.readdir(ino, size, off, fh) {
+        Ok(entries) => {
+            let mut db = DirectoryBuffer::new(req, size);
+            for entry in entries {
+                if !db.add(&entry.name, entry.ino, entry.file_type, entry.offset) {
+                    break;
+                }
+            }
+            db.reply();
+        }
+        Err(err) => req.reply_err(err),
+    }
 }
 
 extern "C" fn readdirplus_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.readdirplus(Request { req }, ino, size, off, fh);
+    let req = Request { req };
+    match fs.readdirplus(ino, size, off, fh) {
+        Ok(entries) => {
+            let mut db = DirectoryBufferPlus::new(req, size);
+            for entry in entries {
+                if !db.add(
+                    &entry.name,
+                    &entry.attr,
+                    entry.attr_timeout,
+                    entry.entry_timeout,
+                    entry.offset,
+                ) {
+                    break;
+                }
+            }
+            db.reply();
+        }
+        Err(err) => req.reply_err(err),
+    }
 }
 
 extern "C" fn read_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.read(Request { req }, ino, size, off, fh);
+    dispatch_reply(Request { req }, fs.read(ino, size, off, fh));
 }
 
 extern "C" fn open_bridge(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.open(Request { req }, ino, flags);
+    dispatch_reply(Request { req }, fs.open(ino, flags));
 }
 
 extern "C" fn write_bridge(
@@ -607,7 +1233,7 @@ extern "C" fn write_bridge(
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let buf_slice = unsafe { std::slice::from_raw_parts(buf, size) };
-    fs.write(Request { req }, ino, buf_slice, off, fh);
+    dispatch_reply(Request { req }, fs.write(ino, buf_slice, off, fh));
 }
 
 extern "C" fn setattr_bridge(
@@ -627,7 +1253,10 @@ extern "C" fn setattr_bridge(
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let atime = crate::clock::unix_to_system_time(atime_sec, atime_nsec);
     let mtime = crate::clock::unix_to_system_time(mtime_sec, mtime_nsec);
-    fs.setattr(Request { req }, ino, mode, uid, gid, size, atime, mtime, to_set);
+    dispatch_reply(
+        Request { req },
+        fs.setattr(ino, mode, uid, gid, size, atime, mtime, to_set),
+    );
 }
 
 extern "C" fn create_bridge(
@@ -646,7 +1275,8 @@ extern "C" fn create_bridge(
             return;
         }
     };
-    fs.create(Request { req }, parent, name_str, mode, flags);
+    let req = Request { req };
+    dispatch_reply(req, fs.create(req.context(), parent, name_str, mode, flags));
 }
 
 extern "C" fn mknod_bridge(
@@ -665,7 +1295,8 @@ extern "C" fn mknod_bridge(
             return;
         }
     };
-    fs.mknod(Request { req }, parent, name_str, mode, rdev);
+    let req = Request { req };
+    dispatch_reply(req, fs.mknod(req.context(), parent, name_str, mode, rdev));
 }
 
 extern "C" fn unlink_bridge(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void) {
@@ -677,7 +1308,7 @@ extern "C" fn unlink_bridge(req: shim_req_t, parent: u64, name: *const c_char, u
             return;
         }
     };
-    fs.unlink(Request { req }, parent, name_str);
+    dispatch_reply(Request { req }, fs.unlink(parent, name_str));
 }
 
 extern "C" fn mkdir_bridge(req: shim_req_t, parent: u64, name: *const c_char, mode: u32, userdata: *mut c_void) {
@@ -689,7 +1320,8 @@ extern "C" fn mkdir_bridge(req: shim_req_t, parent: u64, name: *const c_char, mo
             return;
         }
     };
-    fs.mkdir(Request { req }, parent, name_str, mode);
+    let req = Request { req };
+    dispatch_reply(req, fs.mkdir(req.context(), parent, name_str, mode));
 }
 
 extern "C" fn rmdir_bridge(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void) {
@@ -701,7 +1333,7 @@ extern "C" fn rmdir_bridge(req: shim_req_t, parent: u64, name: *const c_char, us
             return;
         }
     };
-    fs.rmdir(Request { req }, parent, name_str);
+    dispatch_reply(Request { req }, fs.rmdir(parent, name_str));
 }
 
 extern "C" fn symlink_bridge(
@@ -726,12 +1358,13 @@ extern "C" fn symlink_bridge(
             return;
         }
     };
-    fs.symlink(Request { req }, link_str, parent, name_str);
+    let req = Request { req };
+    dispatch_reply(req, fs.symlink(req.context(), link_str, parent, name_str));
 }
 
 extern "C" fn readlink_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.readlink(Request { req }, ino);
+    dispatch_reply(Request { req }, fs.readlink(ino));
 }
 
 extern "C" fn rename_bridge(
@@ -757,7 +1390,7 @@ extern "C" fn rename_bridge(
             return;
         }
     };
-    fs.rename(Request { req }, parent, name_str, newparent, newname_str);
+    dispatch_reply(Request { req }, fs.rename(parent, name_str, newparent, newname_str));
 }
 
 extern "C" fn link_bridge(req: shim_req_t, ino: u64, newparent: u64, newname: *const c_char, userdata: *mut c_void) {
@@ -769,12 +1402,12 @@ extern "C" fn link_bridge(req: shim_req_t, ino: u64, newparent: u64, newname: *c
             return;
         }
     };
-    fs.link(Request { req }, ino, newparent, newname_str);
+    dispatch_reply(Request { req }, fs.link(ino, newparent, newname_str));
 }
 
 extern "C" fn fsync_bridge(req: shim_req_t, ino: u64, datasync: c_int, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.fsync(Request { req }, ino, datasync != 0, fh);
+    dispatch_reply(Request { req }, fs.fsync(ino, datasync != 0, fh));
 }
 
 extern "C" fn fallocate_bridge(
@@ -787,32 +1420,32 @@ extern "C" fn fallocate_bridge(
     userdata: *mut c_void,
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.fallocate(Request { req }, ino, mode, offset, length, fh);
+    dispatch_reply(Request { req }, fs.fallocate(ino, mode, offset, length, fh));
 }
 
 extern "C" fn release_bridge(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.release(Request { req }, ino, fh);
+    dispatch_reply(Request { req }, fs.release(ino, fh));
 }
 
 extern "C" fn releasedir_bridge(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.releasedir(Request { req }, ino, fh);
+    dispatch_reply(Request { req }, fs.releasedir(ino, fh));
 }
 
 extern "C" fn fsyncdir_bridge(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.fsyncdir(Request { req }, ino, datasync != 0);
+    dispatch_reply(Request { req }, fs.fsyncdir(ino, datasync != 0));
 }
 
 extern "C" fn statfs_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.statfs(Request { req }, ino);
+    dispatch_reply(Request { req }, fs.statfs(ino));
 }
 
 extern "C" fn flock_bridge(req: shim_req_t, ino: u64, fh: u64, lock_owner: u64, op: c_int, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    crate::operations::locks::flock(fs, Request { req }, ino, fh, lock_owner, op);
+    dispatch_reply(Request { req }, fs.flock(ino, fh, lock_owner, op));
 }
 
 extern "C" fn getlk_bridge(
@@ -825,7 +1458,7 @@ extern "C" fn getlk_bridge(
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let sh_lock = unsafe { *lock };
-    fs.getlk(Request { req }, ino, fh, lock_owner, sh_lock);
+    dispatch_reply(Request { req }, fs.getlk(ino, fh, lock_owner, sh_lock));
 }
 
 extern "C" fn setlk_bridge(
@@ -839,7 +1472,7 @@ extern "C" fn setlk_bridge(
 ) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
     let sh_lock = unsafe { *lock };
-    crate::operations::locks::setlk(fs, Request { req }, ino, fh, lock_owner, sh_lock, sleep != 0);
+    dispatch_reply(Request { req }, fs.setlk(ino, fh, lock_owner, sh_lock, sleep != 0));
 }
 
 extern "C" fn getxattr_bridge(req: shim_req_t, ino: u64, name: *const c_char, size: usize, userdata: *mut c_void) {
@@ -851,7 +1484,7 @@ extern "C" fn getxattr_bridge(req: shim_req_t, ino: u64, name: *const c_char, si
             return;
         }
     };
-    fs.getxattr(Request { req }, ino, name_str, size);
+    dispatch_reply(Request { req }, fs.getxattr(ino, name_str, size));
 }
 
 extern "C" fn setxattr_bridge(
@@ -876,12 +1509,12 @@ extern "C" fn setxattr_bridge(
     } else {
         &[]
     };
-    fs.setxattr(Request { req }, ino, name_str, val_slice, flags);
+    dispatch_reply(Request { req }, fs.setxattr(ino, name_str, val_slice, flags));
 }
 
 extern "C" fn listxattr_bridge(req: shim_req_t, ino: u64, size: usize, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.listxattr(Request { req }, ino, size);
+    dispatch_reply(Request { req }, fs.listxattr(ino, size));
 }
 
 extern "C" fn removexattr_bridge(req: shim_req_t, ino: u64, name: *const c_char, userdata: *mut c_void) {
@@ -893,7 +1526,7 @@ extern "C" fn removexattr_bridge(req: shim_req_t, ino: u64, name: *const c_char,
             return;
         }
     };
-    fs.removexattr(Request { req }, ino, name_str);
+    dispatch_reply(Request { req }, fs.removexattr(ino, name_str));
 }
 
 extern "C" fn init_bridge(userdata: *mut c_void) {
@@ -976,4 +1609,44 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
     }
 
     if code == 0 { Ok(()) } else { Err(code) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reply_data_borrowed_and_owned() {
+        let raw = b"hello world";
+        let borrowed: ReplyData = raw.as_slice().into();
+        assert_eq!(borrowed.as_slice(), b"hello world");
+
+        let owned: ReplyData = vec![1, 2, 3, 4].into();
+        assert_eq!(owned.as_slice(), &[1, 2, 3, 4]);
+
+        let static_data = borrowed.to_owned();
+        assert_eq!(static_data.as_slice(), b"hello world");
+        assert!(matches!(static_data, ReplyData::Owned(_)));
+    }
+
+    #[test]
+    fn test_fuse_response_constructors_and_to_static() {
+        assert_eq!(FuseResponse::ok(), FuseResponse::Ok);
+        assert_eq!(FuseResponse::write(42), FuseResponse::Write(42));
+        assert_eq!(
+            FuseResponse::open(10, false),
+            FuseResponse::Open {
+                fh: 10,
+                direct_io: false
+            }
+        );
+        assert_eq!(
+            FuseResponse::readlink("target"),
+            FuseResponse::Readlink("target".to_string())
+        );
+        assert_eq!(FuseResponse::xattr_size(100), FuseResponse::XattrSize(100));
+
+        let buf_resp = FuseResponse::buf(b"test data".as_slice());
+        assert_eq!(buf_resp.to_static(), FuseResponse::buf(b"test data".to_vec()));
+    }
 }

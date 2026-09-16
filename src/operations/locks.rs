@@ -1,5 +1,5 @@
 use crate::fs::{FsInner, FsInnerGuard, InMemoryFS};
-use crate::shim::{Request, ShimFlock};
+use crate::shim::{DeferredResult, DeferredToken, FuseResponse, ShimFlock};
 use crate::sync::OpTag;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -19,14 +19,14 @@ pub struct RangeLock {
 }
 
 pub struct FlockWaiter {
-    pub req: Request,
+    pub token: DeferredToken<FuseResponse<'static>>,
     pub fh: u64,
     pub lock_owner: u64,
     pub op: i32,
 }
 
 pub struct RangeLockWaiter {
-    pub req: Request,
+    pub token: DeferredToken<FuseResponse<'static>>,
     pub fh: u64,
     pub lock_owner: u64,
     pub lock: ShimFlock,
@@ -128,7 +128,7 @@ impl LockManager {
         self.range_lock_waiters.values().map(|q| q.len()).sum()
     }
 
-    pub fn wake_flock_waiters_state(&mut self, ino: u64) -> Vec<Request> {
+    pub fn wake_flock_waiters_state(&mut self, ino: u64) -> Vec<DeferredToken<FuseResponse<'static>>> {
         let mut ready_replies = Vec::new();
         if let Some(queue) = self.flock_waiters.get_mut(&ino) {
             while let Some(front) = queue.front() {
@@ -136,7 +136,7 @@ impl LockManager {
                 if can_grant_flock(&self.flock_table, ino, front.fh, base_op) {
                     let waiter = queue.pop_front().unwrap();
                     grant_flock(&mut self.flock_table, ino, waiter.fh, base_op);
-                    ready_replies.push(waiter.req);
+                    ready_replies.push(waiter.token);
                     if base_op == libc::LOCK_EX {
                         break;
                     }
@@ -151,7 +151,7 @@ impl LockManager {
         ready_replies
     }
 
-    pub fn wake_range_lock_waiters_state(&mut self, ino: u64) -> Vec<Request> {
+    pub fn wake_range_lock_waiters_state(&mut self, ino: u64) -> Vec<DeferredToken<FuseResponse<'static>>> {
         let mut ready_replies = Vec::new();
         if let Some(queue) = self.range_lock_waiters.get_mut(&ino) {
             let mut i = 0;
@@ -184,7 +184,7 @@ impl LockManager {
                         req_type,
                         waiter.lock.pid,
                     );
-                    ready_replies.push(waiter.req);
+                    ready_replies.push(waiter.token);
                 } else {
                     i += 1;
                 }
@@ -196,7 +196,14 @@ impl LockManager {
         ready_replies
     }
 
-    pub fn release_flock_state(&mut self, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
+    pub fn release_flock_state(
+        &mut self,
+        ino: u64,
+        fh: u64,
+    ) -> (
+        Vec<DeferredToken<FuseResponse<'static>>>,
+        Vec<DeferredToken<FuseResponse<'static>>>,
+    ) {
         let mut canceled_replies = Vec::new();
         if let Some(state) = self.flock_table.get_mut(&ino) {
             match state {
@@ -217,7 +224,7 @@ impl LockManager {
             let mut kept = VecDeque::with_capacity(queue.len());
             for w in queue.drain(..) {
                 if w.fh == fh {
-                    canceled_replies.push(w.req);
+                    canceled_replies.push(w.token);
                 } else {
                     kept.push_back(w);
                 }
@@ -232,13 +239,13 @@ impl LockManager {
         (canceled_replies, ready_replies)
     }
 
-    pub fn cancel_range_lock_waiters_state(&mut self, ino: u64, fh: u64) -> Vec<Request> {
+    pub fn cancel_range_lock_waiters_state(&mut self, ino: u64, fh: u64) -> Vec<DeferredToken<FuseResponse<'static>>> {
         let mut canceled_replies = Vec::new();
         if let Some(queue) = self.range_lock_waiters.get_mut(&ino) {
             let mut kept = VecDeque::with_capacity(queue.len());
             for w in queue.drain(..) {
                 if w.fh == fh {
-                    canceled_replies.push(w.req);
+                    canceled_replies.push(w.token);
                 } else {
                     kept.push_back(w);
                 }
@@ -252,7 +259,14 @@ impl LockManager {
         canceled_replies
     }
 
-    pub fn release_range_locks_state(&mut self, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
+    pub fn release_range_locks_state(
+        &mut self,
+        ino: u64,
+        fh: u64,
+    ) -> (
+        Vec<DeferredToken<FuseResponse<'static>>>,
+        Vec<DeferredToken<FuseResponse<'static>>>,
+    ) {
         let canceled = self.cancel_range_lock_waiters_state(ino, fh);
         self.range_lock_table.remove(&ino);
         let ready = self.wake_range_lock_waiters_state(ino);
@@ -264,7 +278,10 @@ impl LockManager {
         is_last_handle: bool,
         ino: u64,
         fh: u64,
-    ) -> (Vec<Request>, Vec<Request>) {
+    ) -> (
+        Vec<DeferredToken<FuseResponse<'static>>>,
+        Vec<DeferredToken<FuseResponse<'static>>>,
+    ) {
         let (flock_canceled, flock_ready) = self.release_flock_state(ino, fh);
         let (range_canceled, range_ready) = if is_last_handle {
             self.release_range_locks_state(ino, fh)
@@ -325,7 +342,7 @@ impl LockManager {
         if !canceled.is_empty() {
             inner.defer(move || {
                 for r in canceled {
-                    r.reply_err(libc::EBADF);
+                    r.complete(Err(libc::EBADF));
                 }
             });
         }
@@ -355,7 +372,7 @@ impl LockManager {
         if !ready.is_empty() {
             inner.defer(move || {
                 for r in ready {
-                    r.reply_err(0);
+                    r.complete(Ok(FuseResponse::ok()));
                 }
             });
         }
@@ -367,20 +384,24 @@ impl LockManager {
         if !ready.is_empty() {
             inner.defer(move || {
                 for r in ready {
-                    r.reply_err(0);
+                    r.complete(Ok(FuseResponse::ok()));
                 }
             });
         }
     }
 
-    fn defer_replies(inner: &mut FsInnerGuard<'_>, canceled: Vec<Request>, ready: Vec<Request>) {
+    fn defer_replies(
+        inner: &mut FsInnerGuard<'_>,
+        canceled: Vec<DeferredToken<FuseResponse<'static>>>,
+        ready: Vec<DeferredToken<FuseResponse<'static>>>,
+    ) {
         if !canceled.is_empty() || !ready.is_empty() {
             inner.defer(move || {
                 for r in canceled {
-                    r.reply_err(libc::EBADF);
+                    r.complete(Err(libc::EBADF));
                 }
                 for r in ready {
-                    r.reply_err(0);
+                    r.complete(Ok(FuseResponse::ok()));
                 }
             });
         }
@@ -391,68 +412,67 @@ pub fn wake_flock_waiters(fs: &InMemoryFS, ino: u64) {
     fs.with_inner(OpTag::Lock, |inner| LockManager::wake_flock_waiters(inner, ino));
 }
 
-pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
+pub fn flock_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    fh: u64,
+    lock_owner: u64,
+    op: i32,
+) -> DeferredResult<FuseResponse<'static>> {
     log::trace!("flock(ino={}, fh={}, lock_owner={}, op={})", ino, fh, lock_owner, op);
 
     let non_blocking = (op & libc::LOCK_NB) != 0;
     let base_op = op & !libc::LOCK_NB;
 
     if base_op != libc::LOCK_UN && base_op != libc::LOCK_SH && base_op != libc::LOCK_EX {
-        req.reply_err(libc::EINVAL);
-        return;
+        return DeferredResult::err(libc::EINVAL);
     }
 
     let mut inner = fs.lock_inner(OpTag::Lock);
     if let Err(err) = inner.validate_file_handle(ino, fh) {
-        inner.defer(move || req.reply_err(err));
-        return;
+        return DeferredResult::err(err);
     }
 
     if base_op == libc::LOCK_UN {
         LockManager::release_flock(&mut inner, ino, fh);
-        inner.defer(move || req.reply_err(0));
-        return;
+        return DeferredResult::ok_void();
     }
 
     let has_waiters = inner.locks.flock_waiters.get(&ino).is_some_and(|q| !q.is_empty());
 
     if !has_waiters && can_grant_flock(&inner.locks.flock_table, ino, fh, base_op) {
         grant_flock(&mut inner.locks.flock_table, ino, fh, base_op);
-        inner.defer(move || req.reply_err(0));
-        return;
+        return DeferredResult::ok_void();
     }
 
     if non_blocking {
-        inner.defer(move || req.reply_err(libc::EWOULDBLOCK));
-        return;
+        return DeferredResult::err(libc::EWOULDBLOCK);
     }
 
-    // Blocking request with contention: park request in the waiter queue (0 threads used)
+    // Blocking request with contention: park token in the waiter queue (0 threads used)
+    let (token, rx) = DeferredToken::new();
     inner
         .locks
         .flock_waiters
         .entry(ino)
         .or_default()
         .push_back(FlockWaiter {
-            req,
+            token,
             fh,
             lock_owner,
             op,
         });
+    DeferredResult::deferred(rx)
 }
 
-pub fn getlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) {
-    log::trace!(
-        "getlk(ino={}, fh={}, lock_owner={}, lock={:?})",
-        ino,
-        fh,
-        lock_owner,
-        lock
-    );
-    match getlk_core(fs, ino, fh, lock_owner, lock) {
-        Ok(reply_lock) => req.reply_lock(&reply_lock),
-        Err(err) => req.reply_err(err),
-    }
+pub fn getlk_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    fh: u64,
+    lock_owner: u64,
+    lock: ShimFlock,
+) -> Result<FuseResponse<'static>, i32> {
+    getlk_core(fs, ino, fh, lock_owner, lock).map(FuseResponse::lock)
 }
 
 pub(crate) fn check_range_conflict(ranges: &[RangeLock], lock_owner: u64, start: u64, end: u64, req_type: i16) -> bool {
@@ -517,7 +537,14 @@ pub fn wake_range_lock_waiters(fs: &InMemoryFS, ino: u64) {
 
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
-pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
+pub fn setlk_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    fh: u64,
+    lock_owner: u64,
+    lock: ShimFlock,
+    sleep: bool,
+) -> DeferredResult<FuseResponse<'static>> {
     log::trace!(
         "setlk(ino={}, fh={}, lock_owner={}, lock={:?}, sleep={})",
         ino,
@@ -529,29 +556,23 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
 
     let mut inner = fs.lock_inner(OpTag::Lock);
     if let Err(err) = inner.validate_file_handle(ino, fh) {
-        inner.defer(move || req.reply_err(err));
-        return;
+        return DeferredResult::err(err);
     }
 
     let (start, end) = match normalize_range(&inner, ino, &lock) {
         Ok(range) => range,
-        Err(err) => {
-            inner.defer(move || req.reply_err(err));
-            return;
-        }
+        Err(err) => return DeferredResult::err(err),
     };
 
     let req_type = lock.lock_type;
 
     if req_type == libc::F_UNLCK as i16 {
         LockManager::unlock_range(&mut inner, ino, lock_owner, start, end);
-        inner.defer(move || req.reply_err(0));
-        return;
+        return DeferredResult::ok_void();
     }
 
     if req_type != libc::F_RDLCK as i16 && req_type != libc::F_WRLCK as i16 {
-        inner.defer(move || req.reply_err(libc::EINVAL));
-        return;
+        return DeferredResult::err(libc::EINVAL);
     }
 
     let conflict = {
@@ -575,28 +596,28 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     if !conflict && !waiter_conflict {
         let ranges = inner.locks.range_lock_table.entry(ino).or_default();
         grant_range_lock(ranges, lock_owner, start, end, req_type, lock.pid);
-        inner.defer(move || req.reply_err(0));
-        return;
+        return DeferredResult::ok_void();
     }
 
     if !sleep {
-        inner.defer(move || req.reply_err(libc::EWOULDBLOCK));
-        return;
+        return DeferredResult::err(libc::EWOULDBLOCK);
     }
 
+    let (token, rx) = DeferredToken::new();
     inner
         .locks
         .range_lock_waiters
         .entry(ino)
         .or_default()
         .push_back(RangeLockWaiter {
-            req,
+            token,
             fh,
             lock_owner,
             lock,
             start,
             end,
         });
+    DeferredResult::deferred(rx)
 }
 
 pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32) -> Result<(), i32> {
@@ -868,14 +889,12 @@ mod tests {
     fn test_lock_manager_waiter_waking() {
         let mut lm = LockManager::new();
         let ino = 42;
-        let dummy_req = || Request {
-            req: std::ptr::null_mut(),
-        };
+        let make_waiter_token = || DeferredToken::new().0;
 
         // Test flock waiter queuing & waking
         grant_flock(&mut lm.flock_table, ino, 1, libc::LOCK_EX);
         lm.flock_waiters.entry(ino).or_default().push_back(FlockWaiter {
-            req: dummy_req(),
+            token: make_waiter_token(),
             fh: 2,
             lock_owner: 200,
             op: libc::LOCK_SH,
@@ -899,7 +918,7 @@ mod tests {
             .entry(ino)
             .or_default()
             .push_back(RangeLockWaiter {
-                req: dummy_req(),
+                token: make_waiter_token(),
                 fh: 2,
                 lock_owner: 200,
                 lock: ShimFlock {
@@ -923,7 +942,7 @@ mod tests {
         // Test release_file_handle (flock + range lock waiters + handle release)
         grant_flock(&mut lm.flock_table, ino, 10, libc::LOCK_EX);
         lm.flock_waiters.entry(ino).or_default().push_back(FlockWaiter {
-            req: dummy_req(),
+            token: make_waiter_token(),
             fh: 20,
             lock_owner: 300,
             op: libc::LOCK_SH,
@@ -934,7 +953,7 @@ mod tests {
             .entry(ino)
             .or_default()
             .push_back(RangeLockWaiter {
-                req: dummy_req(),
+                token: make_waiter_token(),
                 fh: 10,
                 lock_owner: 100,
                 lock: ShimFlock {

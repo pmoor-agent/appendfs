@@ -7,45 +7,44 @@ pub mod statfs;
 pub mod xattr;
 
 use crate::fs::InMemoryFS;
-use crate::shim::{Filesystem, Request, ShimFlock};
+use crate::shim::{DeferredResult, DirEntry, DirEntryPlus, Filesystem, FuseResponse, RequestContext, ShimFlock};
 use std::time::SystemTime;
 
 impl Filesystem for InMemoryFS {
-    fn lookup(&self, req: Request, parent: u64, name: &str) {
-        dir::lookup(self, req, parent, name);
+    fn lookup(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+        dir::lookup_response(self, parent, name)
     }
 
-    fn getattr(&self, req: Request, ino: u64) {
-        read_write::getattr(self, req, ino);
+    fn getattr(&self, ino: u64) -> Result<FuseResponse<'static>, i32> {
+        read_write::getattr_response(self, ino)
     }
 
-    fn opendir(&self, req: Request, ino: u64, flags: u32) {
-        dir::opendir(self, req, ino, flags);
+    fn opendir(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32> {
+        dir::opendir_response(self, ino, flags)
     }
 
-    fn readdir(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
-        dir::readdir(self, req, ino, size, offset, fh);
+    fn readdir(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<Vec<DirEntry>, i32> {
+        dir::readdir_entries(self, ino, size, offset, fh)
     }
 
-    fn readdirplus(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
-        dir::readdirplus(self, req, ino, size, offset, fh);
+    fn readdirplus(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<Vec<DirEntryPlus>, i32> {
+        dir::readdirplus_entries(self, ino, size, offset, fh)
     }
 
-    fn read(&self, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
-        read_write::read(self, req, ino, size, offset, fh);
+    fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+        read_write::read_response(self, ino, fh, offset, size)
     }
 
-    fn open(&self, req: Request, ino: u64, flags: u32) {
-        read_write::open(self, req, ino, flags);
+    fn open(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32> {
+        read_write::open_response(self, ino, flags)
     }
 
-    fn write(&self, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64) {
-        read_write::write(self, req, ino, buf, offset, fh);
+    fn write(&self, ino: u64, buf: &[u8], offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+        read_write::write_response(self, ino, fh, buf, offset)
     }
 
     fn setattr(
         &self,
-        req: Request,
         ino: u64,
         mode: u32,
         uid: u32,
@@ -54,109 +53,116 @@ impl Filesystem for InMemoryFS {
         atime: SystemTime,
         mtime: SystemTime,
         to_set: u32,
-    ) {
-        read_write::setattr(self, req, ino, mode, uid, gid, size, atime, mtime, to_set);
+    ) -> Result<FuseResponse<'static>, i32> {
+        read_write::setattr_response(self, ino, mode, uid, gid, size, atime, mtime, to_set)
     }
 
-    fn create(&self, req: Request, parent: u64, name: &str, mode: u32, flags: u32) {
-        read_write::create(self, req, parent, name, mode, flags);
+    fn create(
+        &self,
+        ctx: RequestContext,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        flags: u32,
+    ) -> Result<FuseResponse<'static>, i32> {
+        read_write::create_response(self, parent, name, mode, flags, ctx.uid, ctx.gid)
     }
 
-    fn mknod(&self, req: Request, parent: u64, name: &str, mode: u32, rdev: u32) {
-        special::mknod(self, req, parent, name, mode, rdev);
+    fn mknod(
+        &self,
+        ctx: RequestContext,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        rdev: u32,
+    ) -> Result<FuseResponse<'static>, i32> {
+        special::mknod_response(self, parent, name, mode, rdev, ctx.uid, ctx.gid)
     }
 
-    fn unlink(&self, req: Request, parent: u64, name: &str) {
-        links::unlink(self, req, parent, name);
+    fn unlink(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+        links::unlink_response(self, parent, name)
     }
 
-    fn mkdir(&self, req: Request, parent: u64, name: &str, mode: u32) {
-        dir::mkdir(self, req, parent, name, mode);
+    fn mkdir(&self, ctx: RequestContext, parent: u64, name: &str, mode: u32) -> Result<FuseResponse<'static>, i32> {
+        dir::mkdir_response(self, parent, name, mode, ctx.uid, ctx.gid)
     }
 
-    fn rmdir(&self, req: Request, parent: u64, name: &str) {
-        dir::rmdir(self, req, parent, name);
+    fn rmdir(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+        dir::rmdir_response(self, parent, name)
     }
 
-    fn symlink(&self, req: Request, link: &str, parent: u64, name: &str) {
-        links::symlink(self, req, link, parent, name);
+    fn symlink(&self, ctx: RequestContext, link: &str, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+        links::symlink_response(self, parent, name, link, ctx.uid, ctx.gid)
     }
 
-    fn readlink(&self, req: Request, ino: u64) {
-        links::readlink(self, req, ino);
+    fn readlink(&self, ino: u64) -> Result<FuseResponse<'static>, i32> {
+        links::readlink_response(self, ino)
     }
 
-    fn rename(&self, req: Request, parent: u64, name: &str, newparent: u64, newname: &str) {
-        links::rename(self, req, parent, name, newparent, newname);
+    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, i32> {
+        links::rename_response(self, parent, name, newparent, newname)
     }
 
-    fn link(&self, req: Request, ino: u64, newparent: u64, newname: &str) {
-        links::link(self, req, ino, newparent, newname);
+    fn link(&self, ino: u64, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, i32> {
+        links::link_response(self, ino, newparent, newname)
     }
 
-    fn fsync(&self, req: Request, ino: u64, datasync: bool, fh: u64) {
-        read_write::fsync(self, req, ino, datasync, fh);
+    fn fsync(&self, ino: u64, _datasync: bool, fh: u64) -> DeferredResult<FuseResponse<'static>> {
+        read_write::fsync_response(self, ino, fh, crate::fs::FlushReason::Fsync)
     }
 
-    fn fallocate(&self, req: Request, ino: u64, mode: i32, offset: i64, length: i64, fh: u64) {
-        read_write::fallocate(self, req, ino, mode, offset, length, fh);
+    fn fallocate(&self, ino: u64, mode: i32, offset: i64, length: i64, _fh: u64) -> Result<FuseResponse<'static>, i32> {
+        read_write::fallocate_response(self, ino, mode, offset, length)
     }
 
-    fn release(&self, req: Request, ino: u64, fh: u64) {
-        read_write::release(self, req, ino, fh);
+    fn release(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+        read_write::release_response(self, ino, fh)
     }
 
-    fn releasedir(&self, req: Request, ino: u64, fh: u64) {
-        dir::releasedir(self, req, ino, fh);
+    fn releasedir(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+        dir::releasedir_response(self, ino, fh)
     }
 
-    fn fsyncdir(&self, req: Request, ino: u64, datasync: bool) {
-        dir::fsyncdir(self, req, ino, datasync);
+    fn fsyncdir(&self, ino: u64, datasync: bool) -> DeferredResult<FuseResponse<'static>> {
+        dir::fsyncdir_response(self, ino, datasync)
     }
 
-    fn statfs(&self, req: Request, ino: u64) {
-        statfs::statfs(self, req, ino);
+    fn statfs(&self, ino: u64) -> Result<FuseResponse<'static>, i32> {
+        statfs::statfs_response(self, ino)
     }
 
-    fn flock(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
-        locks::flock(self, req, ino, fh, lock_owner, op);
+    fn flock(&self, ino: u64, fh: u64, lock_owner: u64, op: i32) -> DeferredResult<FuseResponse<'static>> {
+        locks::flock_response(self, ino, fh, lock_owner, op)
     }
 
-    fn getlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) {
-        locks::getlk(self, req, ino, fh, lock_owner, lock);
+    fn getlk(&self, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<FuseResponse<'static>, i32> {
+        locks::getlk_response(self, ino, fh, lock_owner, lock)
     }
 
-    fn setlk(&self, req: Request, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock, sleep: bool) {
-        locks::setlk(self, req, ino, fh, lock_owner, lock, sleep);
+    fn setlk(
+        &self,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        lock: ShimFlock,
+        sleep: bool,
+    ) -> DeferredResult<FuseResponse<'static>> {
+        locks::setlk_response(self, ino, fh, lock_owner, lock, sleep)
     }
 
-    fn getxattr(&self, req: Request, ino: u64, name: &str, size: usize) {
-        match xattr::getxattr_core(self, ino, name, size) {
-            Ok(xattr::GetxattrResult::Size(sz)) => req.reply_xattr(sz),
-            Ok(xattr::GetxattrResult::Data(data)) => req.reply_buf(&data),
-            Err(err) => req.reply_err(err),
-        }
+    fn getxattr(&self, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, i32> {
+        xattr::getxattr_response(self, ino, name, size)
     }
 
-    fn setxattr(&self, req: Request, ino: u64, name: &str, value: &[u8], flags: i32) {
-        match xattr::setxattr_core(self, ino, name, value, flags) {
-            Ok(()) => req.reply_err(0),
-            Err(err) => req.reply_err(err),
-        }
+    fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<FuseResponse<'static>, i32> {
+        xattr::setxattr_response(self, ino, name, value, flags)
     }
 
-    fn listxattr(&self, req: Request, ino: u64, size: usize) {
-        match xattr::listxattr_core(self, ino, size) {
-            Ok(xattr::ListxattrResult::Size(sz)) => req.reply_xattr(sz),
-            Ok(xattr::ListxattrResult::Data(data)) => req.reply_buf(&data),
-            Err(err) => req.reply_err(err),
-        }
+    fn listxattr(&self, ino: u64, size: usize) -> Result<FuseResponse<'static>, i32> {
+        xattr::listxattr_response(self, ino, size)
     }
 
-    fn removexattr(&self, req: Request, ino: u64, name: &str) {
-        match xattr::removexattr_core(self, ino, name) {
-            Ok(()) => req.reply_err(0),
-            Err(err) => req.reply_err(err),
-        }
+    fn removexattr(&self, ino: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+        xattr::removexattr_response(self, ino, name)
     }
 }

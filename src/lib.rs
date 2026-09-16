@@ -56,6 +56,10 @@ pub use remote::{
 };
 #[cfg(any(test, feature = "testing"))]
 pub use remote::{CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, MockRemoteStore, RemoteStoreMetrics};
+pub use shim::{
+    DeferredCallback, DeferredCompletion, DeferredReceiver, DeferredResult, DeferredToken, DirEntry, DirEntryPlus,
+    FileAttr, FileType, Filesystem, FuseResponse, ReplyData, Request, RequestContext, StatfsAttr, dispatch_reply,
+};
 pub use stats::VolumeStats;
 pub use storage::{FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter, WriteMode};
 pub use sync::{ActionGuard, ActionMutex, OpStatSnapshot, OpTag, PostUnlockQueue};

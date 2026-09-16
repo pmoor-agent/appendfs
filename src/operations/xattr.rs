@@ -1,5 +1,6 @@
 use crate::fs::InMemoryFS;
 use crate::node::AttrDelta;
+use crate::shim::FuseResponse;
 use crate::sync::OpTag;
 use std::collections::HashMap;
 
@@ -142,6 +143,34 @@ pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<(), i32
         inner.record_mutation(name.len());
         Ok(())
     })
+}
+
+pub fn getxattr_response(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, i32> {
+    match getxattr_core(fs, ino, name, size)? {
+        GetxattrResult::Size(sz) => Ok(FuseResponse::xattr_size(sz)),
+        GetxattrResult::Data(data) => Ok(FuseResponse::buf(data)),
+    }
+}
+
+pub fn setxattr_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    name: &str,
+    value: &[u8],
+    flags: i32,
+) -> Result<FuseResponse<'static>, i32> {
+    setxattr_core(fs, ino, name, value, flags).map(|()| FuseResponse::ok())
+}
+
+pub fn listxattr_response(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResponse<'static>, i32> {
+    match listxattr_core(fs, ino, size)? {
+        ListxattrResult::Size(sz) => Ok(FuseResponse::xattr_size(sz)),
+        ListxattrResult::Data(data) => Ok(FuseResponse::buf(data)),
+    }
+}
+
+pub fn removexattr_response(fs: &InMemoryFS, ino: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+    removexattr_core(fs, ino, name).map(|()| FuseResponse::ok())
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 use crate::fs::find_parent_inode;
 use crate::fs::{DirHandle, InMemoryFS};
 use crate::node::{AttrDelta, DirectoryDelta, NodeDelta};
-use crate::shim::{self, FileAttr, FileType, Request};
+use crate::shim::{DeferredResult, DirEntry, DirEntryPlus, FileAttr, FileType, FuseResponse};
 use crate::sync::OpTag;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -34,11 +34,8 @@ pub fn lookup_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FileAttr,
     fs.get_attr_locked(&inner, child_ino).ok_or(libc::ENOENT)
 }
 
-pub fn lookup(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
-    match lookup_core(fs, parent, name) {
-        Ok(attr) => req.reply_entry(&attr, 1.0, 1.0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn lookup_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+    lookup_core(fs, parent, name).map(FuseResponse::entry)
 }
 
 pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, i32> {
@@ -137,17 +134,13 @@ pub fn opendir_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
     })
 }
 
-pub fn opendir(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
-    log::trace!("opendir(ino={}, flags=0x{:x})", ino, flags);
-    match opendir_core(fs, ino, flags) {
-        Ok(fh) => req.reply_open(fh, false),
-        Err(e) => req.reply_err(e),
-    }
+pub fn opendir_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32> {
+    opendir_core(fs, ino, flags).map(|fh| FuseResponse::open(fh, false))
 }
 
-pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
-    log::trace!("readdir(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
-    let res = fs.with_inner(OpTag::ReadDir, |inner| {
+pub fn readdir_entries(fs: &InMemoryFS, ino: u64, _size: usize, offset: i64, fh: u64) -> Result<Vec<DirEntry>, i32> {
+    log::trace!("readdir(ino={}, offset={}, fh={})", ino, offset, fh);
+    fs.with_inner(OpTag::ReadDir, |inner| {
         let dir = inner.get_dir_handle(ino, fh)?;
         let parent_ino = if ino == 1 {
             1
@@ -157,32 +150,27 @@ pub fn readdir(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64
         let mut items = Vec::new();
         for (name, item_ino, next_offset) in iter_dir_items(ino, parent_ino, &dir.entries, offset) {
             if let Some(attr) = fs.get_attr_locked(inner, item_ino) {
-                items.push((name.to_string(), item_ino, attr.file_type, next_offset));
+                items.push(DirEntry {
+                    ino: item_ino,
+                    offset: next_offset,
+                    file_type: attr.file_type,
+                    name: name.to_string(),
+                });
             }
         }
         Ok(items)
-    });
-
-    let items = match res {
-        Ok(items) => items,
-        Err(e) => {
-            req.reply_err(e);
-            return;
-        }
-    };
-
-    let mut db = shim::DirectoryBuffer::new(req, size);
-    for (name, item_ino, file_type, next_offset) in items {
-        if !db.add(&name, item_ino, file_type, next_offset) {
-            break;
-        }
-    }
-    db.reply();
+    })
 }
 
-pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
-    log::trace!("readdirplus(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
-    let res = fs.with_inner(OpTag::ReadDir, |inner| {
+pub fn readdirplus_entries(
+    fs: &InMemoryFS,
+    ino: u64,
+    _size: usize,
+    offset: i64,
+    fh: u64,
+) -> Result<Vec<DirEntryPlus>, i32> {
+    log::trace!("readdirplus(ino={}, offset={}, fh={})", ino, offset, fh);
+    fs.with_inner(OpTag::ReadDir, |inner| {
         let dir = inner.get_dir_handle(ino, fh)?;
         let parent_ino = if ino == 1 {
             1
@@ -192,27 +180,18 @@ pub fn readdirplus(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset:
         let mut items = Vec::new();
         for (name, item_ino, next_offset) in iter_dir_items(ino, parent_ino, &dir.entries, offset) {
             if let Some(attr) = fs.get_attr_locked(inner, item_ino) {
-                items.push((name.to_string(), attr, next_offset));
+                items.push(DirEntryPlus {
+                    ino: item_ino,
+                    offset: next_offset,
+                    name: name.to_string(),
+                    attr,
+                    attr_timeout: 1.0,
+                    entry_timeout: 1.0,
+                });
             }
         }
         Ok(items)
-    });
-
-    let items = match res {
-        Ok(items) => items,
-        Err(e) => {
-            req.reply_err(e);
-            return;
-        }
-    };
-
-    let mut db = shim::DirectoryBufferPlus::new(req, size);
-    for (name, attr, next_offset) in items {
-        if !db.add(&name, &attr, 1.0, 1.0, next_offset) {
-            break;
-        }
-    }
-    db.reply();
+    })
 }
 
 pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> Result<FileAttr, i32> {
@@ -290,13 +269,15 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
     })
 }
 
-pub fn mkdir(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32) {
-    let uid = req.uid();
-    let gid = req.gid();
-    match mkdir_core(fs, parent, name, mode, uid, gid) {
-        Ok(attr) => req.reply_entry(&attr, 1.0, 1.0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn mkdir_response(
+    fs: &InMemoryFS,
+    parent: u64,
+    name: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<FuseResponse<'static>, i32> {
+    mkdir_core(fs, parent, name, mode, uid, gid).map(FuseResponse::entry)
 }
 
 pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
@@ -343,23 +324,16 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
     })
 }
 
-pub fn rmdir(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
-    match rmdir_core(fs, parent, name) {
-        Ok(()) => req.reply_err(0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn rmdir_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+    rmdir_core(fs, parent, name).map(|()| FuseResponse::ok())
 }
 
 pub fn releasedir_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
     fs.release_dir_handle(fh, ino)
 }
 
-pub fn releasedir(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
-    log::trace!("releasedir(ino={}, fh={})", ino, fh);
-    match releasedir_core(fs, ino, fh) {
-        Ok(()) => req.reply_err(0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn releasedir_response(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+    releasedir_core(fs, ino, fh).map(|()| FuseResponse::ok())
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -367,9 +341,9 @@ pub async fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), i32> {
     crate::operations::read_write::fsync_core_with_reason(fs, 0, 0, crate::fs::FlushReason::Fsyncdir).await
 }
 
-pub fn fsyncdir(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool) {
+pub fn fsyncdir_response(fs: &InMemoryFS, ino: u64, datasync: bool) -> DeferredResult<FuseResponse<'static>> {
     log::trace!("fsyncdir(ino={}, datasync={})", ino, datasync);
-    crate::operations::read_write::fsync_with_reason(fs, req, 0, 0, crate::fs::FlushReason::Fsyncdir);
+    crate::operations::read_write::fsync_response(fs, 0, 0, crate::fs::FlushReason::Fsyncdir)
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use crate::extent_map::{Extent, ExtentMap};
 use crate::fs::{FileHandle, FlushReason, FsInner, InMemoryFS};
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
-use crate::shim::{FileAttr, FileType, Request};
+use crate::shim::{DeferredCompletion, DeferredResult, FileAttr, FileType, FuseResponse};
 use crate::sync::OpTag;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -18,11 +18,8 @@ pub fn getattr_core(fs: &InMemoryFS, ino: u64) -> Result<FileAttr, i32> {
     fs.get_attr(ino).ok_or(libc::ENOENT)
 }
 
-pub fn getattr(fs: &InMemoryFS, req: Request, ino: u64) {
-    match getattr_core(fs, ino) {
-        Ok(attr) => req.reply_attr(&attr, 1.0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn getattr_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, i32> {
+    getattr_core(fs, ino).map(FuseResponse::attr)
 }
 
 pub fn read_core(fs: &InMemoryFS, ino: u64, fh: u64, offset: i64, size: usize) -> Result<Vec<u8>, i32> {
@@ -33,48 +30,14 @@ pub fn read_core(fs: &InMemoryFS, ino: u64, fh: u64, offset: i64, size: usize) -
     fs.read_handle(ino, fh, offset as u64, size)
 }
 
-pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
-    log::trace!("read(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
-    if offset < 0 {
-        req.reply_err(libc::EINVAL);
-        return;
-    }
-
-    let plan = match fs.plan_read_handle(ino, fh, offset as u64, size) {
-        Ok(p) => p,
-        Err(e) => {
-            req.reply_err(e);
-            return;
-        }
-    };
-
-    // Zero-copy fast path: single in-memory/cache slice or empty/zero read
-    if plan.is_single_borrowable_slice() {
-        plan.execute_single_slice(|buf| req.reply_buf(buf));
-        return;
-    }
-
-    // Fast path: small in-memory read (<= 128 KiB) with zero cold disk slices
-    const MAX_INLINE_READ_BYTES: usize = 128 * 1024;
-    if !plan.has_cold_slices && plan.total_len <= MAX_INLINE_READ_BYTES {
-        match fs.execute_read_plan_sync(plan) {
-            Ok(buf) => req.reply_buf(&buf),
-            Err(e) => req.reply_err(e),
-        }
-        return;
-    }
-
-    // Async offload: cold disk/remote read or large in-memory read
-    let log_cache = fs.log_cache.clone();
-    let volume_key = fs.volume_key.clone();
-    let guard = fs.begin_async_op();
-    crate::async_runtime::spawn(async move {
-        let _guard = guard;
-        match InMemoryFS::execute_read_plan_async(plan, log_cache, volume_key).await {
-            Ok(buf) => req.reply_buf(&buf),
-            Err(e) => req.reply_err(e),
-        }
-    });
+pub fn read_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    fh: u64,
+    offset: i64,
+    size: usize,
+) -> Result<FuseResponse<'static>, i32> {
+    read_core(fs, ino, fh, offset, size).map(FuseResponse::buf)
 }
 
 pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
@@ -136,12 +99,8 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
     }
 }
 
-pub fn open(fs: &InMemoryFS, req: Request, ino: u64, flags: u32) {
-    log::trace!("open(ino={}, flags=0x{:x})", ino, flags);
-    match open_core(fs, ino, flags) {
-        Ok(fh) => req.reply_open(fh, fs.is_virtual_ino(ino)),
-        Err(e) => req.reply_err(e),
-    }
+pub fn open_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32> {
+    open_core(fs, ino, flags).map(|fh| FuseResponse::open(fh, fs.is_virtual_ino(ino)))
 }
 
 pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
@@ -206,12 +165,14 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
     res
 }
 
-pub fn write(fs: &InMemoryFS, req: Request, ino: u64, buf: &[u8], offset: i64, fh: u64) {
-    log::trace!("write(ino={}, len={}, offset={}, fh={})", ino, buf.len(), offset, fh);
-    match write_handle_core(fs, ino, fh, buf, offset) {
-        Ok(count) => req.reply_write(count),
-        Err(e) => req.reply_err(e),
-    }
+pub fn write_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    fh: u64,
+    buf: &[u8],
+    offset: i64,
+) -> Result<FuseResponse<'static>, i32> {
+    write_handle_core(fs, ino, fh, buf, offset).map(FuseResponse::write)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -431,17 +392,19 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
     })
 }
 
-pub fn fallocate(fs: &InMemoryFS, req: Request, ino: u64, mode: i32, offset: i64, length: i64, _fh: u64) {
-    match fallocate_core(fs, ino, mode, offset, length) {
-        Ok(()) => req.reply_err(0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn fallocate_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    mode: i32,
+    offset: i64,
+    length: i64,
+) -> Result<FuseResponse<'static>, i32> {
+    fallocate_core(fs, ino, mode, offset, length).map(|()| FuseResponse::ok())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn setattr(
+pub fn setattr_response(
     fs: &InMemoryFS,
-    req: Request,
     ino: u64,
     mode: u32,
     uid: u32,
@@ -450,11 +413,8 @@ pub fn setattr(
     atime: SystemTime,
     mtime: SystemTime,
     to_set: u32,
-) {
-    match setattr_core(fs, ino, mode, uid, gid, size, atime, mtime, to_set) {
-        Ok(attr) => req.reply_attr(&attr, 1.0),
-        Err(e) => req.reply_err(e),
-    }
+) -> Result<FuseResponse<'static>, i32> {
+    setattr_core(fs, ino, mode, uid, gid, size, atime, mtime, to_set).map(FuseResponse::attr)
 }
 #[allow(clippy::too_many_arguments)]
 fn create_internal(
@@ -556,15 +516,17 @@ pub fn create_core(
     create_internal(fs, parent, name, mode, flags, uid, gid, false).map(|(attr, _)| attr)
 }
 
-pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32, flags: u32) {
-    let uid = req.uid();
-    let gid = req.gid();
-    match create_internal(fs, parent, name, mode, flags, uid, gid, true) {
-        Ok((attr, fh)) => {
-            req.reply_create(&attr, 1.0, 1.0, fh.unwrap());
-        }
-        Err(e) => req.reply_err(e),
-    }
+pub fn create_response(
+    fs: &InMemoryFS,
+    parent: u64,
+    name: &str,
+    mode: u32,
+    flags: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<FuseResponse<'static>, i32> {
+    create_internal(fs, parent, name, mode, flags, uid, gid, true)
+        .map(|(attr, fh)| FuseResponse::create(attr, fh.unwrap()))
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -576,62 +538,47 @@ pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
 /// reason for the flush.
 #[cfg(any(test, feature = "testing"))]
 pub async fn fsync_core_with_reason(fs: &InMemoryFS, ino: u64, fh: u64, reason: FlushReason) -> Result<(), i32> {
-    // Nothing staged and nothing in flight: the flusher syncs the log before it completes a
-    // batch, so everything already folded into `base` is on disk. There is nothing to wait for.
-    let Some(completion) = fs.rollover_for_fsync(ino, fh, reason)? else {
-        return Ok(());
-    };
-
-    fs.wake_flusher();
-    completion
-        .wait()
-        .await
-        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+    fsync_response(fs, ino, fh, reason).wait_async().await.map(|_| ())
 }
 
-pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
-    log::trace!("fsync(ino={}, datasync={}, fh={})", ino, datasync, fh);
-    fsync_with_reason(fs, req, ino, fh, FlushReason::Fsync);
+pub struct FsyncDeferred(pub crate::fs::BatchCompletion);
+
+impl DeferredCompletion<FuseResponse<'static>> for FsyncDeferred {
+    fn on_complete(self: Box<Self>, callback: Box<dyn FnOnce(Result<FuseResponse<'static>, i32>) + Send + 'static>) {
+        self.0.add_callback(Box::new(move |result| {
+            let res = result
+                .map(|()| FuseResponse::ok())
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO));
+            callback(res);
+        }));
+    }
 }
 
-/// Shared body for `fsync` and `fsyncdir`, which differ only in what they report as the
-/// reason for the flush.
-pub(crate) fn fsync_with_reason(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, reason: FlushReason) {
+pub fn fsync_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    fh: u64,
+    reason: FlushReason,
+) -> DeferredResult<FuseResponse<'static>> {
     let completion = match fs.rollover_for_fsync(ino, fh, reason) {
         Ok(c) => c,
-        Err(e) => {
-            req.reply_err(e);
-            return;
-        }
+        Err(e) => return DeferredResult::err(e),
     };
 
-    // See `fsync_core`: with nothing staged or in flight, the log is already synced.
     let Some(completion) = completion else {
-        req.reply_err(0);
-        return;
+        return DeferredResult::ok_void();
     };
 
-    // Reply from whichever thread ends up completing the batch. A batch completion already
-    // has to notify its waiters, so this is just one more of them - no task to spawn, no
-    // runtime to keep alive, and nothing to track for a safe unmount. If the batch has
-    // already landed, the callback runs right here.
-    completion.add_callback(Box::new(move |result| match result {
-        Ok(()) => req.reply_err(0),
-        Err(e) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
-    }));
     fs.wake_flusher();
+    DeferredResult::deferred(FsyncDeferred(completion))
 }
 
 pub fn release_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
     fs.release_file_handle(fh, ino)
 }
 
-pub fn release(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
-    log::trace!("release(ino={}, fh={})", ino, fh);
-    match release_core(fs, ino, fh) {
-        Ok(()) => req.reply_err(0),
-        Err(e) => req.reply_err(e),
-    }
+pub fn release_response(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+    release_core(fs, ino, fh).map(|()| FuseResponse::ok())
 }
 
 #[cfg(test)]
