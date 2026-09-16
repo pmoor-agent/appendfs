@@ -3720,3 +3720,219 @@ fn test_unmount_drains_in_flight_async_operations() {
 
     mount.unmount();
 }
+
+#[test]
+fn test_longest_allowed_file_and_directory_names() {
+    let mut mount = TestMount::new_rw();
+    let mount_path = mount.path().to_path_buf();
+
+    // 1. Verify statvfs f_namemax reports 255
+    let path_c = std::ffi::CString::new(mount.path_str()).unwrap();
+    let mut statvfs_buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::statvfs(path_c.as_ptr(), &mut statvfs_buf) };
+    assert_eq!(res, 0);
+    assert_eq!(statvfs_buf.f_namemax, 255);
+
+    // 2. Prepare boundary names
+    // 255 ASCII bytes (longest valid name)
+    let file_name_255 = "f".repeat(255);
+    // 256 ASCII bytes (first invalid name length)
+    let file_name_256 = "f".repeat(256);
+    // 300 ASCII bytes (well beyond limit)
+    let file_name_300 = "f".repeat(300);
+
+    let dir_name_255 = "d".repeat(255);
+    let dir_name_256 = "d".repeat(256);
+
+    let file_path_255 = mount_path.join(&file_name_255);
+    let file_path_256 = mount_path.join(&file_name_256);
+    let file_path_300 = mount_path.join(&file_name_300);
+
+    let dir_path_255 = mount_path.join(&dir_name_255);
+    let dir_path_256 = mount_path.join(&dir_name_256);
+
+    // 3. Reject creating or looking up files exceeding 255 bytes with ENAMETOOLONG
+    let err_create_256 = fs::write(&file_path_256, b"too long").unwrap_err();
+    assert_eq!(err_create_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    let err_create_300 = fs::write(&file_path_300, b"much too long").unwrap_err();
+    assert_eq!(err_create_300.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    let err_stat_256 = fs::metadata(&file_path_256).unwrap_err();
+    assert_eq!(err_stat_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // Reject deleting non-existent 256-byte name with ENAMETOOLONG
+    let err_unlink_256 = fs::remove_file(&file_path_256).unwrap_err();
+    assert_eq!(err_unlink_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // 4. Create, write, read, and stat a 255-byte file name
+    let file_content_255 = b"Contents of maximum allowed 255-byte file name";
+    fs::write(&file_path_255, file_content_255).unwrap();
+    assert!(file_path_255.exists());
+    assert_eq!(fs::read(&file_path_255).unwrap(), file_content_255);
+
+    let meta = fs::metadata(&file_path_255).unwrap();
+    assert_eq!(meta.len(), file_content_255.len() as u64);
+
+    // 5. Reject creating or removing directories exceeding 255 bytes
+    let err_mkdir_256 = fs::create_dir(&dir_path_256).unwrap_err();
+    assert_eq!(err_mkdir_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    let err_rmdir_256 = fs::remove_dir(&dir_path_256).unwrap_err();
+    assert_eq!(err_rmdir_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // 6. Create a 255-byte directory name
+    fs::create_dir(&dir_path_255).unwrap();
+    assert!(dir_path_255.is_dir());
+
+    // 7. Create a 255-byte file inside the 255-byte directory (nested 255-byte components)
+    let nested_name_255 = "n".repeat(255);
+    let nested_file_path = dir_path_255.join(&nested_name_255);
+    let nested_content = b"Nested inside 255-byte directory";
+    fs::write(&nested_file_path, nested_content).unwrap();
+    assert_eq!(fs::read(&nested_file_path).unwrap(), nested_content);
+
+    // Reject 256-byte child in 255-byte directory
+    let nested_path_256 = dir_path_255.join(&file_name_256);
+    let err_nested_256 = fs::write(&nested_path_256, b"fail").unwrap_err();
+    assert_eq!(err_nested_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // 8. Multi-byte UTF-8 boundary checks:
+    // '🦀' is 4 bytes. 63 * 4 + 3 ASCII bytes ('x') = 255 bytes.
+    let utf8_name_255 = format!("{}{}", "🦀".repeat(63), "xxx");
+    assert_eq!(utf8_name_255.len(), 255);
+    let utf8_path_255 = mount_path.join(&utf8_name_255);
+    let utf8_content = b"UTF-8 255-byte filename payload";
+    fs::write(&utf8_path_255, utf8_content).unwrap();
+    assert_eq!(fs::read(&utf8_path_255).unwrap(), utf8_content);
+
+    // 64 * 4 = 256 bytes (only 64 characters, but 256 bytes!) -> must fail with ENAMETOOLONG
+    let utf8_name_256 = "🦀".repeat(64);
+    assert_eq!(utf8_name_256.len(), 256);
+    let utf8_path_256 = mount_path.join(&utf8_name_256);
+    let err_utf8_256 = fs::write(&utf8_path_256, b"too many bytes").unwrap_err();
+    assert_eq!(err_utf8_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // 9. Symlink: 255-byte name succeeds, 256-byte name fails with ENAMETOOLONG
+    let symlink_name_255 = "s".repeat(255);
+    let symlink_path_255 = mount_path.join(&symlink_name_255);
+    std::os::unix::fs::symlink(&file_name_255, &symlink_path_255).unwrap();
+    assert_eq!(
+        fs::read_link(&symlink_path_255).unwrap().to_str().unwrap(),
+        &file_name_255
+    );
+    assert_eq!(fs::read(&symlink_path_255).unwrap(), file_content_255);
+
+    let symlink_path_256 = mount_path.join("s".repeat(256));
+    let err_symlink_256 = std::os::unix::fs::symlink("target", &symlink_path_256).unwrap_err();
+    assert_eq!(err_symlink_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // 10. Hardlink: 255-byte name succeeds, 256-byte name fails with ENAMETOOLONG
+    let hardlink_name_255 = "h".repeat(255);
+    let hardlink_path_255 = mount_path.join(&hardlink_name_255);
+    fs::hard_link(&file_path_255, &hardlink_path_255).unwrap();
+    assert_eq!(fs::metadata(&file_path_255).unwrap().nlink(), 2);
+    assert_eq!(fs::read(&hardlink_path_255).unwrap(), file_content_255);
+
+    let hardlink_path_256 = mount_path.join("h".repeat(256));
+    let err_hardlink_256 = fs::hard_link(&file_path_255, &hardlink_path_256).unwrap_err();
+    assert_eq!(err_hardlink_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // 11. FIFO via mkfifo: 255-byte succeeds, 256-byte fails with ENAMETOOLONG
+    let fifo_name_255 = "p".repeat(255);
+    let fifo_path_255 = mount_path.join(&fifo_name_255);
+    let c_fifo_255 = std::ffi::CString::new(fifo_path_255.to_str().unwrap()).unwrap();
+    let fifo_ret = unsafe { libc::mkfifo(c_fifo_255.as_ptr(), 0o644) };
+    assert_eq!(fifo_ret, 0, "mkfifo with 255-byte name should succeed");
+
+    let fifo_path_256 = mount_path.join("p".repeat(256));
+    let c_fifo_256 = std::ffi::CString::new(fifo_path_256.to_str().unwrap()).unwrap();
+    let fifo_err_ret = unsafe { libc::mkfifo(c_fifo_256.as_ptr(), 0o644) };
+    assert_eq!(fifo_err_ret, -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // 12. Renames:
+    // Rename 255-byte hardlink to another 255-byte name
+    let renamed_name_255 = "r".repeat(255);
+    let renamed_path_255 = mount_path.join(&renamed_name_255);
+    fs::rename(&hardlink_path_255, &renamed_path_255).unwrap();
+    assert!(!hardlink_path_255.exists());
+    assert!(renamed_path_255.exists());
+    assert_eq!(fs::read(&renamed_path_255).unwrap(), file_content_255);
+
+    // Target 256-byte name fails with ENAMETOOLONG
+    let err_rename_dst_256 = fs::rename(&renamed_path_255, &file_path_256).unwrap_err();
+    assert_eq!(err_rename_dst_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // Source 256-byte name fails with ENAMETOOLONG
+    let err_rename_src_256 = fs::rename(&file_path_256, &renamed_path_255).unwrap_err();
+    assert_eq!(err_rename_src_256.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // 13. Directory listing returns exact 255-byte names
+    let root_entries: Vec<String> = fs::read_dir(&mount_path)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+        .collect();
+    assert!(root_entries.contains(&file_name_255));
+    assert!(root_entries.contains(&dir_name_255));
+    assert!(root_entries.contains(&utf8_name_255));
+    assert!(root_entries.contains(&symlink_name_255));
+    assert!(root_entries.contains(&fifo_name_255));
+    assert!(root_entries.contains(&renamed_name_255));
+
+    // Ensure all data is synced to disk before remount
+    let f1 = fs::OpenOptions::new().write(true).open(&file_path_255).unwrap();
+    f1.sync_all().unwrap();
+    drop(f1);
+
+    let f2 = fs::OpenOptions::new().write(true).open(&nested_file_path).unwrap();
+    f2.sync_all().unwrap();
+    drop(f2);
+
+    let f3 = fs::OpenOptions::new().write(true).open(&utf8_path_255).unwrap();
+    f3.sync_all().unwrap();
+    drop(f3);
+
+    // 14. Persistence across remount & crash recovery
+    mount.remount_rw();
+    let remount_path = mount.path().to_path_buf();
+
+    let remount_file_255 = remount_path.join(&file_name_255);
+    let remount_dir_255 = remount_path.join(&dir_name_255);
+    let remount_nested_file = remount_dir_255.join(&nested_name_255);
+    let remount_utf8_255 = remount_path.join(&utf8_name_255);
+    let remount_symlink_255 = remount_path.join(&symlink_name_255);
+    let remount_renamed_255 = remount_path.join(&renamed_name_255);
+    let remount_fifo_255 = remount_path.join(&fifo_name_255);
+
+    assert!(remount_file_255.exists());
+    assert_eq!(fs::read(&remount_file_255).unwrap(), file_content_255);
+
+    assert!(remount_dir_255.is_dir());
+    assert_eq!(fs::read(&remount_nested_file).unwrap(), nested_content);
+
+    assert!(remount_utf8_255.exists());
+    assert_eq!(fs::read(&remount_utf8_255).unwrap(), utf8_content);
+
+    assert_eq!(
+        fs::read_link(&remount_symlink_255).unwrap().to_str().unwrap(),
+        &file_name_255
+    );
+
+    assert_eq!(fs::read(&remount_renamed_255).unwrap(), file_content_255);
+    assert!(remount_fifo_255.exists());
+
+    // 15. Clean deletion of 255-byte entities on remounted volume
+    fs::remove_file(&remount_file_255).unwrap();
+    fs::remove_file(&remount_nested_file).unwrap();
+    fs::remove_dir(&remount_dir_255).unwrap();
+    fs::remove_file(&remount_utf8_255).unwrap();
+    fs::remove_file(&remount_symlink_255).unwrap();
+    fs::remove_file(&remount_renamed_255).unwrap();
+    fs::remove_file(&remount_fifo_255).unwrap();
+
+    assert!(!remount_file_255.exists());
+    assert!(!remount_dir_255.exists());
+
+    mount.unmount();
+}

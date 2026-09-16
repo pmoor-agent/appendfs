@@ -1199,4 +1199,47 @@ mod tests {
         assert!(!corrupt_report.is_clean());
         assert!(corrupt_report.issues.iter().any(|i| i.code == "CORRUPT_LOG_RECORD"));
     }
+
+    #[test]
+    fn test_directory_entry_name_too_long_detected() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let fs = crate::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        // Inject a directory entry exceeding 255 bytes into root node in base
+        let long_name = "x".repeat(256);
+        let mut root_node = (*fs.inner.lock_for_tests().unwrap().base.get(&1).unwrap())
+            .as_ref()
+            .clone();
+        if let NodeKind::Directory { entries, .. } = &mut root_node.kind {
+            entries.push((long_name, 2));
+        }
+        let child_node = Node {
+            meta: InodeMeta::new(0o644, 1, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
+            kind: NodeKind::File {
+                extent_map: ExtentMap::new(),
+                size: 0,
+            },
+        };
+        let mut inner = fs.inner.lock_for_tests().unwrap();
+        inner.base.insert(1, Arc::new(root_node));
+        inner.base.insert(2, Arc::new(child_node));
+        drop(inner);
+
+        let report = check_fs_integrity(&fs, None, false);
+        assert!(!report.is_clean());
+        assert!(report.issues.iter().any(|i| i.code == "NAME_TOO_LONG"));
+    }
 }
