@@ -334,6 +334,8 @@ pub struct FlushRecord {
     pub reason: FlushReason,
     /// Staged data bytes the batch carried.
     pub bytes: usize,
+    /// Physical bytes appended to the log on disk (headers, deltas, data, and commit trailer).
+    pub disk_bytes: u64,
     /// Mutating operations the batch carried.
     pub ops: usize,
     /// When the flusher picked the batch up.
@@ -362,6 +364,8 @@ pub struct FlushStats {
     pub total_batches: u64,
     /// Staged data bytes flushed since mount.
     pub total_bytes: u64,
+    /// Physical log bytes flushed to disk since mount.
+    pub total_disk_bytes: u64,
     /// Mutating operations flushed since mount.
     pub total_ops: u64,
     /// Cumulative time spent writing and syncing batches since mount.
