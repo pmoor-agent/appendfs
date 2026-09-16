@@ -1,4 +1,4 @@
-use crate::fs::{FsInner, InMemoryFS};
+use crate::fs::{FsInner, FsInnerGuard, InMemoryFS};
 use crate::shim::{Request, ShimFlock};
 use crate::sync::OpTag;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -130,7 +130,7 @@ impl LockManager {
         self.range_lock_waiters.values().map(|q| q.len()).sum()
     }
 
-    pub fn wake_flock_waiters(&mut self, ino: u64) -> Vec<Request> {
+    pub fn wake_flock_waiters_state(&mut self, ino: u64) -> Vec<Request> {
         let mut ready_replies = Vec::new();
         if let Some(queue) = self.flock_waiters.get_mut(&ino) {
             while let Some(front) = queue.front() {
@@ -153,7 +153,7 @@ impl LockManager {
         ready_replies
     }
 
-    pub fn wake_range_lock_waiters(&mut self, ino: u64) -> Vec<Request> {
+    pub fn wake_range_lock_waiters_state(&mut self, ino: u64) -> Vec<Request> {
         let mut ready_replies = Vec::new();
         if let Some(queue) = self.range_lock_waiters.get_mut(&ino) {
             let mut i = 0;
@@ -198,7 +198,7 @@ impl LockManager {
         ready_replies
     }
 
-    pub fn release_flock(&mut self, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
+    pub fn release_flock_state(&mut self, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
         let mut canceled_replies = Vec::new();
         if let Some(state) = self.flock_table.get_mut(&ino) {
             match state {
@@ -230,11 +230,11 @@ impl LockManager {
                 *queue = kept;
             }
         }
-        let ready_replies = self.wake_flock_waiters(ino);
+        let ready_replies = self.wake_flock_waiters_state(ino);
         (canceled_replies, ready_replies)
     }
 
-    pub fn cancel_range_lock_waiters(&mut self, ino: u64, fh: u64) -> Vec<Request> {
+    pub fn cancel_range_lock_waiters_state(&mut self, ino: u64, fh: u64) -> Vec<Request> {
         let mut canceled_replies = Vec::new();
         if let Some(queue) = self.range_lock_waiters.get_mut(&ino) {
             let mut kept = VecDeque::with_capacity(queue.len());
@@ -254,19 +254,24 @@ impl LockManager {
         canceled_replies
     }
 
-    pub fn release_range_locks(&mut self, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
-        let canceled = self.cancel_range_lock_waiters(ino, fh);
+    pub fn release_range_locks_state(&mut self, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
+        let canceled = self.cancel_range_lock_waiters_state(ino, fh);
         self.range_lock_table.remove(&ino);
-        let ready = self.wake_range_lock_waiters(ino);
+        let ready = self.wake_range_lock_waiters_state(ino);
         (canceled, ready)
     }
 
-    pub fn release_file_handle(&mut self, is_last_handle: bool, ino: u64, fh: u64) -> (Vec<Request>, Vec<Request>) {
-        let (flock_canceled, flock_ready) = self.release_flock(ino, fh);
+    pub fn release_file_handle_state(
+        &mut self,
+        is_last_handle: bool,
+        ino: u64,
+        fh: u64,
+    ) -> (Vec<Request>, Vec<Request>) {
+        let (flock_canceled, flock_ready) = self.release_flock_state(ino, fh);
         let (range_canceled, range_ready) = if is_last_handle {
-            self.release_range_locks(ino, fh)
+            self.release_range_locks_state(ino, fh)
         } else {
-            (self.cancel_range_lock_waiters(ino, fh), Vec::new())
+            (self.cancel_range_lock_waiters_state(ino, fh), Vec::new())
         };
         let mut all_canceled = flock_canceled;
         all_canceled.extend(range_canceled);
@@ -275,7 +280,7 @@ impl LockManager {
         (all_canceled, all_ready)
     }
 
-    pub fn unlock_range(&mut self, ino: u64, lock_owner: u64, start: u64, end: u64) {
+    pub fn unlock_range_state(&mut self, ino: u64, lock_owner: u64, start: u64, end: u64) {
         if let Some(ranges) = self.range_lock_table.get_mut(&ino) {
             let mut new_ranges = Vec::new();
             for r in ranges.drain(..) {
@@ -309,10 +314,83 @@ impl LockManager {
             }
         }
     }
+
+    /// Releases the whole-file BSD flock held by `fh` on `ino` and defers notifying canceled/ready waiters.
+    pub fn release_flock(inner: &mut FsInnerGuard<'_>, ino: u64, fh: u64) {
+        let (canceled, ready) = inner.locks.release_flock_state(ino, fh);
+        Self::defer_replies(inner, canceled, ready);
+    }
+
+    /// Cancels all pending POSIX range lock waiters for `fh` on `ino` and defers replying EBADF.
+    pub fn cancel_range_lock_waiters(inner: &mut FsInnerGuard<'_>, ino: u64, fh: u64) {
+        let canceled = inner.locks.cancel_range_lock_waiters_state(ino, fh);
+        if !canceled.is_empty() {
+            inner.defer(move || {
+                for r in canceled {
+                    r.reply_err(libc::EBADF);
+                }
+            });
+        }
+    }
+
+    /// Releases all POSIX range locks held on `ino` and defers waking pending waiters and replying EBADF to canceled requests for `fh`.
+    pub fn release_range_locks(inner: &mut FsInnerGuard<'_>, ino: u64, fh: u64) {
+        let (canceled, ready) = inner.locks.release_range_locks_state(ino, fh);
+        Self::defer_replies(inner, canceled, ready);
+    }
+
+    /// Releases locks associated with `fh` on `ino` (canceling waiters, releasing flock, and releasing range locks if `is_last_handle`) and defers replies.
+    pub fn release_file_handle(inner: &mut FsInnerGuard<'_>, is_last_handle: bool, ino: u64, fh: u64) {
+        let (canceled, ready) = inner.locks.release_file_handle_state(is_last_handle, ino, fh);
+        Self::defer_replies(inner, canceled, ready);
+    }
+
+    /// Unlocks a POSIX byte range on `ino` and defers notifying any ready range lock waiters.
+    pub fn unlock_range(inner: &mut FsInnerGuard<'_>, ino: u64, lock_owner: u64, start: u64, end: u64) {
+        inner.locks.unlock_range_state(ino, lock_owner, start, end);
+        Self::wake_range_lock_waiters(inner, ino);
+    }
+
+    /// Wakes any pending range lock waiters on `ino` and defers replying success.
+    pub fn wake_range_lock_waiters(inner: &mut FsInnerGuard<'_>, ino: u64) {
+        let ready = inner.locks.wake_range_lock_waiters_state(ino);
+        if !ready.is_empty() {
+            inner.defer(move || {
+                for r in ready {
+                    r.reply_err(0);
+                }
+            });
+        }
+    }
+
+    /// Wakes any pending flock waiters on `ino` and defers replying success.
+    pub fn wake_flock_waiters(inner: &mut FsInnerGuard<'_>, ino: u64) {
+        let ready = inner.locks.wake_flock_waiters_state(ino);
+        if !ready.is_empty() {
+            inner.defer(move || {
+                for r in ready {
+                    r.reply_err(0);
+                }
+            });
+        }
+    }
+
+    fn defer_replies(inner: &mut FsInnerGuard<'_>, canceled: Vec<Request>, ready: Vec<Request>) {
+        if !canceled.is_empty() || !ready.is_empty() {
+            inner.defer(move || {
+                for r in canceled {
+                    r.reply_err(libc::EBADF);
+                }
+                for r in ready {
+                    r.reply_err(0);
+                }
+            });
+        }
+    }
 }
 
 pub fn wake_flock_waiters(fs: &InMemoryFS, ino: u64) {
-    fs.with_inner(OpTag::Lock, |inner| inner.wake_flock_waiters(ino));
+    fs.with_inner(OpTag::Lock, |inner| LockManager::wake_flock_waiters(inner, ino));
 }
 
 pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, op: i32) {
@@ -333,7 +411,7 @@ pub fn flock(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     }
 
     if base_op == libc::LOCK_UN {
-        inner.release_flock(ino, fh);
+        LockManager::release_flock(&mut inner, ino, fh);
         inner.defer(move || req.reply_err(0));
         return;
     }
@@ -436,7 +514,7 @@ pub(crate) fn grant_range_lock(
 }
 
 pub fn wake_range_lock_waiters(fs: &InMemoryFS, ino: u64) {
-    fs.with_inner(OpTag::Lock, |inner| inner.wake_range_lock_waiters(ino));
+    fs.with_inner(OpTag::Lock, |inner| LockManager::wake_range_lock_waiters(inner, ino));
 }
 
 // TODO(too-many-lines): extract this into smaller units.
@@ -468,7 +546,7 @@ pub fn setlk(fs: &InMemoryFS, req: Request, ino: u64, fh: u64, lock_owner: u64, 
     let req_type = lock.lock_type;
 
     if req_type == libc::F_UNLCK as i16 {
-        inner.unlock_range(ino, lock_owner, start, end);
+        LockManager::unlock_range(&mut inner, ino, lock_owner, start, end);
         inner.defer(move || req.reply_err(0));
         return;
     }
@@ -534,7 +612,7 @@ pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32)
         inner.validate_file_handle(ino, fh)?;
 
         if base_op == libc::LOCK_UN {
-            inner.release_flock(ino, fh);
+            LockManager::release_flock(inner, ino, fh);
             return Ok(());
         }
 
@@ -660,7 +738,7 @@ pub fn setlk_core(
             grant_range_lock(ranges, lock_owner, start, end, req_type, lock.pid);
             Ok(())
         } else if req_type == libc::F_UNLCK as i16 {
-            inner.unlock_range(ino, lock_owner, start, end);
+            LockManager::unlock_range(inner, ino, lock_owner, start, end);
             Ok(())
         } else {
             Err(libc::EINVAL)
@@ -807,11 +885,11 @@ mod tests {
         assert_eq!(lm.flock_waiter_count(), 1);
 
         // While ino is locked exclusively by fh=1, waking yields no ready requests
-        let ready = lm.wake_flock_waiters(ino);
+        let ready = lm.wake_flock_waiters_state(ino);
         assert!(ready.is_empty());
 
         // Release fh=1
-        let (canceled, ready) = lm.release_flock(ino, 1);
+        let (canceled, ready) = lm.release_flock_state(ino, 1);
         assert!(canceled.is_empty());
         assert_eq!(ready.len(), 1);
         assert_eq!(lm.flock_waiter_count(), 0);
@@ -839,7 +917,7 @@ mod tests {
         assert_eq!(lm.range_lock_waiter_count(), 1);
 
         // Release range locks for fh=1
-        let (canceled, ready) = lm.release_range_locks(ino, 1);
+        let (canceled, ready) = lm.release_range_locks_state(ino, 1);
         assert!(canceled.is_empty());
         assert_eq!(ready.len(), 1);
         assert_eq!(lm.range_lock_waiter_count(), 0);
@@ -873,12 +951,12 @@ mod tests {
             });
 
         // Releasing handle 10 when not last handle cancels range waiter for fh=10 and wakes flock waiter
-        let (canceled, ready) = lm.release_file_handle(false, ino, 10);
+        let (canceled, ready) = lm.release_file_handle_state(false, ino, 10);
         assert_eq!(canceled.len(), 1);
         assert_eq!(ready.len(), 1);
 
         // Releasing handle 10 when last handle clears all remaining range locks
-        let (canceled, ready) = lm.release_file_handle(true, ino, 10);
+        let (canceled, ready) = lm.release_file_handle_state(true, ino, 10);
         assert!(canceled.is_empty());
         assert!(ready.is_empty());
         assert!(!lm.range_lock_table.contains_key(&ino));

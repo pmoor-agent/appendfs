@@ -7,6 +7,7 @@
 
 use super::{DirHandle, FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
 use crate::node::AttrDelta;
+use crate::operations::locks::LockManager;
 use crate::sync::OpTag;
 use std::sync::Arc;
 
@@ -128,21 +129,23 @@ impl InMemoryFS {
                 true
             };
 
-            inner.release_file_handle_locks(is_last_handle, ino, fh);
+            LockManager::release_file_handle(inner, is_last_handle, ino, fh);
             Ok(())
         })
     }
 
     pub fn release_flock(&self, ino: u64, fh: u64) {
-        self.with_inner(OpTag::Handle, |inner| inner.release_flock(ino, fh));
+        self.with_inner(OpTag::Handle, |inner| LockManager::release_flock(inner, ino, fh));
     }
 
     pub fn cancel_range_lock_waiters(&self, ino: u64, fh: u64) {
-        self.with_inner(OpTag::Handle, |inner| inner.cancel_range_lock_waiters(ino, fh));
+        self.with_inner(OpTag::Handle, |inner| {
+            LockManager::cancel_range_lock_waiters(inner, ino, fh)
+        });
     }
 
     pub fn release_range_locks(&self, ino: u64, fh: u64) {
-        self.with_inner(OpTag::Handle, |inner| inner.release_range_locks(ino, fh));
+        self.with_inner(OpTag::Handle, |inner| LockManager::release_range_locks(inner, ino, fh));
     }
 
     pub fn open_count(&self, ino: u64) -> u32 {
