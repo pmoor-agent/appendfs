@@ -89,8 +89,6 @@ pub struct LockManager {
     pub range_lock_waiters: HashMap<u64, VecDeque<RangeLockWaiter>>,
 }
 
-pub type LockManagerState = LockManager;
-
 impl std::fmt::Debug for LockManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LockManager")

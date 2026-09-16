@@ -18,9 +18,7 @@ mod layers;
 mod overlay;
 pub mod virtual_files;
 
-pub use crate::operations::locks::{
-    FlockState, FlockWaiter, LockManager, LockManagerState, RangeLock, RangeLockWaiter,
-};
+pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
 pub use arena::WriteArena;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use overlay::{InnerStatsSnapshot, InodeCounts};
