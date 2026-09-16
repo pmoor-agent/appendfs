@@ -12,7 +12,10 @@
 #include <mutex>
 #include <sys/stat.h>
 
-typedef void *shim_req_t;
+struct shim_req_t {
+  fuse_req_t req;
+  void *userdata;
+};
 
 struct shim_file_attr {
   uint64_t ino;
@@ -57,48 +60,44 @@ struct shim_flock {
 
 extern "C" {
 
-typedef void (*shim_lookup_fn)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
-typedef void (*shim_getattr_fn)(shim_req_t req, uint64_t ino, void *userdata);
-typedef void (*shim_opendir_fn)(shim_req_t req, uint64_t ino, uint32_t flags, void *userdata);
-typedef void (*shim_readdir_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, uint64_t fh, void *userdata);
-typedef void (*shim_readdirplus_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, uint64_t fh,
-                                    void *userdata);
-typedef void (*shim_read_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, uint64_t fh, void *userdata);
-typedef void (*shim_open_fn)(shim_req_t req, uint64_t ino, uint32_t flags, void *userdata);
+typedef void (*shim_lookup_fn)(shim_req_t req, uint64_t parent, const char *name);
+typedef void (*shim_getattr_fn)(shim_req_t req, uint64_t ino);
+typedef void (*shim_opendir_fn)(shim_req_t req, uint64_t ino, uint32_t flags);
+typedef void (*shim_readdir_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, uint64_t fh);
+typedef void (*shim_readdirplus_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, uint64_t fh);
+typedef void (*shim_read_fn)(shim_req_t req, uint64_t ino, size_t size, int64_t off, uint64_t fh);
+typedef void (*shim_open_fn)(shim_req_t req, uint64_t ino, uint32_t flags);
 typedef void (*shim_write_fn)(shim_req_t req, uint64_t ino, const uint8_t *buf, size_t size, int64_t off,
-                              uint64_t fh, void *userdata);
+                              uint64_t fh);
 typedef void (*shim_setattr_fn)(shim_req_t req, uint64_t ino, uint32_t mode, uint32_t uid, uint32_t gid, int64_t size,
                                 int64_t atime_sec, uint32_t atime_nsec, int64_t mtime_sec, uint32_t mtime_nsec,
-                                uint32_t to_set, void *userdata);
-typedef void (*shim_create_fn)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, uint32_t flags,
-                               void *userdata);
-typedef void (*shim_mknod_fn)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, uint32_t rdev,
-                              void *userdata);
-typedef void (*shim_unlink_fn)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
-typedef void (*shim_mkdir_fn)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, void *userdata);
-typedef void (*shim_rmdir_fn)(shim_req_t req, uint64_t parent, const char *name, void *userdata);
-typedef void (*shim_symlink_fn)(shim_req_t req, const char *link, uint64_t parent, const char *name, void *userdata);
-typedef void (*shim_readlink_fn)(shim_req_t req, uint64_t ino, void *userdata);
+                                uint32_t to_set);
+typedef void (*shim_create_fn)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, uint32_t flags);
+typedef void (*shim_mknod_fn)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode, uint32_t rdev);
+typedef void (*shim_unlink_fn)(shim_req_t req, uint64_t parent, const char *name);
+typedef void (*shim_mkdir_fn)(shim_req_t req, uint64_t parent, const char *name, uint32_t mode);
+typedef void (*shim_rmdir_fn)(shim_req_t req, uint64_t parent, const char *name);
+typedef void (*shim_symlink_fn)(shim_req_t req, const char *link, uint64_t parent, const char *name);
+typedef void (*shim_readlink_fn)(shim_req_t req, uint64_t ino);
 typedef void (*shim_rename_fn)(shim_req_t req, uint64_t parent, const char *name, uint64_t newparent,
-                               const char *newname, void *userdata);
-typedef void (*shim_link_fn)(shim_req_t req, uint64_t ino, uint64_t newparent, const char *newname, void *userdata);
-typedef void (*shim_fsync_fn)(shim_req_t req, uint64_t ino, int datasync, uint64_t fh, void *userdata);
+                               const char *newname);
+typedef void (*shim_link_fn)(shim_req_t req, uint64_t ino, uint64_t newparent, const char *newname);
+typedef void (*shim_fsync_fn)(shim_req_t req, uint64_t ino, int datasync, uint64_t fh);
 typedef void (*shim_fallocate_fn)(shim_req_t req, uint64_t ino, int32_t mode, int64_t offset, int64_t length,
-                                  uint64_t fh, void *userdata);
-typedef void (*shim_release_fn)(shim_req_t req, uint64_t ino, uint64_t fh, void *userdata);
-typedef void (*shim_releasedir_fn)(shim_req_t req, uint64_t ino, uint64_t fh, void *userdata);
-typedef void (*shim_fsyncdir_fn)(shim_req_t req, uint64_t ino, int datasync, void *userdata);
-typedef void (*shim_statfs_fn)(shim_req_t req, uint64_t ino, void *userdata);
-typedef void (*shim_flock_fn)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner, int op, void *userdata);
-typedef void (*shim_getlk_fn)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner, struct shim_flock *lock,
-                              void *userdata);
+                                  uint64_t fh);
+typedef void (*shim_release_fn)(shim_req_t req, uint64_t ino, uint64_t fh);
+typedef void (*shim_releasedir_fn)(shim_req_t req, uint64_t ino, uint64_t fh);
+typedef void (*shim_fsyncdir_fn)(shim_req_t req, uint64_t ino, int datasync);
+typedef void (*shim_statfs_fn)(shim_req_t req, uint64_t ino);
+typedef void (*shim_flock_fn)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner, int op);
+typedef void (*shim_getlk_fn)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner, struct shim_flock *lock);
 typedef void (*shim_setlk_fn)(shim_req_t req, uint64_t ino, uint64_t fh, uint64_t lock_owner,
-                              const struct shim_flock *lock, int sleep, void *userdata);
-typedef void (*shim_getxattr_fn)(shim_req_t req, uint64_t ino, const char *name, size_t size, void *userdata);
+                              const struct shim_flock *lock, int sleep);
+typedef void (*shim_getxattr_fn)(shim_req_t req, uint64_t ino, const char *name, size_t size);
 typedef void (*shim_setxattr_fn)(shim_req_t req, uint64_t ino, const char *name, const char *value, size_t size,
-                                 int flags, void *userdata);
-typedef void (*shim_listxattr_fn)(shim_req_t req, uint64_t ino, size_t size, void *userdata);
-typedef void (*shim_removexattr_fn)(shim_req_t req, uint64_t ino, const char *name, void *userdata);
+                                 int flags);
+typedef void (*shim_listxattr_fn)(shim_req_t req, uint64_t ino, size_t size);
+typedef void (*shim_removexattr_fn)(shim_req_t req, uint64_t ino, const char *name);
 typedef void (*shim_init_fn)(void *userdata);
 typedef void (*shim_destroy_fn)(void *userdata);
 
@@ -151,7 +150,7 @@ static std::mutex global_mount_lock;
 static void ll_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.lookup) {
-    ctx->ops.lookup(static_cast<shim_req_t>(req), parent, name, ctx->userdata);
+    ctx->ops.lookup(shim_req_t{req, ctx->userdata}, parent, name);
   } else {
     fuse_reply_err(req, 38); // ENOSYS
   }
@@ -161,7 +160,7 @@ static void ll_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
   (void)fi;
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.getattr) {
-    ctx->ops.getattr(static_cast<shim_req_t>(req), ino, ctx->userdata);
+    ctx->ops.getattr(shim_req_t{req, ctx->userdata}, ino);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -170,7 +169,7 @@ static void ll_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 static void ll_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.opendir) {
-    ctx->ops.opendir(static_cast<shim_req_t>(req), ino, fi ? fi->flags : 0, ctx->userdata);
+    ctx->ops.opendir(shim_req_t{req, ctx->userdata}, ino, fi ? fi->flags : 0);
   } else {
     fuse_reply_open(req, fi);
   }
@@ -180,7 +179,7 @@ static void ll_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, s
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.readdir) {
     uint64_t fh = fi ? fi->fh : 0;
-    ctx->ops.readdir(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), fh, ctx->userdata);
+    ctx->ops.readdir(shim_req_t{req, ctx->userdata}, ino, size, static_cast<int64_t>(off), fh);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -190,7 +189,7 @@ static void ll_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t of
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.readdirplus) {
     uint64_t fh = fi ? fi->fh : 0;
-    ctx->ops.readdirplus(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), fh, ctx->userdata);
+    ctx->ops.readdirplus(shim_req_t{req, ctx->userdata}, ino, size, static_cast<int64_t>(off), fh);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -200,7 +199,7 @@ static void ll_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, stru
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.read) {
     uint64_t fh = fi ? fi->fh : 0;
-    ctx->ops.read(static_cast<shim_req_t>(req), ino, size, static_cast<int64_t>(off), fh, ctx->userdata);
+    ctx->ops.read(shim_req_t{req, ctx->userdata}, ino, size, static_cast<int64_t>(off), fh);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -209,7 +208,7 @@ static void ll_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, stru
 static void ll_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.open) {
-    ctx->ops.open(static_cast<shim_req_t>(req), ino, fi ? fi->flags : 0, ctx->userdata);
+    ctx->ops.open(shim_req_t{req, ctx->userdata}, ino, fi ? fi->flags : 0);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -220,8 +219,8 @@ static void ll_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t siz
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.write) {
     uint64_t fh = fi ? fi->fh : 0;
-    ctx->ops.write(static_cast<shim_req_t>(req), ino, reinterpret_cast<const uint8_t *>(buf), size,
-                   static_cast<int64_t>(off), fh, ctx->userdata);
+    ctx->ops.write(shim_req_t{req, ctx->userdata}, ino, reinterpret_cast<const uint8_t *>(buf), size,
+                   static_cast<int64_t>(off), fh);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -239,8 +238,8 @@ static void ll_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
     uint32_t atime_nsec = attr ? attr->st_atim.tv_nsec : 0;
     int64_t mtime_sec = attr ? attr->st_mtim.tv_sec : 0;
     uint32_t mtime_nsec = attr ? attr->st_mtim.tv_nsec : 0;
-    ctx->ops.setattr(static_cast<shim_req_t>(req), ino, mode, uid, gid, size, atime_sec, atime_nsec, mtime_sec,
-                     mtime_nsec, static_cast<uint32_t>(to_set), ctx->userdata);
+    ctx->ops.setattr(shim_req_t{req, ctx->userdata}, ino, mode, uid, gid, size, atime_sec, atime_nsec, mtime_sec,
+                     mtime_nsec, static_cast<uint32_t>(to_set));
   } else {
     fuse_reply_err(req, 38);
   }
@@ -249,8 +248,7 @@ static void ll_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
 static void ll_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, struct fuse_file_info *fi) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.create) {
-    ctx->ops.create(static_cast<shim_req_t>(req), parent, name, static_cast<uint32_t>(mode), fi ? fi->flags : 0,
-                    ctx->userdata);
+    ctx->ops.create(shim_req_t{req, ctx->userdata}, parent, name, static_cast<uint32_t>(mode), fi ? fi->flags : 0);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -259,8 +257,8 @@ static void ll_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
 static void ll_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev_t rdev) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.mknod) {
-    ctx->ops.mknod(static_cast<shim_req_t>(req), parent, name, static_cast<uint32_t>(mode),
-                   static_cast<uint32_t>(rdev), ctx->userdata);
+    ctx->ops.mknod(shim_req_t{req, ctx->userdata}, parent, name, static_cast<uint32_t>(mode),
+                   static_cast<uint32_t>(rdev));
   } else {
     fuse_reply_err(req, 38);
   }
@@ -269,7 +267,7 @@ static void ll_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
 static void ll_unlink(fuse_req_t req, fuse_ino_t parent, const char *name) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.unlink) {
-    ctx->ops.unlink(static_cast<shim_req_t>(req), parent, name, ctx->userdata);
+    ctx->ops.unlink(shim_req_t{req, ctx->userdata}, parent, name);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -278,7 +276,7 @@ static void ll_unlink(fuse_req_t req, fuse_ino_t parent, const char *name) {
 static void ll_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.mkdir) {
-    ctx->ops.mkdir(static_cast<shim_req_t>(req), parent, name, static_cast<uint32_t>(mode), ctx->userdata);
+    ctx->ops.mkdir(shim_req_t{req, ctx->userdata}, parent, name, static_cast<uint32_t>(mode));
   } else {
     fuse_reply_err(req, 38);
   }
@@ -287,7 +285,7 @@ static void ll_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
 static void ll_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.rmdir) {
-    ctx->ops.rmdir(static_cast<shim_req_t>(req), parent, name, ctx->userdata);
+    ctx->ops.rmdir(shim_req_t{req, ctx->userdata}, parent, name);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -296,7 +294,7 @@ static void ll_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name) {
 static void ll_symlink(fuse_req_t req, const char *link, fuse_ino_t parent, const char *name) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.symlink) {
-    ctx->ops.symlink(static_cast<shim_req_t>(req), link, parent, name, ctx->userdata);
+    ctx->ops.symlink(shim_req_t{req, ctx->userdata}, link, parent, name);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -305,7 +303,7 @@ static void ll_symlink(fuse_req_t req, const char *link, fuse_ino_t parent, cons
 static void ll_readlink(fuse_req_t req, fuse_ino_t ino) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.readlink) {
-    ctx->ops.readlink(static_cast<shim_req_t>(req), ino, ctx->userdata);
+    ctx->ops.readlink(shim_req_t{req, ctx->userdata}, ino);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -316,7 +314,7 @@ static void ll_rename(fuse_req_t req, fuse_ino_t parent, const char *name, fuse_
   (void)flags;
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.rename) {
-    ctx->ops.rename(static_cast<shim_req_t>(req), parent, name, newparent, newname, ctx->userdata);
+    ctx->ops.rename(shim_req_t{req, ctx->userdata}, parent, name, newparent, newname);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -325,7 +323,7 @@ static void ll_rename(fuse_req_t req, fuse_ino_t parent, const char *name, fuse_
 static void ll_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newname) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.link) {
-    ctx->ops.link(static_cast<shim_req_t>(req), ino, newparent, newname, ctx->userdata);
+    ctx->ops.link(shim_req_t{req, ctx->userdata}, ino, newparent, newname);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -335,7 +333,7 @@ static void ll_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_f
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.fsync) {
     uint64_t fh = fi ? fi->fh : 0;
-    ctx->ops.fsync(static_cast<shim_req_t>(req), ino, datasync, fh, ctx->userdata);
+    ctx->ops.fsync(shim_req_t{req, ctx->userdata}, ino, datasync, fh);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -346,8 +344,8 @@ static void ll_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.fallocate) {
     uint64_t fh = fi ? fi->fh : 0;
-    ctx->ops.fallocate(static_cast<shim_req_t>(req), ino, static_cast<int32_t>(mode),
-                       static_cast<int64_t>(offset), static_cast<int64_t>(length), fh, ctx->userdata);
+    ctx->ops.fallocate(shim_req_t{req, ctx->userdata}, ino, static_cast<int32_t>(mode),
+                       static_cast<int64_t>(offset), static_cast<int64_t>(length), fh);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -357,7 +355,7 @@ static void ll_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.release) {
     uint64_t fh = fi ? fi->fh : 0;
-    ctx->ops.release(static_cast<shim_req_t>(req), ino, fh, ctx->userdata);
+    ctx->ops.release(shim_req_t{req, ctx->userdata}, ino, fh);
   } else {
     fuse_reply_err(req, 0);
   }
@@ -367,7 +365,7 @@ static void ll_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.releasedir) {
     uint64_t fh = fi ? fi->fh : 0;
-    ctx->ops.releasedir(static_cast<shim_req_t>(req), ino, fh, ctx->userdata);
+    ctx->ops.releasedir(shim_req_t{req, ctx->userdata}, ino, fh);
   } else {
     fuse_reply_err(req, 0);
   }
@@ -377,7 +375,7 @@ static void ll_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fus
   (void)fi;
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.fsyncdir) {
-    ctx->ops.fsyncdir(static_cast<shim_req_t>(req), ino, datasync, ctx->userdata);
+    ctx->ops.fsyncdir(shim_req_t{req, ctx->userdata}, ino, datasync);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -386,7 +384,7 @@ static void ll_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fus
 static void ll_statfs(fuse_req_t req, fuse_ino_t ino) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.statfs) {
-    ctx->ops.statfs(static_cast<shim_req_t>(req), ino, ctx->userdata);
+    ctx->ops.statfs(shim_req_t{req, ctx->userdata}, ino);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -397,7 +395,7 @@ static void ll_flock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, 
   if (ctx && ctx->ops.flock) {
     uint64_t fh = fi ? fi->fh : 0;
     uint64_t lock_owner = fi ? fi->lock_owner : 0;
-    ctx->ops.flock(static_cast<shim_req_t>(req), ino, fh, lock_owner, op, ctx->userdata);
+    ctx->ops.flock(shim_req_t{req, ctx->userdata}, ino, fh, lock_owner, op);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -414,7 +412,7 @@ static void ll_getlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, 
     sh_lock.start = lock->l_start;
     sh_lock.len = lock->l_len;
     sh_lock.pid = lock->l_pid;
-    ctx->ops.getlk(static_cast<shim_req_t>(req), ino, fh, lock_owner, &sh_lock, ctx->userdata);
+    ctx->ops.getlk(shim_req_t{req, ctx->userdata}, ino, fh, lock_owner, &sh_lock);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -431,7 +429,7 @@ static void ll_setlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, 
     sh_lock.start = lock->l_start;
     sh_lock.len = lock->l_len;
     sh_lock.pid = lock->l_pid;
-    ctx->ops.setlk(static_cast<shim_req_t>(req), ino, fh, lock_owner, &sh_lock, sleep, ctx->userdata);
+    ctx->ops.setlk(shim_req_t{req, ctx->userdata}, ino, fh, lock_owner, &sh_lock, sleep);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -440,7 +438,7 @@ static void ll_setlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, 
 static void ll_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.getxattr && name) {
-    ctx->ops.getxattr(static_cast<shim_req_t>(req), ino, name, size, ctx->userdata);
+    ctx->ops.getxattr(shim_req_t{req, ctx->userdata}, ino, name, size);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -449,7 +447,7 @@ static void ll_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t
 static void ll_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.setxattr && name) {
-    ctx->ops.setxattr(static_cast<shim_req_t>(req), ino, name, value, size, flags, ctx->userdata);
+    ctx->ops.setxattr(shim_req_t{req, ctx->userdata}, ino, name, value, size, flags);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -458,7 +456,7 @@ static void ll_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, const 
 static void ll_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.listxattr) {
-    ctx->ops.listxattr(static_cast<shim_req_t>(req), ino, size, ctx->userdata);
+    ctx->ops.listxattr(shim_req_t{req, ctx->userdata}, ino, size);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -467,7 +465,7 @@ static void ll_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) {
 static void ll_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name) {
   auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
   if (ctx && ctx->ops.removexattr && name) {
-    ctx->ops.removexattr(static_cast<shim_req_t>(req), ino, name, ctx->userdata);
+    ctx->ops.removexattr(shim_req_t{req, ctx->userdata}, ino, name);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -671,51 +669,51 @@ inline void populate_fuse_entry(const shim_file_attr *attr, double attr_timeout,
 
 } // namespace
 
-int shim_reply_err(shim_req_t req, int err) { return fuse_reply_err(static_cast<fuse_req_t>(req), err); }
+int shim_reply_err(fuse_req_t req, int err) { return fuse_reply_err(req, err); }
 
-int shim_reply_entry(shim_req_t req, const shim_file_attr *attr, double attr_timeout, double entry_timeout) {
+int shim_reply_entry(fuse_req_t req, const shim_file_attr *attr, double attr_timeout, double entry_timeout) {
   struct fuse_entry_param e = {};
   populate_fuse_entry(attr, attr_timeout, entry_timeout, &e);
-  return fuse_reply_entry(static_cast<fuse_req_t>(req), &e);
+  return fuse_reply_entry(req, &e);
 }
 
-int shim_reply_attr(shim_req_t req, const shim_file_attr *attr, double attr_timeout) {
+int shim_reply_attr(fuse_req_t req, const shim_file_attr *attr, double attr_timeout) {
   struct stat stbuf = {};
   if (attr) {
     populate_stat(attr, &stbuf);
   }
-  return fuse_reply_attr(static_cast<fuse_req_t>(req), &stbuf, attr_timeout);
+  return fuse_reply_attr(req, &stbuf, attr_timeout);
 }
 
-int shim_reply_buf(shim_req_t req, const char *buf, size_t size) {
-  return fuse_reply_buf(static_cast<fuse_req_t>(req), buf, size);
+int shim_reply_buf(fuse_req_t req, const char *buf, size_t size) {
+  return fuse_reply_buf(req, buf, size);
 }
 
-int shim_reply_open(shim_req_t req, uint64_t fh, bool direct_io) {
+int shim_reply_open(fuse_req_t req, uint64_t fh, bool direct_io) {
   struct fuse_file_info fi = {};
   fi.fh = fh;
   if (direct_io) {
     fi.direct_io = 1;
   }
-  return fuse_reply_open(static_cast<fuse_req_t>(req), &fi);
+  return fuse_reply_open(req, &fi);
 }
 
-int shim_reply_write(shim_req_t req, size_t count) { return fuse_reply_write(static_cast<fuse_req_t>(req), count); }
+int shim_reply_write(fuse_req_t req, size_t count) { return fuse_reply_write(req, count); }
 
-int shim_reply_create(shim_req_t req, const shim_file_attr *attr, double attr_timeout, double entry_timeout,
+int shim_reply_create(fuse_req_t req, const shim_file_attr *attr, double attr_timeout, double entry_timeout,
                       uint64_t fh) {
   struct fuse_entry_param e = {};
   populate_fuse_entry(attr, attr_timeout, entry_timeout, &e);
   struct fuse_file_info fi = {};
   fi.fh = fh;
-  return fuse_reply_create(static_cast<fuse_req_t>(req), &e, &fi);
+  return fuse_reply_create(req, &e, &fi);
 }
 
-int shim_reply_readlink(shim_req_t req, const char *link) {
-  return fuse_reply_readlink(static_cast<fuse_req_t>(req), link);
+int shim_reply_readlink(fuse_req_t req, const char *link) {
+  return fuse_reply_readlink(req, link);
 }
 
-int shim_reply_statfs(shim_req_t req, const shim_statfs_attr *attr) {
+int shim_reply_statfs(fuse_req_t req, const shim_statfs_attr *attr) {
   struct statvfs stbuf = {};
   if (attr) {
     stbuf.f_bsize = attr->bsize;
@@ -728,12 +726,12 @@ int shim_reply_statfs(shim_req_t req, const shim_statfs_attr *attr) {
     stbuf.f_favail = attr->ffree;
     stbuf.f_namemax = attr->namelen;
   }
-  return fuse_reply_statfs(static_cast<fuse_req_t>(req), &stbuf);
+  return fuse_reply_statfs(req, &stbuf);
 }
 
-int shim_reply_lock(shim_req_t req, const struct shim_flock *lock) {
+int shim_reply_lock(fuse_req_t req, const struct shim_flock *lock) {
   if (!lock) {
-    return fuse_reply_err(static_cast<fuse_req_t>(req), EINVAL);
+    return fuse_reply_err(req, EINVAL);
   }
   struct flock fl = {};
   fl.l_type = lock->type;
@@ -741,30 +739,30 @@ int shim_reply_lock(shim_req_t req, const struct shim_flock *lock) {
   fl.l_start = lock->start;
   fl.l_len = lock->len;
   fl.l_pid = lock->pid;
-  return fuse_reply_lock(static_cast<fuse_req_t>(req), &fl);
+  return fuse_reply_lock(req, &fl);
 }
 
-int shim_reply_xattr(shim_req_t req, size_t count) {
-  return fuse_reply_xattr(static_cast<fuse_req_t>(req), count);
+int shim_reply_xattr(fuse_req_t req, size_t count) {
+  return fuse_reply_xattr(req, count);
 }
 
-size_t shim_add_direntry(shim_req_t req, char *buf, size_t bufsize, const char *name, uint64_t ino, uint32_t mode,
+size_t shim_add_direntry(fuse_req_t req, char *buf, size_t bufsize, const char *name, uint64_t ino, uint32_t mode,
                          int64_t off) {
   struct stat stbuf = {};
   stbuf.st_ino = ino;
   stbuf.st_mode = mode;
-  return fuse_add_direntry(static_cast<fuse_req_t>(req), buf, bufsize, name, &stbuf, static_cast<off_t>(off));
+  return fuse_add_direntry(req, buf, bufsize, name, &stbuf, static_cast<off_t>(off));
 }
 
-size_t shim_add_direntry_plus(shim_req_t req, char *buf, size_t bufsize, const char *name, const shim_file_attr *attr,
+size_t shim_add_direntry_plus(fuse_req_t req, char *buf, size_t bufsize, const char *name, const shim_file_attr *attr,
                               double attr_timeout, double entry_timeout, int64_t off) {
   struct fuse_entry_param e = {};
   populate_fuse_entry(attr, attr_timeout, entry_timeout, &e);
-  return fuse_add_direntry_plus(static_cast<fuse_req_t>(req), buf, bufsize, name, &e, static_cast<off_t>(off));
+  return fuse_add_direntry_plus(req, buf, bufsize, name, &e, static_cast<off_t>(off));
 }
 
-shim_fuse_ctx fuse_req_ctx_shim(shim_req_t req) {
-  const struct fuse_ctx *ctx = fuse_req_ctx(static_cast<fuse_req_t>(req));
+shim_fuse_ctx fuse_req_ctx_shim(fuse_req_t req) {
+  const struct fuse_ctx *ctx = fuse_req_ctx(req);
   shim_fuse_ctx result = {};
   if (ctx) {
     result.uid = ctx->uid;

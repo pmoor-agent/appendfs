@@ -40,13 +40,14 @@ pub use dump::{dump_file, dump_log_file, dump_log_reader, dump_summary_file, dum
 pub use extent_map::{Extent, ExtentEntry, ExtentMap};
 pub use fs::{
     BatchCompletion, FLUSH_HISTORY_CAPACITY, FlushReason, FlushRecord, FlushStats, InMemoryFS, InnerStatsSnapshot,
-    InodeCounts,
+    InodeCounts, OpTier,
 };
 pub use log::{
     ExtentState, LogFileCache, LogReader, LogRecord, LogWriter, RecoveryTarget, SharedExtentState, SummaryFooter,
     SummaryHeader, SummaryReader, export_summary, init_volume, init_volume_with_clock, recover_fs,
 };
 pub use node::{InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta};
+pub use operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics};
 pub use remote::{
     BatchLeaderGuard, BlockCache, ConcurrencyLimiter, ConcurrencyPermit, ConfiguredRemote,
     DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, FollowerBlock, MemoryBlockCache, OnDiskBlockCache,
@@ -58,9 +59,9 @@ pub use remote::{
 pub use remote::{CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, MockRemoteStore, RemoteStoreMetrics};
 pub use shim::{
     DeferredCallback, DeferredCompletion, DeferredReceiver, DeferredResult, DeferredToken, DirEntry, DirEntryPlus,
-    FileAttr, FileType, Filesystem, FuseResponse, ReplyData, RequestContext, StatfsAttr,
+    FileAttr, FileType, Filesystem, FuseResponse, ReplyData, Request, RequestContext, StatfsAttr,
 };
-pub use stats::VolumeStats;
+pub use stats::{VolumeStats, format_runtime_status};
 pub use storage::{FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter, WriteMode};
 pub use sync::{ActionGuard, ActionMutex, OpStatSnapshot, OpTag, PostUnlockQueue};
 #[cfg(any(test, feature = "testing"))]

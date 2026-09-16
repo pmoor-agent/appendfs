@@ -1,4 +1,5 @@
 use crate::clock::system_time_to_unix;
+use crate::operations::op::FuseOp;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
@@ -73,11 +74,8 @@ struct ShimStatfsAttr {
     namelen: u32,
 }
 
-#[allow(non_camel_case_types)]
-type shim_req_t = *mut c_void;
-
 type ShimSetattrCallback = extern "C" fn(
-    req: shim_req_t,
+    req: Request,
     ino: u64,
     mode: u32,
     uid: u32,
@@ -88,7 +86,6 @@ type ShimSetattrCallback = extern "C" fn(
     mtime_sec: i64,
     mtime_nsec: u32,
     to_set: u32,
-    userdata: *mut c_void,
 );
 
 #[repr(C)]
@@ -103,80 +100,40 @@ pub struct ShimFlock {
 
 #[repr(C)]
 struct RustLowlevelOps {
-    lookup: Option<extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void)>,
-    getattr: Option<extern "C" fn(req: shim_req_t, ino: u64, userdata: *mut c_void)>,
-    opendir: Option<extern "C" fn(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void)>,
-    readdir: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void)>,
-    readdirplus:
-        Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void)>,
-    read: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void)>,
-    open: Option<extern "C" fn(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void)>,
-    write: Option<
-        extern "C" fn(req: shim_req_t, ino: u64, buf: *const u8, size: usize, off: i64, fh: u64, userdata: *mut c_void),
-    >,
+    lookup: Option<extern "C" fn(req: Request, parent: u64, name: *const c_char)>,
+    getattr: Option<extern "C" fn(req: Request, ino: u64)>,
+    opendir: Option<extern "C" fn(req: Request, ino: u64, flags: u32)>,
+    readdir: Option<extern "C" fn(req: Request, ino: u64, size: usize, off: i64, fh: u64)>,
+    readdirplus: Option<extern "C" fn(req: Request, ino: u64, size: usize, off: i64, fh: u64)>,
+    read: Option<extern "C" fn(req: Request, ino: u64, size: usize, off: i64, fh: u64)>,
+    open: Option<extern "C" fn(req: Request, ino: u64, flags: u32)>,
+    write: Option<extern "C" fn(req: Request, ino: u64, buf: *const u8, size: usize, off: i64, fh: u64)>,
     setattr: Option<ShimSetattrCallback>,
-    create: Option<
-        extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, mode: u32, flags: u32, userdata: *mut c_void),
-    >,
-    mknod: Option<
-        extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, mode: u32, rdev: u32, userdata: *mut c_void),
-    >,
-    unlink: Option<extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void)>,
-    mkdir: Option<extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, mode: u32, userdata: *mut c_void)>,
-    rmdir: Option<extern "C" fn(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void)>,
-    symlink: Option<
-        extern "C" fn(req: shim_req_t, link: *const c_char, parent: u64, name: *const c_char, userdata: *mut c_void),
-    >,
-    readlink: Option<extern "C" fn(req: shim_req_t, ino: u64, userdata: *mut c_void)>,
-    rename: Option<
-        extern "C" fn(
-            req: shim_req_t,
-            parent: u64,
-            name: *const c_char,
-            newparent: u64,
-            newname: *const c_char,
-            userdata: *mut c_void,
-        ),
-    >,
-    link:
-        Option<extern "C" fn(req: shim_req_t, ino: u64, newparent: u64, newname: *const c_char, userdata: *mut c_void)>,
-    fsync: Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, fh: u64, userdata: *mut c_void)>,
-    fallocate: Option<
-        extern "C" fn(req: shim_req_t, ino: u64, mode: i32, offset: i64, length: i64, fh: u64, userdata: *mut c_void),
-    >,
-    release: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void)>,
-    releasedir: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void)>,
-    fsyncdir: Option<extern "C" fn(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void)>,
-    statfs: Option<extern "C" fn(req: shim_req_t, ino: u64, userdata: *mut c_void)>,
-    flock: Option<extern "C" fn(req: shim_req_t, ino: u64, fh: u64, lock_owner: u64, op: c_int, userdata: *mut c_void)>,
-    getlk: Option<
-        extern "C" fn(req: shim_req_t, ino: u64, fh: u64, lock_owner: u64, lock: *mut ShimFlock, userdata: *mut c_void),
-    >,
-    setlk: Option<
-        extern "C" fn(
-            req: shim_req_t,
-            ino: u64,
-            fh: u64,
-            lock_owner: u64,
-            lock: *const ShimFlock,
-            sleep: c_int,
-            userdata: *mut c_void,
-        ),
-    >,
-    getxattr: Option<extern "C" fn(req: shim_req_t, ino: u64, name: *const c_char, size: usize, userdata: *mut c_void)>,
-    setxattr: Option<
-        extern "C" fn(
-            req: shim_req_t,
-            ino: u64,
-            name: *const c_char,
-            value: *const u8,
-            size: usize,
-            flags: c_int,
-            userdata: *mut c_void,
-        ),
-    >,
-    listxattr: Option<extern "C" fn(req: shim_req_t, ino: u64, size: usize, userdata: *mut c_void)>,
-    removexattr: Option<extern "C" fn(req: shim_req_t, ino: u64, name: *const c_char, userdata: *mut c_void)>,
+    create: Option<extern "C" fn(req: Request, parent: u64, name: *const c_char, mode: u32, flags: u32)>,
+    mknod: Option<extern "C" fn(req: Request, parent: u64, name: *const c_char, mode: u32, rdev: u32)>,
+    unlink: Option<extern "C" fn(req: Request, parent: u64, name: *const c_char)>,
+    mkdir: Option<extern "C" fn(req: Request, parent: u64, name: *const c_char, mode: u32)>,
+    rmdir: Option<extern "C" fn(req: Request, parent: u64, name: *const c_char)>,
+    symlink: Option<extern "C" fn(req: Request, link: *const c_char, parent: u64, name: *const c_char)>,
+    readlink: Option<extern "C" fn(req: Request, ino: u64)>,
+    rename:
+        Option<extern "C" fn(req: Request, parent: u64, name: *const c_char, newparent: u64, newname: *const c_char)>,
+    link: Option<extern "C" fn(req: Request, ino: u64, newparent: u64, newname: *const c_char)>,
+    fsync: Option<extern "C" fn(req: Request, ino: u64, datasync: c_int, fh: u64)>,
+    fallocate: Option<extern "C" fn(req: Request, ino: u64, mode: i32, offset: i64, length: i64, fh: u64)>,
+    release: Option<extern "C" fn(req: Request, ino: u64, fh: u64)>,
+    releasedir: Option<extern "C" fn(req: Request, ino: u64, fh: u64)>,
+    fsyncdir: Option<extern "C" fn(req: Request, ino: u64, datasync: c_int)>,
+    statfs: Option<extern "C" fn(req: Request, ino: u64)>,
+    flock: Option<extern "C" fn(req: Request, ino: u64, fh: u64, lock_owner: u64, op: c_int)>,
+    getlk: Option<extern "C" fn(req: Request, ino: u64, fh: u64, lock_owner: u64, lock: *mut ShimFlock)>,
+    setlk:
+        Option<extern "C" fn(req: Request, ino: u64, fh: u64, lock_owner: u64, lock: *const ShimFlock, sleep: c_int)>,
+    getxattr: Option<extern "C" fn(req: Request, ino: u64, name: *const c_char, size: usize)>,
+    setxattr:
+        Option<extern "C" fn(req: Request, ino: u64, name: *const c_char, value: *const u8, size: usize, flags: c_int)>,
+    listxattr: Option<extern "C" fn(req: Request, ino: u64, size: usize)>,
+    removexattr: Option<extern "C" fn(req: Request, ino: u64, name: *const c_char)>,
     init: Option<extern "C" fn(userdata: *mut c_void)>,
     destroy: Option<extern "C" fn(userdata: *mut c_void)>,
 }
@@ -189,8 +146,15 @@ struct FuseCtx {
     umask: libc::mode_t,
 }
 
+/// Opaque handle to underlying FUSE request.
+#[repr(C)]
+pub struct FuseReq {
+    _private: [u8; 0],
+}
+pub type FuseReqT = *mut FuseReq;
+
 unsafe extern "C" {
-    fn fuse_req_ctx_shim(req: *mut c_void) -> FuseCtx;
+    fn fuse_req_ctx_shim(req: FuseReqT) -> FuseCtx;
     fn run_fuse_ll(
         argc: c_int,
         argv: *const *const c_char,
@@ -198,26 +162,26 @@ unsafe extern "C" {
         userdata: *mut c_void,
     ) -> c_int;
 
-    fn shim_reply_err(req: shim_req_t, err: c_int) -> c_int;
-    fn shim_reply_entry(req: shim_req_t, attr: *const ShimFileAttr, attr_timeout: f64, entry_timeout: f64) -> c_int;
-    fn shim_reply_attr(req: shim_req_t, attr: *const ShimFileAttr, attr_timeout: f64) -> c_int;
-    fn shim_reply_buf(req: shim_req_t, buf: *const u8, size: usize) -> c_int;
-    fn shim_reply_open(req: shim_req_t, fh: u64, direct_io: bool) -> c_int;
-    fn shim_reply_write(req: shim_req_t, count: usize) -> c_int;
+    fn shim_reply_err(req: FuseReqT, err: c_int) -> c_int;
+    fn shim_reply_entry(req: FuseReqT, attr: *const ShimFileAttr, attr_timeout: f64, entry_timeout: f64) -> c_int;
+    fn shim_reply_attr(req: FuseReqT, attr: *const ShimFileAttr, attr_timeout: f64) -> c_int;
+    fn shim_reply_buf(req: FuseReqT, buf: *const u8, size: usize) -> c_int;
+    fn shim_reply_open(req: FuseReqT, fh: u64, direct_io: bool) -> c_int;
+    fn shim_reply_write(req: FuseReqT, count: usize) -> c_int;
     fn shim_reply_create(
-        req: shim_req_t,
+        req: FuseReqT,
         attr: *const ShimFileAttr,
         attr_timeout: f64,
         entry_timeout: f64,
         fh: u64,
     ) -> c_int;
-    fn shim_reply_readlink(req: shim_req_t, link: *const c_char) -> c_int;
-    fn shim_reply_statfs(req: shim_req_t, attr: *const ShimStatfsAttr) -> c_int;
-    fn shim_reply_lock(req: shim_req_t, lock: *const ShimFlock) -> c_int;
-    fn shim_reply_xattr(req: shim_req_t, count: usize) -> c_int;
+    fn shim_reply_readlink(req: FuseReqT, link: *const c_char) -> c_int;
+    fn shim_reply_statfs(req: FuseReqT, attr: *const ShimStatfsAttr) -> c_int;
+    fn shim_reply_lock(req: FuseReqT, lock: *const ShimFlock) -> c_int;
+    fn shim_reply_xattr(req: FuseReqT, count: usize) -> c_int;
 
     fn shim_add_direntry(
-        req: shim_req_t,
+        req: FuseReqT,
         buf: *mut c_char,
         bufsize: usize,
         name: *const c_char,
@@ -226,7 +190,7 @@ unsafe extern "C" {
         off: i64,
     ) -> usize;
     fn shim_add_direntry_plus(
-        req: shim_req_t,
+        req: FuseReqT,
         buf: *mut c_char,
         bufsize: usize,
         name: *const c_char,
@@ -269,19 +233,27 @@ fn convert_file_attr(attr: &FileAttr) -> ShimFileAttr {
     }
 }
 
+#[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct Request {
-    pub(crate) req: shim_req_t,
+pub struct Request {
+    pub req: FuseReqT,
+    pub userdata: *mut c_void,
 }
 
 unsafe impl Send for Request {}
 
 impl Request {
-    #[cfg(test)]
-    pub(crate) fn new_mock() -> Self {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_mock() -> Self {
         Self {
             req: std::ptr::null_mut(),
+            userdata: std::ptr::null_mut(),
         }
+    }
+
+    #[inline]
+    pub(crate) fn fs(&self) -> &crate::fs::InMemoryFS {
+        unsafe { &*(self.userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) }
     }
 
     pub(crate) fn reply_err(self, err: i32) {
@@ -418,8 +390,7 @@ impl Request {
             return RequestContext::default();
         }
         unsafe {
-            let fuse_req = self.req as *mut c_void;
-            let ctx = fuse_req_ctx_shim(fuse_req);
+            let ctx = fuse_req_ctx_shim(self.req);
             RequestContext {
                 uid: ctx.uid,
                 gid: ctx.gid,
@@ -887,22 +858,6 @@ impl<T> Drop for DeferredToken<T> {
     }
 }
 
-/// Dispatches a `FuseResponse` result (either immediately or asynchronously) to a FUSE request.
-#[inline]
-pub(crate) fn dispatch_reply(req: Request, res: impl Into<DeferredResult<FuseResponse<'static>>>) {
-    let deferred = res.into();
-    match deferred {
-        DeferredResult::Ready(result) => {
-            reply_result(req, result);
-        }
-        DeferredResult::Deferred(completion) => {
-            completion.on_complete(Box::new(move |result| {
-                reply_result(req, result);
-            }));
-        }
-    }
-}
-
 struct DirBufCore {
     req: Request,
     buf: Vec<u8>,
@@ -922,7 +877,7 @@ impl DirBufCore {
 
     fn fill<F>(&mut self, name: &str, fill_fn: F) -> bool
     where
-        F: FnOnce(shim_req_t, *mut c_char, usize, *const c_char) -> usize,
+        F: FnOnce(FuseReqT, *mut c_char, usize, *const c_char) -> usize,
     {
         if self.full {
             return false;
@@ -1127,65 +1082,69 @@ pub trait Filesystem {
     fn removexattr(&self, ino: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
 }
 
+#[inline]
+fn c_str_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+}
+
+fn handle_op<R>(req: Request, op: FuseOp, f: impl FnOnce(&crate::fs::InMemoryFS) -> R)
+where
+    R: Into<DeferredResult<FuseResponse<'static>>>,
+{
+    let fs = req.fs();
+    let start = fs.clock.monotonic();
+    let res = f(fs);
+    fs.dispatch_reply(req, op, res, start);
+}
+
 // Lowlevel C callback bridges
-extern "C" fn lookup_bridge(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::ENOENT);
-            return;
-        }
-    };
-    dispatch_reply(Request { req }, fs.lookup(parent, name_str));
+extern "C" fn lookup_bridge(req: Request, parent: u64, name: *const c_char) {
+    handle_op(req, FuseOp::Lookup, |fs| {
+        let name_str = c_str_to_str(name).ok_or(libc::ENOENT)?;
+        fs.lookup(parent, name_str)
+    });
 }
 
-extern "C" fn getattr_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.getattr(ino));
+extern "C" fn getattr_bridge(req: Request, ino: u64) {
+    handle_op(req, FuseOp::Getattr, |fs| fs.getattr(ino));
 }
 
-extern "C" fn opendir_bridge(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.opendir(ino, flags));
+extern "C" fn opendir_bridge(req: Request, ino: u64, flags: u32) {
+    handle_op(req, FuseOp::Opendir, |fs| fs.opendir(ino, flags));
 }
 
-extern "C" fn readdir_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.readdir(ino, size, off, fh));
+extern "C" fn readdir_bridge(req: Request, ino: u64, size: usize, off: i64, fh: u64) {
+    handle_op(req, FuseOp::Readdir, |fs| fs.readdir(ino, size, off, fh));
 }
 
-extern "C" fn readdirplus_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.readdirplus(ino, size, off, fh));
+extern "C" fn readdirplus_bridge(req: Request, ino: u64, size: usize, off: i64, fh: u64) {
+    handle_op(req, FuseOp::Readdirplus, |fs| fs.readdirplus(ino, size, off, fh));
 }
 
-extern "C" fn read_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.read(ino, size, off, fh));
+extern "C" fn read_bridge(req: Request, ino: u64, size: usize, off: i64, fh: u64) {
+    handle_op(req, FuseOp::Read, |fs| fs.read(ino, size, off, fh));
 }
 
-extern "C" fn open_bridge(req: shim_req_t, ino: u64, flags: u32, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.open(ino, flags));
+extern "C" fn open_bridge(req: Request, ino: u64, flags: u32) {
+    handle_op(req, FuseOp::Open, |fs| fs.open(ino, flags));
 }
 
-extern "C" fn write_bridge(
-    req: shim_req_t,
-    ino: u64,
-    buf: *const u8,
-    size: usize,
-    off: i64,
-    fh: u64,
-    userdata: *mut c_void,
-) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let buf_slice = unsafe { std::slice::from_raw_parts(buf, size) };
-    dispatch_reply(Request { req }, fs.write(ino, buf_slice, off, fh));
+extern "C" fn write_bridge(req: Request, ino: u64, buf: *const u8, size: usize, off: i64, fh: u64) {
+    handle_op(req, FuseOp::Write, |fs| {
+        let buf_slice = if size > 0 && !buf.is_null() {
+            unsafe { std::slice::from_raw_parts(buf, size) }
+        } else {
+            &[]
+        };
+        fs.write(ino, buf_slice, off, fh)
+    });
 }
 
 extern "C" fn setattr_bridge(
-    req: shim_req_t,
+    req: Request,
     ino: u64,
     mode: u32,
     uid: u32,
@@ -1196,293 +1155,153 @@ extern "C" fn setattr_bridge(
     mtime_sec: i64,
     mtime_nsec: u32,
     to_set: u32,
-    userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let atime = crate::clock::unix_to_system_time(atime_sec, atime_nsec);
-    let mtime = crate::clock::unix_to_system_time(mtime_sec, mtime_nsec);
-    dispatch_reply(
-        Request { req },
-        fs.setattr(ino, mode, uid, gid, size, atime, mtime, to_set),
-    );
+    handle_op(req, FuseOp::Setattr, |fs| {
+        let atime = crate::clock::unix_to_system_time(atime_sec, atime_nsec);
+        let mtime = crate::clock::unix_to_system_time(mtime_sec, mtime_nsec);
+        fs.setattr(ino, mode, uid, gid, size, atime, mtime, to_set)
+    });
 }
 
-extern "C" fn create_bridge(
-    req: shim_req_t,
-    parent: u64,
-    name: *const c_char,
-    mode: u32,
-    flags: u32,
-    userdata: *mut c_void,
-) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::EINVAL);
-            return;
-        }
-    };
-    dispatch_reply(
-        Request { req },
-        fs.create(Request { req }.context(), parent, name_str, mode, flags),
-    );
+extern "C" fn create_bridge(req: Request, parent: u64, name: *const c_char, mode: u32, flags: u32) {
+    handle_op(req, FuseOp::Create, |fs| {
+        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        fs.create(req.context(), parent, name_str, mode, flags)
+    });
 }
 
-extern "C" fn mknod_bridge(
-    req: shim_req_t,
-    parent: u64,
-    name: *const c_char,
-    mode: u32,
-    rdev: u32,
-    userdata: *mut c_void,
-) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::EINVAL);
-            return;
-        }
-    };
-    dispatch_reply(
-        Request { req },
-        fs.mknod(Request { req }.context(), parent, name_str, mode, rdev),
-    );
+extern "C" fn mknod_bridge(req: Request, parent: u64, name: *const c_char, mode: u32, rdev: u32) {
+    handle_op(req, FuseOp::Mknod, |fs| {
+        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        fs.mknod(req.context(), parent, name_str, mode, rdev)
+    });
 }
 
-extern "C" fn unlink_bridge(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::ENOENT);
-            return;
-        }
-    };
-    dispatch_reply(Request { req }, fs.unlink(parent, name_str));
+extern "C" fn unlink_bridge(req: Request, parent: u64, name: *const c_char) {
+    handle_op(req, FuseOp::Unlink, |fs| {
+        let name_str = c_str_to_str(name).ok_or(libc::ENOENT)?;
+        fs.unlink(parent, name_str)
+    });
 }
 
-extern "C" fn mkdir_bridge(req: shim_req_t, parent: u64, name: *const c_char, mode: u32, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::EINVAL);
-            return;
-        }
-    };
-    dispatch_reply(
-        Request { req },
-        fs.mkdir(Request { req }.context(), parent, name_str, mode),
-    );
+extern "C" fn mkdir_bridge(req: Request, parent: u64, name: *const c_char, mode: u32) {
+    handle_op(req, FuseOp::Mkdir, |fs| {
+        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        fs.mkdir(req.context(), parent, name_str, mode)
+    });
 }
 
-extern "C" fn rmdir_bridge(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::ENOENT);
-            return;
-        }
-    };
-    dispatch_reply(Request { req }, fs.rmdir(parent, name_str));
+extern "C" fn rmdir_bridge(req: Request, parent: u64, name: *const c_char) {
+    handle_op(req, FuseOp::Rmdir, |fs| {
+        let name_str = c_str_to_str(name).ok_or(libc::ENOENT)?;
+        fs.rmdir(parent, name_str)
+    });
 }
 
-extern "C" fn symlink_bridge(
-    req: shim_req_t,
-    link: *const c_char,
-    parent: u64,
-    name: *const c_char,
-    userdata: *mut c_void,
-) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let link_str = match unsafe { CStr::from_ptr(link) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::EINVAL);
-            return;
-        }
-    };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::EINVAL);
-            return;
-        }
-    };
-    dispatch_reply(
-        Request { req },
-        fs.symlink(Request { req }.context(), link_str, parent, name_str),
-    );
+extern "C" fn symlink_bridge(req: Request, link: *const c_char, parent: u64, name: *const c_char) {
+    handle_op(req, FuseOp::Symlink, |fs| {
+        let link_str = c_str_to_str(link).ok_or(libc::EINVAL)?;
+        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        fs.symlink(req.context(), link_str, parent, name_str)
+    });
 }
 
-extern "C" fn readlink_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.readlink(ino));
+extern "C" fn readlink_bridge(req: Request, ino: u64) {
+    handle_op(req, FuseOp::Readlink, |fs| fs.readlink(ino));
 }
 
-extern "C" fn rename_bridge(
-    req: shim_req_t,
-    parent: u64,
-    name: *const c_char,
-    newparent: u64,
-    newname: *const c_char,
-    userdata: *mut c_void,
-) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::ENOENT);
-            return;
-        }
-    };
-    let newname_str = match unsafe { CStr::from_ptr(newname) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::EINVAL);
-            return;
-        }
-    };
-    dispatch_reply(Request { req }, fs.rename(parent, name_str, newparent, newname_str));
+extern "C" fn rename_bridge(req: Request, parent: u64, name: *const c_char, newparent: u64, newname: *const c_char) {
+    handle_op(req, FuseOp::Rename, |fs| {
+        let name_str = c_str_to_str(name).ok_or(libc::ENOENT)?;
+        let newname_str = c_str_to_str(newname).ok_or(libc::EINVAL)?;
+        fs.rename(parent, name_str, newparent, newname_str)
+    });
 }
 
-extern "C" fn link_bridge(req: shim_req_t, ino: u64, newparent: u64, newname: *const c_char, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let newname_str = match unsafe { CStr::from_ptr(newname) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::EINVAL);
-            return;
-        }
-    };
-    dispatch_reply(Request { req }, fs.link(ino, newparent, newname_str));
+extern "C" fn link_bridge(req: Request, ino: u64, newparent: u64, newname: *const c_char) {
+    handle_op(req, FuseOp::Link, |fs| {
+        let newname_str = c_str_to_str(newname).ok_or(libc::EINVAL)?;
+        fs.link(ino, newparent, newname_str)
+    });
 }
 
-extern "C" fn fsync_bridge(req: shim_req_t, ino: u64, datasync: c_int, fh: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.fsync(ino, datasync != 0, fh));
+extern "C" fn fsync_bridge(req: Request, ino: u64, datasync: c_int, fh: u64) {
+    handle_op(req, FuseOp::Fsync, |fs| fs.fsync(ino, datasync != 0, fh));
 }
 
-extern "C" fn fallocate_bridge(
-    req: shim_req_t,
-    ino: u64,
-    mode: i32,
-    offset: i64,
-    length: i64,
-    fh: u64,
-    userdata: *mut c_void,
-) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.fallocate(ino, mode, offset, length, fh));
+extern "C" fn fallocate_bridge(req: Request, ino: u64, mode: i32, offset: i64, length: i64, fh: u64) {
+    handle_op(req, FuseOp::Fallocate, |fs| fs.fallocate(ino, mode, offset, length, fh));
 }
 
-extern "C" fn release_bridge(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.release(ino, fh));
+extern "C" fn release_bridge(req: Request, ino: u64, fh: u64) {
+    handle_op(req, FuseOp::Release, |fs| fs.release(ino, fh));
 }
 
-extern "C" fn releasedir_bridge(req: shim_req_t, ino: u64, fh: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.releasedir(ino, fh));
+extern "C" fn releasedir_bridge(req: Request, ino: u64, fh: u64) {
+    handle_op(req, FuseOp::Releasedir, |fs| fs.releasedir(ino, fh));
 }
 
-extern "C" fn fsyncdir_bridge(req: shim_req_t, ino: u64, datasync: c_int, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.fsyncdir(ino, datasync != 0));
+extern "C" fn fsyncdir_bridge(req: Request, ino: u64, datasync: c_int) {
+    handle_op(req, FuseOp::Fsyncdir, |fs| fs.fsyncdir(ino, datasync != 0));
 }
 
-extern "C" fn statfs_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.statfs(ino));
+extern "C" fn statfs_bridge(req: Request, ino: u64) {
+    handle_op(req, FuseOp::Statfs, |fs| fs.statfs(ino));
 }
 
-extern "C" fn flock_bridge(req: shim_req_t, ino: u64, fh: u64, lock_owner: u64, op: c_int, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.flock(ino, fh, lock_owner, op));
+extern "C" fn flock_bridge(req: Request, ino: u64, fh: u64, lock_owner: u64, op: c_int) {
+    handle_op(req, FuseOp::Flock, |fs| fs.flock(ino, fh, lock_owner, op));
 }
 
-extern "C" fn getlk_bridge(
-    req: shim_req_t,
-    ino: u64,
-    fh: u64,
-    lock_owner: u64,
-    lock: *mut ShimFlock,
-    userdata: *mut c_void,
-) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let sh_lock = unsafe { *lock };
-    dispatch_reply(Request { req }, fs.getlk(ino, fh, lock_owner, sh_lock));
+extern "C" fn getlk_bridge(req: Request, ino: u64, fh: u64, lock_owner: u64, lock: *mut ShimFlock) {
+    handle_op(req, FuseOp::Getlk, |fs| {
+        let sh_lock = unsafe { *lock };
+        fs.getlk(ino, fh, lock_owner, sh_lock)
+    });
 }
 
-extern "C" fn setlk_bridge(
-    req: shim_req_t,
-    ino: u64,
-    fh: u64,
-    lock_owner: u64,
-    lock: *const ShimFlock,
-    sleep: c_int,
-    userdata: *mut c_void,
-) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let sh_lock = unsafe { *lock };
-    dispatch_reply(Request { req }, fs.setlk(ino, fh, lock_owner, sh_lock, sleep != 0));
+extern "C" fn setlk_bridge(req: Request, ino: u64, fh: u64, lock_owner: u64, lock: *const ShimFlock, sleep: c_int) {
+    handle_op(req, FuseOp::Setlk, |fs| {
+        let sh_lock = unsafe { *lock };
+        fs.setlk(ino, fh, lock_owner, sh_lock, sleep != 0)
+    });
 }
 
-extern "C" fn getxattr_bridge(req: shim_req_t, ino: u64, name: *const c_char, size: usize, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::EINVAL);
-            return;
-        }
-    };
-    dispatch_reply(Request { req }, fs.getxattr(ino, name_str, size));
+extern "C" fn getxattr_bridge(req: Request, ino: u64, name: *const c_char, size: usize) {
+    handle_op(req, FuseOp::Getxattr, |fs| {
+        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        fs.getxattr(ino, name_str, size)
+    });
 }
 
 extern "C" fn setxattr_bridge(
-    req: shim_req_t,
+    req: Request,
     ino: u64,
     name: *const c_char,
     value: *const u8,
     size: usize,
     flags: c_int,
-    userdata: *mut c_void,
 ) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::EINVAL);
-            return;
-        }
-    };
     let val_slice = if size > 0 && !value.is_null() {
         unsafe { std::slice::from_raw_parts(value, size) }
     } else {
         &[]
     };
-    dispatch_reply(Request { req }, fs.setxattr(ino, name_str, val_slice, flags));
+    handle_op(req, FuseOp::Setxattr, |fs| {
+        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        fs.setxattr(ino, name_str, val_slice, flags)
+    });
 }
 
-extern "C" fn listxattr_bridge(req: shim_req_t, ino: u64, size: usize, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    dispatch_reply(Request { req }, fs.listxattr(ino, size));
+extern "C" fn listxattr_bridge(req: Request, ino: u64, size: usize) {
+    handle_op(req, FuseOp::Listxattr, |fs| fs.listxattr(ino, size));
 }
 
-extern "C" fn removexattr_bridge(req: shim_req_t, ino: u64, name: *const c_char, userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            Request { req }.reply_err(libc::EINVAL);
-            return;
-        }
-    };
-    dispatch_reply(Request { req }, fs.removexattr(ino, name_str));
+extern "C" fn removexattr_bridge(req: Request, ino: u64, name: *const c_char) {
+    handle_op(req, FuseOp::Removexattr, |fs| {
+        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        fs.removexattr(ino, name_str)
+    });
 }
 
 extern "C" fn init_bridge(userdata: *mut c_void) {
@@ -1607,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reply_result_and_dispatch_with_mock_request() {
+    fn test_reply_result_with_mock_request() {
         let req = Request::new_mock();
         reply_result(req, Ok(FuseResponse::ok()));
         reply_result(req, Ok(FuseResponse::write(10)));
@@ -1616,8 +1435,5 @@ mod tests {
         reply_result(req, Ok(FuseResponse::buf(b"abc".as_slice())));
         reply_result(req, Ok(FuseResponse::xattr_size(10)));
         reply_result(req, Err(libc::ENOENT));
-
-        dispatch_reply(req, Ok(FuseResponse::ok()));
-        dispatch_reply(req, DeferredResult::ok(FuseResponse::ok()));
     }
 }

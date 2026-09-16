@@ -19,6 +19,7 @@ mod overlay;
 pub mod virtual_files;
 
 pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
+pub use crate::operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics, OpTier};
 pub use arena::WriteArena;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use overlay::{InnerStatsSnapshot, InodeCounts};
@@ -27,6 +28,7 @@ pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry};
 use crate::clock::{Clock, SystemClock};
 use crate::log::{LogFileCache, LogManifest, LogWriter};
 use crate::node::{EntryDelta, Node};
+use crate::shim::{DeferredResult, FuseResponse, Request};
 use crate::storage::Storage;
 use crate::sync::{ActionGuard, ActionMutex, OpTag, PostUnlockQueue};
 use std::collections::{HashMap, VecDeque};
@@ -790,6 +792,8 @@ pub struct InMemoryFS {
     pub replication_notifier: Arc<(Mutex<bool>, Condvar)>,
     /// Tracks in-flight asynchronous operations (e.g. cold reads, async fsyncs) to ensure safe unmount without use-after-free.
     pub async_tracker: Arc<crate::async_runtime::AsyncTracker>,
+    /// Cumulative FUSE operation telemetry tracking calls and execution latency.
+    pub op_metrics: Arc<FuseOpMetrics>,
     /// Optional fixed IV for exported summary files (used for deterministic golden fixture generation and testing).
     pub deterministic_summary_iv: Option<[u8; 12]>,
 }
@@ -839,6 +843,7 @@ impl InMemoryFS {
         let manifest = Arc::new(RwLock::new(LogManifest::new_with_time(start_gen, now)));
 
         let virtual_files = Arc::new(virtual_files::VirtualFileRegistry::new());
+        let async_tracker = Arc::new(crate::async_runtime::AsyncTracker::new());
 
         let inner = FsInner {
             base: map,
@@ -888,7 +893,8 @@ impl InMemoryFS {
             generations_since_last_summary: AtomicU64::new(0),
             last_summary_generation: AtomicU64::new(0),
             replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
-            async_tracker: Arc::new(crate::async_runtime::AsyncTracker::new()),
+            async_tracker,
+            op_metrics: Arc::new(FuseOpMetrics::new()),
             deterministic_summary_iv: None,
         };
         fs.register_runtime_status();
@@ -1096,6 +1102,35 @@ impl InMemoryFS {
     /// Blocks until all tracked asynchronous operations complete and drop their guards.
     pub fn drain_async_ops(&self) {
         self.async_tracker.drain();
+    }
+
+    /// Dispatches a FUSE response with declarative operation categorization and latency tracking.
+    #[inline]
+    pub fn dispatch_reply(
+        &self,
+        req: Request,
+        op: FuseOp,
+        res: impl Into<DeferredResult<FuseResponse<'static>>>,
+        start: Duration,
+    ) {
+        self.op_metrics.record_call(op);
+        let res = res.into();
+        match res {
+            DeferredResult::Ready(ready) => {
+                let duration = self.clock.elapsed_since(start);
+                self.op_metrics.record_duration(op, duration);
+                crate::shim::reply_result(req, ready);
+            }
+            DeferredResult::Deferred(completion) => {
+                let op_metrics = self.op_metrics.clone();
+                let clock = self.clock.clone();
+                completion.on_complete(Box::new(move |final_res| {
+                    let duration = clock.elapsed_since(start);
+                    op_metrics.record_duration(op, duration);
+                    crate::shim::reply_result(req, final_res);
+                }));
+            }
+        }
     }
 
     pub(crate) fn allocate_inode(&self) -> u64 {
