@@ -251,7 +251,7 @@ fn run_background(weak: &Weak<InMemoryFS>, wakeup: &Arc<(Mutex<Wakeup>, Condvar)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::SystemClock;
+    use crate::clock::{Clock, SystemClock};
     use crate::fs::InMemoryFS;
     use crate::log::LogWriter;
     use crate::operations::read_write::{create_core, write_core};
@@ -374,6 +374,10 @@ mod tests {
             "the sealed generation must be recorded in the manifest"
         );
         assert!(
+            !fs.manifest.read().unwrap().logs.iter().any(|l| l.generation == 2),
+            "the unopened successor generation must not be recorded in the manifest yet"
+        );
+        assert!(
             !writer.is_open(),
             "the rolled log writer must be in lazy mode (unopened) on idle roll"
         );
@@ -390,6 +394,7 @@ mod tests {
             assert!(!writer.is_open());
             assert!(!storage.exists("000002.log"));
             assert!(!storage.exists("000003.log"));
+            assert!(!fs.manifest.read().unwrap().logs.iter().any(|l| l.generation == 2));
         }
 
         // New activity arrives: lazy log writer opens 000002.log
@@ -398,6 +403,18 @@ mod tests {
         assert_eq!(writer.generation(), 2);
         assert!(writer.is_open());
         assert!(storage.exists("000002.log"));
+
+        let manifest = fs.manifest.read().unwrap();
+        let gen2 = manifest
+            .logs
+            .iter()
+            .find(|l| l.generation == 2)
+            .expect("generation 2 must be recorded in the manifest after being opened");
+        assert_eq!(
+            gen2.created_at,
+            clock.now(),
+            "manifest creation time must match the time generation 2 was actually opened"
+        );
     }
 
     #[test]

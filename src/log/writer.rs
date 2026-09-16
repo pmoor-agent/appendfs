@@ -240,41 +240,26 @@ impl LogWriter {
             Err(e) => e.into_inner(),
         };
 
-        let aged = match &*state {
+        let (next_gen, sealed_md5) = match &mut *state {
             // Nothing written yet, so there is nothing to seal.
-            ActiveLogState::Unopened { .. } => false,
+            ActiveLogState::Unopened { .. } => return Ok(None),
             ActiveLogState::Open(active) => {
-                active.current_offset > FILE_HEADER_SIZE as u64
-                    && clock.now().duration_since(active.created_at).unwrap_or_default() >= max_age
+                if active.current_offset <= FILE_HEADER_SIZE as u64
+                    || clock.now().duration_since(active.created_at).unwrap_or_default() < max_age
+                {
+                    return Ok(None);
+                }
+
+                active.writer.sync()?;
+                let sealed_md5 = active.md5_hasher.clone().compute().0;
+                let next_gen = active.generation + 1;
+                (next_gen, sealed_md5)
             }
         };
 
-        if !aged {
-            return Ok(None);
-        }
-
-        let old_state = std::mem::replace(
-            &mut *state,
-            ActiveLogState::Unopened {
-                generation: 0,
-                created_at: None,
-            },
-        );
-
-        let ActiveLogState::Open(mut active) = old_state else {
-            return Ok(None);
-        };
-
-        if let Err(e) = active.writer.sync() {
-            *state = ActiveLogState::Open(active);
-            return Err(e);
-        }
-
-        let sealed_md5 = active.md5_hasher.clone().compute().0;
-        let next_gen = active.generation + 1;
         log::info!(
             "Age-rolled log file: sealed generation {}, next generation {} is lazy (unopened)",
-            active.generation,
+            next_gen - 1,
             next_gen
         );
         *state = ActiveLogState::Unopened {

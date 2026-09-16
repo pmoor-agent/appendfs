@@ -143,7 +143,9 @@ impl InMemoryFS {
             {
                 let mut manifest = self.manifest.write().unwrap();
                 manifest.set_generation_md5(sealed_gen, md5);
-                manifest.record_roll(next_gen, self.clock.now(), crate::log::record::FILE_HEADER_SIZE as u64);
+                if writer.is_open() {
+                    manifest.record_roll(next_gen, self.clock.now(), crate::log::record::FILE_HEADER_SIZE as u64);
+                }
             }
 
             self.generations_since_last_summary.fetch_add(1, Ordering::SeqCst);
@@ -182,8 +184,8 @@ impl InMemoryFS {
             }
         } else {
             // No sealed digest means nothing was sealed: `roll_if_needed` reports the lazy
-            // open of the very first log file this way, so `next_gen` is a brand new
-            // generation rather than the successor of one that just ended.
+            // open of an unopened log file (the initial generation or a successor left lazy
+            // after an idle age rollover), so `next_gen` is freshly opened on disk now.
             let mut manifest = self.manifest.write().unwrap();
             manifest.record_roll(next_gen, self.clock.now(), crate::log::record::FILE_HEADER_SIZE as u64);
         }
