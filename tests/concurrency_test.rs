@@ -755,15 +755,15 @@ fn run_concurrent_stress(seed: u64) {
         let inner = fs.inner.lock_for_tests().unwrap();
         assert!(inner.handles.is_empty(), "seed {}: leaked handles", seed);
         assert!(inner.open_counts.is_empty(), "seed {}: leaked open_counts", seed);
+        assert_eq!(inner.locks.flock_count(), 0, "seed {}: leaked flock entries", seed);
+        assert_eq!(
+            inner.locks.range_lock_count(),
+            0,
+            "seed {}: leaked range lock entries",
+            seed
+        );
+        assert!(inner.locks.is_empty(), "seed {}: leaked lock manager state", seed);
     }
-    assert_eq!(fs.locks.flock_count(), 0, "seed {}: leaked flock entries", seed);
-    assert_eq!(
-        fs.locks.range_lock_count(),
-        0,
-        "seed {}: leaked range lock entries",
-        seed
-    );
-    assert!(fs.locks.is_empty(), "seed {}: leaked lock manager state", seed);
 }
 
 #[test]

@@ -469,6 +469,8 @@ pub struct FsInner {
     pub flushing_bytes: usize,
     /// Total mutating operations across all frozen batches in `flushing`.
     pub flushing_ops: usize,
+    /// Whole-file BSD flock and POSIX byte-range record lock manager.
+    pub locks: LockManager,
 }
 
 impl FsInner {
@@ -727,10 +729,8 @@ impl<'a> Drop for FsInnerGuard<'a> {
 
 pub struct InMemoryFS {
     /// Consolidated critical section protecting all in-memory metadata, layer overlay,
-    /// file/dir handles, open counts, and write arena buffers.
+    /// file/dir handles, open counts, write arena buffers, and lock manager state.
     pub inner: ActionMutex<FsInner>,
-    /// Independent whole-file BSD flock and POSIX byte-range record lock manager.
-    pub locks: LockManager,
     /// Authoritative manifest of all active log generations and lineage.
     pub manifest: Arc<RwLock<LogManifest>>,
     pub next_inode: AtomicU64,
@@ -852,11 +852,11 @@ impl InMemoryFS {
             staged_ops: 0,
             flushing_bytes: 0,
             flushing_ops: 0,
+            locks: LockManager::new(),
         };
 
         let fs = Self {
             inner: ActionMutex::new(inner),
-            locks: LockManager::new(),
             manifest,
             next_inode: AtomicU64::new(2),
             last_tx_id: AtomicU64::new(0),

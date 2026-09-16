@@ -431,8 +431,6 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push('\n');
 
     // 6. Handles & Locks
-    let flock_count = fs.locks.flock_count();
-    let range_lock_count = fs.locks.range_lock_count();
     let mutex_lock_count = fs.inner.lock_count();
     let mutex_busy_time = fs.inner.busy_time();
     let mutex_wait_time = fs.inner.wait_time();
@@ -447,8 +445,8 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push_str(&format!("  Open Virt Handles:  {}\n", snap.virt_handles_count));
     out.push_str(&format!("  Open Dir Handles:   {}\n", snap.dir_handles_count));
     out.push_str(&format!("  Open Inodes:        {}\n", snap.open_inodes_count));
-    out.push_str(&format!("  Active File Locks:  {}\n", flock_count));
-    out.push_str(&format!("  Active Range Locks: {}\n", range_lock_count));
+    out.push_str(&format!("  Active File Locks:  {}\n", snap.flock_count));
+    out.push_str(&format!("  Active Range Locks: {}\n", snap.range_lock_count));
     out.push_str(&format!("  Mutex Lock Count:   {}\n", mutex_lock_count));
     out.push_str(&format!(
         "  Mutex Busy Time:    {} (avg: {} / lock)\n",
