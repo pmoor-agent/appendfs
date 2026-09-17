@@ -168,4 +168,22 @@ mod tests {
         let queried_sock = fs.get_attr(sock_attr.ino).unwrap();
         assert_eq!(queried_sock.file_type, FileType::Socket);
     }
+
+    #[test]
+    fn test_mknod_name_length_boundaries() {
+        let fs = InMemoryFS::new();
+
+        let name_255 = "p".repeat(255);
+        let name_256 = "p".repeat(256);
+
+        // 255-byte FIFO succeeds
+        let fifo_attr = mknod_core(&fs, 1, &name_255, libc::S_IFIFO | 0o644, 0, 1000, 1000).unwrap();
+        assert_eq!(fifo_attr.file_type, FileType::NamedPipe);
+
+        // 256-byte FIFO fails with ENAMETOOLONG
+        assert_eq!(
+            mknod_core(&fs, 1, &name_256, libc::S_IFIFO | 0o644, 0, 1000, 1000),
+            Err(libc::ENAMETOOLONG)
+        );
+    }
 }

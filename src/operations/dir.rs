@@ -474,4 +474,33 @@ mod tests {
         assert_eq!(post_getattr - pre_getattr, 0);
         assert_eq!(post_total - pre_total, 1);
     }
+
+    #[test]
+    fn test_directory_name_length_boundaries() {
+        let fs = InMemoryFS::new();
+
+        // 255-byte name should succeed for mkdir
+        let name_255 = "d".repeat(255);
+        let attr_255 = mkdir_core(&fs, 1, &name_255, 0o755, 1000, 1000).unwrap();
+        assert_eq!(attr_255.file_type, FileType::Directory);
+
+        // lookup_core should find it
+        let looked_up = lookup_core(&fs, 1, &name_255).unwrap();
+        assert_eq!(looked_up.ino, attr_255.ino);
+
+        // 256-byte name should fail with ENAMETOOLONG
+        let name_256 = "d".repeat(256);
+        assert_eq!(
+            mkdir_core(&fs, 1, &name_256, 0o755, 1000, 1000),
+            Err(libc::ENAMETOOLONG)
+        );
+        assert_eq!(lookup_core(&fs, 1, &name_256), Err(libc::ENAMETOOLONG));
+
+        // rmdir_core with 256-byte name should return ENAMETOOLONG
+        assert_eq!(rmdir_core(&fs, 1, &name_256), Err(libc::ENAMETOOLONG));
+
+        // rmdir_core with 255-byte name should succeed
+        assert_eq!(rmdir_core(&fs, 1, &name_255), Ok(()));
+        assert_eq!(lookup_core(&fs, 1, &name_255), Err(libc::ENOENT));
+    }
 }

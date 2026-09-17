@@ -859,4 +859,21 @@ mod tests {
             assert_eq!(dir_res, Ok(()));
         });
     }
+
+    #[test]
+    fn test_file_create_name_length_boundaries() {
+        let fs = InMemoryFS::new();
+
+        // 255-byte name should succeed for create
+        let name_255 = "f".repeat(255);
+        let attr_255 = create_core(&fs, 1, &name_255, 0o644, 0, 1000, 1000).unwrap();
+        assert_eq!(attr_255.file_type, FileType::RegularFile);
+
+        // 256-byte name should fail with ENAMETOOLONG
+        let name_256 = "f".repeat(256);
+        assert_eq!(
+            create_core(&fs, 1, &name_256, 0o644, 0, 1000, 1000),
+            Err(libc::ENAMETOOLONG)
+        );
+    }
 }
