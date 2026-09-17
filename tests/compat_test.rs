@@ -72,14 +72,14 @@ pub fn verify_recovery_with_latest_summary_missing(fixture_dir: &Path) {
 
     // 2. Verify forward mutability on top of the reconstructed volume
     let next_gen = appendfs::find_latest_generation_in_storage(storage.as_ref()) + 1;
-    let start_tx = fs.last_tx_id.load(Ordering::SeqCst) + 1;
+    let start_batch_id = fs.last_batch_id.load(Ordering::SeqCst) + 1;
     let writer = Arc::new(
         LogWriter::create(
             storage.clone(),
             next_gen,
             clock.as_ref(),
             appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            start_tx,
+            start_batch_id,
             volume_key,
         )
         .unwrap(),
@@ -125,14 +125,14 @@ pub fn verify_recovery_from_latest_summary_snapshot(fixture_dir: &Path) {
 
     // 2. Verify forward mutability
     let next_gen = appendfs::find_latest_generation_in_storage(storage.as_ref()) + 1;
-    let start_tx = fs.last_tx_id.load(Ordering::SeqCst) + 1;
+    let start_batch_id = fs.last_batch_id.load(Ordering::SeqCst) + 1;
     let writer = Arc::new(
         LogWriter::create(
             storage.clone(),
             next_gen,
             clock.as_ref(),
             appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            start_tx,
+            start_batch_id,
             volume_key,
         )
         .unwrap(),

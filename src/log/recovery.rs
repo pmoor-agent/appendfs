@@ -18,8 +18,8 @@ use std::time::SystemTime;
 pub enum RecoveryTarget {
     /// Replay all available logs and summaries up to the latest state.
     Latest,
-    /// Replay up to and including transaction ID `tx_id`.
-    TxId(u64),
+    /// Replay up to and including flush batch ID `batch_id`.
+    BatchId(u64),
     /// Replay up to and including the given wall-clock timestamp.
     Timestamp(std::time::SystemTime),
     /// Replay up to and including log generation `generation`.
@@ -47,7 +47,7 @@ pub fn recover_fs(
                 Ok(reader) => {
                     let eligible = match target {
                         RecoveryTarget::Latest => true,
-                        RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
+                        RecoveryTarget::BatchId(max_batch) => reader.header.last_batch_id <= max_batch,
                         RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
                         RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
                     };
@@ -118,19 +118,21 @@ pub fn recover_fs(
     }
 
     let mut min_log_gen = 0u64;
-    let mut last_tx_id = 0u64;
+    let mut last_batch_id = 0u64;
+    let mut expected_batch_id: Option<u64> = None;
 
     // 2. Fast-recover from summary file if available
     if let Some((summary_gen, _rev, reader)) = latest_summary {
         log::info!(
-            "Fast-recovering appendfs state from summary file (generation: {}, inodes: {}, last_tx_id: {})...",
+            "Fast-recovering appendfs state from summary file (generation: {}, inodes: {}, last_batch_id: {})...",
             summary_gen,
             reader.footer.entry_count,
-            reader.header.last_tx_id
+            reader.header.last_batch_id
         );
         let inodes_map = reader.read_all_inodes()?;
         let next_ino = reader.header.next_inode;
-        last_tx_id = reader.header.last_tx_id;
+        last_batch_id = reader.header.last_batch_id;
+        expected_batch_id = Some(last_batch_id + 1);
         last_op_time = Some(reader.header.created_at);
 
         fs_instance.inner.lock(OpTag::Other).unwrap().base = inodes_map;
@@ -186,10 +188,6 @@ pub fn recover_fs(
             let header = record.header;
 
             if header.op_code == OpCode::FlushCommit {
-                if header.tx_id > last_tx_id {
-                    last_tx_id = header.tx_id;
-                }
-
                 let commit = crate::wire::deserialize::<FlushCommitPayload>(&record.payload).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -209,33 +207,42 @@ pub fn recover_fs(
                     ));
                 }
 
+                if let Some(expected) = expected_batch_id {
+                    if commit.batch_id != expected {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "gap detected in log stream: expected batch_id {}, got {}",
+                                expected, commit.batch_id
+                            ),
+                        ));
+                    }
+                    expected_batch_id = Some(expected + 1);
+                } else {
+                    expected_batch_id = Some(commit.batch_id + 1);
+                }
+
+                if let RecoveryTarget::BatchId(max_batch) = target
+                    && commit.batch_id > max_batch
+                {
+                    target_cutoff_reached = true;
+                    break;
+                }
+
                 committed_records_count += commit.record_count + 1;
 
                 let mut current_batch: HashMap<u64, EntryDelta> = HashMap::new();
 
                 for buffered in pending.drain(..) {
                     // Check if this record exceeds point-in-time recovery target
-                    match target {
-                        RecoveryTarget::TxId(max_tx) => {
-                            if buffered.header.tx_id > max_tx {
-                                target_cutoff_reached = true;
-                                break;
-                            }
-                        }
-                        RecoveryTarget::Timestamp(max_time) => {
-                            if let Some(op_time) = buffered.op_time()
-                                && op_time > max_time
-                            {
-                                target_cutoff_reached = true;
-                                break;
-                            }
-                        }
-                        _ => {}
+                    if let RecoveryTarget::Timestamp(max_time) = target
+                        && let Some(op_time) = buffered.op_time()
+                        && op_time > max_time
+                    {
+                        target_cutoff_reached = true;
+                        break;
                     }
 
-                    if buffered.header.tx_id > last_tx_id {
-                        last_tx_id = buffered.header.tx_id;
-                    }
                     let target_ino = buffered.header.inode;
                     if target_ino > max_inode {
                         max_inode = target_ino;
@@ -269,6 +276,15 @@ pub fn recover_fs(
                 }
 
                 if target_cutoff_reached {
+                    break;
+                }
+
+                last_batch_id = commit.batch_id;
+
+                if let RecoveryTarget::BatchId(max_batch) = target
+                    && commit.batch_id == max_batch
+                {
+                    target_cutoff_reached = true;
                     break;
                 }
             } else {
@@ -334,7 +350,7 @@ pub fn recover_fs(
         .unwrap()
         .base
         .retain(|_ino, arc| arc.meta.nlink > 0 || arc.is_dir());
-    fs_instance.last_tx_id.store(last_tx_id, Ordering::SeqCst);
+    fs_instance.last_batch_id.store(last_batch_id, Ordering::SeqCst);
     fs_instance.set_recovered_time(last_op_time);
 
     Ok(fs_instance)
@@ -348,7 +364,7 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
-    fn test_recovery_to_specific_tx_id() {
+    fn test_recovery_to_specific_batch_id() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         crate::init_volume(
             storage.clone(),
@@ -380,18 +396,18 @@ mod tests {
         fs.log_writer = Some(writer);
         fs.set_storage(storage.clone());
 
-        // Tx 1-3: Create dir "step1"
+        // Batch 1: Create dir "step1"
         let d1 = crate::operations::dir::mkdir_core(&fs, 1, "step1", 0o755, 1000, 1000).unwrap();
         fs.quiesce().unwrap();
-        let tx_after_step1 = fs.log_writer.as_ref().unwrap().last_tx_id();
+        let batch_after_step1 = fs.log_writer.as_ref().unwrap().last_batch_id();
 
-        // Tx 4-7: Create file "file1.txt" inside "step1"
+        // Batch 2: Create file "file1.txt" inside "step1"
         let f1 = crate::operations::read_write::create_core(&fs, d1.ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f1.ino, b"version 1", 0).unwrap();
         fs.quiesce().unwrap();
-        let tx_after_file1 = fs.log_writer.as_ref().unwrap().last_tx_id();
+        let batch_after_file1 = fs.log_writer.as_ref().unwrap().last_batch_id();
 
-        // Tx 8-11: Create file "file2.txt" inside "step1"
+        // Batch 3: Create file "file2.txt" inside "step1"
         let f2 = crate::operations::read_write::create_core(&fs, d1.ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f2.ino, b"version 2", 0).unwrap();
         fs.quiesce().unwrap();
@@ -409,30 +425,93 @@ mod tests {
         assert!(fs_latest.lookup_child(d1_ino, "file1.txt").is_some());
         assert!(fs_latest.lookup_child(d1_ino, "file2.txt").is_some());
 
-        // 2. Recover to tx_after_step1 -> only step1 exists, no file1.txt or file2.txt
-        let fs_tx1 = recover_fs(
+        // 2. Recover to batch_after_step1 -> only step1 exists, no file1.txt or file2.txt
+        let fs_b1 = recover_fs(
             storage.clone(),
-            RecoveryTarget::TxId(tx_after_step1),
+            RecoveryTarget::BatchId(batch_after_step1),
             Arc::new(SystemClock),
             VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        assert!(fs_tx1.lookup_child(1, "step1").is_some());
-        let d1_tx1 = fs_tx1.lookup_child(1, "step1").unwrap();
-        assert!(fs_tx1.lookup_child(d1_tx1, "file1.txt").is_none());
-        assert!(fs_tx1.lookup_child(d1_tx1, "file2.txt").is_none());
+        assert!(fs_b1.lookup_child(1, "step1").is_some());
+        let d1_b1 = fs_b1.lookup_child(1, "step1").unwrap();
+        assert!(fs_b1.lookup_child(d1_b1, "file1.txt").is_none());
+        assert!(fs_b1.lookup_child(d1_b1, "file2.txt").is_none());
 
-        // 3. Recover to tx_after_file1 -> step1 and file1.txt exist, but not file2.txt
-        let fs_tx6 = recover_fs(
+        // 3. Recover to batch_after_file1 -> step1 and file1.txt exist, but not file2.txt
+        let fs_b2 = recover_fs(
             storage.clone(),
-            RecoveryTarget::TxId(tx_after_file1),
+            RecoveryTarget::BatchId(batch_after_file1),
             Arc::new(SystemClock),
             VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let d1_tx6 = fs_tx6.lookup_child(1, "step1").unwrap();
-        assert!(fs_tx6.lookup_child(d1_tx6, "file1.txt").is_some());
-        assert!(fs_tx6.lookup_child(d1_tx6, "file2.txt").is_none());
+        let d1_b2 = fs_b2.lookup_child(1, "step1").unwrap();
+        assert!(fs_b2.lookup_child(d1_b2, "file1.txt").is_some());
+        assert!(fs_b2.lookup_child(d1_b2, "file2.txt").is_none());
+    }
+
+    #[test]
+    fn test_recovery_detects_batch_gap() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        // Writer 1 starts at batch 1 and writes batch 1
+        let writer1 = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        writer1
+            .append_record(crate::log::record::OpCode::Data, 1, b"batch1 data")
+            .unwrap();
+        writer1.emit_flush_commit(1, &*clock).unwrap();
+        writer1.flush().unwrap();
+        assert_eq!(writer1.last_batch_id(), 1);
+        drop(writer1);
+
+        // Writer 2 starts at batch 3 (simulating a dropped/missing batch 2)
+        let writer2 = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                2,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                3,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        writer2
+            .append_record(crate::log::record::OpCode::Data, 1, b"batch3 data")
+            .unwrap();
+        writer2.emit_flush_commit(1, &*clock).unwrap();
+        writer2.flush().unwrap();
+        assert_eq!(writer2.last_batch_id(), 3);
+        drop(writer2);
+
+        // Recovery should fail due to detected gap (expected batch 2, got 3)
+        let res = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        );
+        assert!(res.is_err());
+        let err_str = res.err().unwrap().to_string();
+        assert!(err_str.contains("gap detected in log stream: expected batch_id 2, got 3"));
     }
 
     #[test]

@@ -1,20 +1,18 @@
 use rand::RngCore;
 
 /// Derives a deterministic 96-bit (12-byte) nonce for a log record.
-/// Format: `[generation (4 bytes BE) || tx_id (8 bytes BE)]`
+/// Format: `[generation (4 bytes BE) || record_offset (8 bytes BE)]`
 ///
-/// Uniqueness rests on `tx_id` alone, which is why narrowing `generation` to 32 bits is safe.
-/// A volume's `tx_id` is a single monotonic counter: the writer seeds it from the highest
-/// value recovery observed and bumps it once per record, so it never repeats across
-/// generations, rolls or remounts. The generation bytes are domain separation, not part of
-/// the uniqueness argument - two records can never share a `tx_id` to begin with, so a
-/// generation past 2^32 wrapping into an earlier one still cannot produce a repeated nonce.
+/// Uniqueness rests on `(generation, record_offset)`. Within a single generation file,
+/// records are strictly append-only, so every record starts at a unique, monotonically
+/// increasing byte offset. Across generation rolls, `generation` increases monotonically,
+/// ensuring nonces never repeat across the volume's lifetime.
 #[inline]
-pub fn derive_record_nonce(generation: u64, tx_id: u64) -> [u8; 12] {
+pub fn derive_record_nonce(generation: u64, record_offset: u64) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     let gen_u32 = (generation & 0xFFFF_FFFF) as u32;
     nonce[0..4].copy_from_slice(&gen_u32.to_be_bytes());
-    nonce[4..12].copy_from_slice(&tx_id.to_be_bytes());
+    nonce[4..12].copy_from_slice(&record_offset.to_be_bytes());
     nonce
 }
 
@@ -38,16 +36,16 @@ mod tests {
 
     #[test]
     fn test_record_nonce_derivation() {
-        let n1 = derive_record_nonce(1, 100);
-        let n2 = derive_record_nonce(1, 101);
-        let n3 = derive_record_nonce(2, 100);
+        let n1 = derive_record_nonce(1, 32);
+        let n2 = derive_record_nonce(1, 100);
+        let n3 = derive_record_nonce(2, 32);
 
         assert_ne!(n1, n2);
         assert_ne!(n1, n3);
         assert_ne!(n2, n3);
 
         assert_eq!(&n1[0..4], &1u32.to_be_bytes());
-        assert_eq!(&n1[4..12], &100u64.to_be_bytes());
+        assert_eq!(&n1[4..12], &32u64.to_be_bytes());
     }
 
     #[test]

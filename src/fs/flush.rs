@@ -160,17 +160,17 @@ impl InMemoryFS {
 
             if should_emit_summary {
                 let storage = writer.storage();
-                let last_tx_id = writer.last_tx_id();
-                match self.export_summary_for_base(storage.as_ref(), sealed_gen, last_tx_id) {
+                let last_batch_id = writer.last_batch_id();
+                match self.export_summary_for_base(storage.as_ref(), sealed_gen, last_batch_id) {
                     Ok(filename) => {
                         self.bytes_since_last_summary.store(0, Ordering::SeqCst);
                         self.generations_since_last_summary.store(0, Ordering::SeqCst);
                         self.last_summary_generation.store(sealed_gen, Ordering::SeqCst);
                         log::info!(
-                            "Exported periodic summary snapshot {} for sealed generation {} (last_tx_id: {})",
+                            "Exported periodic summary snapshot {} for sealed generation {} (last_batch_id: {})",
                             filename,
                             sealed_gen,
-                            last_tx_id
+                            last_batch_id
                         );
                     }
                     Err(e) => {
@@ -269,7 +269,7 @@ impl InMemoryFS {
                             let chunk_len = std::cmp::min(max_extent_size, data.len() - chunk_start);
                             let chunk = &data[chunk_start..chunk_start + chunk_len];
 
-                            let (_, generation, record_log_offset, record_size) =
+                            let (generation, record_log_offset, record_size) =
                                 writer.append_record(OpCode::Data, ino, chunk)?;
                             written_count += 1;
                             flushed_data_bytes += chunk_len as u64;
@@ -620,10 +620,10 @@ impl InMemoryFS {
         self.quiesce()?;
         let snapshot = self.inner.lock(OpTag::Flush).unwrap().snapshot_all();
         let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
-        let last_tx_id = self
+        let last_batch_id = self
             .log_writer
             .as_ref()
-            .map_or_else(|| self.last_tx_id.load(Ordering::SeqCst), |w| w.last_tx_id());
+            .map_or_else(|| self.last_batch_id.load(Ordering::SeqCst), |w| w.last_batch_id());
         let next_inode = self.next_inode.load(Ordering::SeqCst);
         let manifest = self.sync_manifest_md5s_and_snapshot(storage, generation);
         let now = self.clock.now();
@@ -652,7 +652,7 @@ impl InMemoryFS {
                 manifest: &manifest,
                 volume_header: &self.volume_header,
                 generation,
-                last_tx_id,
+                last_batch_id,
                 next_inode,
                 created_at: now,
             },
@@ -675,7 +675,7 @@ impl InMemoryFS {
         &self,
         storage: &dyn Storage,
         sealed_gen: u64,
-        last_tx_id: u64,
+        last_batch_id: u64,
     ) -> std::io::Result<String> {
         let snapshot = self.inner.lock(OpTag::Flush).unwrap().base.clone();
         let next_inode = self.next_inode.load(Ordering::SeqCst);
@@ -700,7 +700,7 @@ impl InMemoryFS {
                 manifest: &manifest,
                 volume_header: &self.volume_header,
                 generation: sealed_gen,
-                last_tx_id,
+                last_batch_id,
                 next_inode,
                 created_at: now,
             },

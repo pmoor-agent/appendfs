@@ -675,7 +675,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                                             ));
                                                         } else if let Err(e) = fs.volume_key.decrypt_record(
                                                             generation,
-                                                            rec_header.tx_id,
+                                                            record_log_offset,
                                                             rec_header.op_code as u8,
                                                             rec_ino,
                                                             &payload,

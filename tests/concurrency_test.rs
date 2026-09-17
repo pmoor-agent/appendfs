@@ -337,8 +337,8 @@ fn dump_log_records_for_inode(storage: &dyn Storage, ino: u64) {
                 };
             if mentions {
                 eprintln!(
-                    "    {:?} tx={} inode={} offset={} payload={:?}",
-                    rec.header.op_code, rec.header.tx_id, rec.header.inode, rec.record_log_offset, decoded
+                    "    {:?} inode={} offset={} payload={:?}",
+                    rec.header.op_code, rec.header.inode, rec.record_log_offset, decoded
                 );
             }
         }
@@ -641,8 +641,8 @@ fn dump_preserved_repro() {
             let rec = rec.unwrap();
             let decoded = rec.decode().ok();
             eprintln!(
-                "{:?} tx={} inode={} offset={} payload={:?}",
-                rec.header.op_code, rec.header.tx_id, rec.header.inode, rec.record_log_offset, decoded
+                "{:?} inode={} offset={} payload={:?}",
+                rec.header.op_code, rec.header.inode, rec.record_log_offset, decoded
             );
         }
     }

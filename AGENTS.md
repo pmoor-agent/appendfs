@@ -163,7 +163,7 @@ The generator produces:
 ## Architectural & Recovery Invariants
 
 - **State Restoration Invariant**:
-  - Any runtime state, counter, or threshold in `InMemoryFS` that governs operational lifecycle decisions (e.g. `last_summary_generation` for log pruning/tiered eviction, `next_inode`, `last_tx_id`) **must be explicitly restored in `recover_fs`** from the recovered summary file or replayed log stream.
+  - Any runtime state, counter, or threshold in `InMemoryFS` that governs operational lifecycle decisions (e.g. `last_summary_generation` for log pruning/tiered eviction, `next_inode`, `last_batch_id`) **must be explicitly restored in `recover_fs`** from the recovered summary file or replayed log stream.
   - An unmount/remount or crash recovery cycle must never reset operational progress or disable lifecycle tasks like tiered pruning.
 - **Test-Only Exports & Standalone Binaries**:
   - Whenever mock stores, latency wrappers, or test doubles are gated behind `#[cfg(any(test, feature = "testing"))]` in submodules, ensure all top-level re-exports in `src/lib.rs` use the identical `cfg` gate so standalone binaries (`src/bin/*`, examples, benchmarks) compile cleanly without requiring test flags.

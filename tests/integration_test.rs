@@ -1280,8 +1280,8 @@ fn test_mount_ro_rejects_mutations_and_enables_point_in_time_time_travel() {
         "RO mount must never write to disk files"
     );
 
-    // 5. RO Mount with Point-in-Time Historical Recovery (TxId cutoff before step2)
-    mount.remount_ro(appendfs::RecoveryTarget::TxId(4));
+    // 5. RO Mount with Point-in-Time Historical Recovery (BatchId cutoff before step2)
+    mount.remount_ro(appendfs::RecoveryTarget::BatchId(1));
 
     // step1 exists
     let file1 = mount.path().join("step1/file1.txt");
@@ -2574,14 +2574,14 @@ fn test_tampered_record_header_is_rejected_not_served() {
     }
 
     // Flip a bit in every record header's `inode` field, simulating an attacker with write
-    // access but no key. Layout is op_code(1) tx_id(8) inode(8) payload_len(4) auth_tag(16).
+    // access but no key. Layout is op_code(1) inode(8) payload_len(4) auth_tag(16).
     let mut bytes = storage.get_file_bytes("000001.log").unwrap();
     let header_size = appendfs::log::record::RECORD_HEADER_SIZE;
     let mut off = appendfs::log::record::FILE_HEADER_SIZE;
     let mut tampered = 0;
     while off + header_size <= bytes.len() {
-        let payload_len = u32::from_be_bytes(bytes[off + 17..off + 21].try_into().unwrap()) as usize;
-        bytes[off + 9] ^= 0x01;
+        let payload_len = u32::from_be_bytes(bytes[off + 9..off + 13].try_into().unwrap()) as usize;
+        bytes[off + 1] ^= 0x01;
         tampered += 1;
         off += header_size + payload_len;
     }
@@ -3219,9 +3219,10 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
     let next_gen = recovered_fs.manifest.read().unwrap().next_generation;
     assert_eq!(next_gen, 4);
 
-    let start_tx = recovered_fs.last_tx_id.load(Ordering::SeqCst) + 1;
-    let writer2 =
-        Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), next_gen, 1500, start_tx, key.clone()).unwrap());
+    let start_batch_id = recovered_fs.last_batch_id.load(Ordering::SeqCst) + 1;
+    let writer2 = Arc::new(
+        appendfs::LogWriter::create_lazy(storage.clone(), next_gen, 1500, start_batch_id, key.clone()).unwrap(),
+    );
     recovered_fs.log_writer = Some(writer2);
     recovered_fs.set_summary_intervals(2500, 0);
 
@@ -3316,9 +3317,10 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
     let next_gen = recovered_fs.manifest.read().unwrap().next_generation;
     assert_eq!(next_gen, 4);
 
-    let start_tx = recovered_fs.last_tx_id.load(Ordering::SeqCst) + 1;
-    let writer2 =
-        Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), next_gen, 1500, start_tx, key.clone()).unwrap());
+    let start_batch_id = recovered_fs.last_batch_id.load(Ordering::SeqCst) + 1;
+    let writer2 = Arc::new(
+        appendfs::LogWriter::create_lazy(storage.clone(), next_gen, 1500, start_batch_id, key.clone()).unwrap(),
+    );
     recovered_fs.log_writer = Some(writer2);
     recovered_fs.set_summary_intervals(0, 3);
 

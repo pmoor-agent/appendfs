@@ -39,7 +39,7 @@ import zstandard as zstd
 FILE_MAGIC = b"APPF"
 SUMMARY_MAGIC = b"APPS"
 FILE_HEADER_SIZE = 32
-RECORD_HEADER_SIZE = 37
+RECORD_HEADER_SIZE = 29
 
 OP_DATA = 1
 OP_DATA_ZSTD = 2
@@ -191,15 +191,15 @@ def parse_entry_delta(payload: bytes) -> tuple:
         raise ValueError(f"Unknown LogEntryDelta tag: {tag}")
 
 
-def derive_record_nonce(generation: int, tx_id: int) -> bytes:
+def derive_record_nonce(generation: int, record_offset: int) -> bytes:
     """Derives a deterministic 12-byte nonce matching AppendFS's derive_record_nonce."""
     gen_u32 = generation & 0xFFFFFFFF
-    return struct.pack(">IQ", gen_u32, tx_id)
+    return struct.pack(">IQ", gen_u32, record_offset)
 
 
-def derive_record_aad(op_code: int, tx_id: int, inode: int) -> bytes:
+def derive_record_aad(op_code: int, record_offset: int, inode: int) -> bytes:
     """Constructs 17-byte Associated Data matching AppendFS's record_aad."""
-    return struct.pack(">BQQ", op_code, tx_id, inode)
+    return struct.pack(">BQQ", op_code, record_offset, inode)
 
 
 def parse_log_filename(name: str) -> Optional[Tuple[int, int]]:
@@ -255,27 +255,27 @@ class VolumeDecryptor:
         self.cipher = ChaCha20Poly1305(key_bytes) if key_bytes else None
 
     def decode_record(
-        self, generation: int, tx_id: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
+        self, generation: int, record_offset: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
     ) -> bytes:
         if self.cipher is not None:
-            nonce = derive_record_nonce(generation, tx_id)
-            aad = derive_record_aad(op_code, tx_id, inode)
+            nonce = derive_record_nonce(generation, record_offset)
+            aad = derive_record_aad(op_code, record_offset, inode)
             ciphertext_with_tag = payload + auth_tag
             try:
                 decrypted = self.cipher.decrypt(nonce, ciphertext_with_tag, aad)
             except Exception as e:
-                raise ValueError(f"Decryption / authentication failed for record (gen={generation}, tx={tx_id}, ino={inode}): {e}")
+                raise ValueError(f"Decryption / authentication failed for record (gen={generation}, offset=0x{record_offset:x}, ino={inode}): {e}")
             data = decrypted
         else:
             # Plaintext volume
             if not self.no_verify:
-                aad = derive_record_aad(op_code, tx_id, inode)
+                aad = derive_record_aad(op_code, record_offset, inode)
                 hasher = blake3.blake3()
                 hasher.update(aad)
                 hasher.update(payload)
                 expected_tag = hasher.digest()[:16]
                 if expected_tag != auth_tag:
-                    raise ValueError(f"BLAKE3 checksum mismatch for record (gen={generation}, tx={tx_id}, ino={inode})")
+                    raise ValueError(f"BLAKE3 checksum mismatch for record (gen={generation}, offset=0x{record_offset:x}, ino={inode})")
             data = payload
 
         # Decompress if Zstd
@@ -386,8 +386,8 @@ class Restorer:
         self.inode_types: Dict[int, str] = {1: "dir"}
         self.inode_modes: Dict[int, int] = {}
         self.inode_times: Dict[int, Tuple[Optional[Tuple[int, int]], Tuple[int, int]]] = {}
-        self.expected_tx_id: Optional[int] = None
-        self.last_committed_tx_id: Optional[int] = None
+        self.expected_batch_id: Optional[int] = None
+        self.last_committed_batch_id: Optional[int] = None
         self.tombstoned_inodes: Set[int] = set()
 
     def _add_dir_entry(self, parent_ino: int, name: str, child_ino: int):
@@ -439,31 +439,20 @@ class Restorer:
                 if not rh_bytes or len(rh_bytes) < RECORD_HEADER_SIZE:
                     break
                 rec_log_offset = f.tell() - RECORD_HEADER_SIZE
-                op, tx, ino, plen, tag = struct.unpack(">BQQI16s", rh_bytes)
+                op, ino, plen, tag = struct.unpack(">BQI16s", rh_bytes)
                 raw_payload = f.read(plen)
                 if len(raw_payload) < plen:
                     # Truncated record at end of log due to crash mid-flush; discard
                     break
 
-                # 1. Check transaction ID monotonicity and continuity (gapless)
-                if self.expected_tx_id is not None:
-                    if tx != self.expected_tx_id:
-                        raise ValueError(
-                            f"Transaction ID gap/inversion in {log_path.name} @ offset 0x{rec_log_offset:x}: "
-                            f"expected tx_id {self.expected_tx_id}, got {tx}"
-                        )
-                    self.expected_tx_id += 1
-                else:
-                    self.expected_tx_id = tx + 1
-
-                # 2. Check for integrity errors: operations targeting deleted/tombstoned inodes
+                # 1. Check for integrity errors: operations targeting deleted/tombstoned inodes
                 if ino in self.tombstoned_inodes:
                     raise ValueError(
                         f"Integrity violation in {log_path.name} @ offset 0x{rec_log_offset:x}: "
                         f"record op={op} targets previously deleted/tombstoned inode {ino}"
                     )
 
-                # 3. Check for data targeting non-file inodes
+                # 2. Check for data targeting non-file inodes
                 if op in (OP_DATA, OP_DATA_ZSTD):
                     itype = self.inode_types.get(ino)
                     if itype is not None and itype != "file":
@@ -473,7 +462,7 @@ class Restorer:
                         )
 
                 try:
-                    payload = self.decryptor.decode_record(gen, tx, op, ino, raw_payload, tag)
+                    payload = self.decryptor.decode_record(gen, rec_log_offset, op, ino, raw_payload, tag)
                 except Exception as e:
                     raise ValueError(
                         f"Failed to decode/decrypt record in {log_path.name} @ offset 0x{rec_log_offset:x}: {e}"
@@ -492,19 +481,31 @@ class Restorer:
                             f"Malformed InodeDelta for ino {ino} in {log_path.name} @ offset 0x{rec_log_offset:x}: {e}"
                         ) from e
                 elif op == OP_FLUSH_COMMIT:
-                    if len(payload) < 16:
+                    if len(payload) < 24:
                         raise ValueError(
                             f"Malformed FlushCommit payload (len={len(payload)}) in {log_path.name} @ offset 0x{rec_log_offset:x}"
                         )
-                    commit_secs, commit_nsecs, claimed_count = struct.unpack(">qII", payload[:16])
+                    batch_id, commit_secs, commit_nsecs, claimed_count = struct.unpack(">QqII", payload[:24])
                     if claimed_count != records_in_batch:
                         raise ValueError(
                             f"FlushCommit record count mismatch in {log_path.name} @ offset 0x{rec_log_offset:x}: "
                             f"commit claimed {claimed_count} records but batch buffered {records_in_batch}"
                         )
+
+                    # Check flush batch ID monotonicity and continuity (gapless)
+                    if self.expected_batch_id is not None:
+                        if batch_id != self.expected_batch_id:
+                            raise ValueError(
+                                f"Flush batch ID gap/inversion in {log_path.name} @ offset 0x{rec_log_offset:x}: "
+                                f"expected batch_id {self.expected_batch_id}, got {batch_id}"
+                            )
+                        self.expected_batch_id += 1
+                    else:
+                        self.expected_batch_id = batch_id + 1
+
                     # Atomic commit point for the batch!
                     self._commit_batch(batch_chunks, batch_deltas)
-                    self.last_committed_tx_id = tx
+                    self.last_committed_batch_id = batch_id
                     batch_chunks.clear()
                     batch_deltas.clear()
                     records_in_batch = 0
@@ -523,10 +524,10 @@ class Restorer:
                 batch_chunks.clear()
                 batch_deltas.clear()
                 records_in_batch = 0
-                if self.last_committed_tx_id is not None:
-                    self.expected_tx_id = self.last_committed_tx_id + 1
+                if self.last_committed_batch_id is not None:
+                    self.expected_batch_id = self.last_committed_batch_id + 1
                 else:
-                    self.expected_tx_id = None
+                    self.expected_batch_id = None
 
     def _commit_batch(self, batch_chunks: Dict[Tuple[int, int], bytes], batch_deltas: Dict[int, tuple]):
         if self.dry_run:

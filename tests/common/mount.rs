@@ -56,13 +56,13 @@ impl TestMount {
         .unwrap();
         let latest_gen = appendfs::find_latest_generation_in_storage(storage.as_ref());
         let next_gen = latest_gen + 1;
-        let start_tx = fs.last_tx_id.load(Ordering::SeqCst) + 1;
+        let start_batch_id = fs.last_batch_id.load(Ordering::SeqCst) + 1;
         let writer = Arc::new(
             appendfs::LogWriter::create_lazy(
                 storage,
                 next_gen,
                 appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-                start_tx,
+                start_batch_id,
                 VolumeKey::plaintext_arc(),
             )
             .unwrap(),
@@ -150,7 +150,7 @@ impl TestMount {
         )
         .unwrap();
         let next_gen = appendfs::find_latest_generation_in_storage(storage.as_ref()) + 1;
-        let start_tx = fs.last_tx_id.load(Ordering::SeqCst) + 1;
+        let start_batch_id = fs.last_batch_id.load(Ordering::SeqCst) + 1;
         let mut writer_res = None;
         let acquired = appendfs::wait_until(
             || {
@@ -158,7 +158,7 @@ impl TestMount {
                     storage.clone(),
                     next_gen,
                     appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-                    start_tx,
+                    start_batch_id,
                     VolumeKey::plaintext_arc(),
                 );
                 let ok = res.is_ok();

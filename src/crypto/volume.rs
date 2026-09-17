@@ -222,7 +222,7 @@ impl VolumeHeader {
 
 /// Builds the associated data authenticated alongside a record payload.
 ///
-/// The record nonce already covers `generation` and `tx_id` (a mismatch there yields a
+/// The record nonce already covers `generation` and `record_offset` (a mismatch there yields a
 /// different nonce, which fails the tag), and `payload_len`/`checksum` are covered
 /// implicitly - truncating or extending the ciphertext breaks authentication. `op_code`
 /// and `inode` have no such protection, so without binding them a valid ciphertext could
@@ -231,10 +231,10 @@ impl VolumeHeader {
 ///
 /// `payload_len` and `checksum` are deliberately excluded: both are derived from the
 /// ciphertext, so feeding them in would make the AAD depend on the encryption's output.
-fn record_aad(op_code: u8, tx_id: u64, inode: u64) -> [u8; 17] {
+fn record_aad(op_code: u8, record_offset: u64, inode: u64) -> [u8; 17] {
     let mut aad = [0u8; 17];
     aad[0] = op_code;
-    aad[1..9].copy_from_slice(&tx_id.to_be_bytes());
+    aad[1..9].copy_from_slice(&record_offset.to_be_bytes());
     aad[9..17].copy_from_slice(&inode.to_be_bytes());
     aad
 }
@@ -303,13 +303,13 @@ impl VolumeKey {
     pub fn encrypt_record(
         &self,
         generation: u64,
-        tx_id: u64,
+        record_offset: u64,
         op_code: u8,
         inode: u64,
         payload: &[u8],
     ) -> Result<(Vec<u8>, [u8; 16]), CryptoError> {
-        let nonce = derive_record_nonce(generation, tx_id);
-        let aad = record_aad(op_code, tx_id, inode);
+        let nonce = derive_record_nonce(generation, record_offset);
+        let aad = record_aad(op_code, record_offset, inode);
         encrypt_payload(self.cipher, &self.key, &nonce, &aad, payload)
     }
 
@@ -320,14 +320,14 @@ impl VolumeKey {
     pub fn decrypt_record(
         &self,
         generation: u64,
-        tx_id: u64,
+        record_offset: u64,
         op_code: u8,
         inode: u64,
         ciphertext: &[u8],
         expected_tag: &[u8; 16],
     ) -> Result<Vec<u8>, CryptoError> {
-        let nonce = derive_record_nonce(generation, tx_id);
-        let aad = record_aad(op_code, tx_id, inode);
+        let nonce = derive_record_nonce(generation, record_offset);
+        let aad = record_aad(op_code, record_offset, inode);
         decrypt_payload(self.cipher, &self.key, &nonce, &aad, ciphertext, expected_tag)
     }
 
@@ -452,31 +452,31 @@ mod tests {
         .unwrap();
 
         let payload = b"extent belonging to inode 5";
-        let (ct, tag) = key.encrypt_record(1, 100, OP, 5, payload).unwrap();
+        let (ct, tag) = key.encrypt_record(1, 32, OP, 5, payload).unwrap();
 
         // Baseline: the untampered record round-trips.
-        assert_eq!(key.decrypt_record(1, 100, OP, 5, &ct, &tag).unwrap(), payload);
+        assert_eq!(key.decrypt_record(1, 32, OP, 5, &ct, &tag).unwrap(), payload);
 
         // Reattributing the payload to a different inode must fail, even though the
         // ciphertext is byte-for-byte intact.
         assert_eq!(
-            key.decrypt_record(1, 100, OP, 6, &ct, &tag).unwrap_err(),
+            key.decrypt_record(1, 32, OP, 6, &ct, &tag).unwrap_err(),
             CryptoError::AuthFailed
         );
 
         // Relabelling the record as a different opcode must fail too.
         assert_eq!(
-            key.decrypt_record(1, 100, OP + 1, 5, &ct, &tag).unwrap_err(),
+            key.decrypt_record(1, 32, OP + 1, 5, &ct, &tag).unwrap_err(),
             CryptoError::AuthFailed
         );
 
-        // Generation and tx_id remain bound via the nonce.
+        // Generation and record_offset remain bound via the nonce.
         assert_eq!(
-            key.decrypt_record(2, 100, OP, 5, &ct, &tag).unwrap_err(),
+            key.decrypt_record(2, 32, OP, 5, &ct, &tag).unwrap_err(),
             CryptoError::AuthFailed
         );
         assert_eq!(
-            key.decrypt_record(1, 101, OP, 5, &ct, &tag).unwrap_err(),
+            key.decrypt_record(1, 64, OP, 5, &ct, &tag).unwrap_err(),
             CryptoError::AuthFailed
         );
     }
@@ -486,9 +486,9 @@ mod tests {
         let key = VolumeKey::plaintext();
         let payload = b"unencrypted bytes";
 
-        let (ct, tag) = key.encrypt_record(1, 100, OP, 5, payload).unwrap();
+        let (ct, tag) = key.encrypt_record(1, 32, OP, 5, payload).unwrap();
         assert_eq!(&ct[..], &payload[..]);
-        assert_eq!(key.decrypt_record(1, 100, OP, 5, &ct, &tag).unwrap(), payload);
+        assert_eq!(key.decrypt_record(1, 32, OP, 5, &ct, &tag).unwrap(), payload);
     }
 
     #[test]

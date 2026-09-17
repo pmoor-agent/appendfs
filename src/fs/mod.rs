@@ -738,7 +738,7 @@ pub struct InMemoryFS {
     /// Authoritative manifest of all active log generations and lineage.
     pub manifest: Arc<RwLock<LogManifest>>,
     pub next_inode: AtomicU64,
-    pub last_tx_id: AtomicU64,
+    pub last_batch_id: AtomicU64,
     pub clock: Arc<dyn Clock>,
     pub log_writer: Option<Arc<LogWriter>>,
     pub log_cache: Option<Arc<LogFileCache>>,
@@ -863,7 +863,7 @@ impl InMemoryFS {
             inner: ActionMutex::new(inner),
             manifest,
             next_inode: AtomicU64::new(2),
-            last_tx_id: AtomicU64::new(0),
+            last_batch_id: AtomicU64::new(0),
             clock,
             log_writer,
             log_cache,

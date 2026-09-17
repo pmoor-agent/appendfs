@@ -2,7 +2,7 @@
 File:                "000000.summary"
 Generation:          0
 Format Version:      1
-Last Transaction ID: 0
+Last Batch ID:       0
 Next Inode:          2
 File Size:           256 B
 Encryption:          Plaintext (None)

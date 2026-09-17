@@ -799,3 +799,15 @@ fn log_file_count(log_dir: &std::path::Path) -> usize {
         .map(|entries| entries.flatten().count())
         .unwrap_or(0)
 }
+
+#[test]
+fn test_cli_mount_ro_batch_id_flag_and_no_tx_id_alias() {
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["mount-ro", "--help"])
+        .output()
+        .expect("failed to run mount-ro --help");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--batch-id"));
+    assert!(!stdout.contains("--tx-id"));
+}
