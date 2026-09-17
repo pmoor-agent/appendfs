@@ -1,3 +1,4 @@
+use crate::error::FsError;
 #[cfg(any(test, feature = "testing"))]
 use crate::fs::find_parent_inode;
 use crate::fs::{DirHandle, InMemoryFS};
@@ -7,15 +8,15 @@ use crate::sync::OpTag;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-pub fn lookup_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FileAttr, i32> {
+pub fn lookup_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FileAttr, FsError> {
     log::trace!("lookup(parent={}, name={})", parent, name);
     if name.len() > 255 {
-        return Err(libc::ENAMETOOLONG);
+        return Err(FsError::ENAMETOOLONG);
     }
     let inner = fs.inner.lock(OpTag::Lookup).unwrap();
-    let parent_attr = fs.get_attr_locked(&inner, parent).ok_or(libc::ENOENT)?;
+    let parent_attr = fs.get_attr_locked(&inner, parent).ok_or(FsError::ENOENT)?;
     if parent_attr.file_type != FileType::Directory {
-        return Err(libc::ENOTDIR);
+        return Err(FsError::ENOTDIR);
     }
 
     if name == "." {
@@ -27,24 +28,24 @@ pub fn lookup_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FileAttr,
         } else {
             inner.get_parent_dir_inode(parent).unwrap_or(1)
         };
-        return fs.get_attr_locked(&inner, dotdot_ino).ok_or(libc::ENOENT);
+        return fs.get_attr_locked(&inner, dotdot_ino).ok_or(FsError::ENOENT);
     }
 
-    let child_ino = fs.lookup_child_locked(&inner, parent, name).ok_or(libc::ENOENT)?;
-    fs.get_attr_locked(&inner, child_ino).ok_or(libc::ENOENT)
+    let child_ino = fs.lookup_child_locked(&inner, parent, name).ok_or(FsError::ENOENT)?;
+    fs.get_attr_locked(&inner, child_ino).ok_or(FsError::ENOENT)
 }
 
-pub fn lookup_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+pub fn lookup_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
     lookup_core(fs, parent, name).map(FuseResponse::entry)
 }
 
-pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, i32> {
+pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, FsError> {
     let inner = fs.inner.lock(OpTag::ReadDir).unwrap();
-    let attr = fs.get_attr_locked(&inner, ino).ok_or(libc::ENOENT)?;
+    let attr = fs.get_attr_locked(&inner, ino).ok_or(FsError::ENOENT)?;
     if attr.file_type != FileType::Directory {
-        return Err(libc::ENOTDIR);
+        return Err(FsError::ENOTDIR);
     }
-    let mut entries = inner.list_directory(ino).ok_or(libc::ENOENT)?;
+    let mut entries = inner.list_directory(ino).ok_or(FsError::ENOENT)?;
     drop(inner);
     if ino == 1 {
         let mut map: BTreeMap<String, u64> = entries.into_iter().collect();
@@ -107,13 +108,13 @@ pub fn iter_dir_entries<'a>(
     iter_dir_entries_with_parent(ino, dotdot_ino, entries, offset)
 }
 
-pub fn opendir_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
+pub fn opendir_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> {
     fs.with_inner(OpTag::OpenDir, |inner| {
-        let attr = fs.get_attr_locked(inner, ino).ok_or(libc::ENOENT)?;
+        let attr = fs.get_attr_locked(inner, ino).ok_or(FsError::ENOENT)?;
         if attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
-        let mut entries = inner.list_directory(ino).ok_or(libc::ENOENT)?;
+        let mut entries = inner.list_directory(ino).ok_or(FsError::ENOENT)?;
         if ino == 1 {
             let mut map: BTreeMap<String, u64> = entries.into_iter().collect();
             for (name, v_ino) in fs.list_virtual_entries() {
@@ -134,11 +135,17 @@ pub fn opendir_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
     })
 }
 
-pub fn opendir_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32> {
+pub fn opendir_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
     opendir_core(fs, ino, flags).map(|fh| FuseResponse::open(fh, false))
 }
 
-pub fn readdir_entries(fs: &InMemoryFS, ino: u64, _size: usize, offset: i64, fh: u64) -> Result<Vec<DirEntry>, i32> {
+pub fn readdir_entries(
+    fs: &InMemoryFS,
+    ino: u64,
+    _size: usize,
+    offset: i64,
+    fh: u64,
+) -> Result<Vec<DirEntry>, FsError> {
     log::trace!("readdir(ino={}, offset={}, fh={})", ino, offset, fh);
     fs.with_inner(OpTag::ReadDir, |inner| {
         let dir = inner.get_dir_handle(ino, fh)?;
@@ -168,7 +175,7 @@ pub fn readdirplus_entries(
     _size: usize,
     offset: i64,
     fh: u64,
-) -> Result<Vec<DirEntryPlus>, i32> {
+) -> Result<Vec<DirEntryPlus>, FsError> {
     log::trace!("readdirplus(ino={}, offset={}, fh={})", ino, offset, fh);
     fs.with_inner(OpTag::ReadDir, |inner| {
         let dir = inner.get_dir_handle(ino, fh)?;
@@ -198,7 +205,7 @@ pub fn readdir_response(
     size: usize,
     offset: i64,
     fh: u64,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     readdir_entries(fs, ino, size, offset, fh).map(|entries| FuseResponse::readdir(entries, size))
 }
 
@@ -208,13 +215,20 @@ pub fn readdirplus_response(
     size: usize,
     offset: i64,
     fh: u64,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     readdirplus_entries(fs, ino, size, offset, fh).map(|entries| FuseResponse::readdirplus(entries, size))
 }
 
-pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> Result<FileAttr, i32> {
+pub fn mkdir_core(
+    fs: &InMemoryFS,
+    parent: u64,
+    name: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<FileAttr, FsError> {
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
 
     fs.with_inner(OpTag::Mkdir, |inner| {
@@ -229,16 +243,16 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
         );
 
         if name.len() > 255 {
-            return Err(libc::ENAMETOOLONG);
+            return Err(FsError::ENAMETOOLONG);
         }
 
-        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(FsError::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
 
         if fs.lookup_child_locked(inner, parent, name).is_some() {
-            return Err(libc::EEXIST);
+            return Err(FsError::EEXIST);
         }
 
         let new_ino = fs.allocate_inode();
@@ -293,13 +307,13 @@ pub fn mkdir_response(
     parent: u64,
     name: &str,
     mode: u32,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     mkdir_core(fs, parent, name, mode, ctx.uid, ctx.gid).map(FuseResponse::entry)
 }
 
-pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
+pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), FsError> {
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
 
     fs.with_inner(OpTag::Rmdir, |inner| {
@@ -307,23 +321,23 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
         log::trace!("rmdir(parent={}, name={})", parent, name);
 
         if name.len() > 255 {
-            return Err(libc::ENAMETOOLONG);
+            return Err(FsError::ENAMETOOLONG);
         }
 
-        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(FsError::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
 
-        let child_ino = fs.lookup_child_locked(inner, parent, name).ok_or(libc::ENOENT)?;
-        let child_attr = fs.get_attr_locked(inner, child_ino).ok_or(libc::ENOENT)?;
+        let child_ino = fs.lookup_child_locked(inner, parent, name).ok_or(FsError::ENOENT)?;
+        let child_attr = fs.get_attr_locked(inner, child_ino).ok_or(FsError::ENOENT)?;
         if child_attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
 
-        let entries = inner.list_directory(child_ino).ok_or(libc::ENOENT)?;
+        let entries = inner.list_directory(child_ino).ok_or(FsError::ENOENT)?;
         if !entries.is_empty() {
-            return Err(libc::ENOTEMPTY);
+            return Err(FsError::ENOTEMPTY);
         }
 
         inner.remove_dir_entry(parent, name, now);
@@ -341,20 +355,20 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
     })
 }
 
-pub fn rmdir_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+pub fn rmdir_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
     rmdir_core(fs, parent, name).map(|()| FuseResponse::ok())
 }
 
-pub fn releasedir_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
+pub fn releasedir_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), FsError> {
     fs.release_dir_handle(fh, ino)
 }
 
-pub fn releasedir_response(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+pub fn releasedir_response(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
     releasedir_core(fs, ino, fh).map(|()| FuseResponse::ok())
 }
 
 #[cfg(any(test, feature = "testing"))]
-pub async fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), i32> {
+pub async fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), FsError> {
     crate::operations::read_write::fsync_core_with_reason(fs, 0, 0, crate::fs::FlushReason::Fsyncdir).await
 }
 
@@ -483,15 +497,15 @@ mod tests {
         let name_256 = "d".repeat(256);
         assert_eq!(
             mkdir_core(&fs, 1, &name_256, 0o755, 1000, 1000),
-            Err(libc::ENAMETOOLONG)
+            Err(FsError::ENAMETOOLONG)
         );
-        assert_eq!(lookup_core(&fs, 1, &name_256), Err(libc::ENAMETOOLONG));
+        assert_eq!(lookup_core(&fs, 1, &name_256), Err(FsError::ENAMETOOLONG));
 
         // rmdir_core with 256-byte name should return ENAMETOOLONG
-        assert_eq!(rmdir_core(&fs, 1, &name_256), Err(libc::ENAMETOOLONG));
+        assert_eq!(rmdir_core(&fs, 1, &name_256), Err(FsError::ENAMETOOLONG));
 
         // rmdir_core with 255-byte name should succeed
         assert_eq!(rmdir_core(&fs, 1, &name_255), Ok(()));
-        assert_eq!(lookup_core(&fs, 1, &name_255), Err(libc::ENOENT));
+        assert_eq!(lookup_core(&fs, 1, &name_255), Err(FsError::ENOENT));
     }
 }

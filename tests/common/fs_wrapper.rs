@@ -1,3 +1,4 @@
+use appendfs::FsError;
 use appendfs::InMemoryFS;
 use appendfs::clock::{Clock, SystemClock};
 use appendfs::crypto::VolumeKey;
@@ -294,31 +295,31 @@ impl TestFS {
         self.fs.lookup_child(parent, name)
     }
 
-    pub fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<u64, i32> {
+    pub fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<u64, FsError> {
         appendfs::operations::dir::mkdir_core(&self.fs, parent, name, mode, 1000, 1000).map(|attr| attr.ino)
     }
 
-    pub fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64, i32> {
+    pub fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64, FsError> {
         appendfs::operations::read_write::create_core(&self.fs, parent, name, mode, 0, 1000, 1000).map(|attr| attr.ino)
     }
 
-    pub fn write(&self, ino: u64, offset: u64, buf: &[u8]) -> Result<usize, i32> {
+    pub fn write(&self, ino: u64, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
         appendfs::operations::read_write::write_core(&self.fs, ino, buf, offset as i64)
     }
 
-    pub fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, i32> {
+    pub fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
         let fh = self.open(ino, libc::O_RDONLY as u32)?;
         let res = appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset as i64, len);
         let _ = self.release(ino, fh);
-        res.and_then(|resp| resp.into_bytes().ok_or(libc::EIO))
+        res.and_then(|resp| resp.into_bytes().ok_or(FsError::EIO))
     }
 
-    pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, i32> {
+    pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
         appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset as i64, len)
-            .and_then(|resp| resp.into_bytes().ok_or(libc::EIO))
+            .and_then(|resp| resp.into_bytes().ok_or(FsError::EIO))
     }
 
-    pub fn read_all(&self, ino: u64) -> Result<Vec<u8>, i32> {
+    pub fn read_all(&self, ino: u64) -> Result<Vec<u8>, FsError> {
         let fh = self.open(ino, libc::O_RDONLY as u32)?;
         let mut result = Vec::new();
         let chunk_size = 64 * 1024;
@@ -344,23 +345,23 @@ impl TestFS {
         res
     }
 
-    pub fn punch(&self, ino: u64, offset: u64, len: u64) -> Result<(), i32> {
+    pub fn punch(&self, ino: u64, offset: u64, len: u64) -> Result<(), FsError> {
         appendfs::operations::read_write::punch_hole_core(&self.fs, ino, offset, len)
     }
 
-    pub fn unlink(&self, parent: u64, name: &str) -> Result<(), i32> {
+    pub fn unlink(&self, parent: u64, name: &str) -> Result<(), FsError> {
         appendfs::operations::links::unlink_core(&self.fs, parent, name)
     }
 
-    pub fn rmdir(&self, parent: u64, name: &str) -> Result<(), i32> {
+    pub fn rmdir(&self, parent: u64, name: &str) -> Result<(), FsError> {
         appendfs::operations::dir::rmdir_core(&self.fs, parent, name)
     }
 
-    pub fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64, i32> {
+    pub fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64, FsError> {
         appendfs::operations::links::symlink_core(&self.fs, parent, name, target, 1000, 1000).map(|attr| attr.ino)
     }
 
-    pub fn link(&self, ino: u64, newparent: u64, newname: &str) -> Result<(), i32> {
+    pub fn link(&self, ino: u64, newparent: u64, newname: &str) -> Result<(), FsError> {
         appendfs::operations::links::link_core(&self.fs, ino, newparent, newname).map(|_| ())
     }
 
@@ -374,7 +375,7 @@ impl TestFS {
         size: Option<u64>,
         atime: Option<SystemTime>,
         mtime: Option<SystemTime>,
-    ) -> Result<(), i32> {
+    ) -> Result<(), FsError> {
         use appendfs::operations::read_write::{
             FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_SIZE,
             FUSE_SET_ATTR_UID, setattr_core,
@@ -414,38 +415,38 @@ impl TestFS {
         .map(|_| ())
     }
 
-    pub fn readlink(&self, ino: u64) -> Result<String, i32> {
+    pub fn readlink(&self, ino: u64) -> Result<String, FsError> {
         appendfs::operations::links::readlink_core(&self.fs, ino)
     }
 
-    pub fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), i32> {
+    pub fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), FsError> {
         appendfs::operations::links::rename_core(&self.fs, parent, name, newparent, newname)
     }
 
-    pub fn opendir(&self, ino: u64) -> Result<u64, i32> {
+    pub fn opendir(&self, ino: u64) -> Result<u64, FsError> {
         appendfs::operations::dir::opendir_core(&self.fs, ino, 0)
     }
 
-    pub fn releasedir(&self, ino: u64, fh: u64) -> Result<(), i32> {
+    pub fn releasedir(&self, ino: u64, fh: u64) -> Result<(), FsError> {
         appendfs::operations::dir::releasedir_core(&self.fs, ino, fh)
     }
 
-    pub fn open(&self, ino: u64, flags: u32) -> Result<u64, i32> {
+    pub fn open(&self, ino: u64, flags: u32) -> Result<u64, FsError> {
         appendfs::operations::read_write::open_core(&self.fs, ino, flags)
     }
 
-    pub fn release(&self, ino: u64, fh: u64) -> Result<(), i32> {
+    pub fn release(&self, ino: u64, fh: u64) -> Result<(), FsError> {
         appendfs::operations::read_write::release_core(&self.fs, ino, fh)
     }
 
-    pub fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<(), i32> {
+    pub fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<(), FsError> {
         appendfs::operations::xattr::setxattr_core(&self.fs, ino, name, value, flags).map(|_| ())
     }
 
     /// Runs the real two-phase getxattr protocol (query size, then fetch with that
     /// size) rather than just requesting a large fixed buffer, so this exercises the
     /// same size/ERANGE path a real xattr syscall would.
-    pub fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, i32> {
+    pub fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, FsError> {
         use appendfs::shim::FuseResponse;
         match appendfs::operations::xattr::getxattr_core(&self.fs, ino, name, 0)? {
             // A 0-length value is indistinguishable from "just tell me the size" at
@@ -464,13 +465,13 @@ impl TestFS {
         }
     }
 
-    pub fn removexattr(&self, ino: u64, name: &str) -> Result<(), i32> {
+    pub fn removexattr(&self, ino: u64, name: &str) -> Result<(), FsError> {
         appendfs::operations::xattr::removexattr_core(&self.fs, ino, name).map(|_| ())
     }
 
     /// Same two-phase size-then-data protocol as `getxattr`; returns the decoded,
     /// null-separated attribute names.
-    pub fn listxattr(&self, ino: u64) -> Result<Vec<String>, i32> {
+    pub fn listxattr(&self, ino: u64) -> Result<Vec<String>, FsError> {
         use appendfs::shim::FuseResponse;
         let buf = match appendfs::operations::xattr::listxattr_core(&self.fs, ino, 0)? {
             // See the same-value comment in `getxattr` - size 0 has no second call to make.

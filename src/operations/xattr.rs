@@ -1,3 +1,4 @@
+use crate::error::FsError;
 use crate::fs::InMemoryFS;
 use crate::node::AttrDelta;
 use crate::shim::FuseResponse;
@@ -7,21 +8,21 @@ use std::collections::HashMap;
 pub const XATTR_NAME_MAX: usize = 255;
 pub const XATTR_SIZE_MAX: usize = 65536;
 
-pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, i32> {
+pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, FsError> {
     let inner = fs.inner.lock(OpTag::Xattr).unwrap();
     if fs.get_attr_locked(&inner, ino).is_none() {
-        return Err(libc::ENOENT);
+        return Err(FsError::ENOENT);
     }
     if fs.is_virtual_ino(ino) {
-        return Err(libc::ENODATA);
+        return Err(FsError::ENODATA);
     }
 
-    let val = inner.get_xattr(ino, name).ok_or(libc::ENODATA)?;
+    let val = inner.get_xattr(ino, name).ok_or(FsError::ENODATA)?;
     drop(inner);
     if size == 0 {
         Ok(FuseResponse::xattr_size(val.len()))
     } else if size < val.len() {
-        Err(libc::ERANGE)
+        Err(FsError::ERANGE)
     } else {
         Ok(FuseResponse::buf(val))
     }
@@ -33,20 +34,20 @@ pub fn setxattr_core(
     name: &str,
     value: &[u8],
     flags: i32,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
     if fs.is_virtual_ino(ino) {
-        return Err(libc::EPERM);
+        return Err(FsError::EPERM);
     }
 
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return Err(libc::ERANGE);
+        return Err(FsError::ERANGE);
     }
 
     if value.len() > XATTR_SIZE_MAX {
-        return Err(libc::E2BIG);
+        return Err(FsError::E2BIG);
     }
 
     let now = fs.clock.now();
@@ -60,15 +61,15 @@ pub fn setxattr_core(
 
     fs.with_inner(OpTag::Xattr, |inner| {
         if fs.get_attr_locked(inner, ino).is_none() {
-            return Err(libc::ENOENT);
+            return Err(FsError::ENOENT);
         }
 
         let exists = inner.get_xattr(ino, name).is_some();
         if (flags & libc::XATTR_CREATE) != 0 && exists {
-            return Err(libc::EEXIST);
+            return Err(FsError::EEXIST);
         }
         if (flags & libc::XATTR_REPLACE) != 0 && !exists {
-            return Err(libc::ENODATA);
+            return Err(FsError::ENODATA);
         }
 
         inner.update_attr_delta(ino, delta);
@@ -77,10 +78,10 @@ pub fn setxattr_core(
     })
 }
 
-pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResponse<'static>, i32> {
+pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResponse<'static>, FsError> {
     let inner = fs.inner.lock(OpTag::Xattr).unwrap();
     if fs.get_attr_locked(&inner, ino).is_none() {
-        return Err(libc::ENOENT);
+        return Err(FsError::ENOENT);
     }
     if fs.is_virtual_ino(ino) {
         return Ok(if size == 0 {
@@ -90,7 +91,7 @@ pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResp
         });
     }
 
-    let keys = inner.list_xattrs(ino).ok_or(libc::ENOENT)?;
+    let keys = inner.list_xattrs(ino).ok_or(FsError::ENOENT)?;
     drop(inner);
     let mut buf = Vec::new();
     for key in keys {
@@ -101,18 +102,18 @@ pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResp
     if size == 0 {
         Ok(FuseResponse::xattr_size(buf.len()))
     } else if size < buf.len() {
-        Err(libc::ERANGE)
+        Err(FsError::ERANGE)
     } else {
         Ok(FuseResponse::buf(buf))
     }
 }
 
-pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
     if fs.is_virtual_ino(ino) {
-        return Err(libc::EPERM);
+        return Err(FsError::EPERM);
     }
 
     let now = fs.clock.now();
@@ -126,11 +127,11 @@ pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<FuseRes
 
     fs.with_inner(OpTag::Xattr, |inner| {
         if fs.get_attr_locked(inner, ino).is_none() {
-            return Err(libc::ENOENT);
+            return Err(FsError::ENOENT);
         }
 
         if inner.get_xattr(ino, name).is_none() {
-            return Err(libc::ENODATA);
+            return Err(FsError::ENODATA);
         }
 
         inner.update_attr_delta(ino, delta);
@@ -155,7 +156,7 @@ mod tests {
         let ino = attr.ino;
 
         // 1. Missing attribute returns ENODATA
-        assert_eq!(getxattr_core(&fs, ino, "user.comment", 0), Err(libc::ENODATA));
+        assert_eq!(getxattr_core(&fs, ino, "user.comment", 0), Err(FsError::ENODATA));
 
         // 2. Set attribute
         assert_eq!(
@@ -170,7 +171,7 @@ mod tests {
         );
 
         // 4. Query with insufficient buffer -> ERANGE
-        assert_eq!(getxattr_core(&fs, ino, "user.comment", 5), Err(libc::ERANGE));
+        assert_eq!(getxattr_core(&fs, ino, "user.comment", 5), Err(FsError::ERANGE));
 
         // 5. Query with sufficient buffer -> Data
         assert_eq!(
@@ -191,8 +192,8 @@ mod tests {
 
         // 7. Remove attribute
         assert_eq!(removexattr_core(&fs, ino, "user.comment"), Ok(FuseResponse::ok()));
-        assert_eq!(getxattr_core(&fs, ino, "user.comment", 0), Err(libc::ENODATA));
-        assert_eq!(removexattr_core(&fs, ino, "user.comment"), Err(libc::ENODATA));
+        assert_eq!(getxattr_core(&fs, ino, "user.comment", 0), Err(FsError::ENODATA));
+        assert_eq!(removexattr_core(&fs, ino, "user.comment"), Err(FsError::ENODATA));
     }
 
     #[test]
@@ -204,7 +205,7 @@ mod tests {
         // REPLACE fails on nonexistent attribute
         assert_eq!(
             setxattr_core(&fs, ino, "user.tag", b"v1", libc::XATTR_REPLACE),
-            Err(libc::ENODATA)
+            Err(FsError::ENODATA)
         );
 
         // CREATE succeeds on nonexistent attribute
@@ -216,7 +217,7 @@ mod tests {
         // CREATE fails on existing attribute
         assert_eq!(
             setxattr_core(&fs, ino, "user.tag", b"v2", libc::XATTR_CREATE),
-            Err(libc::EEXIST)
+            Err(FsError::EEXIST)
         );
 
         // REPLACE succeeds on existing attribute

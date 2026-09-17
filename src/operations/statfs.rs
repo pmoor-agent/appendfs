@@ -1,7 +1,8 @@
+use crate::error::FsError;
 use crate::fs::InMemoryFS;
 use crate::shim::{FuseResponse, StatfsAttr};
 
-pub fn statfs_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, i32> {
+pub fn statfs_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, FsError> {
     log::trace!("statfs(ino={})", ino);
     let active_inodes = fs.inode_counts().total_active() as u64;
 

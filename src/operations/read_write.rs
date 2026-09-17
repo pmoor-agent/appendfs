@@ -1,3 +1,4 @@
+use crate::error::FsError;
 use crate::extent_map::{Extent, ExtentMap};
 use crate::fs::{FileHandle, FlushReason, FsInner, InMemoryFS};
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
@@ -13,42 +14,48 @@ pub const FUSE_SET_ATTR_SIZE: u32 = 1 << 3;
 pub const FUSE_SET_ATTR_ATIME: u32 = 1 << 4;
 pub const FUSE_SET_ATTR_MTIME: u32 = 1 << 5;
 
-pub fn getattr_core(fs: &InMemoryFS, ino: u64) -> Result<FileAttr, i32> {
+pub fn getattr_core(fs: &InMemoryFS, ino: u64) -> Result<FileAttr, FsError> {
     log::trace!("getattr(ino={})", ino);
-    fs.get_attr(ino).ok_or(libc::ENOENT)
+    fs.get_attr(ino).ok_or(FsError::ENOENT)
 }
 
-pub fn getattr_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, i32> {
+pub fn getattr_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, FsError> {
     getattr_core(fs, ino).map(FuseResponse::attr)
 }
 
-pub fn read_core(fs: &InMemoryFS, ino: u64, fh: u64, offset: i64, size: usize) -> Result<FuseResponse<'static>, i32> {
+pub fn read_core(
+    fs: &InMemoryFS,
+    ino: u64,
+    fh: u64,
+    offset: i64,
+    size: usize,
+) -> Result<FuseResponse<'static>, FsError> {
     log::trace!("read(ino={}, fh={}, size={}, offset={})", ino, fh, size, offset);
     if offset < 0 {
-        return Err(libc::EINVAL);
+        return Err(FsError::EINVAL);
     }
     fs.read_handle(ino, fh, offset as u64, size).map(FuseResponse::buf)
 }
 
 pub use read_core as read_response;
 
-pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
+pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> {
     let write_requested = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0;
     if write_requested && fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
 
     if fs.is_virtual_ino(ino) {
         if write_requested {
-            return Err(libc::EACCES);
+            return Err(FsError::EACCES);
         }
         // Virtual files generate content outside the inner lock to prevent lock-ordering inversions
         // or self-deadlocks (since status generators query filesystem layer state).
         let content = fs.virtual_files.generate_content(ino, fs).unwrap_or_default();
         fs.with_inner(OpTag::Open, |inner| {
-            let attr = fs.get_attr_locked(inner, ino).ok_or(libc::ENOENT)?;
+            let attr = fs.get_attr_locked(inner, ino).ok_or(FsError::ENOENT)?;
             if attr.file_type != FileType::RegularFile {
-                return Err(libc::EISDIR);
+                return Err(FsError::EISDIR);
             }
             let fh = inner.allocate_fh();
             inner.insert_file_handle(
@@ -66,9 +73,9 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
         let now = fs.clock.now();
         let trunc = (flags & libc::O_TRUNC as u32) != 0;
         fs.with_inner(OpTag::Open, |inner| {
-            let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+            let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
             if attr.file_type != FileType::RegularFile {
-                return Err(libc::EISDIR);
+                return Err(FsError::EISDIR);
             }
             let fh = inner.allocate_fh();
             inner.insert_file_handle(fh, FileHandle::Regular { ino, flags });
@@ -91,21 +98,21 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
     }
 }
 
-pub fn open_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32> {
+pub fn open_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
     open_core(fs, ino, flags).map(|fh| FuseResponse::open(fh, fs.is_virtual_ino(ino)))
 }
 
-pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
+pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
     log::trace!("write(ino={}, fh={}, len={}, offset={})", ino, fh, buf.len(), offset);
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
     if fs.is_virtual_ino(ino) {
-        return Err(libc::EPERM);
+        return Err(FsError::EPERM);
     }
 
     if offset < 0 {
-        return Err(libc::EINVAL);
+        return Err(FsError::EINVAL);
     }
 
     let now = fs.clock.now();
@@ -114,13 +121,13 @@ pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset:
 
     fs.with_inner(OpTag::Write, |inner| {
         inner.validate_regular_handle(ino, fh)?;
-        let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+        let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
-            return Err(libc::EBADF);
+            return Err(FsError::EBADF);
         }
 
         if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
-            return Err(libc::ENOENT);
+            return Err(FsError::ENOENT);
         }
 
         let slices = inner.live_arena.append(buf);
@@ -147,9 +154,9 @@ pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset:
 }
 
 #[cfg(any(test, feature = "testing"))]
-pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
+pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
     if fs.is_virtual_ino(ino) {
-        return Err(libc::EPERM);
+        return Err(FsError::EPERM);
     }
     let fh = open_core(fs, ino, libc::O_RDWR as u32)?;
     let res = write_handle_core(fs, ino, fh, buf, offset);
@@ -163,7 +170,7 @@ pub fn write_response(
     fh: u64,
     buf: &[u8],
     offset: i64,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     write_handle_core(fs, ino, fh, buf, offset).map(FuseResponse::write)
 }
 
@@ -178,7 +185,7 @@ pub fn setattr_core(
     atime: SystemTime,
     mtime: SystemTime,
     to_set: u32,
-) -> Result<FileAttr, i32> {
+) -> Result<FileAttr, FsError> {
     log::trace!(
         "setattr(ino={}, mode=0o{:o}, uid={}, gid={}, size={}, to_set=0x{:x})",
         ino,
@@ -190,10 +197,10 @@ pub fn setattr_core(
     );
 
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
     if fs.is_virtual_ino(ino) {
-        return Err(libc::EPERM);
+        return Err(FsError::EPERM);
     }
 
     let now = fs.clock.now();
@@ -222,7 +229,7 @@ pub fn setattr_core(
     }
 
     fs.with_inner(OpTag::SetAttr, |inner| {
-        let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+        let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
 
         if (to_set & FUSE_SET_ATTR_SIZE) != 0 && attr.file_type == FileType::RegularFile {
             log::trace!("truncating file to {}", size);
@@ -242,15 +249,15 @@ pub fn setattr_core(
 
         inner.update_attr_delta(ino, attr_delta);
         inner.record_mutation(0);
-        inner.get_attr(ino).ok_or(libc::ENOENT)
+        inner.get_attr(ino).ok_or(FsError::ENOENT)
     })
 }
 
 /// Internal helper: punches a zero hole in `[offset, offset + len)` within an already-locked `FsInner`.
-fn punch_hole_locked(inner: &mut FsInner, ino: u64, offset: u64, len: u64, now: SystemTime) -> Result<(), i32> {
-    let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+fn punch_hole_locked(inner: &mut FsInner, ino: u64, offset: u64, len: u64, now: SystemTime) -> Result<(), FsError> {
+    let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
     if attr.file_type != FileType::RegularFile {
-        return Err(libc::EISDIR);
+        return Err(FsError::EISDIR);
     }
 
     let file_size = attr.size as u64;
@@ -260,7 +267,7 @@ fn punch_hole_locked(inner: &mut FsInner, ino: u64, offset: u64, len: u64, now: 
     }
 
     if !inner.live.contains_key(&ino) && !inner.exists_below_live(ino) {
-        return Err(libc::ENOENT);
+        return Err(FsError::ENOENT);
     }
     let entry = inner
         .live
@@ -282,10 +289,10 @@ fn punch_hole_locked(inner: &mut FsInner, ino: u64, offset: u64, len: u64, now: 
 /// the range from the live delta's extent map - which would leave the layer with no opinion
 /// and let the read fall through to `base`, resurrecting the punched data - it inserts an
 /// explicit `ExtentState::Zero` that masks whatever lies below.
-pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Result<(), i32> {
+pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Result<(), FsError> {
     log::trace!("punch_hole(ino={}, offset={}, len={})", ino, offset, len);
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
     let now = fs.clock.now();
     fs.with_inner(OpTag::Fallocate, |inner| {
@@ -294,8 +301,8 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
 }
 
 /// Internal helper: raises a file's recorded size to `new_size` within an already-locked `FsInner`.
-fn grow_size_locked(inner: &mut FsInner, ino: u64, new_size: u64, now: SystemTime) -> Result<(), i32> {
-    let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+fn grow_size_locked(inner: &mut FsInner, ino: u64, new_size: u64, now: SystemTime) -> Result<(), FsError> {
+    let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
     let entry = inner
         .live
         .entry(ino)
@@ -323,7 +330,7 @@ fn grow_size_locked(inner: &mut FsInner, ino: u64, new_size: u64, now: SystemTim
 /// alternative is worse: glibc's `posix_fallocate` responds to `EOPNOTSUPP` by writing
 /// zeros over the whole range by hand, so refusing a 1 GiB preallocation would push 1 GiB
 /// of zeros through the write path.
-pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length: i64) -> Result<(), i32> {
+pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length: i64) -> Result<(), FsError> {
     log::trace!(
         "fallocate(ino={}, mode=0x{:x}, offset={}, length={})",
         ino,
@@ -332,13 +339,13 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
         length
     );
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
     if fs.is_virtual_ino(ino) {
-        return Err(libc::EPERM);
+        return Err(FsError::EPERM);
     }
     if offset < 0 || length <= 0 {
-        return Err(libc::EINVAL);
+        return Err(FsError::EINVAL);
     }
 
     const SUPPORTED: i32 = libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE;
@@ -346,11 +353,11 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
         // Notably COLLAPSE_RANGE and INSERT_RANGE, which shift every byte above the range
         // and would mean re-keying every extent above `offset` in every layer - including
         // expressing that shift in a delta relative to `base`. Refusing is spec-legal.
-        return Err(libc::EOPNOTSUPP);
+        return Err(FsError::EOPNOTSUPP);
     }
 
     if mode & libc::FALLOC_FL_PUNCH_HOLE != 0 && mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
-        return Err(libc::EINVAL);
+        return Err(FsError::EINVAL);
     }
 
     let start = offset as u64;
@@ -359,9 +366,9 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
     let now = fs.clock.now();
 
     fs.with_inner(OpTag::Fallocate, |inner| {
-        let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+        let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
-            return Err(libc::EISDIR);
+            return Err(FsError::EISDIR);
         }
 
         if mode & libc::FALLOC_FL_PUNCH_HOLE != 0 {
@@ -390,7 +397,7 @@ pub fn fallocate_response(
     mode: i32,
     offset: i64,
     length: i64,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     fallocate_core(fs, ino, mode, offset, length).map(|()| FuseResponse::ok())
 }
 
@@ -405,7 +412,7 @@ pub fn setattr_response(
     atime: SystemTime,
     mtime: SystemTime,
     to_set: u32,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     setattr_core(fs, ino, mode, uid, gid, size, atime, mtime, to_set).map(FuseResponse::attr)
 }
 #[allow(clippy::too_many_arguments)]
@@ -418,9 +425,9 @@ fn create_internal(
     uid: u32,
     gid: u32,
     open_handle: bool,
-) -> Result<(FileAttr, Option<u64>), i32> {
+) -> Result<(FileAttr, Option<u64>), FsError> {
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
 
     fs.with_inner(OpTag::Create, |inner| {
@@ -436,16 +443,16 @@ fn create_internal(
         );
 
         if name.len() > 255 {
-            return Err(libc::ENAMETOOLONG);
+            return Err(FsError::ENAMETOOLONG);
         }
 
-        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(FsError::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
 
         if fs.lookup_child_locked(inner, parent, name).is_some() {
-            return Err(libc::EEXIST);
+            return Err(FsError::EEXIST);
         }
 
         let new_ino = fs.allocate_inode();
@@ -504,7 +511,7 @@ pub fn create_core(
     flags: u32,
     uid: u32,
     gid: u32,
-) -> Result<FileAttr, i32> {
+) -> Result<FileAttr, FsError> {
     create_internal(fs, parent, name, mode, flags, uid, gid, false).map(|(attr, _)| attr)
 }
 
@@ -515,31 +522,32 @@ pub fn create_response(
     name: &str,
     mode: u32,
     flags: u32,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     create_internal(fs, parent, name, mode, flags, ctx.uid, ctx.gid, true)
         .map(|(attr, fh)| FuseResponse::create(attr, fh.unwrap()))
 }
 
 #[cfg(any(test, feature = "testing"))]
-pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
+pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), FsError> {
     fsync_core_with_reason(fs, ino, fh, FlushReason::Fsync).await
 }
 
 /// Shared body for `fsync` and `fsyncdir`, which differ only in what they report as the
 /// reason for the flush.
 #[cfg(any(test, feature = "testing"))]
-pub async fn fsync_core_with_reason(fs: &InMemoryFS, ino: u64, fh: u64, reason: FlushReason) -> Result<(), i32> {
+pub async fn fsync_core_with_reason(fs: &InMemoryFS, ino: u64, fh: u64, reason: FlushReason) -> Result<(), FsError> {
     fsync_response(fs, ino, fh, reason).wait_async().await.map(|_| ())
 }
 
 pub struct FsyncDeferred(pub crate::fs::BatchCompletion);
 
 impl DeferredCompletion<FuseResponse<'static>> for FsyncDeferred {
-    fn on_complete(self: Box<Self>, callback: Box<dyn FnOnce(Result<FuseResponse<'static>, i32>) + Send + 'static>) {
+    fn on_complete(
+        self: Box<Self>,
+        callback: Box<dyn FnOnce(Result<FuseResponse<'static>, FsError>) + Send + 'static>,
+    ) {
         self.0.add_callback(Box::new(move |result| {
-            let res = result
-                .map(|()| FuseResponse::ok())
-                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO));
+            let res = result.map(|()| FuseResponse::ok()).map_err(FsError::from);
             callback(res);
         }));
     }
@@ -564,11 +572,11 @@ pub fn fsync_response(
     DeferredResult::deferred(FsyncDeferred(completion))
 }
 
-pub fn release_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
+pub fn release_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), FsError> {
     fs.release_file_handle(fh, ino)
 }
 
-pub fn release_response(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+pub fn release_response(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
     release_core(fs, ino, fh).map(|()| FuseResponse::ok())
 }
 
@@ -592,18 +600,18 @@ mod tests {
         // Modes that shift file contents are refused outright. Silently ignoring the flag
         // and allocating instead would leave the caller's data at the wrong offsets.
         for mode in [libc::FALLOC_FL_COLLAPSE_RANGE, libc::FALLOC_FL_INSERT_RANGE] {
-            assert_eq!(fallocate_core(&fs, ino, mode, 0, 128), Err(libc::EOPNOTSUPP));
+            assert_eq!(fallocate_core(&fs, ino, mode, 0, 128), Err(FsError::EOPNOTSUPP));
         }
 
         // `vfs_fallocate` screens this pairing before FUSE sees it, but the check still has
         // to hold for direct callers.
         assert_eq!(
             fallocate_core(&fs, ino, libc::FALLOC_FL_PUNCH_HOLE, 0, 128),
-            Err(libc::EINVAL)
+            Err(FsError::EINVAL)
         );
 
-        assert_eq!(fallocate_core(&fs, ino, 0, -1, 128), Err(libc::EINVAL));
-        assert_eq!(fallocate_core(&fs, ino, 0, 0, 0), Err(libc::EINVAL));
+        assert_eq!(fallocate_core(&fs, ino, 0, -1, 128), Err(FsError::EINVAL));
+        assert_eq!(fallocate_core(&fs, ino, 0, 0, 0), Err(FsError::EINVAL));
 
         // KEEP_SIZE alone has nothing to reserve, so it must leave the file untouched.
         assert_eq!(fallocate_core(&fs, ino, libc::FALLOC_FL_KEEP_SIZE, 0, 4096), Ok(()));
@@ -660,9 +668,9 @@ mod tests {
         fs.set_read_only(true);
         assert_eq!(
             fallocate_core(&fs, ino, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, 0, 64),
-            Err(libc::EROFS)
+            Err(FsError::EROFS)
         );
-        assert_eq!(punch_hole_core(&fs, ino, 0, 64), Err(libc::EROFS));
+        assert_eq!(punch_hole_core(&fs, ino, 0, 64), Err(FsError::EROFS));
     }
 
     #[test]
@@ -811,7 +819,7 @@ mod tests {
         let name_256 = "f".repeat(256);
         assert_eq!(
             create_core(&fs, 1, &name_256, 0o644, 0, 1000, 1000),
-            Err(libc::ENAMETOOLONG)
+            Err(FsError::ENAMETOOLONG)
         );
     }
 }

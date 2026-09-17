@@ -1,3 +1,7 @@
+use appendfs::Clock;
+use appendfs::FsError;
+use appendfs::InMemoryFS;
+use appendfs::Storage;
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{VolumeHeader, VolumeKey};
 use appendfs::log::{LogFileCache, LogWriter, init_volume, init_volume_with_clock};
@@ -9,18 +13,18 @@ use appendfs::remote::{
     MockRemoteStore, RemoteRegistry, RemoteStore, RemoteTargetConfig, check_remote_integrity,
 };
 use appendfs::storage::MemoryStorage;
-use appendfs::{Clock, InMemoryFS, Storage, wait_until};
+use appendfs::wait_until;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 
-fn read_test(fs: &InMemoryFS, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+fn read_test(fs: &InMemoryFS, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, FsError> {
     let fh = open_core(fs, ino, libc::O_RDONLY as u32)?;
     let res = read_core(fs, ino, fh, offset as i64, size);
     let _ = release_core(fs, ino, fh);
-    res.and_then(|r| r.into_bytes().ok_or(libc::EIO))
+    res.and_then(|r| r.into_bytes().ok_or(FsError::EIO))
 }
 
 #[test]
@@ -974,7 +978,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     release_core(&fs_arc, remotes_ino, fh).unwrap();
     assert_eq!(
         read_core(&fs_arc, remotes_ino, fh, 0, 4096),
-        Err(libc::EBADF),
+        Err(FsError::EBADF),
         "Reading from released handle must return EBADF"
     );
 }

@@ -5,6 +5,8 @@ use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+pub use crate::error::FsError;
+
 // High-level safe representation of file types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileType {
@@ -256,12 +258,21 @@ impl Request {
         unsafe { &*(self.userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) }
     }
 
-    pub(crate) fn reply_err(self, err: i32) {
+    pub(crate) fn reply_err(self, err: FsError) {
         if self.req.is_null() {
             return;
         }
         unsafe {
-            shim_reply_err(self.req, err);
+            shim_reply_err(self.req, err.raw());
+        }
+    }
+
+    pub(crate) fn reply_ok(self) {
+        if self.req.is_null() {
+            return;
+        }
+        unsafe {
+            shim_reply_err(self.req, 0);
         }
     }
 
@@ -340,7 +351,7 @@ impl Request {
         let c_link = match CString::new(link) {
             Ok(c) => c,
             Err(_) => {
-                self.reply_err(libc::EIO);
+                self.reply_err(FsError::EIO);
                 return;
             }
         };
@@ -488,7 +499,7 @@ impl<'a> AsRef<[u8]> for ReplyData<'a> {
 
 /// High-level typed representation of a successful response sent back to the FUSE kernel.
 ///
-/// Handlers can return `Result<FuseResponse<'a>, i32>` without directly interacting with
+/// Handlers can return `Result<FuseResponse<'a>, FsError>` without directly interacting with
 /// `Request` or raw FFI pointers.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FuseResponse<'a> {
@@ -648,7 +659,7 @@ impl<'a> FuseResponse<'a> {
     /// Sends this response over the FUSE request handle.
     pub(crate) fn send(self, req: Request) {
         match self {
-            FuseResponse::Ok => req.reply_err(0),
+            FuseResponse::Ok => req.reply_ok(),
             FuseResponse::Entry(attr) => req.reply_entry(&attr),
             FuseResponse::Attr(attr) => req.reply_attr(&attr),
             FuseResponse::Open { fh, direct_io } => req.reply_open(fh, direct_io),
@@ -681,9 +692,9 @@ impl<'a> FuseResponse<'a> {
     }
 }
 
-/// Helper to dispatch a `Result<FuseResponse, i32>` to a FUSE request.
+/// Helper to dispatch a `Result<FuseResponse, FsError>` to a FUSE request.
 #[inline]
-pub(crate) fn reply_result<'a>(req: Request, result: Result<FuseResponse<'a>, i32>) {
+pub(crate) fn reply_result<'a>(req: Request, result: Result<FuseResponse<'a>, FsError>) {
     match result {
         Ok(resp) => resp.send(req),
         Err(err) => req.reply_err(err),
@@ -691,7 +702,7 @@ pub(crate) fn reply_result<'a>(req: Request, result: Result<FuseResponse<'a>, i3
 }
 
 /// Trait implemented by deferred async completions (e.g. batch flushes, lock acquisitions).
-pub type DeferredCallback<T> = Box<dyn FnOnce(Result<T, i32>) + Send + 'static>;
+pub type DeferredCallback<T> = Box<dyn FnOnce(Result<T, FsError>) + Send + 'static>;
 
 pub trait DeferredCompletion<T>: Send + 'static {
     fn on_complete(self: Box<Self>, callback: DeferredCallback<T>);
@@ -706,7 +717,7 @@ impl<T> std::fmt::Debug for dyn DeferredCompletion<T> {
 /// Rich result type representing an operation that either completed immediately or was deferred.
 pub enum DeferredResult<T = FuseResponse<'static>> {
     /// The operation completed immediately (e.g. uncontended lock, cached read).
-    Ready(Result<T, i32>),
+    Ready(Result<T, FsError>),
     /// The operation is pending an external event (batch disk sync, lock waiter wake).
     Deferred(Box<dyn DeferredCompletion<T>>),
 }
@@ -721,7 +732,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for DeferredResult<T> {
 }
 
 impl<T: Send + 'static> DeferredResult<T> {
-    pub fn ready(res: Result<T, i32>) -> Self {
+    pub fn ready(res: Result<T, FsError>) -> Self {
         DeferredResult::Ready(res)
     }
 
@@ -729,8 +740,8 @@ impl<T: Send + 'static> DeferredResult<T> {
         DeferredResult::Ready(Ok(val))
     }
 
-    pub fn err(errno: i32) -> Self {
-        DeferredResult::Ready(Err(errno))
+    pub fn err(err: FsError) -> Self {
+        DeferredResult::Ready(Err(err))
     }
 
     pub fn deferred(completion: impl DeferredCompletion<T> + 'static) -> Self {
@@ -745,21 +756,21 @@ impl<T: Send + 'static> DeferredResult<T> {
         matches!(self, DeferredResult::Deferred(_))
     }
 
-    pub fn into_ready(self) -> Option<Result<T, i32>> {
+    pub fn into_ready(self) -> Option<Result<T, FsError>> {
         match self {
             DeferredResult::Ready(r) => Some(r),
             DeferredResult::Deferred(_) => None,
         }
     }
 
-    pub fn on_complete(self, callback: impl FnOnce(Result<T, i32>) + Send + 'static) {
+    pub fn on_complete(self, callback: impl FnOnce(Result<T, FsError>) + Send + 'static) {
         match self {
             DeferredResult::Ready(res) => callback(res),
             DeferredResult::Deferred(completion) => completion.on_complete(Box::new(callback)),
         }
     }
 
-    pub fn wait(self) -> Result<T, i32> {
+    pub fn wait(self) -> Result<T, FsError> {
         match self {
             DeferredResult::Ready(res) => res,
             DeferredResult::Deferred(completion) => {
@@ -767,12 +778,12 @@ impl<T: Send + 'static> DeferredResult<T> {
                 completion.on_complete(Box::new(move |res| {
                     let _ = tx.send(res);
                 }));
-                rx.recv().unwrap_or(Err(libc::EIO))
+                rx.recv().unwrap_or(Err(FsError::EIO))
             }
         }
     }
 
-    pub async fn wait_async(self) -> Result<T, i32> {
+    pub async fn wait_async(self) -> Result<T, FsError> {
         match self {
             DeferredResult::Ready(res) => res,
             DeferredResult::Deferred(completion) => {
@@ -780,7 +791,7 @@ impl<T: Send + 'static> DeferredResult<T> {
                 completion.on_complete(Box::new(move |res| {
                     let _ = tx.send(res);
                 }));
-                rx.await.unwrap_or(Err(libc::EIO))
+                rx.await.unwrap_or(Err(FsError::EIO))
             }
         }
     }
@@ -792,14 +803,14 @@ impl DeferredResult<FuseResponse<'static>> {
     }
 }
 
-impl<T> From<Result<T, i32>> for DeferredResult<T> {
-    fn from(res: Result<T, i32>) -> Self {
+impl<T> From<Result<T, FsError>> for DeferredResult<T> {
+    fn from(res: Result<T, FsError>) -> Self {
         DeferredResult::Ready(res)
     }
 }
 
 struct DeferredTokenInner<T> {
-    result: Option<Result<T, i32>>,
+    result: Option<Result<T, FsError>>,
     callback: Option<DeferredCallback<T>>,
 }
 
@@ -822,7 +833,7 @@ impl<T: Send + 'static> DeferredToken<T> {
         (Self { state: state.clone() }, DeferredReceiver { state })
     }
 
-    pub fn complete(self, result: Result<T, i32>) {
+    pub fn complete(self, result: Result<T, FsError>) {
         let mut guard = self.state.lock().unwrap();
         if let Some(cb) = guard.callback.take() {
             drop(guard);
@@ -849,10 +860,10 @@ impl<T> Drop for DeferredToken<T> {
     fn drop(&mut self) {
         let mut guard = self.state.lock().unwrap();
         if guard.result.is_none() {
-            guard.result = Some(Err(libc::ECANCELED));
+            guard.result = Some(Err(FsError::ECANCELED));
             if let Some(cb) = guard.callback.take() {
                 drop(guard);
-                cb(Err(libc::ECANCELED));
+                cb(Err(FsError::ECANCELED));
             }
         }
     }
@@ -1017,14 +1028,14 @@ impl DirEntryPlus {
 pub trait Filesystem {
     fn init(&self) {}
     fn destroy(&self) {}
-    fn lookup(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
-    fn getattr(&self, ino: u64) -> Result<FuseResponse<'static>, i32>;
-    fn opendir(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32>;
-    fn readdir(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
-    fn readdirplus(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
-    fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
-    fn open(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32>;
-    fn write(&self, ino: u64, buf: &[u8], offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
+    fn lookup(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError>;
+    fn getattr(&self, ino: u64) -> Result<FuseResponse<'static>, FsError>;
+    fn opendir(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError>;
+    fn readdir(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError>;
+    fn readdirplus(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError>;
+    fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError>;
+    fn open(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError>;
+    fn write(&self, ino: u64, buf: &[u8], offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError>;
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
@@ -1036,7 +1047,7 @@ pub trait Filesystem {
         atime: SystemTime,
         mtime: SystemTime,
         to_set: u32,
-    ) -> Result<FuseResponse<'static>, i32>;
+    ) -> Result<FuseResponse<'static>, FsError>;
     fn create(
         &self,
         ctx: RequestContext,
@@ -1044,7 +1055,7 @@ pub trait Filesystem {
         name: &str,
         mode: u32,
         flags: u32,
-    ) -> Result<FuseResponse<'static>, i32>;
+    ) -> Result<FuseResponse<'static>, FsError>;
     fn mknod(
         &self,
         ctx: RequestContext,
@@ -1052,22 +1063,35 @@ pub trait Filesystem {
         name: &str,
         mode: u32,
         rdev: u32,
-    ) -> Result<FuseResponse<'static>, i32>;
-    fn unlink(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
-    fn mkdir(&self, ctx: RequestContext, parent: u64, name: &str, mode: u32) -> Result<FuseResponse<'static>, i32>;
-    fn rmdir(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
-    fn symlink(&self, ctx: RequestContext, link: &str, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
-    fn readlink(&self, ino: u64) -> Result<FuseResponse<'static>, i32>;
-    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, i32>;
-    fn link(&self, ino: u64, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, i32>;
+    ) -> Result<FuseResponse<'static>, FsError>;
+    fn unlink(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError>;
+    fn mkdir(&self, ctx: RequestContext, parent: u64, name: &str, mode: u32) -> Result<FuseResponse<'static>, FsError>;
+    fn rmdir(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError>;
+    fn symlink(
+        &self,
+        ctx: RequestContext,
+        link: &str,
+        parent: u64,
+        name: &str,
+    ) -> Result<FuseResponse<'static>, FsError>;
+    fn readlink(&self, ino: u64) -> Result<FuseResponse<'static>, FsError>;
+    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, FsError>;
+    fn link(&self, ino: u64, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, FsError>;
     fn fsync(&self, ino: u64, datasync: bool, fh: u64) -> DeferredResult<FuseResponse<'static>>;
-    fn fallocate(&self, ino: u64, mode: i32, offset: i64, length: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
-    fn release(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32>;
-    fn releasedir(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32>;
+    fn fallocate(
+        &self,
+        ino: u64,
+        mode: i32,
+        offset: i64,
+        length: i64,
+        fh: u64,
+    ) -> Result<FuseResponse<'static>, FsError>;
+    fn release(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, FsError>;
+    fn releasedir(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, FsError>;
     fn fsyncdir(&self, ino: u64, datasync: bool) -> DeferredResult<FuseResponse<'static>>;
-    fn statfs(&self, ino: u64) -> Result<FuseResponse<'static>, i32>;
+    fn statfs(&self, ino: u64) -> Result<FuseResponse<'static>, FsError>;
     fn flock(&self, ino: u64, fh: u64, lock_owner: u64, op: i32) -> DeferredResult<FuseResponse<'static>>;
-    fn getlk(&self, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<FuseResponse<'static>, i32>;
+    fn getlk(&self, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<FuseResponse<'static>, FsError>;
     fn setlk(
         &self,
         ino: u64,
@@ -1076,10 +1100,10 @@ pub trait Filesystem {
         lock: ShimFlock,
         sleep: bool,
     ) -> DeferredResult<FuseResponse<'static>>;
-    fn getxattr(&self, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, i32>;
-    fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<FuseResponse<'static>, i32>;
-    fn listxattr(&self, ino: u64, size: usize) -> Result<FuseResponse<'static>, i32>;
-    fn removexattr(&self, ino: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
+    fn getxattr(&self, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, FsError>;
+    fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<FuseResponse<'static>, FsError>;
+    fn listxattr(&self, ino: u64, size: usize) -> Result<FuseResponse<'static>, FsError>;
+    fn removexattr(&self, ino: u64, name: &str) -> Result<FuseResponse<'static>, FsError>;
 }
 
 #[inline]
@@ -1103,7 +1127,7 @@ where
 // Lowlevel C callback bridges
 extern "C" fn lookup_bridge(req: Request, parent: u64, name: *const c_char) {
     handle_op(req, FuseOp::Lookup, |fs| {
-        let name_str = c_str_to_str(name).ok_or(libc::ENOENT)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::ENOENT)?;
         fs.lookup(parent, name_str)
     });
 }
@@ -1165,43 +1189,43 @@ extern "C" fn setattr_bridge(
 
 extern "C" fn create_bridge(req: Request, parent: u64, name: *const c_char, mode: u32, flags: u32) {
     handle_op(req, FuseOp::Create, |fs| {
-        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::EINVAL)?;
         fs.create(req.context(), parent, name_str, mode, flags)
     });
 }
 
 extern "C" fn mknod_bridge(req: Request, parent: u64, name: *const c_char, mode: u32, rdev: u32) {
     handle_op(req, FuseOp::Mknod, |fs| {
-        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::EINVAL)?;
         fs.mknod(req.context(), parent, name_str, mode, rdev)
     });
 }
 
 extern "C" fn unlink_bridge(req: Request, parent: u64, name: *const c_char) {
     handle_op(req, FuseOp::Unlink, |fs| {
-        let name_str = c_str_to_str(name).ok_or(libc::ENOENT)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::ENOENT)?;
         fs.unlink(parent, name_str)
     });
 }
 
 extern "C" fn mkdir_bridge(req: Request, parent: u64, name: *const c_char, mode: u32) {
     handle_op(req, FuseOp::Mkdir, |fs| {
-        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::EINVAL)?;
         fs.mkdir(req.context(), parent, name_str, mode)
     });
 }
 
 extern "C" fn rmdir_bridge(req: Request, parent: u64, name: *const c_char) {
     handle_op(req, FuseOp::Rmdir, |fs| {
-        let name_str = c_str_to_str(name).ok_or(libc::ENOENT)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::ENOENT)?;
         fs.rmdir(parent, name_str)
     });
 }
 
 extern "C" fn symlink_bridge(req: Request, link: *const c_char, parent: u64, name: *const c_char) {
     handle_op(req, FuseOp::Symlink, |fs| {
-        let link_str = c_str_to_str(link).ok_or(libc::EINVAL)?;
-        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        let link_str = c_str_to_str(link).ok_or(FsError::EINVAL)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::EINVAL)?;
         fs.symlink(req.context(), link_str, parent, name_str)
     });
 }
@@ -1212,15 +1236,15 @@ extern "C" fn readlink_bridge(req: Request, ino: u64) {
 
 extern "C" fn rename_bridge(req: Request, parent: u64, name: *const c_char, newparent: u64, newname: *const c_char) {
     handle_op(req, FuseOp::Rename, |fs| {
-        let name_str = c_str_to_str(name).ok_or(libc::ENOENT)?;
-        let newname_str = c_str_to_str(newname).ok_or(libc::EINVAL)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::ENOENT)?;
+        let newname_str = c_str_to_str(newname).ok_or(FsError::EINVAL)?;
         fs.rename(parent, name_str, newparent, newname_str)
     });
 }
 
 extern "C" fn link_bridge(req: Request, ino: u64, newparent: u64, newname: *const c_char) {
     handle_op(req, FuseOp::Link, |fs| {
-        let newname_str = c_str_to_str(newname).ok_or(libc::EINVAL)?;
+        let newname_str = c_str_to_str(newname).ok_or(FsError::EINVAL)?;
         fs.link(ino, newparent, newname_str)
     });
 }
@@ -1255,6 +1279,9 @@ extern "C" fn flock_bridge(req: Request, ino: u64, fh: u64, lock_owner: u64, op:
 
 extern "C" fn getlk_bridge(req: Request, ino: u64, fh: u64, lock_owner: u64, lock: *mut ShimFlock) {
     handle_op(req, FuseOp::Getlk, |fs| {
+        if lock.is_null() {
+            return Err(FsError::EINVAL);
+        }
         let sh_lock = unsafe { *lock };
         fs.getlk(ino, fh, lock_owner, sh_lock)
     });
@@ -1262,6 +1289,9 @@ extern "C" fn getlk_bridge(req: Request, ino: u64, fh: u64, lock_owner: u64, loc
 
 extern "C" fn setlk_bridge(req: Request, ino: u64, fh: u64, lock_owner: u64, lock: *const ShimFlock, sleep: c_int) {
     handle_op(req, FuseOp::Setlk, |fs| {
+        if lock.is_null() {
+            return DeferredResult::err(FsError::EINVAL);
+        }
         let sh_lock = unsafe { *lock };
         fs.setlk(ino, fh, lock_owner, sh_lock, sleep != 0)
     });
@@ -1269,7 +1299,7 @@ extern "C" fn setlk_bridge(req: Request, ino: u64, fh: u64, lock_owner: u64, loc
 
 extern "C" fn getxattr_bridge(req: Request, ino: u64, name: *const c_char, size: usize) {
     handle_op(req, FuseOp::Getxattr, |fs| {
-        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::EINVAL)?;
         fs.getxattr(ino, name_str, size)
     });
 }
@@ -1288,7 +1318,7 @@ extern "C" fn setxattr_bridge(
         &[]
     };
     handle_op(req, FuseOp::Setxattr, |fs| {
-        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::EINVAL)?;
         fs.setxattr(ino, name_str, val_slice, flags)
     });
 }
@@ -1299,7 +1329,7 @@ extern "C" fn listxattr_bridge(req: Request, ino: u64, size: usize) {
 
 extern "C" fn removexattr_bridge(req: Request, ino: u64, name: *const c_char) {
     handle_op(req, FuseOp::Removexattr, |fs| {
-        let name_str = c_str_to_str(name).ok_or(libc::EINVAL)?;
+        let name_str = c_str_to_str(name).ok_or(FsError::EINVAL)?;
         fs.removexattr(ino, name_str)
     });
 }
@@ -1314,15 +1344,15 @@ extern "C" fn destroy_bridge(userdata: *mut c_void) {
     fs.destroy();
 }
 
-pub fn mount(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), i32> {
+pub fn mount(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), FsError> {
     mount_arc(args, std::sync::Arc::new(fs))
 }
 
-pub fn mount_ro(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), i32> {
+pub fn mount_ro(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), FsError> {
     mount_ro_arc(args, std::sync::Arc::new(fs))
 }
 
-pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), i32> {
+pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), FsError> {
     fs.set_read_only(true);
     // Injects kernel-level read-only mount option
     args.push("-o".to_string());
@@ -1330,7 +1360,7 @@ pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemor
     mount_arc(args, fs)
 }
 
-pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), i32> {
+pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), FsError> {
     let c_args_owners: Vec<CString> = args.into_iter().map(|arg| CString::new(arg).unwrap()).collect();
 
     let c_args: Vec<*const c_char> = c_args_owners.iter().map(|arg| arg.as_ptr()).collect();
@@ -1383,7 +1413,7 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
         }
     }
 
-    if code == 0 { Ok(()) } else { Err(code) }
+    if code == 0 { Ok(()) } else { Err(FsError(code)) }
 }
 
 #[cfg(test)]
@@ -1434,6 +1464,6 @@ mod tests {
         reply_result(req, Ok(FuseResponse::readlink("dest")));
         reply_result(req, Ok(FuseResponse::buf(b"abc".as_slice())));
         reply_result(req, Ok(FuseResponse::xattr_size(10)));
-        reply_result(req, Err(libc::ENOENT));
+        reply_result(req, Err(FsError::ENOENT));
     }
 }

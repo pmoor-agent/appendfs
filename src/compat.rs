@@ -1,4 +1,5 @@
 use crate::clock::Clock;
+use crate::error::FsError;
 use crate::fs::InMemoryFS;
 use crate::log::{LogWriter, init_volume_with_clock_and_uids};
 use crate::operations::dir::mkdir_core;
@@ -13,7 +14,7 @@ use crate::shim::FileType;
 use crate::storage::{OsStorage, Storage};
 use crate::{VolumeHeader, VolumeKey};
 
-fn compat_write(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, i32> {
+fn compat_write(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
     let fh = open_core(fs, ino, libc::O_RDWR as u32)?;
     let res = write_handle_core(fs, ino, fh, buf, offset);
     let _ = release_core(fs, ino, fh);
@@ -159,7 +160,7 @@ pub fn compat_multi_extent_full() -> Vec<u8> {
 /// Populates the canonical compatibility filesystem tree on `fs` across 3 distinct flush cycles.
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
-pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), i32> {
+pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), FsError> {
     // --- BATCH 1: Initial directories, partial file write, and initial xattr ---
     clock.set_offset(10);
     let dir_empty = mkdir_core(fs, 1, "dir_empty", 0o755, 1000, 1000)?;
@@ -196,7 +197,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     setxattr_core(fs, hello_file.ino, "user.test_attr", b"compat_v1", 0)?;
 
     // Commit Batch 1 to log
-    fs.quiesce().map_err(|_| libc::EIO)?;
+    fs.quiesce()?;
 
     // --- BATCH 2: Subdirectories, empty file, binary payload, multi-extent part 1 ---
     clock.set_offset(60);
@@ -278,7 +279,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     compat_write(fs, multi_extent.ino, &p1, 0)?;
 
     // Commit Batch 2 to log
-    fs.quiesce().map_err(|_| libc::EIO)?;
+    fs.quiesce()?;
 
     // --- BATCH 3: Multi-extent part 2, sparse file, hardlink, symlinks, special files, and attrs ---
     clock.set_offset(170);
@@ -487,7 +488,7 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     )?;
 
     // Commit Batch 3 to log
-    fs.quiesce().map_err(|_| libc::EIO)?;
+    fs.quiesce()?;
 
     Ok(())
 }
@@ -542,7 +543,7 @@ pub fn create_canonical_compat_volume(out_dir: &Path) -> io::Result<()> {
     fs.set_log_dir(out_dir);
 
     // 3. Populate canonical tree across 3 flushes
-    populate_compat_tree(&fs, &clock).map_err(io::Error::from_raw_os_error)?;
+    populate_compat_tree(&fs, &clock).map_err(io::Error::from)?;
 
     // 4. Export final summary snapshot -> writes 000001.summary
     clock.set_offset(500);
@@ -624,7 +625,7 @@ pub fn create_canonical_compat_volume_encrypted(out_dir: &Path, passphrase: &str
     fs.set_log_dir(out_dir);
 
     // 3. Populate canonical tree across 3 flushes
-    populate_compat_tree(&fs, &clock).map_err(io::Error::from_raw_os_error)?;
+    populate_compat_tree(&fs, &clock).map_err(io::Error::from)?;
 
     // 4. Export final summary snapshot -> writes 000001.summary with explicit IV
     clock.set_offset(500);

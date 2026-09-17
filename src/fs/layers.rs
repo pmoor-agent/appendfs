@@ -9,6 +9,7 @@
 //! one can straddle that move and miss the batch entirely.
 
 use super::InMemoryFS;
+use crate::error::FsError;
 use crate::extent_map::Extent;
 use crate::node::{EntryDelta, Node, NodeDelta, NodeKind};
 use crate::shim::{FileAttr, FileType};
@@ -257,10 +258,10 @@ impl<'a> InodeLayerStack<'a> {
         offset: u64,
         size: usize,
         log_cache: Option<&crate::log::LogFileCache>,
-    ) -> Result<ReadPlan, i32> {
-        let attr = self.attr().ok_or(libc::ENOENT)?;
+    ) -> Result<ReadPlan, FsError> {
+        let attr = self.attr().ok_or(FsError::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
-            return Err(libc::EISDIR);
+            return Err(FsError::EISDIR);
         }
 
         let file_size = attr.size as u64;
@@ -408,7 +409,7 @@ impl<'a> InodeLayerStack<'a> {
     }
 
     /// Reads file data resolving extents across layers.
-    pub fn read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<Vec<u8>, i32> {
+    pub fn read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<Vec<u8>, FsError> {
         let plan = self.plan_read_file_data(offset, size, fs.log_cache.as_deref())?;
         fs.execute_read_plan_sync(plan)
     }
@@ -515,7 +516,7 @@ impl ReadPlan {
 
 impl InMemoryFS {
     /// Executes a [`ReadPlan`] synchronously, reading any cold disk extents via [`LogFileCache`].
-    pub fn execute_read_plan_sync(&self, plan: ReadPlan) -> Result<Vec<u8>, i32> {
+    pub fn execute_read_plan_sync(&self, plan: ReadPlan) -> Result<Vec<u8>, FsError> {
         execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key)
     }
 
@@ -528,10 +529,10 @@ impl InMemoryFS {
         plan: ReadPlan,
         log_cache: Option<Arc<crate::log::LogFileCache>>,
         volume_key: Arc<crate::crypto::VolumeKey>,
-    ) -> Result<Vec<u8>, i32> {
+    ) -> Result<Vec<u8>, FsError> {
         tokio::task::spawn_blocking(move || execute_read_plan(plan, log_cache.as_deref(), &volume_key))
             .await
-            .map_err(|_| libc::EIO)?
+            .map_err(|_| FsError::EIO)?
     }
 }
 
@@ -544,7 +545,7 @@ pub fn execute_read_plan(
     mut plan: ReadPlan,
     log_cache: Option<&crate::log::LogFileCache>,
     volume_key: &crate::crypto::VolumeKey,
-) -> Result<Vec<u8>, i32> {
+) -> Result<Vec<u8>, FsError> {
     if plan.total_len == 0 || plan.slices.is_empty() {
         return Ok(Vec::new());
     }
@@ -583,7 +584,7 @@ pub fn execute_read_plan(
     // Staged write buffers / arena chunks can be freed immediately, even if
     // disk or remote S3 reads below take significant time.
     if !cold_slices.is_empty() {
-        let cache = log_cache.ok_or(libc::EIO)?;
+        let cache = log_cache.ok_or(FsError::EIO)?;
         execute_cold_slices(cold_slices, &mut dst_buf, cache, volume_key)?;
     }
 
@@ -595,7 +596,7 @@ fn execute_cold_slices(
     dst_buf: &mut [u8],
     cache: &crate::log::LogFileCache,
     volume_key: &crate::crypto::VolumeKey,
-) -> Result<(), i32> {
+) -> Result<(), FsError> {
     if cold_slices.is_empty() {
         return Ok(());
     }
@@ -637,11 +638,11 @@ fn execute_cold_slices(
 
     let chunk_size = jobs.len().div_ceil(num_workers);
 
-    std::thread::scope(|s| -> Result<(), i32> {
+    std::thread::scope(|s| -> Result<(), FsError> {
         let mut handles = Vec::with_capacity(num_workers);
 
         for chunk in jobs.chunks_mut(chunk_size) {
-            let handle = s.spawn(move || -> Result<(), i32> {
+            let handle = s.spawn(move || -> Result<(), FsError> {
                 for job in chunk {
                     match &job.slice.source {
                         ReadSliceSource::Disk {
@@ -661,7 +662,7 @@ fn execute_cold_slices(
                                     &mut *job.target,
                                     volume_key,
                                 )
-                                .map_err(|_| libc::EIO)?;
+                                .map_err(|_| FsError::EIO)?;
                         }
                         _ => panic!("expected Disk slice in cold_slices"),
                     }
@@ -672,7 +673,7 @@ fn execute_cold_slices(
         }
 
         for h in handles {
-            h.join().map_err(|_| libc::EIO)??;
+            h.join().map_err(|_| FsError::EIO)??;
         }
         Ok(())
     })

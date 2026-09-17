@@ -7,6 +7,7 @@ pub mod compat;
 pub mod compress;
 pub mod crypto;
 pub mod dump;
+pub mod error;
 pub mod extent_map;
 pub mod fs;
 pub mod log;
@@ -37,6 +38,7 @@ pub use clock::{
     AdvancingClock, Clock, MockClock, SystemClock, format_local_civil_time, format_utc_civil_time, parse_timestamp,
 };
 pub use dump::{dump_file, dump_log_file, dump_log_reader, dump_summary_file, dump_summary_reader};
+pub use error::FsError;
 pub use extent_map::{Extent, ExtentEntry, ExtentMap};
 pub use fs::{
     BatchCompletion, FLUSH_HISTORY_CAPACITY, FlushReason, FlushRecord, FlushStats, InMemoryFS, InnerStatsSnapshot,
@@ -67,18 +69,18 @@ pub use sync::{ActionGuard, ActionMutex, OpStatSnapshot, OpTag, PostUnlockQueue}
 #[cfg(any(test, feature = "testing"))]
 pub use test_utils::wait_until;
 
-pub fn mount(args: Vec<String>, fs: InMemoryFS) -> Result<(), i32> {
+pub fn mount(args: Vec<String>, fs: InMemoryFS) -> Result<(), FsError> {
     shim::mount(args, fs)
 }
 
-pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<InMemoryFS>) -> Result<(), i32> {
+pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<InMemoryFS>) -> Result<(), FsError> {
     shim::mount_arc(args, fs)
 }
 
-pub fn mount_ro(args: Vec<String>, fs: InMemoryFS) -> Result<(), i32> {
+pub fn mount_ro(args: Vec<String>, fs: InMemoryFS) -> Result<(), FsError> {
     shim::mount_ro(args, fs)
 }
 
-pub fn mount_ro_arc(args: Vec<String>, fs: std::sync::Arc<InMemoryFS>) -> Result<(), i32> {
+pub fn mount_ro_arc(args: Vec<String>, fs: std::sync::Arc<InMemoryFS>) -> Result<(), FsError> {
     shim::mount_ro_arc(args, fs)
 }
