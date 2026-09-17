@@ -594,7 +594,15 @@ mod tests {
         )
         .unwrap();
 
+        let mut fs = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        fs.clock = Arc::clone(&clock) as Arc<dyn Clock>;
         let writer = Arc::new(
             LogWriter::create(
                 storage.clone(),
@@ -606,15 +614,6 @@ mod tests {
             )
             .unwrap(),
         );
-
-        let mut fs = recover_fs(
-            storage.clone(),
-            RecoveryTarget::Latest,
-            Arc::new(SystemClock),
-            VolumeKey::plaintext_arc(),
-        )
-        .unwrap();
-        fs.clock = Arc::clone(&clock) as Arc<dyn Clock>;
         fs.log_writer = Some(writer);
         fs.set_storage(storage.clone());
 
@@ -631,7 +630,7 @@ mod tests {
         )
         .unwrap();
 
-        let expected_md5_1 = crate::log::manifest::compute_storage_file_md5(storage.as_ref(), "000001.log").unwrap();
+        let expected_md5_1 = *md5::compute(mem_storage.get_file_bytes("000001.log").unwrap());
         let manifest = recovered.manifest.read().unwrap();
         let entry = manifest.get_by_generation(1).expect("generation 1 in manifest");
         assert_eq!(entry.md5, Some(expected_md5_1));
@@ -651,7 +650,7 @@ mod tests {
         )
         .unwrap();
 
-        let expected_md5_torn = crate::log::manifest::compute_storage_file_md5(storage.as_ref(), "000001.log").unwrap();
+        let expected_md5_torn = *md5::compute(mem_storage.get_file_bytes("000001.log").unwrap());
         let manifest = recovered_torn.manifest.read().unwrap();
         let entry = manifest.get_by_generation(1).expect("generation 1 in manifest");
         assert_eq!(entry.md5, Some(expected_md5_torn));

@@ -717,6 +717,13 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
         ));
     }
 
+    let active_gen = fs.log_writer.as_ref().map(|w| w.generation());
+    if let Err(err) = manifest.ensure_sealed_md5s(active_gen) {
+        report
+            .issues
+            .push(IntegrityIssue::error("MANIFEST_SEALED_LOG_MISSING_MD5", None, err));
+    }
+
     for info in &manifest.logs {
         if info.generation >= manifest.next_generation {
             report.issues.push(IntegrityIssue::error(
@@ -1241,5 +1248,41 @@ mod tests {
         let report = check_fs_integrity(&fs, None, false);
         assert!(!report.is_clean());
         assert!(report.issues.iter().any(|i| i.code == "NAME_TOO_LONG"));
+    }
+
+    #[test]
+    fn test_sealed_log_missing_md5_detected() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let fs = crate::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        // Add sealed generation without MD5 to manifest
+        {
+            let mut manifest = fs.manifest.write().unwrap();
+            manifest.record_roll(1, std::time::SystemTime::UNIX_EPOCH, 32);
+            manifest.next_generation = 2;
+        }
+
+        // Without an active log writer, generation 1 is sealed and must have an MD5
+        let report = check_fs_integrity(&fs, None, false);
+        assert!(!report.is_clean());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.code == "MANIFEST_SEALED_LOG_MISSING_MD5")
+        );
     }
 }

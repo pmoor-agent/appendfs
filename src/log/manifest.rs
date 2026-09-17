@@ -196,34 +196,27 @@ impl LogManifest {
         self.logs.iter().find(|l| l.generation == generation)
     }
 
-    /// Computes and populates MD5 for any sealed log generation whose MD5 is not yet recorded.
-    pub fn populate_sealed_md5s(&mut self, storage: &dyn crate::storage::Storage, active_gen: u64) {
-        for entry in &mut self.logs {
-            if entry.generation < active_gen
-                && entry.md5.is_none()
-                && storage.exists(&entry.filename)
-                && let Ok(digest) = compute_storage_file_md5(storage, &entry.filename)
-            {
-                entry.md5 = Some(digest);
-            }
+    /// Ensures and validates that all sealed log entries in the manifest have an authenticated MD5.
+    ///
+    /// If `active_generation` is provided (e.g. from an active `LogWriter`), that generation is
+    /// permitted to have `md5 == None` because it is actively receiving writes. All other log entries
+    /// MUST have `md5.is_some()`.
+    pub fn ensure_sealed_md5s(&self, active_generation: Option<u64>) -> Result<(), String> {
+        let missing: Vec<u64> = self
+            .logs
+            .iter()
+            .filter(|l| Some(l.generation) != active_generation && l.md5.is_none())
+            .map(|l| l.generation)
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Sealed log generation(s) missing MD5 checksum in manifest: {:?}",
+                missing
+            ))
         }
     }
-}
-
-/// Helper to compute MD5 digest of a stored file using streaming reads.
-pub fn compute_storage_file_md5(storage: &dyn crate::storage::Storage, name: &str) -> std::io::Result<[u8; 16]> {
-    let reader = storage.open_reader(name)?;
-    let len = reader.len()?;
-    let mut ctx = md5::Context::new();
-    let mut offset = 0;
-    let mut buf = [0u8; 64 * 1024];
-    while offset < len {
-        let chunk_len = ((len - offset) as usize).min(buf.len());
-        reader.read_exact_at(offset, &mut buf[..chunk_len])?;
-        ctx.consume(&buf[..chunk_len]);
-        offset += chunk_len as u64;
-    }
-    Ok(*ctx.compute())
 }
 
 /// Dynamically computed live extent statistics for a single log generation.
@@ -289,5 +282,27 @@ mod tests {
         assert_eq!(manifest.logs[1].generation, 1);
         assert_eq!(manifest.logs[1].revision, 1);
         assert_eq!(manifest.logs[1].filename, "000001_r1.log");
+    }
+
+    #[test]
+    fn test_ensure_sealed_md5s() {
+        let mut manifest = LogManifest::new_with_time(1, SystemTime::UNIX_EPOCH);
+        // Generation 1 is active (md5: None)
+        assert!(manifest.ensure_sealed_md5s(Some(1)).is_ok());
+        assert!(manifest.ensure_sealed_md5s(None).is_err());
+
+        // Roll to generation 2, sealing generation 1
+        manifest.set_generation_md5(1, [42u8; 16]);
+        manifest.record_roll(2, SystemTime::UNIX_EPOCH, 32);
+
+        // Gen 1 has md5, Gen 2 is active without md5
+        assert!(manifest.ensure_sealed_md5s(Some(2)).is_ok());
+        assert!(manifest.ensure_sealed_md5s(Some(1)).is_err()); // Gen 2 missing md5
+        assert!(manifest.ensure_sealed_md5s(None).is_err()); // Gen 2 missing md5
+
+        // Seal Gen 2 as well
+        manifest.set_generation_md5(2, [99u8; 16]);
+        assert!(manifest.ensure_sealed_md5s(None).is_ok());
+        assert!(manifest.ensure_sealed_md5s(Some(3)).is_ok());
     }
 }

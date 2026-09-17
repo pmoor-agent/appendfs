@@ -480,6 +480,18 @@ impl LogWriter {
     pub fn last_batch_id(&self) -> u64 {
         self.batch_id.load(Ordering::SeqCst).saturating_sub(1)
     }
+
+    /// Returns the streaming MD5 digest of all bytes written to the active log file so far.
+    pub fn current_md5(&self) -> Option<[u8; 16]> {
+        let state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match &*state {
+            ActiveLogState::Unopened { .. } => None,
+            ActiveLogState::Open(active) => Some(active.md5_hasher.clone().compute().0),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -307,6 +307,13 @@ impl InMemoryFS {
             let active_offset = writer.current_offset();
             {
                 let mut manifest = self.manifest.write().unwrap();
+                if manifest.get_by_generation(active_gen).is_none() {
+                    manifest.record_roll(
+                        active_gen,
+                        self.clock.now(),
+                        crate::log::record::FILE_HEADER_SIZE as u64,
+                    );
+                }
                 if let Some(entry) = manifest.get_mut_by_generation(active_gen) {
                     entry.record_count += written_count + 1; // including FlushCommit
                     entry.total_data_bytes += flushed_data_bytes;
@@ -581,32 +588,6 @@ impl InMemoryFS {
         crate::check::check_fs_integrity(self, log_dir, verify_data)
     }
 
-    fn sync_manifest_md5s_and_snapshot(&self, storage: &dyn Storage, active_gen: u64) -> crate::log::LogManifest {
-        let needed: Vec<(u64, String)> = {
-            let m = self.manifest.read().unwrap();
-            m.logs
-                .iter()
-                .filter(|l| l.generation < active_gen && l.md5.is_none())
-                .map(|l| (l.generation, l.filename.clone()))
-                .collect()
-        };
-
-        let mut computed = Vec::new();
-        for (generation_num, fname) in needed {
-            if storage.exists(&fname)
-                && let Ok(digest) = crate::log::manifest::compute_storage_file_md5(storage, &fname)
-            {
-                computed.push((generation_num, digest));
-            }
-        }
-
-        let mut m = self.manifest.write().unwrap();
-        for (generation_num, digest) in computed {
-            m.set_generation_md5(generation_num, digest);
-        }
-        m.clone()
-    }
-
     /// Exports a single-file summary snapshot of the current in-memory filesystem state to `storage`.
     pub fn export_summary(&self, storage: &dyn Storage) -> std::io::Result<String> {
         self.export_summary_with_iv(storage, None)
@@ -637,10 +618,25 @@ impl InMemoryFS {
             .as_ref()
             .map_or_else(|| self.last_batch_id.load(Ordering::SeqCst), |w| w.last_batch_id());
         let next_inode = self.next_inode.load(Ordering::SeqCst);
-        let mut manifest = self.sync_manifest_md5s_and_snapshot(storage, generation);
-        for entry in &mut manifest.logs {
-            if entry.generation >= generation {
-                entry.md5 = None;
+
+        let mut manifest = self.manifest.read().unwrap().clone();
+        manifest.logs.retain(|l| l.generation <= generation);
+
+        // Seal the active generation's MD5 into the manifest snapshot for the summary file
+        if let Some(ref writer) = self.log_writer
+            && writer.generation() == generation
+            && let Some(md5) = writer.current_md5()
+        {
+            if manifest.get_by_generation(generation).is_none() {
+                manifest.record_roll(
+                    generation,
+                    self.clock.now(),
+                    crate::log::record::FILE_HEADER_SIZE as u64,
+                );
+            }
+            if let Some(entry) = manifest.get_mut_by_generation(generation) {
+                entry.md5 = Some(md5);
+                entry.total_bytes = writer.current_offset();
             }
         }
         let now = self.clock.now();
@@ -696,7 +692,9 @@ impl InMemoryFS {
     ) -> std::io::Result<String> {
         let snapshot = self.inner.lock(OpTag::Flush).unwrap().base.clone();
         let next_inode = self.next_inode.load(Ordering::SeqCst);
-        let manifest = self.sync_manifest_md5s_and_snapshot(storage, sealed_gen + 1);
+        let mut manifest = self.manifest.read().unwrap().clone();
+        manifest.logs.retain(|l| l.generation <= sealed_gen);
+        manifest.next_generation = sealed_gen + 1;
         let now = self.clock.now();
 
         if self.volume_header.cipher != self.volume_key.cipher() {

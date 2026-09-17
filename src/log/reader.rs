@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(records[1].payload, b"payload22");
 
         let computed_md5 = reader.finish_md5().unwrap();
-        let expected_md5 = crate::log::manifest::compute_storage_file_md5(&storage, &writer.filename()).unwrap();
+        let expected_md5 = *md5::compute(storage.get_file_bytes(&writer.filename()).unwrap());
         assert_eq!(computed_md5, expected_md5);
     }
 
@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(records.len(), 1);
 
         let computed_md5 = reader.finish_md5().unwrap();
-        let expected_md5 = crate::log::manifest::compute_storage_file_md5(&storage, &filename).unwrap();
+        let expected_md5 = *md5::compute(storage.get_file_bytes(&filename).unwrap());
         assert_eq!(computed_md5, expected_md5);
     }
 }

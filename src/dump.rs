@@ -1511,7 +1511,7 @@ mod tests {
                     record_count: 50,
                     total_bytes: 5000,
                     total_data_bytes: 4096,
-                    md5: None,
+                    md5: Some([1u8; 16]),
                 },
                 crate::log::LogFileInfo {
                     generation: 2,
@@ -1521,7 +1521,7 @@ mod tests {
                     record_count: 50,
                     total_bytes: 5000,
                     total_data_bytes: 4096,
-                    md5: None,
+                    md5: Some([2u8; 16]),
                 },
             ],
             next_generation: 3,
