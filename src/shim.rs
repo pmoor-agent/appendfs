@@ -1413,12 +1413,14 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
 
     let code = unsafe { run_fuse_ll(c_args.len() as c_int, c_args.as_ptr(), &ops, raw_userdata) };
 
-    // Clean up heap allocation and execute unmount flush/sync (only on read-write mounts)
+    // Reclaims the heap allocation handed to the C bridge. The unmount flush/sync already
+    // happened inside `destroy_bridge` (`fs.destroy()`), which fires from within
+    // `run_fuse_ll` before it returns here - so there's nothing left to flush, just this
+    // `Box` to drop.
     unsafe {
-        let arc_fs = Box::from_raw(raw_userdata as *mut std::sync::Arc<crate::fs::InMemoryFS>);
-        if !arc_fs.is_read_only() {
-            let _ = arc_fs.sync_and_export_summary();
-        }
+        drop(Box::from_raw(
+            raw_userdata as *mut std::sync::Arc<crate::fs::InMemoryFS>,
+        ));
     }
 
     if code == 0 { Ok(()) } else { Err(FsError(code)) }

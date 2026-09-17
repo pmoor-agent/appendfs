@@ -5,11 +5,8 @@ use crate::shim::{FileAttr, FileType, FuseResponse, RequestContext};
 use crate::sync::OpTag;
 
 pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), FsError> {
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
-
     fs.with_inner(OpTag::Unlink, |inner| {
+        inner.check_shutdown(true)?;
         let now = fs.clock.now();
         log::trace!("unlink(parent={}, name={})", parent, name);
 
@@ -65,11 +62,8 @@ pub fn symlink_core(
     uid: u32,
     gid: u32,
 ) -> Result<FileAttr, FsError> {
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
-
     fs.with_inner(OpTag::Symlink, |inner| {
+        inner.check_shutdown(true)?;
         let now = fs.clock.now();
         log::trace!(
             "symlink(parent={}, name={}, link={}, uid={}, gid={})",
@@ -141,7 +135,10 @@ pub fn symlink_response(
 
 pub fn readlink_core(fs: &InMemoryFS, ino: u64) -> Result<String, FsError> {
     log::trace!("readlink(ino={})", ino);
-    fs.read_link(ino).ok_or(FsError::EINVAL)
+    fs.with_inner(OpTag::ReadLink, |inner| {
+        inner.check_shutdown(false)?;
+        inner.read_link(ino).ok_or(FsError::EINVAL)
+    })
 }
 
 pub fn readlink_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, FsError> {
@@ -151,11 +148,8 @@ pub fn readlink_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'stat
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
 pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), FsError> {
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
-
     fs.with_inner(OpTag::Rename, |inner| {
+        inner.check_shutdown(true)?;
         let now = fs.clock.now();
         log::trace!(
             "rename(parent={}, name={}, newparent={}, newname={})",
@@ -314,11 +308,8 @@ pub fn rename_response(
 }
 
 pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Result<FileAttr, FsError> {
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
-
     fs.with_inner(OpTag::Link, |inner| {
+        inner.check_shutdown(true)?;
         let now = fs.clock.now();
         log::trace!("link(ino={}, newparent={}, newname={})", ino, newparent, newname);
 

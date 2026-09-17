@@ -14,11 +14,8 @@ pub fn mknod_core(
     uid: u32,
     gid: u32,
 ) -> Result<FileAttr, FsError> {
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
-
     fs.with_inner(OpTag::Mknod, |inner| {
+        inner.check_shutdown(true)?;
         let now = fs.clock.now();
         log::trace!(
             "mknod(parent={}, name={}, mode=0o{:o}, rdev={}, uid={}, gid={})",

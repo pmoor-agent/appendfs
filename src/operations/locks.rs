@@ -391,6 +391,28 @@ impl LockManager {
         }
     }
 
+    /// Drains every parked flock and range-lock waiter across all inodes, replying `EIO` to
+    /// each. Used by shutdown once the filesystem is `Stopped`, so a client parked waiting on
+    /// a lock another client never released gets a definitive reply instead of hanging forever.
+    /// Unlike the per-`(ino, fh)` cancellation used on handle release, which only covers one
+    /// waiter's own handle, this clears everyone still queued behind it.
+    pub fn cancel_all_waiters(inner: &mut FsInnerGuard<'_>) {
+        let mut tokens = Vec::new();
+        for (_, queue) in inner.locks.flock_waiters.drain() {
+            tokens.extend(queue.into_iter().map(|w| w.token));
+        }
+        for (_, queue) in inner.locks.range_lock_waiters.drain() {
+            tokens.extend(queue.into_iter().map(|w| w.token));
+        }
+        if !tokens.is_empty() {
+            inner.defer(move || {
+                for token in tokens {
+                    token.complete(Err(FsError::EIO));
+                }
+            });
+        }
+    }
+
     fn defer_replies(
         inner: &mut FsInnerGuard<'_>,
         canceled: Vec<DeferredToken<FuseResponse<'static>>>,
@@ -431,6 +453,12 @@ pub fn flock_response(
 
     let mut inner = fs.lock_inner(OpTag::Lock);
     if let Err(err) = inner.validate_file_handle(ino, fh) {
+        return DeferredResult::err(err);
+    }
+    // Unlocking is allowed through a read-only shutdown so clients can still clean up; a
+    // fully `Stopped` filesystem rejects it regardless (`check_shutdown` ignores `mutating`
+    // in that phase).
+    if let Err(err) = inner.check_shutdown(base_op != libc::LOCK_UN) {
         return DeferredResult::err(err);
     }
 
@@ -567,6 +595,13 @@ pub fn setlk_response(
 
     let req_type = lock.lock_type;
 
+    // Unlocking is allowed through a read-only shutdown so clients can still clean up; a
+    // fully `Stopped` filesystem rejects it regardless (`check_shutdown` ignores `mutating`
+    // in that phase).
+    if let Err(err) = inner.check_shutdown(req_type != libc::F_UNLCK as i16) {
+        return DeferredResult::err(err);
+    }
+
     if req_type == libc::F_UNLCK as i16 {
         LockManager::unlock_range(&mut inner, ino, lock_owner, start, end);
         return DeferredResult::ok_void();
@@ -630,6 +665,7 @@ pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32)
 
     fs.with_inner(OpTag::Lock, |inner| {
         inner.validate_file_handle(ino, fh)?;
+        inner.check_shutdown(base_op != libc::LOCK_UN)?;
 
         if base_op == libc::LOCK_UN {
             LockManager::release_flock(inner, ino, fh);
@@ -698,6 +734,7 @@ fn coalesce_ranges(ranges: &mut Vec<RangeLock>) {
 
 pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<ShimFlock, FsError> {
     let inner = fs.inner.lock(OpTag::Lock).unwrap();
+    inner.check_shutdown(false)?;
     inner.validate_file_handle(ino, fh)?;
     let (start, end) = normalize_range(&inner, ino, &lock)?;
 
@@ -748,6 +785,7 @@ pub fn setlk_core(
         let (start, end) = normalize_range(inner, ino, &lock)?;
 
         let req_type = lock.lock_type;
+        inner.check_shutdown(req_type != libc::F_UNLCK as i16)?;
 
         if req_type == libc::F_RDLCK as i16 || req_type == libc::F_WRLCK as i16 {
             let ranges = inner.locks.range_lock_table.entry(ino).or_default();

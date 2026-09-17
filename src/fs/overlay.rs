@@ -484,11 +484,12 @@ impl InMemoryFS {
 
     pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, FsError> {
         self.with_inner(OpTag::ReadPlan, |inner| {
+            inner.check_shutdown(false)?;
             let plan = inner.with_inode_layers(ino, |layers| {
                 layers.plan_read_file_data(offset, size, self.log_cache.as_deref())
             })?;
 
-            if self.track_atime && plan.total_len > 0 {
+            if self.track_atime && plan.total_len > 0 && inner.shutdown_state == super::ShutdownState::Running {
                 let now = self.clock.now();
                 inner.update_attr_delta(
                     ino,

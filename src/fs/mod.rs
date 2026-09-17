@@ -42,6 +42,23 @@ use std::time::{Duration, SystemTime};
 
 pub type DirSnapshot = Arc<Vec<(String, u64)>>;
 
+/// Where a filesystem sits in its shutdown lifecycle, stored on [`FsInner`] so every handler
+/// observes it inside the same critical section that performs its mutation - closing the race
+/// where a write could pass a pre-lock read-only check and land in `live` after a concurrent
+/// `shutdown()` already believed everything was drained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShutdownState {
+    /// Normal operation: reads and writes both proceed.
+    #[default]
+    Running,
+    /// Mutating operations are rejected (`EROFS`); reads still proceed. Set at the start of
+    /// `InMemoryFS::destroy()`, before `live`/`flushing` are drained.
+    ReadOnly,
+    /// Every operation, including reads, is rejected (`EIO`). Set once `live`/`flushing` have
+    /// been fully drained and exported, immediately before the flusher thread is stopped.
+    Stopped,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirHandle {
     pub ino: u64,
@@ -478,6 +495,30 @@ pub struct FsInner {
     pub flushing_ops: usize,
     /// Whole-file BSD flock and POSIX byte-range record lock manager.
     pub locks: LockManager,
+    /// Current phase of the shutdown lifecycle; see [`ShutdownState`].
+    pub shutdown_state: ShutdownState,
+}
+
+impl FsInner {
+    /// Returns an error if the current shutdown phase should reject this operation.
+    ///
+    /// Pass `mutating = true` for anything that stages a change in `live` (writes, metadata
+    /// updates, new lock grants); pass `false` for pure reads. Call this as the first statement
+    /// inside the `with_inner`/`lock_inner` closure that performs the operation, not before
+    /// acquiring the lock, so it observes the state atomically with the mutation it guards.
+    pub fn check_shutdown(&self, mutating: bool) -> Result<(), FsError> {
+        match self.shutdown_state {
+            ShutdownState::Running => Ok(()),
+            ShutdownState::ReadOnly => {
+                if mutating {
+                    Err(FsError::EROFS)
+                } else {
+                    Ok(())
+                }
+            }
+            ShutdownState::Stopped => Err(FsError::EIO),
+        }
+    }
 }
 
 impl FsInner {
@@ -760,8 +801,6 @@ pub struct InMemoryFS {
     pub(crate) flusher: flusher::Flusher,
     /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to false.
     pub track_atime: bool,
-    /// When true, filesystem is mounted strictly read-only (EROFS).
-    pub read_only: std::sync::atomic::AtomicBool,
     /// Active VolumeHeader holding unlocked Data Encryption Keys.
     pub volume_key: Arc<crate::crypto::VolumeKey>,
     /// Volume identity and key-check material, carried alongside the key it belongs to.
@@ -863,6 +902,7 @@ impl InMemoryFS {
             flushing_bytes: 0,
             flushing_ops: 0,
             locks: LockManager::new(),
+            shutdown_state: ShutdownState::Running,
         };
 
         let fs = Self {
@@ -882,7 +922,6 @@ impl InMemoryFS {
             flush_interval: AtomicU64::new(0),
             flusher: flusher::Flusher::new(),
             track_atime: false,
-            read_only: std::sync::atomic::AtomicBool::new(false),
             volume_key,
             volume_header: crate::crypto::VolumeHeader::plaintext(),
             virtual_files,
@@ -1053,12 +1092,23 @@ impl InMemoryFS {
         Ok(())
     }
 
+    /// Marks the filesystem read-only (or, passed `false`, lifts a read-only marking that was
+    /// never escalated to a full shutdown). Backed by [`ShutdownState`] on `FsInner` rather than
+    /// a standalone flag, so this observes/updates the same state every handler checks inside
+    /// its own critical section - never downgrades out of `Stopped`.
     pub fn set_read_only(&self, ro: bool) {
-        self.read_only.store(ro, std::sync::atomic::Ordering::SeqCst);
+        self.with_inner(OpTag::Other, |inner| {
+            inner.shutdown_state = match (inner.shutdown_state, ro) {
+                (ShutdownState::Stopped, _) => ShutdownState::Stopped,
+                (_, true) => ShutdownState::ReadOnly,
+                (_, false) => ShutdownState::Running,
+            };
+        });
     }
 
+    /// True once the filesystem is read-only or fully stopped.
     pub fn is_read_only(&self) -> bool {
-        self.read_only.load(std::sync::atomic::Ordering::SeqCst)
+        self.with_inner(OpTag::Other, |inner| inner.shutdown_state != ShutdownState::Running)
     }
 
     pub fn recovered_time(&self) -> Option<SystemTime> {
@@ -1129,8 +1179,11 @@ impl InMemoryFS {
 impl Drop for InMemoryFS {
     fn drop(&mut self) {
         if !std::thread::panicking() {
+            // `destroy()` already drains `live`/`flushing` and exports the final summary as
+            // part of its shutdown sequence; a second call here would just re-export an
+            // unchanged summary. Idempotent against `destroy()` having already run via FUSE's
+            // `destroy` callback - every step it takes checks `ShutdownState` first.
             self.destroy();
-            let _ = self.sync_and_export_summary();
         }
     }
 }

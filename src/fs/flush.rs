@@ -5,11 +5,12 @@
 //! trailing `FlushCommit` confirming atomic persistence. Recovery replays `LogEntryDelta`
 //! records directly onto `base`, guaranteeing identical state transitions across crash recovery.
 
-use super::{FlushReason, FsInner, InMemoryFS};
+use super::{FlushReason, FsInner, InMemoryFS, ShutdownState};
 use crate::error::FsError;
 use crate::extent_map::Extent;
 use crate::log::{GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode, RECORD_HEADER_SIZE};
 use crate::node::{EntryDelta, NodeDelta, NodeKind};
+use crate::operations::locks::LockManager;
 use crate::storage::Storage;
 use crate::sync::OpTag;
 use std::collections::HashMap;
@@ -485,22 +486,45 @@ impl InMemoryFS {
         self.flusher.start(self, (secs > 0).then(|| Duration::from_secs(secs)));
     }
 
-    /// Cleanly stops the flusher and drains in-flight async operations upon FUSE unmount.
+    /// Formal shutdown sequence, run once per filesystem lifetime (idempotent against repeat
+    /// calls from FUSE's `destroy` callback and `Drop` both firing): read-only, drain `live`
+    /// and `flushing` to a final durable summary, stop accepting all requests including reads,
+    /// then stop the flusher and drain whatever background/lock work remains.
     pub fn destroy(&self) {
-        // Only a filesystem that had a thread writing for it can strand queued batches;
-        // an inline one still has whatever thread is tearing it down.
-        if !self.is_read_only() && self.flusher.stop() {
-            let completions: Vec<_> = {
-                let inner = self.inner.lock(OpTag::Flush).unwrap();
-                inner.flushing.iter().map(|b| b.completion.clone()).collect()
-            };
-            for completion in completions {
-                completion.complete(Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "filesystem destroyed",
-                )));
+        // `Drop` calls `destroy()` unconditionally as a backstop for sessions where FUSE's
+        // `destroy` callback never fires (standalone binaries, tests); on a FUSE mount that
+        // means this runs twice. Bail out on the second call so it doesn't re-export an
+        // unchanged summary or re-notify replication for nothing.
+        let already_stopped = self.with_inner(OpTag::Other, |inner| {
+            if inner.shutdown_state == ShutdownState::Stopped {
+                true
+            } else {
+                inner.shutdown_state = ShutdownState::ReadOnly;
+                false
             }
+        });
+        if already_stopped {
+            return;
         }
+
+        // Stopping the background thread first, rather than after, means `quiesce()` below
+        // always drains inline through `run_flush_cycle()` itself (`is_background()` is now
+        // false) instead of waiting on a thread that - having just been told to exit - might
+        // never service it. That is what makes this safe to do unconditionally instead of
+        // the old behavior of failing queued completions with `Interrupted`.
+        self.flusher.stop();
+
+        // Drains `live`/`flushing` and exports the final summary before anything is torn
+        // down, so unmount never strands a write the way discarding queued completions used
+        // to. A no-op if there's no log (in-memory-only session) or the session was already
+        // fully read-only (nothing was ever staged).
+        let _ = self.sync_and_export_summary();
+
+        self.with_inner(OpTag::Other, |inner| {
+            inner.shutdown_state = ShutdownState::Stopped;
+            LockManager::cancel_all_waiters(inner);
+        });
+
         self.drain_async_ops();
     }
 
