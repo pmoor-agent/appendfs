@@ -620,13 +620,29 @@ impl InMemoryFS {
     ) -> std::io::Result<String> {
         self.quiesce()?;
         let snapshot = self.inner.lock(OpTag::Flush).unwrap().snapshot_all();
-        let generation = self.log_writer.as_ref().map_or(1, |w| w.generation());
+        let generation = self.log_writer.as_ref().map_or_else(
+            || {
+                self.manifest
+                    .read()
+                    .unwrap()
+                    .logs
+                    .last()
+                    .map(|l| l.generation)
+                    .unwrap_or(1)
+            },
+            |w| w.generation(),
+        );
         let last_batch_id = self
             .log_writer
             .as_ref()
             .map_or_else(|| self.last_batch_id.load(Ordering::SeqCst), |w| w.last_batch_id());
         let next_inode = self.next_inode.load(Ordering::SeqCst);
-        let manifest = self.sync_manifest_md5s_and_snapshot(storage, generation);
+        let mut manifest = self.sync_manifest_md5s_and_snapshot(storage, generation);
+        for entry in &mut manifest.logs {
+            if entry.generation >= generation {
+                entry.md5 = None;
+            }
+        }
         let now = self.clock.now();
 
         // The header goes into the summary in plaintext while the key encrypts its body, so
