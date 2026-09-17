@@ -76,18 +76,10 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     // Verify generation 1 MD5 is now recorded in the manifest ledger
     let manifest = fs.manifest.read().unwrap().clone();
     let gen1_info = manifest.get_by_generation(1).unwrap();
-    assert!(
-        gen1_info.md5.is_some(),
-        "Sealed generation 1 must have authenticated MD5 recorded"
-    );
-    let gen1_md5 = gen1_info.md5.unwrap();
+    let gen1_md5 = gen1_info.md5;
 
     let gen2_info = manifest.get_by_generation(2).unwrap();
-    assert!(
-        gen2_info.md5.is_some(),
-        "Sealed generation 2 must have authenticated MD5 recorded"
-    );
-    let gen2_md5 = gen2_info.md5.unwrap();
+    let gen2_md5 = gen2_info.md5;
 
     // 3. Setup two mock remote targets: "aws" (writable) and "b2" (writable)
     let remote_aws = Arc::new(MockRemoteStore::new());
@@ -176,7 +168,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
 
     let manifest = fs.manifest.read().unwrap().clone();
     let gen1_info = manifest.get_by_generation(1).unwrap();
-    let gen1_md5 = gen1_info.md5.unwrap();
+    let gen1_md5 = gen1_info.md5;
 
     // Upload 000001.log to remote store
     let mock = Arc::new(MockRemoteStore::new());
@@ -526,7 +518,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     // Force roll to generation 2 (seals generation 1)
     let sealed = writer.force_roll(&*clock).unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
-    let sealed_md5 = sealed.md5.unwrap();
+    let sealed_md5 = sealed.md5;
     fs.manifest.write().unwrap().record_sealed_log(sealed);
     fs.export_summary(storage.as_ref()).unwrap();
 

@@ -546,28 +546,6 @@ impl InMemoryFS {
                 live_ratio,
             });
         }
-        if let Some(ref writer) = self.log_writer {
-            let writer_gen = writer.generation();
-            if writer.is_open() && manifest.get_by_generation(writer_gen).is_none() {
-                let (live_bytes, live_extents) = live_map.get(&writer_gen).copied().unwrap_or((0, 0));
-                let total_data_bytes = writer.total_data_bytes();
-                let live_ratio = if total_data_bytes > 0 {
-                    live_bytes as f64 / total_data_bytes as f64
-                } else {
-                    0.0
-                };
-                result.push(GenerationLiveStats {
-                    generation: writer_gen,
-                    filename: writer.filename(),
-                    record_count: writer.record_count(),
-                    total_bytes: writer.current_offset(),
-                    total_data_bytes,
-                    live_bytes,
-                    live_extents,
-                    live_ratio,
-                });
-            }
-        }
         result
     }
 
@@ -598,9 +576,6 @@ impl InMemoryFS {
 
         let snapshot = self.inner.lock(OpTag::Flush).unwrap().snapshot_all();
         let manifest = self.manifest.read().unwrap().clone();
-        manifest
-            .ensure_sealed_md5s()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let generation = manifest.logs.last().map(|l| l.generation).unwrap_or(0);
         let last_batch_id = self
@@ -661,9 +636,17 @@ impl InMemoryFS {
     ) -> std::io::Result<String> {
         let snapshot = self.inner.lock(OpTag::Flush).unwrap().base.clone();
         let next_inode = self.next_inode.load(Ordering::SeqCst);
-        let mut manifest = self.manifest.read().unwrap().clone();
-        manifest.logs.retain(|l| l.generation <= sealed_gen);
-        manifest.next_generation = sealed_gen + 1;
+        let manifest = self.manifest.read().unwrap().clone();
+        debug_assert!(
+            manifest.logs.iter().all(|l| l.generation <= sealed_gen),
+            "manifest must not contain generations beyond sealed_gen {}",
+            sealed_gen
+        );
+        debug_assert_eq!(
+            manifest.next_generation,
+            sealed_gen + 1,
+            "manifest next_generation must equal sealed_gen + 1"
+        );
         let now = self.clock.now();
 
         if self.volume_header.cipher != self.volume_key.cipher() {
@@ -700,9 +683,7 @@ impl InMemoryFS {
     pub fn sync_and_export_summary_with_iv(&self, explicit_iv: Option<[u8; 12]>) -> std::io::Result<Option<String>> {
         self.quiesce()?;
         if let Some(ref writer) = self.log_writer {
-            if writer.current_offset() <= crate::log::record::FILE_HEADER_SIZE as u64
-                && self.manifest.read().unwrap().logs.is_empty()
-            {
+            if !writer.is_open() {
                 // Read-only session where no log records were ever flushed or written
                 return Ok(None);
             }
@@ -1025,6 +1006,7 @@ mod tests {
         // Fold the punch into base, then confirm it did not become a data record: the only
         // payload ever written was the original 1000 bytes.
         fs.quiesce().unwrap();
+        fs.force_roll_active_log().unwrap();
         expect_holed(&fs.read_file_data(ino, 0, 1000).unwrap());
 
         let stats = fs.calculate_generation_live_stats();
@@ -1231,31 +1213,24 @@ mod tests {
         crate::operations::read_write::write_core(&fs, ino1, &data1, 0).unwrap();
         fs.quiesce().unwrap();
 
-        // Check manifest and stats after gen 1 write
-        let stats = fs.calculate_generation_live_stats();
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].generation, 1);
-        assert_eq!(stats[0].filename, "000001.log");
-        assert_eq!(stats[0].total_data_bytes, 100);
-        assert_eq!(stats[0].live_bytes, 100);
-        assert_eq!(stats[0].live_extents, 1);
-        assert!((stats[0].live_ratio - 1.0).abs() < 1e-6);
-
         // Overwrite 40 bytes of file1 (offset 0..40)
         let overwrite_data = vec![0xBB; 40];
         crate::operations::read_write::write_core(&fs, ino1, &overwrite_data, 0).unwrap();
         fs.quiesce().unwrap();
 
-        // Now gen 1 only has 60 live bytes (offset 40..100) and gen 1 total data is 140 bytes
+        // Export summary snapshot (seals active gen 1 into manifest and leaves gen 2 unopened)
+        let summary_file = fs.export_summary(storage.as_ref()).unwrap();
+        assert!(storage.exists(&summary_file));
+
+        // Now gen 1 is sealed in manifest with 60 live bytes (offset 40..100) and 140 total data bytes
         let stats = fs.calculate_generation_live_stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].generation, 1);
+        assert_eq!(stats[0].filename, "000001.log");
         assert_eq!(stats[0].total_data_bytes, 140);
         assert_eq!(stats[0].live_bytes, 100); // 60 from 1st write + 40 from 2nd write (both landed in gen 1)
         assert_eq!(stats[0].live_extents, 2);
         assert!((stats[0].live_ratio - (100.0 / 140.0)).abs() < 1e-6);
-
-        // Export summary snapshot
-        let summary_file = fs.export_summary(storage.as_ref()).unwrap();
-        assert!(storage.exists(&summary_file));
 
         // Recover filesystem and verify manifest is restored identically
         let recovered = crate::log::recover_fs(
@@ -1309,8 +1284,9 @@ mod tests {
             crate::operations::read_write::create_core(&fs, sub_ino, "file3.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, file3_attr.ino, &[9, 10, 11, 12], 0).unwrap();
 
-        // Flush creation to disk
+        // Flush creation to disk and seal active generation 1
         fs.quiesce().unwrap();
+        fs.force_roll_active_log().unwrap();
 
         // Verify live stats show 3 files and 12 live bytes
         let stats_before = fs.calculate_generation_live_stats();
@@ -1333,7 +1309,7 @@ mod tests {
         assert_eq!(stats_after[0].live_extents, 0);
 
         // 3. Inspect the log dump to verify InodeDelta records were written
-        let dump_text = crate::dump::dump_log_file(storage.as_ref(), "000001.log", 1, None).unwrap();
+        let dump_text = crate::dump::dump_log_file(storage.as_ref(), "000002.log", 2, None).unwrap();
         assert!(dump_text.contains("InodeDelta"));
 
         // 4. Recover filesystem and verify no orphaned nodes remain
@@ -1384,8 +1360,9 @@ mod tests {
             crate::operations::links::link_core(&fs, file_attr.ino, gletscher_attr.ino, "shared_link.txt").unwrap();
         assert_eq!(link_attr.nlink, 2);
 
-        // Commit everything to disk
+        // Commit everything to disk and seal active generation 1
         fs.quiesce().unwrap();
+        fs.force_roll_active_log().unwrap();
 
         let stats1 = fs.calculate_generation_live_stats();
         assert_eq!(stats1[0].live_bytes, 25);

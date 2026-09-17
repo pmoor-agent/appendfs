@@ -47,7 +47,7 @@ fn make_writer(
     start_tx: u64,
 ) -> Arc<appendfs::LogWriter> {
     Arc::new(
-        appendfs::LogWriter::create(
+        appendfs::LogWriter::create_lazy_with_clock(
             storage,
             generation,
             clock,

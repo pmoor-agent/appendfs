@@ -514,7 +514,7 @@ impl RemoteReplicationWorker {
             }
 
             let expected_len = log_entry.total_bytes;
-            let expected_md5 = log_entry.md5.as_ref();
+            let expected_md5 = Some(&log_entry.md5);
 
             for (r_idx, r) in stores.iter().enumerate() {
                 if r.read_only {
@@ -919,14 +919,9 @@ impl RemoteReplicationWorker {
 
                 if let Some(remote_obj) = map.get(filename)
                     && remote_obj.size == log_entry.total_bytes
+                    && remote_obj.etag_md5() == Some(log_entry.md5)
                 {
-                    if let Some(expected_md5) = log_entry.md5 {
-                        if remote_obj.etag_md5() == Some(expected_md5) {
-                            verified_copies += 1;
-                        }
-                    } else {
-                        verified_copies += 1;
-                    }
+                    verified_copies += 1;
                 }
             }
 

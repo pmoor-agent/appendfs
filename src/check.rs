@@ -720,12 +720,6 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
         ));
     }
 
-    if let Err(err) = manifest.ensure_sealed_md5s() {
-        report
-            .issues
-            .push(IntegrityIssue::error("MANIFEST_SEALED_LOG_MISSING_MD5", None, err));
-    }
-
     for info in &manifest.logs {
         if info.generation >= manifest.next_generation {
             report.issues.push(IntegrityIssue::error(
@@ -795,10 +789,7 @@ pub fn check_remote_integrity(
     };
 
     for log_entry in &manifest.logs {
-        // Only verify sealed generations that have an authenticated MD5 ledger entry
-        let Some(expected_md5) = log_entry.md5 else {
-            continue;
-        };
+        let expected_md5 = log_entry.md5;
 
         match listed_objects.get(&log_entry.filename) {
             Some(remote_obj) => {
@@ -1250,50 +1241,5 @@ mod tests {
         let report = check_fs_integrity(&fs, None, false);
         assert!(!report.is_clean());
         assert!(report.issues.iter().any(|i| i.code == "NAME_TOO_LONG"));
-    }
-
-    #[test]
-    fn test_sealed_log_missing_md5_detected() {
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        crate::init_volume(
-            storage.clone(),
-            &VolumeKey::plaintext(),
-            crate::crypto::VolumeHeader::plaintext(),
-        )
-        .unwrap();
-
-        let fs = crate::recover_fs(
-            storage,
-            crate::RecoveryTarget::Latest,
-            Arc::new(SystemClock),
-            VolumeKey::plaintext_arc(),
-        )
-        .unwrap();
-
-        // Add sealed generation without MD5 to manifest
-        {
-            let mut manifest = fs.manifest.write().unwrap();
-            manifest.logs.push(crate::log::LogFileInfo {
-                generation: 1,
-                revision: 0,
-                filename: "000001.log".to_string(),
-                created_at: std::time::SystemTime::UNIX_EPOCH,
-                record_count: 10,
-                total_bytes: 32,
-                total_data_bytes: 0,
-                md5: None,
-            });
-            manifest.next_generation = 2;
-        }
-
-        // Without an active log writer, generation 1 is sealed and must have an MD5
-        let report = check_fs_integrity(&fs, None, false);
-        assert!(!report.is_clean());
-        assert!(
-            report
-                .issues
-                .iter()
-                .any(|i| i.code == "MANIFEST_SEALED_LOG_MISSING_MD5")
-        );
     }
 }

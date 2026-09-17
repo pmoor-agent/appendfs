@@ -429,7 +429,7 @@ mod tests {
             .find(|l| l.generation == 2)
             .expect("generation 2 must be recorded in the manifest after being sealed");
         assert_eq!(gen2.created_at, clock.now());
-        assert!(gen2.md5.is_some());
+        assert_ne!(gen2.md5, [0u8; 16]);
     }
 
     #[test]

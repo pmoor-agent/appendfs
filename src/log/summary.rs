@@ -235,10 +235,6 @@ pub fn export_summary_with_iv(
     let volume_header_bytes =
         crate::wire::serialize(volume_header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    manifest
-        .ensure_sealed_md5s()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
     let mut uncompressed_body = Vec::new();
     let (manifest_offset, entry_count) = write_summary_body(&mut uncompressed_body, &inodes_snapshot, manifest)?;
 
@@ -385,7 +381,7 @@ pub struct SummaryReader {
     pub manifest: crate::log::LogManifest,
     /// Parsed from the plaintext blob, so callers get volume identity without a second read.
     pub volume_header: crate::crypto::VolumeHeader,
-    decompressed_body: Vec<u8>,
+    pub decompressed_body: Vec<u8>,
     pub volume_key: Arc<VolumeKey>,
 }
 

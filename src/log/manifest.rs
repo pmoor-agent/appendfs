@@ -21,12 +21,7 @@ pub struct LogFileInfo {
     /// Total uncompressed extent payload data bytes written.
     pub total_data_bytes: u64,
     /// Authenticated MD5 digest of the completed, sealed generation log file.
-    ///
-    /// This is `None` while the log file is actively receiving appends (the active generation),
-    /// because checksums and physical size continuously evolve with each write. Once the generation
-    /// is sealed (via log roll or size threshold), its final MD5 digest is computed and populated here.
-    #[serde(default)]
-    pub md5: Option<[u8; 16]>,
+    pub md5: [u8; 16],
 }
 
 /// Returns the physical filename for a given log generation (e.g. "000001.log").
@@ -75,34 +70,6 @@ fn parse_generation_revision_filename(filename: &str, extension: &str) -> Option
     }
 }
 
-impl LogFileInfo {
-    pub fn new(generation: u64, created_at: SystemTime, initial_header_size: u64) -> Self {
-        Self {
-            generation,
-            revision: 0,
-            filename: log_filename(generation),
-            created_at,
-            record_count: 0,
-            total_bytes: initial_header_size,
-            total_data_bytes: 0,
-            md5: None,
-        }
-    }
-
-    pub fn new_with_revision(generation: u64, revision: u32, created_at: SystemTime, initial_header_size: u64) -> Self {
-        Self {
-            generation,
-            revision,
-            filename: log_filename_with_revision(generation, revision),
-            created_at,
-            record_count: 0,
-            total_bytes: initial_header_size,
-            total_data_bytes: 0,
-            md5: None,
-        }
-    }
-}
-
 /// Authoritative manifest of all sealed log generations and lineage for the filesystem.
 ///
 /// The active log generation is managed exclusively by `LogWriter` and is never included in
@@ -134,48 +101,27 @@ impl LogManifest {
     }
 
     /// Records a sealed log file entry into the manifest and advances `next_generation`.
+    ///
+    /// Panics if an entry for `(generation, revision)` has already been recorded in the manifest.
     pub fn record_sealed_log(&mut self, log: LogFileInfo) {
-        debug_assert!(log.md5.is_some(), "sealed log must have an MD5 digest");
-        if let Some(existing) = self
-            .logs
-            .iter_mut()
-            .find(|l| l.generation == log.generation && l.revision == log.revision)
-        {
-            *existing = log;
-        } else {
-            if log.generation >= self.next_generation {
-                self.next_generation = log.generation + 1;
-            }
-            self.logs.push(log);
+        assert!(
+            !self
+                .logs
+                .iter()
+                .any(|l| l.generation == log.generation && l.revision == log.revision),
+            "generation {} revision {} already recorded in manifest",
+            log.generation,
+            log.revision
+        );
+        if log.generation >= self.next_generation {
+            self.next_generation = log.generation + 1;
         }
-    }
-
-    /// Finds a mutable reference to a log file entry by generation number.
-    pub fn get_mut_by_generation(&mut self, generation: u64) -> Option<&mut LogFileInfo> {
-        self.logs.iter_mut().find(|l| l.generation == generation)
+        self.logs.push(log);
     }
 
     /// Finds a reference to a log file entry by generation number.
     pub fn get_by_generation(&self, generation: u64) -> Option<&LogFileInfo> {
         self.logs.iter().find(|l| l.generation == generation)
-    }
-
-    /// Ensures and validates that all sealed log entries in the manifest have an authenticated MD5.
-    pub fn ensure_sealed_md5s(&self) -> Result<(), String> {
-        let missing: Vec<u64> = self
-            .logs
-            .iter()
-            .filter(|l| l.md5.is_none())
-            .map(|l| l.generation)
-            .collect();
-        if missing.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "Sealed log generation(s) missing MD5 checksum in manifest: {:?}",
-                missing
-            ))
-        }
     }
 }
 
@@ -214,7 +160,7 @@ mod tests {
             record_count: 5,
             total_bytes: 1024,
             total_data_bytes: 512,
-            md5: Some([1u8; 16]),
+            md5: [1u8; 16],
         };
         manifest.record_sealed_log(log1);
         assert_eq!(manifest.logs.len(), 1);
@@ -230,7 +176,7 @@ mod tests {
             record_count: 3,
             total_bytes: 2048,
             total_data_bytes: 1024,
-            md5: Some([2u8; 16]),
+            md5: [2u8; 16],
         };
         manifest.record_sealed_log(log2);
         assert_eq!(manifest.logs.len(), 2);
@@ -269,7 +215,7 @@ mod tests {
             record_count: 1,
             total_bytes: 32,
             total_data_bytes: 0,
-            md5: Some([42u8; 16]),
+            md5: [42u8; 16],
         });
         assert_eq!(manifest.logs.len(), 1);
         assert_eq!(manifest.logs[0].generation, 1);
@@ -278,26 +224,20 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_sealed_md5s() {
+    #[should_panic(expected = "generation 1 revision 0 already recorded in manifest")]
+    fn test_record_sealed_log_duplicate_panics() {
         let mut manifest = LogManifest::new(1);
-        // Empty manifest has all sealed logs with MD5
-        assert!(manifest.ensure_sealed_md5s().is_ok());
-
-        // Add sealed log with MD5
-        manifest.record_sealed_log(LogFileInfo {
+        let log = LogFileInfo {
             generation: 1,
             revision: 0,
             filename: "000001.log".to_string(),
             created_at: SystemTime::UNIX_EPOCH,
-            record_count: 10,
-            total_bytes: 100,
-            total_data_bytes: 50,
-            md5: Some([42u8; 16]),
-        });
-        assert!(manifest.ensure_sealed_md5s().is_ok());
-
-        // Corrupt an entry by clearing MD5
-        manifest.logs[0].md5 = None;
-        assert!(manifest.ensure_sealed_md5s().is_err());
+            record_count: 5,
+            total_bytes: 1024,
+            total_data_bytes: 512,
+            md5: [1u8; 16],
+        };
+        manifest.record_sealed_log(log.clone());
+        manifest.record_sealed_log(log);
     }
 }

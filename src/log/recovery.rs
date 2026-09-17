@@ -310,7 +310,7 @@ pub fn recover_fs(
             record_count: committed_records_count,
             total_bytes: log_file_len,
             total_data_bytes: log_data_bytes,
-            md5: Some(log_md5),
+            md5: log_md5,
         };
         fs_instance.manifest.write().unwrap().record_sealed_log(log_file_info);
 
@@ -617,7 +617,7 @@ mod tests {
         let expected_md5_1 = *md5::compute(mem_storage.get_file_bytes("000001.log").unwrap());
         let manifest = recovered.manifest.read().unwrap();
         let entry = manifest.get_by_generation(1).expect("generation 1 in manifest");
-        assert_eq!(entry.md5, Some(expected_md5_1));
+        assert_eq!(entry.md5, expected_md5_1);
         drop(manifest);
         drop(recovered);
 
@@ -637,6 +637,6 @@ mod tests {
         let expected_md5_torn = *md5::compute(mem_storage.get_file_bytes("000001.log").unwrap());
         let manifest = recovered_torn.manifest.read().unwrap();
         let entry = manifest.get_by_generation(1).expect("generation 1 in manifest");
-        assert_eq!(entry.md5, Some(expected_md5_torn));
+        assert_eq!(entry.md5, expected_md5_torn);
     }
 }
