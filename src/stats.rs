@@ -214,7 +214,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     let volume_id_hex = hex::encode(fs.volume_header.volume_id);
 
     let next_ino = fs.next_inode.load(Ordering::SeqCst);
-    let last_tx = fs.last_tx_id.load(Ordering::SeqCst);
+    let last_batch = fs.last_batch_id.load(Ordering::SeqCst);
 
     let rec_time_str = match snap.recovered_time {
         Some(t) => {
@@ -249,7 +249,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push_str(&format!("  Total Generations:  {}\n", total_gens));
     out.push_str(&format!("  Physical Log Size:  {}\n", format_bytes(total_disk_bytes)));
     out.push_str(&format!("  Next Inode:         {}\n", next_ino));
-    out.push_str(&format!("  Last Tx ID:         {}\n", last_tx));
+    out.push_str(&format!("  Last Batch ID:      {}\n", last_batch));
     out.push_str(&format!("  Last Recovery:      {}\n", rec_time_str));
     out.push('\n');
 

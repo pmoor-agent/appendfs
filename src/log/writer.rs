@@ -81,7 +81,7 @@ use crate::crypto::VolumeKey;
 /// Active log writer managing append-only writes to generation log files with automatic rolling.
 pub struct LogWriter {
     active_state: Mutex<ActiveLogState>,
-    tx_id: AtomicU64,
+    batch_id: AtomicU64,
     storage: Arc<dyn Storage>,
     max_log_size: u64,
     max_log_age: Option<std::time::Duration>,
@@ -96,7 +96,7 @@ pub struct LogWriter {
 impl std::fmt::Debug for LogWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogWriter")
-            .field("tx_id", &self.tx_id.load(Ordering::Relaxed))
+            .field("batch_id", &self.batch_id.load(Ordering::Relaxed))
             .field("max_log_size", &self.max_log_size)
             .field("cipher", &self.volume_key.cipher())
             .finish()
@@ -110,14 +110,14 @@ impl LogWriter {
         generation: u64,
         clock: &dyn Clock,
         max_log_size: u64,
-        start_tx_id: u64,
+        start_batch_id: u64,
         volume_key: Arc<VolumeKey>,
     ) -> io::Result<Self> {
         let lock = storage.acquire_exclusive_lock()?;
         let active_file = open_generation_file(&storage, generation, clock.now())?;
         Ok(Self {
             active_state: Mutex::new(ActiveLogState::Open(active_file)),
-            tx_id: AtomicU64::new(start_tx_id),
+            batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
@@ -133,7 +133,7 @@ impl LogWriter {
         storage: Arc<dyn Storage>,
         generation: u64,
         max_log_size: u64,
-        start_tx_id: u64,
+        start_batch_id: u64,
         volume_key: Arc<VolumeKey>,
     ) -> io::Result<Self> {
         let lock = storage.acquire_exclusive_lock()?;
@@ -142,7 +142,7 @@ impl LogWriter {
                 generation,
                 created_at: None,
             }),
-            tx_id: AtomicU64::new(start_tx_id),
+            batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
@@ -302,10 +302,8 @@ impl LogWriter {
 
     /// Appends a record (`RecordHeader` + payload bytes) to the active log file.
     ///
-    /// Returns `(tx_id, generation, record_log_offset, record_size)`.
-    pub fn append_record(&self, op_code: OpCode, inode: u64, payload: &[u8]) -> io::Result<(u64, u64, u64, u32)> {
-        let tx = self.tx_id.fetch_add(1, Ordering::SeqCst);
-
+    /// Returns `(generation, record_log_offset, record_size)`.
+    pub fn append_record(&self, op_code: OpCode, inode: u64, payload: &[u8]) -> io::Result<(u64, u64, u32)> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -326,12 +324,13 @@ impl LogWriter {
         };
 
         let generation = active.generation;
+        let record_log_offset = active.current_offset;
         let (actual_op, cipher_payload, auth_tag) = crate::log::codec::encode(
             &self.volume_key,
             self.compression,
             crate::log::codec::RecordId {
                 generation,
-                tx_id: tx,
+                record_offset: record_log_offset,
                 op_code: op_code as u8,
                 inode,
             },
@@ -340,7 +339,6 @@ impl LogWriter {
 
         let header = RecordHeader {
             op_code: actual_op,
-            tx_id: tx,
             inode,
             payload_len: cipher_payload.len() as u32,
             auth_tag,
@@ -348,7 +346,6 @@ impl LogWriter {
         let header_bytes = header.to_bytes();
         let total_bytes = header_bytes.len() + cipher_payload.len();
 
-        let record_log_offset = active.current_offset;
         let write_result = (|| -> io::Result<()> {
             active.writer.append(&header_bytes)?;
             if !cipher_payload.is_empty() {
@@ -369,7 +366,7 @@ impl LogWriter {
         }
         active.current_offset += total_bytes as u64;
 
-        Ok((tx, generation, record_log_offset, total_bytes as u32))
+        Ok((generation, record_log_offset, total_bytes as u32))
     }
 
     /// Rolls back the active log file to `offset` if it is currently in `generation`
@@ -392,10 +389,13 @@ impl LogWriter {
         Ok(())
     }
 
-    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records
+    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records.
+    /// Assigns and returns the next monotonic `batch_id`.
     pub fn emit_flush_commit(&self, record_count: u32, clock: &dyn Clock) -> io::Result<u64> {
+        let batch_id = self.batch_id.fetch_add(1, Ordering::SeqCst);
         let now = clock.now();
         let commit_payload = FlushCommitPayload {
+            batch_id,
             timestamp: now,
             record_count,
         };
@@ -403,8 +403,8 @@ impl LogWriter {
         let payload_bytes =
             crate::wire::serialize(&commit_payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let (tx, _, _, _) = self.append_record(OpCode::FlushCommit, 0, &payload_bytes)?;
-        Ok(tx)
+        self.append_record(OpCode::FlushCommit, 0, &payload_bytes)?;
+        Ok(batch_id)
     }
 
     /// Flushes unwritten internal buffers through to persistent media.
@@ -459,7 +459,7 @@ impl LogWriter {
         }
     }
 
-    /// Returns the active log file name (e.g. `000001.log`).
+    /// Returns the current log filename.
     pub fn filename(&self) -> String {
         let state = match self.active_state.lock() {
             Ok(g) => g,
@@ -476,9 +476,9 @@ impl LogWriter {
         PathBuf::from(self.filename())
     }
 
-    /// Returns the last transaction ID assigned by this writer.
-    pub fn last_tx_id(&self) -> u64 {
-        self.tx_id.load(Ordering::SeqCst).saturating_sub(1)
+    /// Returns the last batch ID assigned by this writer.
+    pub fn last_batch_id(&self) -> u64 {
+        self.batch_id.load(Ordering::SeqCst).saturating_sub(1)
     }
 }
 
@@ -506,8 +506,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(writer.generation(), 1);
-        let (tx, gen_num, offset, rec_size) = writer.append_record(OpCode::Data, 100, b"test_data").unwrap();
-        assert_eq!(tx, 1);
+        let (gen_num, offset, rec_size) = writer.append_record(OpCode::Data, 100, b"test_data").unwrap();
         assert_eq!(gen_num, 1);
         assert_eq!(offset, FILE_HEADER_SIZE as u64);
         assert_eq!(rec_size, (crate::log::record::RECORD_HEADER_SIZE + 9) as u32);
@@ -520,7 +519,7 @@ mod tests {
         let writer = LogWriter::create(storage.clone(), 1, &clock, 30, 1, VolumeKey::plaintext_arc()).unwrap();
 
         for _ in 0..5 {
-            let (_, gen_num, _, _) = writer.append_record(OpCode::Data, 1, b"0123456789").unwrap();
+            let (gen_num, _, _) = writer.append_record(OpCode::Data, 1, b"0123456789").unwrap();
             assert_eq!(gen_num, 1);
         }
         assert_eq!(writer.generation(), 1);
@@ -538,7 +537,7 @@ mod tests {
         writer.roll_if_needed(1000, &clock).unwrap();
         assert_eq!(writer.generation(), 2);
 
-        let (_, gen_num, _, _) = writer.append_record(OpCode::Data, 2, b"0123456789").unwrap();
+        let (gen_num, _, _) = writer.append_record(OpCode::Data, 2, b"0123456789").unwrap();
         assert_eq!(gen_num, 2);
     }
 
@@ -558,7 +557,8 @@ mod tests {
 
         writer.append_record(OpCode::InodeDelta, 1, b"payload").unwrap();
         writer.append_record(OpCode::Data, 1, b"more").unwrap();
-        writer.emit_flush_commit(2, &clock).unwrap();
+        let committed_batch_id = writer.emit_flush_commit(2, &clock).unwrap();
+        assert_eq!(committed_batch_id, 1);
 
         let records: Vec<_> = LogReader::open(storage.as_ref(), &writer.filename(), VolumeKey::plaintext_arc())
             .unwrap()
@@ -567,6 +567,7 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].header.op_code, OpCode::FlushCommit);
         let payload: FlushCommitPayload = crate::wire::deserialize(&records[2].payload).unwrap();
+        assert_eq!(payload.batch_id, 1);
         assert_eq!(payload.record_count, 2);
     }
 
@@ -668,8 +669,7 @@ mod tests {
         assert!(!storage.exists("000003.log"));
 
         // First write into generation 2 lazily opens 000002.log
-        let (tx, gen_num, offset, _) = writer.append_record(OpCode::Data, 10, b"generation 2 data").unwrap();
-        assert_eq!(tx, 2);
+        let (gen_num, offset, _) = writer.append_record(OpCode::Data, 10, b"generation 2 data").unwrap();
         assert_eq!(gen_num, 2);
         assert_eq!(offset, FILE_HEADER_SIZE as u64);
         assert!(writer.is_open());

@@ -80,18 +80,18 @@ fn fetch_and_verify_summary(
             Ok(reader) => {
                 let eligible = match target {
                     RecoveryTarget::Latest => true,
-                    RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
+                    RecoveryTarget::BatchId(max_batch) => reader.header.last_batch_id <= max_batch,
                     RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
                     RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
                 };
                 if eligible {
                     storage.rename(&tmp_name, &summary_name)?;
                     log::info!(
-                        "Fetched and verified remote checkpoint {} from remote '{}' (generation: {}, last_tx_id: {})",
+                        "Fetched and verified remote checkpoint {} from remote '{}' (generation: {}, last_batch_id: {})",
                         summary_name,
                         target_remote.name,
                         gen_num,
-                        reader.header.last_tx_id
+                        reader.header.last_batch_id
                     );
                     return Ok(Some(reader));
                 } else {
@@ -147,7 +147,7 @@ pub fn prepare_remote_recovery_for_target(
         if let Ok(reader) = SummaryReader::open(storage, file, volume_key.clone()) {
             let eligible = match target {
                 RecoveryTarget::Latest => true,
-                RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
+                RecoveryTarget::BatchId(max_batch) => reader.header.last_batch_id <= max_batch,
                 RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
                 RecoveryTarget::Generation(max_gen) => *gen_num <= max_gen,
             };
@@ -188,7 +188,7 @@ pub fn prepare_remote_recovery_for_target(
             local_summaries.push(((latest_remote_gen, latest_remote_rev), summary_name));
             let eligible = match target {
                 RecoveryTarget::Latest => true,
-                RecoveryTarget::TxId(max_tx) => reader.header.last_tx_id <= max_tx,
+                RecoveryTarget::BatchId(max_batch) => reader.header.last_batch_id <= max_batch,
                 RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
                 RecoveryTarget::Generation(max_gen) => latest_remote_gen <= max_gen,
             };
@@ -228,7 +228,7 @@ pub fn prepare_remote_recovery_for_target(
             .map(|l| l.generation)
             .max()
             .unwrap_or(0),
-        RecoveryTarget::TxId(_) => max_manifest_gen,
+        RecoveryTarget::BatchId(_) => max_manifest_gen,
     };
 
     let mut chosen_summary_gen = best_local_eligible.as_ref().map(|(g, _, _)| *g);
@@ -262,7 +262,7 @@ pub fn prepare_remote_recovery_for_target(
                 .map(|l| l.generation)
                 .max()
                 .unwrap_or(base_gen),
-            RecoveryTarget::TxId(_) | RecoveryTarget::Latest => max_manifest_gen,
+            RecoveryTarget::BatchId(_) | RecoveryTarget::Latest => max_manifest_gen,
         };
 
         for log_gen in (base_gen + 1)..=replay_upper {

@@ -120,7 +120,7 @@ impl TestFS {
                 manifest: &manifest,
                 volume_header: &fs.volume_header,
                 generation: 0,
-                last_tx_id: 0,
+                last_batch_id: 0,
                 next_inode: 2,
                 created_at: clock.now(),
             },
@@ -165,7 +165,7 @@ impl TestFS {
                 manifest: &manifest,
                 volume_header: &fs.volume_header,
                 generation: 0,
-                last_tx_id: 0,
+                last_batch_id: 0,
                 next_inode: 2,
                 created_at: clock.now(),
             },
@@ -592,13 +592,13 @@ impl TestFS {
         .unwrap();
 
         let next_gen = recovered.manifest.read().unwrap().next_generation;
-        let start_tx = recovered.last_tx_id.load(Ordering::SeqCst) + 1;
+        let start_batch_id = recovered.last_batch_id.load(Ordering::SeqCst) + 1;
         let writer = make_writer(
             storage.clone(),
             next_gen,
             &*clock,
             appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            start_tx,
+            start_batch_id,
         );
         recovered.attach_log_writer(writer);
         recovered.set_storage(storage.clone());
@@ -673,13 +673,13 @@ impl TestFS {
         )
         .unwrap();
         let next_gen = recovered.manifest.read().unwrap().next_generation;
-        let start_tx = recovered.last_tx_id.load(Ordering::SeqCst) + 1;
+        let start_batch_id = recovered.last_batch_id.load(Ordering::SeqCst) + 1;
         let writer = make_writer(
             storage.clone(),
             next_gen,
             &*clock,
             appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            start_tx,
+            start_batch_id,
         );
         recovered.attach_log_writer(writer);
         recovered.set_storage(storage.clone());

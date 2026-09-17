@@ -23,7 +23,7 @@ pub struct SummaryHeader {
     pub version: u32,
     pub generation: u64,
     pub revision: u32,
-    pub last_tx_id: u64,
+    pub last_batch_id: u64,
     pub next_inode: u64,
     #[serde(with = "crate::clock::serde_system_time")]
     pub created_at: std::time::SystemTime,
@@ -38,7 +38,7 @@ pub struct SummaryHeader {
 impl SummaryHeader {
     pub fn new(
         generation: u64,
-        last_tx_id: u64,
+        last_batch_id: u64,
         next_inode: u64,
         created_at: std::time::SystemTime,
         iv: [u8; 12],
@@ -50,7 +50,7 @@ impl SummaryHeader {
             version: CURRENT_SUMMARY_VERSION,
             generation,
             revision: 0,
-            last_tx_id,
+            last_batch_id,
             next_inode,
             created_at,
             iv,
@@ -179,7 +179,7 @@ pub struct SummarySnapshot<'a> {
     /// Volume identity and key-check material, written unencrypted ahead of the body.
     pub volume_header: &'a crate::crypto::VolumeHeader,
     pub generation: u64,
-    pub last_tx_id: u64,
+    pub last_batch_id: u64,
     pub next_inode: u64,
     pub created_at: std::time::SystemTime,
 }
@@ -209,7 +209,7 @@ pub fn export_summary_with_iv(
         manifest,
         volume_header,
         generation,
-        last_tx_id,
+        last_batch_id,
         next_inode,
         created_at,
     } = *snapshot;
@@ -244,7 +244,7 @@ pub fn export_summary_with_iv(
 
     let header = SummaryHeader::new(
         generation,
-        last_tx_id,
+        last_batch_id,
         next_inode,
         created_at,
         iv,
@@ -284,11 +284,11 @@ pub fn export_summary_with_iv(
     storage.rename(&tmp_filename, &filename)?;
 
     log::info!(
-        "Exported single-file summary snapshot {} (generation: {}, inodes: {}, last_tx_id: {})",
+        "Exported single-file summary snapshot {} (generation: {}, inodes: {}, last_batch_id: {})",
         filename,
         generation,
         inodes_snapshot.len(),
-        last_tx_id
+        last_batch_id
     );
 
     Ok(filename)
@@ -367,7 +367,7 @@ pub fn init_volume_with_clock_uids_and_iv(
             manifest: &manifest,
             volume_header: &volume_header,
             generation: 0,
-            last_tx_id: 0,
+            last_batch_id: 0,
             next_inode: 2,
             created_at: clock.now(),
         },
@@ -762,7 +762,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
-                last_tx_id: 42,
+                last_batch_id: 42,
                 next_inode: 3,
                 created_at: SystemTime::now(),
             },
@@ -773,7 +773,7 @@ mod tests {
 
         let reader = SummaryReader::open(storage.as_ref(), &filename, VolumeKey::plaintext_arc()).unwrap();
         assert_eq!(reader.header.generation, 1);
-        assert_eq!(reader.header.last_tx_id, 42);
+        assert_eq!(reader.header.last_batch_id, 42);
         assert_eq!(reader.header.next_inode, 3);
         assert_eq!(reader.footer.entry_count, 2);
 
@@ -829,7 +829,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 4,
-                last_tx_id: 999,
+                last_batch_id: 999,
                 next_inode: 51,
                 created_at: SystemTime::now(),
             },
@@ -862,7 +862,7 @@ mod tests {
 
         let reader = SummaryReader::open(storage.as_ref(), "000000.summary", VolumeKey::plaintext_arc()).unwrap();
         assert_eq!(reader.header.generation, 0);
-        assert_eq!(reader.header.last_tx_id, 0);
+        assert_eq!(reader.header.last_batch_id, 0);
         assert_eq!(reader.header.next_inode, 2);
         assert_eq!(reader.manifest.next_generation, 1);
         assert_eq!(reader.manifest.next_filename(), "000001.log");
@@ -1006,7 +1006,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
-                last_tx_id: 42,
+                last_batch_id: 42,
                 next_inode: 3,
                 created_at: SystemTime::UNIX_EPOCH,
             },
@@ -1027,7 +1027,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
-                last_tx_id: 42,
+                last_batch_id: 42,
                 next_inode: 3,
                 created_at: SystemTime::UNIX_EPOCH,
             },

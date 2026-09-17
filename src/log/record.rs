@@ -7,7 +7,7 @@ pub const FILE_MAGIC: [u8; 4] = *b"APPF";
 pub const CURRENT_VERSION: u32 = 1;
 /// magic(4) + version(4) + generation(8) + revision(4) + created_at seconds(8) + nanoseconds(4).
 pub const FILE_HEADER_SIZE: usize = 32;
-pub const RECORD_HEADER_SIZE: usize = 37;
+pub const RECORD_HEADER_SIZE: usize = 29;
 pub const AUTH_TAG_SIZE: usize = 16;
 
 /// Fixed-size header written at offset 0 of every `.log` file.
@@ -113,20 +113,19 @@ impl std::fmt::Display for OpCode {
     }
 }
 
-/// Compact per-record header (37 bytes).
+/// Compact per-record header (29 bytes).
 ///
 /// Deliberately carries no `key_id`: whether a payload is encrypted is a property of the
 /// volume, recorded once in the volume header where the key check value vouches for it.
 /// A per-record copy would be unauthenticated - this header is not covered by `auth_tag` -
 /// and clearing it used to downgrade an encrypted read into a raw one.
 ///
-/// The 16-byte `auth_tag` protects both header metadata (via AEAD AAD: `[op_code, tx_id, inode]`)
+/// The 16-byte `auth_tag` protects both header metadata (via AEAD AAD: `[op_code, record_offset, inode]`)
 /// and payload bytes across both encrypted (Poly1305 detached tag) and unencrypted (BLAKE3 16-byte hash) volumes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordHeader {
     pub op_code: OpCode,
-    pub tx_id: u64,
     pub inode: u64,
     pub payload_len: u32,
     /// 16-byte authentication tag (Poly1305 or BLAKE3) covering `AAD || payload`.
@@ -137,23 +136,20 @@ impl RecordHeader {
     pub fn to_bytes(&self) -> [u8; RECORD_HEADER_SIZE] {
         let mut buf = [0u8; RECORD_HEADER_SIZE];
         buf[0] = self.op_code as u8;
-        buf[1..9].copy_from_slice(&self.tx_id.to_be_bytes());
-        buf[9..17].copy_from_slice(&self.inode.to_be_bytes());
-        buf[17..21].copy_from_slice(&self.payload_len.to_be_bytes());
-        buf[21..37].copy_from_slice(&self.auth_tag);
+        buf[1..9].copy_from_slice(&self.inode.to_be_bytes());
+        buf[9..13].copy_from_slice(&self.payload_len.to_be_bytes());
+        buf[13..29].copy_from_slice(&self.auth_tag);
         buf
     }
 
     pub fn from_bytes(bytes: &[u8; RECORD_HEADER_SIZE]) -> Result<Self, &'static str> {
         let op_code = OpCode::try_from(bytes[0])?;
-        let tx_id = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
-        let inode = u64::from_be_bytes(bytes[9..17].try_into().unwrap());
-        let payload_len = u32::from_be_bytes(bytes[17..21].try_into().unwrap());
-        let auth_tag = bytes[21..37].try_into().unwrap();
+        let inode = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
+        let payload_len = u32::from_be_bytes(bytes[9..13].try_into().unwrap());
+        let auth_tag = bytes[13..29].try_into().unwrap();
 
         Ok(Self {
             op_code,
-            tx_id,
             inode,
             payload_len,
             auth_tag,
@@ -165,6 +161,7 @@ impl RecordHeader {
 /// batch, after all of that batch's other records.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlushCommitPayload {
+    pub batch_id: u64,
     #[serde(with = "crate::clock::serde_system_time")]
     pub timestamp: SystemTime,
     pub record_count: u32,
@@ -665,7 +662,6 @@ mod tests {
     fn test_record_header_serialization() {
         let header = RecordHeader {
             op_code: OpCode::Data,
-            tx_id: 1001,
             inode: 5,
             payload_len: 4096,
             auth_tag: [0xAA; AUTH_TAG_SIZE],

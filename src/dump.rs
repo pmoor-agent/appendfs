@@ -104,7 +104,7 @@ pub struct OpCodeStats {
 
 /// Reads and analyzes a single `.log` generation file, formatting the output based on `verbosity`:
 /// - `verbosity == 0`: File header, summary statistics, whole-file checksum, operations histogram, payload sizes histogram.
-/// - `verbosity == 1`: Summary + complete record list (op, tx_id, inode, offsets, payloads).
+/// - `verbosity == 1`: Summary + complete record list (op, inode, offsets, payloads).
 /// - `verbosity >= 2`: Summary + all records + full hex/ASCII data dumps for writes.
 pub fn dump_log_file(
     storage: &dyn Storage,
@@ -237,7 +237,7 @@ pub fn dump_log_reader_with_path(
 
         let id = crate::log::codec::RecordId {
             generation: file_header.generation,
-            tx_id: header.tx_id,
+            record_offset,
             op_code: header.op_code as u8,
             inode: header.inode,
         };
@@ -245,7 +245,7 @@ pub fn dump_log_reader_with_path(
         if let Some(key) = volume_key {
             match key.decrypt_record(
                 file_header.generation,
-                header.tx_id,
+                record_offset,
                 header.op_code as u8,
                 header.inode,
                 &raw_payload,
@@ -455,13 +455,12 @@ pub fn dump_log_reader_with_path(
 
                     writeln!(
                         out,
-                        "#{:<5} [0x{:08x} / {:<8}] {:<14} inode {:<5} tx {:<5} len {:<8} tag {:02x}{:02x}{:02x}{:02x} {}",
+                        "#{:<5} [0x{:08x} / {:<8}] {:<14} inode {:<5} len {:<8} tag {:02x}{:02x}{:02x}{:02x} {}",
                         i + 1,
                         offset,
                         offset,
                         header.op_code,
                         header.inode,
-                        header.tx_id,
                         format_bytes(header.payload_len as u64),
                         header.auth_tag[0],
                         header.auth_tag[1],
@@ -557,7 +556,7 @@ fn dump_encrypted_summary_without_key(
     writeln!(out, "Generation:          {}", header.generation).unwrap();
     writeln!(out, "Revision:            {}", header.revision).unwrap();
     writeln!(out, "Format Version:      {}", header.version).unwrap();
-    writeln!(out, "Last Transaction ID: {}", header.last_tx_id).unwrap();
+    writeln!(out, "Last Batch ID:       {}", header.last_batch_id).unwrap();
     writeln!(out, "Next Inode:          {}", header.next_inode).unwrap();
     writeln!(out, "File Size:           {}", format_bytes(file_len)).unwrap();
     writeln!(out, "Encryption:          {}", volume_header.cipher).unwrap();
@@ -721,7 +720,7 @@ pub fn dump_summary_reader_with_path(
     }
     writeln!(out, "Generation:          {}", reader.header.generation).unwrap();
     writeln!(out, "Format Version:      {}", reader.header.version).unwrap();
-    writeln!(out, "Last Transaction ID: {}", reader.header.last_tx_id).unwrap();
+    writeln!(out, "Last Batch ID:       {}", reader.header.last_batch_id).unwrap();
     writeln!(out, "Next Inode:          {}", reader.header.next_inode).unwrap();
     writeln!(out, "File Size:           {}", format_bytes(file_len)).unwrap();
     writeln!(out, "Encryption:          {}", reader.volume_header.cipher).unwrap();
@@ -1079,7 +1078,6 @@ pub fn dump_summary_reader_with_path(
 fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump_data_hex: bool) {
     let dummy_header = crate::log::record::RecordHeader {
         op_code: opcode,
-        tx_id: 0,
         inode: 0,
         payload_len: payload.len() as u32,
         auth_tag: [0; crate::log::record::AUTH_TAG_SIZE],
@@ -1103,7 +1101,8 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
         Ok(crate::log::record::DecodedPayload::FlushCommit(b)) => {
             writeln!(
                 out,
-                "      batch_record_count: {}, commit_timestamp: {}",
+                "      batch_id: {}, batch_record_count: {}, commit_timestamp: {}",
+                b.batch_id,
                 b.record_count,
                 format_system_time(b.timestamp)
             )
@@ -1534,7 +1533,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
-                last_tx_id: 100,
+                last_batch_id: 100,
                 next_inode: 4,
                 created_at: std::time::SystemTime::now(),
             },

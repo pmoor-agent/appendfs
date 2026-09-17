@@ -463,7 +463,7 @@ fn cmd_mount(args: MountArgs) {
         manifest.next_generation
     };
 
-    let start_tx = fs_instance.last_tx_id.load(Ordering::SeqCst) + 1;
+    let start_batch_id = fs_instance.last_batch_id.load(Ordering::SeqCst) + 1;
 
     // The volume header decides how writes are compressed; it was read back during
     // recovery, so a mount never has to be told separately.
@@ -474,7 +474,8 @@ fn cmd_mount(args: MountArgs) {
     let max_log_age = appendfs::cli::parse_duration(&args.max_log_age)
         .ok()
         .map(|cli| cli.min(std::time::Duration::from_secs(registry.policy.max_log_age_secs)));
-    let writer = match LogWriter::create_lazy(storage.clone(), next_gen, args.max_log_size, start_tx, volume_key) {
+    let writer = match LogWriter::create_lazy(storage.clone(), next_gen, args.max_log_size, start_batch_id, volume_key)
+    {
         Ok(w) => Arc::new(w.with_compression(compression).with_max_log_age(max_log_age)),
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -551,8 +552,8 @@ fn cmd_mount(args: MountArgs) {
 
 fn cmd_mount_ro(args: MountRoArgs) {
     let log_dir = &args.log_dir;
-    let target = if let Some(tx_id) = args.tx_id {
-        appendfs::RecoveryTarget::TxId(tx_id)
+    let target = if let Some(batch_id) = args.batch_id {
+        appendfs::RecoveryTarget::BatchId(batch_id)
     } else if let Some(ref time_str) = args.at_time {
         match appendfs::parse_timestamp(time_str) {
             Ok(t) => appendfs::RecoveryTarget::Timestamp(t),
@@ -619,7 +620,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
     fs_instance.set_remote_registry(Arc::clone(&registry_arc));
 
-    let effective_tx_id = fs_instance.last_tx_id.load(Ordering::SeqCst);
+    let effective_batch_id = fs_instance.last_batch_id.load(Ordering::SeqCst);
     let effective_gen = {
         let manifest = fs_instance.manifest.read().unwrap();
         manifest.logs.last().map(|l| l.generation).unwrap_or(1)
@@ -629,8 +630,8 @@ fn cmd_mount_ro(args: MountRoArgs) {
         .map_or_else(|| "N/A".to_string(), appendfs::format_local_civil_time);
 
     println!(
-        "Recovered appendfs state (read-only) -> Effective Version: generation {}, last tx_id: {}, timestamp: {}",
-        effective_gen, effective_tx_id, effective_time_str
+        "Recovered appendfs state (read-only) -> Effective Version: generation {}, last batch_id: {}, timestamp: {}",
+        effective_gen, effective_batch_id, effective_time_str
     );
     println!(
         "Mounting appendfs (read-only) at '{}' with log-dir '{}' (foreground: {})...",

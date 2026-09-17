@@ -440,9 +440,9 @@ pub struct MountRoArgs {
     #[command(flatten)]
     pub common: MountCommonArgs,
 
-    /// Target transaction ID for point-in-time historical recovery
-    #[arg(long = "tx-id")]
-    pub tx_id: Option<u64>,
+    /// Target flush batch ID for point-in-time historical recovery
+    #[arg(long = "batch-id")]
+    pub batch_id: Option<u64>,
 
     /// Target timestamp for point-in-time recovery (unix epoch secs or ISO 8601 string, e.g. "2026-08-17T10:00:00Z")
     #[arg(long = "at-time")]

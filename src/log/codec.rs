@@ -19,7 +19,7 @@ use std::io;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordId {
     pub generation: u64,
-    pub tx_id: u64,
+    pub record_offset: u64,
     pub op_code: u8,
     pub inode: u64,
 }
@@ -42,7 +42,13 @@ pub fn encode(
     };
 
     let (ciphertext, auth_tag) = key
-        .encrypt_record(id.generation, id.tx_id, actual_op as u8, id.inode, &data_to_encrypt)
+        .encrypt_record(
+            id.generation,
+            id.record_offset,
+            actual_op as u8,
+            id.inode,
+            &data_to_encrypt,
+        )
         .map_err(io::Error::from)?;
     Ok((actual_op, ciphertext, auth_tag))
 }
@@ -50,7 +56,7 @@ pub fn encode(
 /// Recovers the original payload from bytes read out of the log.
 pub fn decode(key: &VolumeKey, id: RecordId, stored: &[u8], auth_tag: &[u8; 16]) -> io::Result<Vec<u8>> {
     let plain = key
-        .decrypt_record(id.generation, id.tx_id, id.op_code, id.inode, stored, auth_tag)
+        .decrypt_record(id.generation, id.record_offset, id.op_code, id.inode, stored, auth_tag)
         .map_err(io::Error::from)?;
     if id.op_code == OpCode::DataZstd as u8 {
         crate::compress::decompress_zstd(&plain)
@@ -66,7 +72,7 @@ mod tests {
 
     const ID: RecordId = RecordId {
         generation: 3,
-        tx_id: 77,
+        record_offset: 128,
         op_code: 1,
         inode: 42,
     };
@@ -141,7 +147,7 @@ mod tests {
         };
 
         // The identity is bound into the AAD, so an intact record cannot be moved onto
-        // another inode or relabelled as another record type.
+        // another inode, relabelled as another record type, or moved to another offset.
         let other_inode = RecordId {
             inode: ID.inode + 1,
             ..actual_id
@@ -156,5 +162,10 @@ mod tests {
             ..actual_id
         };
         assert!(decode(&key, other_op, &stored, &tag).is_err());
+        let other_offset = RecordId {
+            record_offset: ID.record_offset + 1,
+            ..actual_id
+        };
+        assert!(decode(&key, other_offset, &stored, &tag).is_err());
     }
 }
