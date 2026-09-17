@@ -3039,13 +3039,19 @@ fn test_periodic_summary_generation_on_log_rolls() {
 
     let f1_ino = recovered_fs.lookup_child(1, "file1.bin").unwrap();
     let fh1 = appendfs::operations::read_write::open_core(&recovered_fs, f1_ino, libc::O_RDONLY as u32).unwrap();
-    let buf1 = appendfs::operations::read_write::read_core(&recovered_fs, f1_ino, fh1, 0, 1000).unwrap();
+    let buf1 = appendfs::operations::read_write::read_core(&recovered_fs, f1_ino, fh1, 0, 1000)
+        .unwrap()
+        .into_bytes()
+        .unwrap();
     appendfs::operations::read_write::release_core(&recovered_fs, f1_ino, fh1).unwrap();
     assert_eq!(buf1, vec![0x11u8; 1000]);
 
     let f4_ino = recovered_fs.lookup_child(1, "file4.bin").unwrap();
     let fh4 = appendfs::operations::read_write::open_core(&recovered_fs, f4_ino, libc::O_RDONLY as u32).unwrap();
-    let buf4 = appendfs::operations::read_write::read_core(&recovered_fs, f4_ino, fh4, 0, 1000).unwrap();
+    let buf4 = appendfs::operations::read_write::read_core(&recovered_fs, f4_ino, fh4, 0, 1000)
+        .unwrap()
+        .into_bytes()
+        .unwrap();
     appendfs::operations::read_write::release_core(&recovered_fs, f4_ino, fh4).unwrap();
     assert_eq!(buf4, vec![0x44u8; 1000]);
 }

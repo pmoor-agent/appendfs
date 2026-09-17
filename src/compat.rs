@@ -655,7 +655,10 @@ pub fn lookup_path(fs: &InMemoryFS, path: &str) -> Option<u64> {
 
 fn read_compat_file(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<u8> {
     let fh = open_core(fs, ino, libc::O_RDONLY as u32).expect("open compat file");
-    let data = read_core(fs, ino, fh, offset, size).expect("read compat file");
+    let data = read_core(fs, ino, fh, offset, size)
+        .expect("read compat file")
+        .into_bytes()
+        .unwrap_or_default();
     release_core(fs, ino, fh).expect("release compat file");
     data
 }
