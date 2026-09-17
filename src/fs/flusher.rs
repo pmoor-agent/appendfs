@@ -26,6 +26,7 @@ const RETRY_DELAY: Duration = Duration::from_millis(100);
 struct Telemetry {
     total_batches: u64,
     total_bytes: u64,
+    total_disk_bytes: u64,
     total_ops: u64,
     total_persist: Duration,
     total_fold: Duration,
@@ -153,6 +154,7 @@ impl Flusher {
         let mut telemetry = self.telemetry.lock().unwrap();
         telemetry.total_batches += 1;
         telemetry.total_bytes += record.bytes as u64;
+        telemetry.total_disk_bytes += record.disk_bytes;
         telemetry.total_ops += record.ops as u64;
         telemetry.total_persist += record.persist;
         telemetry.total_fold += record.fold;
@@ -171,6 +173,7 @@ impl Flusher {
             interval: *self.interval.lock().unwrap(),
             total_batches: telemetry.total_batches,
             total_bytes: telemetry.total_bytes,
+            total_disk_bytes: telemetry.total_disk_bytes,
             total_ops: telemetry.total_ops,
             total_persist: telemetry.total_persist,
             total_fold: telemetry.total_fold,
@@ -436,6 +439,11 @@ mod tests {
         assert_eq!(stats.count_for(crate::fs::FlushReason::Quiesce), 1);
         assert_eq!(stats.count_for(crate::fs::FlushReason::Threshold), 0);
         assert!(stats.total_bytes > 0);
+        assert!(stats.total_disk_bytes > stats.total_bytes);
+        assert_eq!(
+            stats.total_disk_bytes,
+            stats.recent.iter().map(|r| r.disk_bytes).sum::<u64>()
+        );
         assert_eq!(
             stats.total_ops as usize,
             stats.recent.iter().map(|r| r.ops).sum::<usize>()
@@ -501,6 +509,7 @@ mod tests {
         let stats = fs.flush_stats();
         assert_eq!(stats.recent.len(), 2);
         for record in &stats.recent {
+            assert!(record.disk_bytes > 0, "disk_bytes must be non-zero");
             assert!(
                 record.persist > Duration::ZERO,
                 "writing and syncing the batch must be measured"
@@ -515,6 +524,11 @@ mod tests {
         }
 
         assert_eq!(
+            stats.total_disk_bytes,
+            stats.recent.iter().map(|r| r.disk_bytes).sum::<u64>(),
+            "cumulative disk bytes must agree with the history"
+        );
+        assert_eq!(
             stats.total_persist,
             stats.recent.iter().map(|r| r.persist).sum::<Duration>(),
             "cumulative disk time must agree with the history"
@@ -523,6 +537,75 @@ mod tests {
             stats.total_fold,
             stats.recent.iter().map(|r| r.fold).sum::<Duration>(),
             "cumulative fold time must agree with the history"
+        );
+    }
+
+    #[test]
+    fn test_flush_record_disk_bytes_matches_storage_size() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = SystemClock;
+        let writer = Arc::new(
+            LogWriter::create(
+                Arc::clone(&storage),
+                1,
+                &clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_log(writer);
+
+        stage_a_write(&fs, "disk_test.bin");
+        fs.quiesce().unwrap();
+
+        let stats = fs.flush_stats();
+        assert_eq!(stats.total_batches, 1);
+        let record = stats.recent.first().expect("one batch");
+
+        // The log file starts with a 16-byte header, followed by the batch's data chunks,
+        // inode deltas, and FlushCommit trailer.
+        let file_len = storage.file_len("000001.log").unwrap();
+        assert_eq!(
+            file_len,
+            crate::log::FILE_HEADER_SIZE as u64 + record.disk_bytes,
+            "on-disk batch size must match bytes appended to the log file"
+        );
+        assert_eq!(stats.total_disk_bytes, record.disk_bytes);
+        assert!(record.disk_bytes > record.bytes as u64);
+
+        // A second metadata-only batch (e.g. chmod) has 0 staged payload bytes
+        // but still takes on-disk space for its delta and commit trailer.
+        crate::operations::read_write::setattr_core(
+            &fs,
+            1,
+            0o750,
+            0,
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+            std::time::SystemTime::UNIX_EPOCH,
+            crate::operations::read_write::FUSE_SET_ATTR_MODE,
+        )
+        .unwrap();
+        fs.quiesce().unwrap();
+
+        let stats2 = fs.flush_stats();
+        assert_eq!(stats2.total_batches, 2);
+        let record2 = stats2.recent.last().expect("second batch");
+        assert_eq!(record2.bytes, 0, "metadata batch has 0 staged data bytes");
+        assert!(record2.disk_bytes > 0, "metadata batch takes non-zero on-disk space");
+
+        let updated_file_len = storage.file_len("000001.log").unwrap();
+        assert_eq!(
+            updated_file_len,
+            file_len + record2.disk_bytes,
+            "subsequent batch disk_bytes must match incremental file growth"
+        );
+        assert_eq!(
+            stats2.total_disk_bytes,
+            stats2.recent.iter().map(|r| r.disk_bytes).sum::<u64>()
         );
     }
 

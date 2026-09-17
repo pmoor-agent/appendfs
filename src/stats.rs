@@ -348,9 +348,10 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         }
     ));
     out.push_str(&format!(
-        "  Batches Flushed:    {} ({}, {} ops)\n",
+        "  Batches Flushed:    {} ({} staged, {} on disk, {} ops)\n",
         flush.total_batches,
         format_bytes(flush.total_bytes),
+        format_bytes(flush.total_disk_bytes),
         flush.total_ops
     ));
     out.push_str(&format!(
@@ -376,17 +377,18 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     } else {
         out.push_str("  Recent Flushes:\n");
         out.push_str(&format!(
-            "    {:<7} {:<11} {:>10} {:>7}  {:>10} {:>10} {:>10}  {}\n",
-            "batch", "reason", "bytes", "ops", "disk", "fold", "total", "age"
+            "    {:<7} {:<11} {:>10} {:>10} {:>7}  {:>10} {:>10} {:>10}  {}\n",
+            "batch", "reason", "bytes", "on-disk", "ops", "disk", "fold", "total", "age"
         ));
         let now = fs.clock.now();
         for record in flush.recent.iter().rev() {
             let age = now.duration_since(record.started_at).unwrap_or_default().as_secs();
             out.push_str(&format!(
-                "    #{:<6} {:<11} {:>10} {:>7}  {:>10} {:>10} {:>10}  {}s ago\n",
+                "    #{:<6} {:<11} {:>10} {:>10} {:>7}  {:>10} {:>10} {:>10}  {}s ago\n",
                 record.id,
                 record.reason,
                 format_bytes(record.bytes as u64),
+                format_bytes(record.disk_bytes),
                 record.ops,
                 format_duration(record.persist),
                 format_duration(record.fold),

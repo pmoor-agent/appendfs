@@ -202,7 +202,7 @@ impl InMemoryFS {
         &self,
         frozen: &mut HashMap<u64, EntryDelta>,
         writer: &LogWriter,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<u64> {
         debug_assert!(self.flusher.in_cycle(), "only the flusher may write batches to the log");
         // Clamped because extent lengths are u32, and because a zero would make the
         // chunking loop below never advance.
@@ -215,7 +215,7 @@ impl InMemoryFS {
         let batch_start_offset = writer.current_offset();
         writer.checkpoint_batch_start();
 
-        let write_res = (|| -> std::io::Result<u64> {
+        let write_res = (|| -> std::io::Result<(u64, u64)> {
             let mut written_count = 0u32;
             let mut flushed_data_bytes = 0u64;
 
@@ -312,11 +312,12 @@ impl InMemoryFS {
                     entry.total_bytes = active_offset;
                 }
             }
-            Ok(flushed_data_bytes)
+            let disk_bytes = active_offset.saturating_sub(batch_start_offset);
+            Ok((flushed_data_bytes, disk_bytes))
         })();
 
-        let flushed_data_bytes = match write_res {
-            Ok(bytes) => bytes,
+        let (flushed_data_bytes, disk_bytes) = match write_res {
+            Ok(res) => res,
             Err(e) => {
                 let _ = writer.rollback_to(batch_gen, batch_start_offset);
                 return Err(e);
@@ -326,7 +327,7 @@ impl InMemoryFS {
         self.bytes_since_last_summary
             .fetch_add(flushed_data_bytes, Ordering::SeqCst);
 
-        Ok(())
+        Ok(disk_bytes)
     }
 
     /// Writes every queued flush batch to the log and folds it into `base`.
@@ -369,7 +370,7 @@ impl InMemoryFS {
                 let mut entries = batch.entries.clone();
 
                 let persist_start = self.clock.monotonic();
-                self.synthesize_and_write_flushing_layer(&mut entries, writer)?;
+                let disk_bytes = self.synthesize_and_write_flushing_layer(&mut entries, writer)?;
                 let fold_start = self.clock.monotonic();
 
                 // Committed and durable: pop it and fold its effects into `base`.
@@ -385,6 +386,7 @@ impl InMemoryFS {
                     id: popped.id,
                     reason: popped.reason,
                     bytes: popped.bytes,
+                    disk_bytes,
                     ops: popped.ops,
                     started_at,
                     persist: fold_start.saturating_sub(persist_start),
@@ -392,10 +394,11 @@ impl InMemoryFS {
                     duration: finished.saturating_sub(started_monotonic),
                 };
                 log::debug!(
-                    "Flushed batch {} ({}): {} bytes, {} ops in {:?} ({:?} disk, {:?} fold)",
+                    "Flushed batch {} ({}): {} staged bytes ({} on disk), {} ops in {:?} ({:?} disk, {:?} fold)",
                     record.id,
                     record.reason,
                     record.bytes,
+                    record.disk_bytes,
                     record.ops,
                     record.duration,
                     record.persist,
