@@ -1,6 +1,6 @@
 use crate::fs::InMemoryFS;
 use crate::node::{AttrDelta, NodeDelta, SymlinkDelta};
-use crate::shim::{FileAttr, FileType, FuseResponse};
+use crate::shim::{FileAttr, FileType, FuseResponse, RequestContext};
 use crate::sync::OpTag;
 
 pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
@@ -130,13 +130,12 @@ pub fn symlink_core(
 
 pub fn symlink_response(
     fs: &InMemoryFS,
+    ctx: RequestContext,
+    link: &str,
     parent: u64,
     name: &str,
-    link: &str,
-    uid: u32,
-    gid: u32,
 ) -> Result<FuseResponse<'static>, i32> {
-    symlink_core(fs, parent, name, link, uid, gid).map(FuseResponse::entry)
+    symlink_core(fs, parent, name, link, ctx.uid, ctx.gid).map(FuseResponse::entry)
 }
 
 pub fn readlink_core(fs: &InMemoryFS, ino: u64) -> Result<String, i32> {

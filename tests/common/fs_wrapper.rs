@@ -310,11 +310,12 @@ impl TestFS {
         let fh = self.open(ino, libc::O_RDONLY as u32)?;
         let res = appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset as i64, len);
         let _ = self.release(ino, fh);
-        res
+        res.and_then(|resp| resp.into_bytes().ok_or(libc::EIO))
     }
 
     pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, i32> {
         appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset as i64, len)
+            .and_then(|resp| resp.into_bytes().ok_or(libc::EIO))
     }
 
     pub fn read_all(&self, ino: u64) -> Result<Vec<u8>, i32> {
@@ -324,12 +325,13 @@ impl TestFS {
         let mut offset = 0i64;
         let res = loop {
             match appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset, chunk_size) {
-                Ok(chunk) => {
+                Ok(resp) => {
+                    let chunk = resp.as_bytes().unwrap_or_default();
                     if chunk.is_empty() {
                         break Ok(result);
                     }
                     let read_len = chunk.len();
-                    result.extend_from_slice(&chunk);
+                    result.extend_from_slice(chunk);
                     if read_len < chunk_size {
                         break Ok(result);
                     }
@@ -437,45 +439,49 @@ impl TestFS {
     }
 
     pub fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<(), i32> {
-        appendfs::operations::xattr::setxattr_core(&self.fs, ino, name, value, flags)
+        appendfs::operations::xattr::setxattr_core(&self.fs, ino, name, value, flags).map(|_| ())
     }
 
     /// Runs the real two-phase getxattr protocol (query size, then fetch with that
     /// size) rather than just requesting a large fixed buffer, so this exercises the
     /// same size/ERANGE path a real xattr syscall would.
     pub fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, i32> {
-        use appendfs::operations::xattr::GetxattrResult;
+        use appendfs::shim::FuseResponse;
         match appendfs::operations::xattr::getxattr_core(&self.fs, ino, name, 0)? {
             // A 0-length value is indistinguishable from "just tell me the size" at
             // size 0 - same ambiguity a real getxattr(2) caller has - so short-circuit
             // instead of re-querying with size 0 and hitting that same branch again.
-            GetxattrResult::Size(0) => Ok(Vec::new()),
-            GetxattrResult::Size(size) => {
+            FuseResponse::XattrSize(0) => Ok(Vec::new()),
+            FuseResponse::XattrSize(size) => {
                 match appendfs::operations::xattr::getxattr_core(&self.fs, ino, name, size)? {
-                    GetxattrResult::Data(data) => Ok(data),
-                    GetxattrResult::Size(_) => unreachable!("size query answered with another size"),
+                    FuseResponse::Buf(data) => Ok(data.to_vec()),
+                    FuseResponse::XattrSize(_) => unreachable!("size query answered with another size"),
+                    _ => unreachable!("unexpected getxattr response"),
                 }
             }
-            GetxattrResult::Data(_) => unreachable!("size-0 query returned data"),
+            FuseResponse::Buf(_) => unreachable!("size-0 query returned data"),
+            _ => unreachable!("unexpected getxattr response"),
         }
     }
 
     pub fn removexattr(&self, ino: u64, name: &str) -> Result<(), i32> {
-        appendfs::operations::xattr::removexattr_core(&self.fs, ino, name)
+        appendfs::operations::xattr::removexattr_core(&self.fs, ino, name).map(|_| ())
     }
 
     /// Same two-phase size-then-data protocol as `getxattr`; returns the decoded,
     /// null-separated attribute names.
     pub fn listxattr(&self, ino: u64) -> Result<Vec<String>, i32> {
-        use appendfs::operations::xattr::ListxattrResult;
+        use appendfs::shim::FuseResponse;
         let buf = match appendfs::operations::xattr::listxattr_core(&self.fs, ino, 0)? {
             // See the same-value comment in `getxattr` - size 0 has no second call to make.
-            ListxattrResult::Size(0) => Vec::new(),
-            ListxattrResult::Size(size) => match appendfs::operations::xattr::listxattr_core(&self.fs, ino, size)? {
-                ListxattrResult::Data(data) => data,
-                ListxattrResult::Size(_) => unreachable!("size query answered with another size"),
+            FuseResponse::XattrSize(0) => Vec::new(),
+            FuseResponse::XattrSize(size) => match appendfs::operations::xattr::listxattr_core(&self.fs, ino, size)? {
+                FuseResponse::Buf(data) => data.to_vec(),
+                FuseResponse::XattrSize(_) => unreachable!("size query answered with another size"),
+                _ => unreachable!("unexpected listxattr response"),
             },
-            ListxattrResult::Data(data) => data,
+            FuseResponse::Buf(data) => data.to_vec(),
+            _ => unreachable!("unexpected listxattr response"),
         };
         Ok(buf
             .split(|&b| b == 0)

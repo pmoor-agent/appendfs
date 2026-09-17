@@ -58,7 +58,7 @@ pub use remote::{
 pub use remote::{CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, MockRemoteStore, RemoteStoreMetrics};
 pub use shim::{
     DeferredCallback, DeferredCompletion, DeferredReceiver, DeferredResult, DeferredToken, DirEntry, DirEntryPlus,
-    FileAttr, FileType, Filesystem, FuseResponse, ReplyData, Request, RequestContext, StatfsAttr, dispatch_reply,
+    FileAttr, FileType, Filesystem, FuseResponse, ReplyData, RequestContext, StatfsAttr,
 };
 pub use stats::VolumeStats;
 pub use storage::{FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter, WriteMode};

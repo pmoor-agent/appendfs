@@ -181,7 +181,16 @@ struct RustLowlevelOps {
     destroy: Option<extern "C" fn(userdata: *mut c_void)>,
 }
 
+#[repr(C)]
+struct FuseCtx {
+    uid: u32,
+    gid: u32,
+    pid: libc::pid_t,
+    umask: libc::mode_t,
+}
+
 unsafe extern "C" {
+    fn fuse_req_ctx_shim(req: *mut c_void) -> FuseCtx;
     fn run_fuse_ll(
         argc: c_int,
         argv: *const *const c_char,
@@ -261,21 +270,21 @@ fn convert_file_attr(attr: &FileAttr) -> ShimFileAttr {
 }
 
 #[derive(Clone, Copy)]
-pub struct Request {
+pub(crate) struct Request {
     pub(crate) req: shim_req_t,
 }
 
 unsafe impl Send for Request {}
 
 impl Request {
-    #[cfg(any(test, feature = "testing"))]
-    pub fn new_mock() -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_mock() -> Self {
         Self {
             req: std::ptr::null_mut(),
         }
     }
 
-    pub fn reply_err(self, err: i32) {
+    pub(crate) fn reply_err(self, err: i32) {
         if self.req.is_null() {
             return;
         }
@@ -284,27 +293,32 @@ impl Request {
         }
     }
 
-    pub fn reply_entry(self, attr: &FileAttr, attr_timeout: f64, entry_timeout: f64) {
+    pub(crate) fn reply_entry(self, attr: &FileAttr) {
         if self.req.is_null() {
             return;
         }
         let shim_attr = convert_file_attr(attr);
         unsafe {
-            shim_reply_entry(self.req, &shim_attr, attr_timeout, entry_timeout);
+            shim_reply_entry(
+                self.req,
+                &shim_attr,
+                FuseResponse::DEFAULT_TIMEOUT,
+                FuseResponse::DEFAULT_TIMEOUT,
+            );
         }
     }
 
-    pub fn reply_attr(self, attr: &FileAttr, attr_timeout: f64) {
+    pub(crate) fn reply_attr(self, attr: &FileAttr) {
         if self.req.is_null() {
             return;
         }
         let shim_attr = convert_file_attr(attr);
         unsafe {
-            shim_reply_attr(self.req, &shim_attr, attr_timeout);
+            shim_reply_attr(self.req, &shim_attr, FuseResponse::DEFAULT_TIMEOUT);
         }
     }
 
-    pub fn reply_buf(self, buf: &[u8]) {
+    pub(crate) fn reply_buf(self, buf: &[u8]) {
         if self.req.is_null() {
             return;
         }
@@ -313,7 +327,7 @@ impl Request {
         }
     }
 
-    pub fn reply_open(self, fh: u64, direct_io: bool) {
+    pub(crate) fn reply_open(self, fh: u64, direct_io: bool) {
         if self.req.is_null() {
             return;
         }
@@ -322,7 +336,7 @@ impl Request {
         }
     }
 
-    pub fn reply_write(self, count: usize) {
+    pub(crate) fn reply_write(self, count: usize) {
         if self.req.is_null() {
             return;
         }
@@ -331,17 +345,23 @@ impl Request {
         }
     }
 
-    pub fn reply_create(self, attr: &FileAttr, attr_timeout: f64, entry_timeout: f64, fh: u64) {
+    pub(crate) fn reply_create(self, attr: &FileAttr, fh: u64) {
         if self.req.is_null() {
             return;
         }
         let shim_attr = convert_file_attr(attr);
         unsafe {
-            shim_reply_create(self.req, &shim_attr, attr_timeout, entry_timeout, fh);
+            shim_reply_create(
+                self.req,
+                &shim_attr,
+                FuseResponse::DEFAULT_TIMEOUT,
+                FuseResponse::DEFAULT_TIMEOUT,
+                fh,
+            );
         }
     }
 
-    pub fn reply_readlink(self, link: &str) {
+    pub(crate) fn reply_readlink(self, link: &str) {
         if self.req.is_null() {
             return;
         }
@@ -357,7 +377,7 @@ impl Request {
         }
     }
 
-    pub fn reply_statfs(self, attr: &StatfsAttr) {
+    pub(crate) fn reply_statfs(self, attr: &StatfsAttr) {
         if self.req.is_null() {
             return;
         }
@@ -375,7 +395,7 @@ impl Request {
         }
     }
 
-    pub fn reply_lock(self, lock: &ShimFlock) {
+    pub(crate) fn reply_lock(self, lock: &ShimFlock) {
         if self.req.is_null() {
             return;
         }
@@ -384,7 +404,7 @@ impl Request {
         }
     }
 
-    pub fn reply_xattr(self, count: usize) {
+    pub(crate) fn reply_xattr(self, count: usize) {
         if self.req.is_null() {
             return;
         }
@@ -393,49 +413,19 @@ impl Request {
         }
     }
 
-    pub fn uid(&self) -> u32 {
+    pub(crate) fn context(&self) -> RequestContext {
         if self.req.is_null() {
-            return 1000;
+            return RequestContext::default();
         }
         unsafe {
             let fuse_req = self.req as *mut c_void;
             let ctx = fuse_req_ctx_shim(fuse_req);
-            ctx.uid
+            RequestContext {
+                uid: ctx.uid,
+                gid: ctx.gid,
+                pid: ctx.pid as u32,
+            }
         }
-    }
-
-    pub fn gid(&self) -> u32 {
-        if self.req.is_null() {
-            return 1000;
-        }
-        unsafe {
-            let fuse_req = self.req as *mut c_void;
-            let ctx = fuse_req_ctx_shim(fuse_req);
-            ctx.gid
-        }
-    }
-
-    pub fn pid(&self) -> u32 {
-        if self.req.is_null() {
-            return 0;
-        }
-        unsafe {
-            let fuse_req = self.req as *mut c_void;
-            let ctx = fuse_req_ctx_shim(fuse_req);
-            ctx.pid as u32
-        }
-    }
-
-    pub fn context(&self) -> RequestContext {
-        RequestContext {
-            uid: self.uid(),
-            gid: self.gid(),
-            pid: self.pid(),
-        }
-    }
-
-    pub fn reply_fuse_response(self, result: Result<FuseResponse<'_>, i32>) {
-        reply_result(self, result);
     }
 }
 
@@ -533,22 +523,17 @@ impl<'a> AsRef<[u8]> for ReplyData<'a> {
 pub enum FuseResponse<'a> {
     /// Void success (maps to `fuse_reply_err(req, 0)`).
     Ok,
-    /// Directory entry with attributes, attribute cache timeout, and entry cache timeout (in seconds).
-    Entry(FileAttr, f64, f64),
-    /// File attributes with attribute cache timeout (in seconds).
-    Attr(FileAttr, f64),
+    /// Directory entry with attributes (using default cache timeout).
+    Entry(FileAttr),
+    /// File attributes (using default cache timeout).
+    Attr(FileAttr),
     /// File or directory handle allocation with direct_io flag.
     Open { fh: u64, direct_io: bool },
     /// Number of bytes written.
     Write(usize),
-    /// Atomic create reply: entry attributes, attribute timeout, entry timeout, and allocated file handle.
-    Create {
-        attr: FileAttr,
-        attr_timeout: f64,
-        entry_timeout: f64,
-        fh: u64,
-    },
-    /// Raw buffer payload (e.g. read data, readdir directory stream, xattr value).
+    /// Atomic create reply: entry attributes and allocated file handle (using default cache timeout).
+    Create { attr: FileAttr, fh: u64 },
+    /// Raw buffer payload (e.g. read data, xattr value).
     Buf(ReplyData<'a>),
     /// Symbolic link target string.
     Readlink(String),
@@ -558,6 +543,13 @@ pub enum FuseResponse<'a> {
     Lock(ShimFlock),
     /// Extended attribute size query response.
     XattrSize(usize),
+    /// Directory stream entries for readdir.
+    Readdir { entries: Vec<DirEntry>, max_size: usize },
+    /// Directory stream entries for readdirplus.
+    ReaddirPlus {
+        entries: Vec<DirEntryPlus>,
+        max_size: usize,
+    },
 }
 
 impl<'a> FuseResponse<'a> {
@@ -570,22 +562,12 @@ impl<'a> FuseResponse<'a> {
 
     #[inline]
     pub fn entry(attr: FileAttr) -> Self {
-        FuseResponse::Entry(attr, Self::DEFAULT_TIMEOUT, Self::DEFAULT_TIMEOUT)
-    }
-
-    #[inline]
-    pub fn entry_with_timeout(attr: FileAttr, attr_timeout: f64, entry_timeout: f64) -> Self {
-        FuseResponse::Entry(attr, attr_timeout, entry_timeout)
+        FuseResponse::Entry(attr)
     }
 
     #[inline]
     pub fn attr(attr: FileAttr) -> Self {
-        FuseResponse::Attr(attr, Self::DEFAULT_TIMEOUT)
-    }
-
-    #[inline]
-    pub fn attr_with_timeout(attr: FileAttr, attr_timeout: f64) -> Self {
-        FuseResponse::Attr(attr, attr_timeout)
+        FuseResponse::Attr(attr)
     }
 
     #[inline]
@@ -600,12 +582,7 @@ impl<'a> FuseResponse<'a> {
 
     #[inline]
     pub fn create(attr: FileAttr, fh: u64) -> Self {
-        FuseResponse::Create {
-            attr,
-            attr_timeout: Self::DEFAULT_TIMEOUT,
-            entry_timeout: Self::DEFAULT_TIMEOUT,
-            fh,
-        }
+        FuseResponse::Create { attr, fh }
     }
 
     #[inline]
@@ -633,63 +610,109 @@ impl<'a> FuseResponse<'a> {
         FuseResponse::XattrSize(size)
     }
 
+    #[inline]
+    pub fn readdir(entries: Vec<DirEntry>, max_size: usize) -> Self {
+        FuseResponse::Readdir { entries, max_size }
+    }
+
+    #[inline]
+    pub fn readdirplus(entries: Vec<DirEntryPlus>, max_size: usize) -> Self {
+        FuseResponse::ReaddirPlus { entries, max_size }
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            FuseResponse::Buf(buf) => Some(buf.as_slice()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn into_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            FuseResponse::Buf(ReplyData::Borrowed(b)) => Some(b.to_vec()),
+            FuseResponse::Buf(ReplyData::Owned(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn xattr_size_value(&self) -> Option<usize> {
+        match self {
+            FuseResponse::XattrSize(sz) => Some(*sz),
+            _ => None,
+        }
+    }
+
     /// Converts this response into an owned `'static` response that can be safely sent across
     /// threads or queued in asynchronous runtimes.
     pub fn to_static(&self) -> FuseResponse<'static> {
         match self {
             FuseResponse::Ok => FuseResponse::Ok,
-            FuseResponse::Entry(a, at, et) => FuseResponse::Entry(*a, *at, *et),
-            FuseResponse::Attr(a, at) => FuseResponse::Attr(*a, *at),
+            FuseResponse::Entry(a) => FuseResponse::Entry(*a),
+            FuseResponse::Attr(a) => FuseResponse::Attr(*a),
             FuseResponse::Open { fh, direct_io } => FuseResponse::Open {
                 fh: *fh,
                 direct_io: *direct_io,
             },
             FuseResponse::Write(c) => FuseResponse::Write(*c),
-            FuseResponse::Create {
-                attr,
-                attr_timeout,
-                entry_timeout,
-                fh,
-            } => FuseResponse::Create {
-                attr: *attr,
-                attr_timeout: *attr_timeout,
-                entry_timeout: *entry_timeout,
-                fh: *fh,
-            },
+            FuseResponse::Create { attr, fh } => FuseResponse::Create { attr: *attr, fh: *fh },
             FuseResponse::Buf(b) => FuseResponse::Buf(b.to_owned()),
             FuseResponse::Readlink(s) => FuseResponse::Readlink(s.clone()),
             FuseResponse::Statfs(s) => FuseResponse::Statfs(*s),
             FuseResponse::Lock(l) => FuseResponse::Lock(*l),
             FuseResponse::XattrSize(s) => FuseResponse::XattrSize(*s),
+            FuseResponse::Readdir { entries, max_size } => FuseResponse::Readdir {
+                entries: entries.clone(),
+                max_size: *max_size,
+            },
+            FuseResponse::ReaddirPlus { entries, max_size } => FuseResponse::ReaddirPlus {
+                entries: entries.clone(),
+                max_size: *max_size,
+            },
         }
     }
 
     /// Sends this response over the FUSE request handle.
-    pub fn send(self, req: Request) {
+    pub(crate) fn send(self, req: Request) {
         match self {
             FuseResponse::Ok => req.reply_err(0),
-            FuseResponse::Entry(attr, a_to, e_to) => req.reply_entry(&attr, a_to, e_to),
-            FuseResponse::Attr(attr, to) => req.reply_attr(&attr, to),
+            FuseResponse::Entry(attr) => req.reply_entry(&attr),
+            FuseResponse::Attr(attr) => req.reply_attr(&attr),
             FuseResponse::Open { fh, direct_io } => req.reply_open(fh, direct_io),
             FuseResponse::Write(count) => req.reply_write(count),
-            FuseResponse::Create {
-                attr,
-                attr_timeout,
-                entry_timeout,
-                fh,
-            } => req.reply_create(&attr, attr_timeout, entry_timeout, fh),
+            FuseResponse::Create { attr, fh } => req.reply_create(&attr, fh),
             FuseResponse::Buf(buf) => req.reply_buf(buf.as_slice()),
             FuseResponse::Readlink(link) => req.reply_readlink(&link),
             FuseResponse::Statfs(stat) => req.reply_statfs(&stat),
             FuseResponse::Lock(lock) => req.reply_lock(&lock),
             FuseResponse::XattrSize(size) => req.reply_xattr(size),
+            FuseResponse::Readdir { entries, max_size } => {
+                let mut db = DirectoryBuffer::new(req, max_size);
+                for entry in entries {
+                    if !db.add(&entry.name, entry.ino, entry.file_type, entry.offset) {
+                        break;
+                    }
+                }
+                db.reply();
+            }
+            FuseResponse::ReaddirPlus { entries, max_size } => {
+                let mut db = DirectoryBufferPlus::new(req, max_size);
+                for entry in entries {
+                    if !db.add(&entry.name, &entry.attr, entry.offset) {
+                        break;
+                    }
+                }
+                db.reply();
+            }
         }
     }
 }
 
 /// Helper to dispatch a `Result<FuseResponse, i32>` to a FUSE request.
 #[inline]
-pub fn reply_result<'a>(req: Request, result: Result<FuseResponse<'a>, i32>) {
+pub(crate) fn reply_result<'a>(req: Request, result: Result<FuseResponse<'a>, i32>) {
     match result {
         Ok(resp) => resp.send(req),
         Err(err) => req.reply_err(err),
@@ -866,30 +889,18 @@ impl<T> Drop for DeferredToken<T> {
 
 /// Dispatches a `FuseResponse` result (either immediately or asynchronously) to a FUSE request.
 #[inline]
-pub fn dispatch_reply(req: Request, res: impl Into<DeferredResult<FuseResponse<'static>>>) {
+pub(crate) fn dispatch_reply(req: Request, res: impl Into<DeferredResult<FuseResponse<'static>>>) {
     let deferred = res.into();
     match deferred {
         DeferredResult::Ready(result) => {
-            req.reply_fuse_response(result);
+            reply_result(req, result);
         }
         DeferredResult::Deferred(completion) => {
             completion.on_complete(Box::new(move |result| {
-                req.reply_fuse_response(result);
+                reply_result(req, result);
             }));
         }
     }
-}
-
-#[repr(C)]
-struct FuseCtx {
-    uid: u32,
-    gid: u32,
-    pid: i32,
-    umask: u32,
-}
-
-unsafe extern "C" {
-    fn fuse_req_ctx_shim(req: shim_req_t) -> FuseCtx;
 }
 
 struct DirBufCore {
@@ -903,49 +914,45 @@ impl DirBufCore {
     fn new(req: Request, max_size: usize) -> Self {
         Self {
             req,
-            buf: Vec::with_capacity(max_size),
+            buf: Vec::new(),
             max_size,
             full: false,
         }
     }
 
-    fn is_full(&self) -> bool {
-        self.full
-    }
-
-    fn fill<F>(&mut self, name: &str, ffi_fill: F) -> bool
+    fn fill<F>(&mut self, name: &str, fill_fn: F) -> bool
     where
         F: FnOnce(shim_req_t, *mut c_char, usize, *const c_char) -> usize,
     {
         if self.full {
             return false;
         }
+
         let c_name = match CString::new(name) {
             Ok(c) => c,
             Err(_) => return false,
         };
 
-        let current_len = self.buf.len();
-        let remaining = self.max_size.saturating_sub(current_len);
-        if remaining == 0 {
-            self.full = true;
-            return false;
+        if self.req.req.is_null() {
+            return true;
         }
 
+        let old_len = self.buf.len();
         self.buf.resize(self.max_size, 0);
 
-        let needed = ffi_fill(
+        let remaining = self.max_size.saturating_sub(old_len);
+        let entry_size = fill_fn(
             self.req.req,
-            self.buf[current_len..].as_mut_ptr() as *mut c_char,
+            unsafe { self.buf.as_mut_ptr().add(old_len) as *mut c_char },
             remaining,
             c_name.as_ptr(),
         );
 
-        if needed <= remaining {
-            self.buf.truncate(current_len + needed);
+        if entry_size <= remaining {
+            self.buf.truncate(old_len + entry_size);
             true
         } else {
-            self.buf.truncate(current_len);
+            self.buf.truncate(old_len);
             self.full = true;
             false
         }
@@ -956,15 +963,11 @@ impl DirBufCore {
     }
 }
 
-pub struct DirectoryBuffer(DirBufCore);
+pub(crate) struct DirectoryBuffer(DirBufCore);
 
 impl DirectoryBuffer {
-    pub fn new(req: Request, max_size: usize) -> Self {
+    pub(crate) fn new(req: Request, max_size: usize) -> Self {
         Self(DirBufCore::new(req, max_size))
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.0.is_full()
     }
 
     pub fn add(&mut self, name: &str, ino: u64, file_type: FileType, next_off: i64) -> bool {
@@ -988,18 +991,14 @@ impl DirectoryBuffer {
     }
 }
 
-pub struct DirectoryBufferPlus(DirBufCore);
+pub(crate) struct DirectoryBufferPlus(DirBufCore);
 
 impl DirectoryBufferPlus {
-    pub fn new(req: Request, max_size: usize) -> Self {
+    pub(crate) fn new(req: Request, max_size: usize) -> Self {
         Self(DirBufCore::new(req, max_size))
     }
 
-    pub fn is_full(&self) -> bool {
-        self.0.is_full()
-    }
-
-    pub fn add(&mut self, name: &str, attr: &FileAttr, attr_timeout: f64, entry_timeout: f64, next_off: i64) -> bool {
+    pub fn add(&mut self, name: &str, attr: &FileAttr, next_off: i64) -> bool {
         let shim_attr = convert_file_attr(attr);
         self.0.fill(name, |req, buf_ptr, remaining, c_name_ptr| unsafe {
             shim_add_direntry_plus(
@@ -1008,8 +1007,8 @@ impl DirectoryBufferPlus {
                 remaining,
                 c_name_ptr,
                 &shim_attr,
-                attr_timeout,
-                entry_timeout,
+                FuseResponse::DEFAULT_TIMEOUT,
+                FuseResponse::DEFAULT_TIMEOUT,
                 next_off,
             )
         })
@@ -1047,8 +1046,6 @@ pub struct DirEntryPlus {
     pub name: String,
     pub attr: FileAttr,
     pub offset: i64,
-    pub attr_timeout: f64,
-    pub entry_timeout: f64,
 }
 
 impl DirEntryPlus {
@@ -1058,25 +1055,6 @@ impl DirEntryPlus {
             name: name.into(),
             attr,
             offset,
-            attr_timeout: 1.0,
-            entry_timeout: 1.0,
-        }
-    }
-
-    pub fn with_timeouts(
-        name: impl Into<String>,
-        attr: FileAttr,
-        offset: i64,
-        attr_timeout: f64,
-        entry_timeout: f64,
-    ) -> Self {
-        Self {
-            ino: attr.ino,
-            name: name.into(),
-            attr,
-            offset,
-            attr_timeout,
-            entry_timeout,
         }
     }
 }
@@ -1087,8 +1065,8 @@ pub trait Filesystem {
     fn lookup(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32>;
     fn getattr(&self, ino: u64) -> Result<FuseResponse<'static>, i32>;
     fn opendir(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32>;
-    fn readdir(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<Vec<DirEntry>, i32>;
-    fn readdirplus(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<Vec<DirEntryPlus>, i32>;
+    fn readdir(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
+    fn readdirplus(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
     fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
     fn open(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32>;
     fn write(&self, ino: u64, buf: &[u8], offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32>;
@@ -1174,42 +1152,12 @@ extern "C" fn opendir_bridge(req: shim_req_t, ino: u64, flags: u32, userdata: *m
 
 extern "C" fn readdir_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let req = Request { req };
-    match fs.readdir(ino, size, off, fh) {
-        Ok(entries) => {
-            let mut db = DirectoryBuffer::new(req, size);
-            for entry in entries {
-                if !db.add(&entry.name, entry.ino, entry.file_type, entry.offset) {
-                    break;
-                }
-            }
-            db.reply();
-        }
-        Err(err) => req.reply_err(err),
-    }
+    dispatch_reply(Request { req }, fs.readdir(ino, size, off, fh));
 }
 
 extern "C" fn readdirplus_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    let req = Request { req };
-    match fs.readdirplus(ino, size, off, fh) {
-        Ok(entries) => {
-            let mut db = DirectoryBufferPlus::new(req, size);
-            for entry in entries {
-                if !db.add(
-                    &entry.name,
-                    &entry.attr,
-                    entry.attr_timeout,
-                    entry.entry_timeout,
-                    entry.offset,
-                ) {
-                    break;
-                }
-            }
-            db.reply();
-        }
-        Err(err) => req.reply_err(err),
-    }
+    dispatch_reply(Request { req }, fs.readdirplus(ino, size, off, fh));
 }
 
 extern "C" fn read_bridge(req: shim_req_t, ino: u64, size: usize, off: i64, fh: u64, userdata: *mut c_void) {
@@ -1275,8 +1223,10 @@ extern "C" fn create_bridge(
             return;
         }
     };
-    let req = Request { req };
-    dispatch_reply(req, fs.create(req.context(), parent, name_str, mode, flags));
+    dispatch_reply(
+        Request { req },
+        fs.create(Request { req }.context(), parent, name_str, mode, flags),
+    );
 }
 
 extern "C" fn mknod_bridge(
@@ -1295,8 +1245,10 @@ extern "C" fn mknod_bridge(
             return;
         }
     };
-    let req = Request { req };
-    dispatch_reply(req, fs.mknod(req.context(), parent, name_str, mode, rdev));
+    dispatch_reply(
+        Request { req },
+        fs.mknod(Request { req }.context(), parent, name_str, mode, rdev),
+    );
 }
 
 extern "C" fn unlink_bridge(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void) {
@@ -1320,8 +1272,10 @@ extern "C" fn mkdir_bridge(req: shim_req_t, parent: u64, name: *const c_char, mo
             return;
         }
     };
-    let req = Request { req };
-    dispatch_reply(req, fs.mkdir(req.context(), parent, name_str, mode));
+    dispatch_reply(
+        Request { req },
+        fs.mkdir(Request { req }.context(), parent, name_str, mode),
+    );
 }
 
 extern "C" fn rmdir_bridge(req: shim_req_t, parent: u64, name: *const c_char, userdata: *mut c_void) {
@@ -1358,8 +1312,10 @@ extern "C" fn symlink_bridge(
             return;
         }
     };
-    let req = Request { req };
-    dispatch_reply(req, fs.symlink(req.context(), link_str, parent, name_str));
+    dispatch_reply(
+        Request { req },
+        fs.symlink(Request { req }.context(), link_str, parent, name_str),
+    );
 }
 
 extern "C" fn readlink_bridge(req: shim_req_t, ino: u64, userdata: *mut c_void) {
@@ -1648,5 +1604,20 @@ mod tests {
 
         let buf_resp = FuseResponse::buf(b"test data".as_slice());
         assert_eq!(buf_resp.to_static(), FuseResponse::buf(b"test data".to_vec()));
+    }
+
+    #[test]
+    fn test_reply_result_and_dispatch_with_mock_request() {
+        let req = Request::new_mock();
+        reply_result(req, Ok(FuseResponse::ok()));
+        reply_result(req, Ok(FuseResponse::write(10)));
+        reply_result(req, Ok(FuseResponse::open(1, false)));
+        reply_result(req, Ok(FuseResponse::readlink("dest")));
+        reply_result(req, Ok(FuseResponse::buf(b"abc".as_slice())));
+        reply_result(req, Ok(FuseResponse::xattr_size(10)));
+        reply_result(req, Err(libc::ENOENT));
+
+        dispatch_reply(req, Ok(FuseResponse::ok()));
+        dispatch_reply(req, DeferredResult::ok(FuseResponse::ok()));
     }
 }

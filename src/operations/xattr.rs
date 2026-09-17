@@ -7,19 +7,7 @@ use std::collections::HashMap;
 pub const XATTR_NAME_MAX: usize = 255;
 pub const XATTR_SIZE_MAX: usize = 65536;
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum GetxattrResult {
-    Size(usize),
-    Data(Vec<u8>),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum ListxattrResult {
-    Size(usize),
-    Data(Vec<u8>),
-}
-
-pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Result<GetxattrResult, i32> {
+pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, i32> {
     let inner = fs.inner.lock(OpTag::Xattr).unwrap();
     if fs.get_attr_locked(&inner, ino).is_none() {
         return Err(libc::ENOENT);
@@ -31,15 +19,21 @@ pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Resu
     let val = inner.get_xattr(ino, name).ok_or(libc::ENODATA)?;
     drop(inner);
     if size == 0 {
-        Ok(GetxattrResult::Size(val.len()))
+        Ok(FuseResponse::xattr_size(val.len()))
     } else if size < val.len() {
         Err(libc::ERANGE)
     } else {
-        Ok(GetxattrResult::Data(val))
+        Ok(FuseResponse::buf(val))
     }
 }
 
-pub fn setxattr_core(fs: &InMemoryFS, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<(), i32> {
+pub fn setxattr_core(
+    fs: &InMemoryFS,
+    ino: u64,
+    name: &str,
+    value: &[u8],
+    flags: i32,
+) -> Result<FuseResponse<'static>, i32> {
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
@@ -79,20 +73,20 @@ pub fn setxattr_core(fs: &InMemoryFS, ino: u64, name: &str, value: &[u8], flags:
 
         inner.update_attr_delta(ino, delta);
         inner.record_mutation(name.len() + value.len());
-        Ok(())
+        Ok(FuseResponse::ok())
     })
 }
 
-pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<ListxattrResult, i32> {
+pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResponse<'static>, i32> {
     let inner = fs.inner.lock(OpTag::Xattr).unwrap();
     if fs.get_attr_locked(&inner, ino).is_none() {
         return Err(libc::ENOENT);
     }
     if fs.is_virtual_ino(ino) {
         return Ok(if size == 0 {
-            ListxattrResult::Size(0)
+            FuseResponse::xattr_size(0)
         } else {
-            ListxattrResult::Data(Vec::new())
+            FuseResponse::buf(Vec::new())
         });
     }
 
@@ -105,15 +99,15 @@ pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<Listxatt
     }
 
     if size == 0 {
-        Ok(ListxattrResult::Size(buf.len()))
+        Ok(FuseResponse::xattr_size(buf.len()))
     } else if size < buf.len() {
         Err(libc::ERANGE)
     } else {
-        Ok(ListxattrResult::Data(buf))
+        Ok(FuseResponse::buf(buf))
     }
 }
 
-pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<(), i32> {
+pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
@@ -141,37 +135,14 @@ pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<(), i32
 
         inner.update_attr_delta(ino, delta);
         inner.record_mutation(name.len());
-        Ok(())
+        Ok(FuseResponse::ok())
     })
 }
 
-pub fn getxattr_response(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, i32> {
-    match getxattr_core(fs, ino, name, size)? {
-        GetxattrResult::Size(sz) => Ok(FuseResponse::xattr_size(sz)),
-        GetxattrResult::Data(data) => Ok(FuseResponse::buf(data)),
-    }
-}
-
-pub fn setxattr_response(
-    fs: &InMemoryFS,
-    ino: u64,
-    name: &str,
-    value: &[u8],
-    flags: i32,
-) -> Result<FuseResponse<'static>, i32> {
-    setxattr_core(fs, ino, name, value, flags).map(|()| FuseResponse::ok())
-}
-
-pub fn listxattr_response(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResponse<'static>, i32> {
-    match listxattr_core(fs, ino, size)? {
-        ListxattrResult::Size(sz) => Ok(FuseResponse::xattr_size(sz)),
-        ListxattrResult::Data(data) => Ok(FuseResponse::buf(data)),
-    }
-}
-
-pub fn removexattr_response(fs: &InMemoryFS, ino: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
-    removexattr_core(fs, ino, name).map(|()| FuseResponse::ok())
-}
+pub use getxattr_core as getxattr_response;
+pub use listxattr_core as listxattr_response;
+pub use removexattr_core as removexattr_response;
+pub use setxattr_core as setxattr_response;
 
 #[cfg(test)]
 mod tests {
@@ -187,10 +158,16 @@ mod tests {
         assert_eq!(getxattr_core(&fs, ino, "user.comment", 0), Err(libc::ENODATA));
 
         // 2. Set attribute
-        assert_eq!(setxattr_core(&fs, ino, "user.comment", b"hello world", 0), Ok(()));
+        assert_eq!(
+            setxattr_core(&fs, ino, "user.comment", b"hello world", 0),
+            Ok(FuseResponse::ok())
+        );
 
         // 3. Query size (size == 0)
-        assert_eq!(getxattr_core(&fs, ino, "user.comment", 0), Ok(GetxattrResult::Size(11)));
+        assert_eq!(
+            getxattr_core(&fs, ino, "user.comment", 0),
+            Ok(FuseResponse::xattr_size(11))
+        );
 
         // 4. Query with insufficient buffer -> ERANGE
         assert_eq!(getxattr_core(&fs, ino, "user.comment", 5), Err(libc::ERANGE));
@@ -198,22 +175,22 @@ mod tests {
         // 5. Query with sufficient buffer -> Data
         assert_eq!(
             getxattr_core(&fs, ino, "user.comment", 20),
-            Ok(GetxattrResult::Data(b"hello world".to_vec()))
+            Ok(FuseResponse::buf(b"hello world".to_vec()))
         );
 
         // 6. List attributes
         match listxattr_core(&fs, ino, 0).unwrap() {
-            ListxattrResult::Size(sz) => assert_eq!(sz, "user.comment\0".len()),
+            FuseResponse::XattrSize(sz) => assert_eq!(sz, "user.comment\0".len()),
             _ => panic!("Expected Size result"),
         }
 
         match listxattr_core(&fs, ino, 64).unwrap() {
-            ListxattrResult::Data(data) => assert_eq!(data, b"user.comment\0"),
+            FuseResponse::Buf(data) => assert_eq!(data.as_slice(), b"user.comment\0"),
             _ => panic!("Expected Data result"),
         }
 
         // 7. Remove attribute
-        assert_eq!(removexattr_core(&fs, ino, "user.comment"), Ok(()));
+        assert_eq!(removexattr_core(&fs, ino, "user.comment"), Ok(FuseResponse::ok()));
         assert_eq!(getxattr_core(&fs, ino, "user.comment", 0), Err(libc::ENODATA));
         assert_eq!(removexattr_core(&fs, ino, "user.comment"), Err(libc::ENODATA));
     }
@@ -231,7 +208,10 @@ mod tests {
         );
 
         // CREATE succeeds on nonexistent attribute
-        assert_eq!(setxattr_core(&fs, ino, "user.tag", b"v1", libc::XATTR_CREATE), Ok(()));
+        assert_eq!(
+            setxattr_core(&fs, ino, "user.tag", b"v1", libc::XATTR_CREATE),
+            Ok(FuseResponse::ok())
+        );
 
         // CREATE fails on existing attribute
         assert_eq!(
@@ -240,11 +220,14 @@ mod tests {
         );
 
         // REPLACE succeeds on existing attribute
-        assert_eq!(setxattr_core(&fs, ino, "user.tag", b"v2", libc::XATTR_REPLACE), Ok(()));
+        assert_eq!(
+            setxattr_core(&fs, ino, "user.tag", b"v2", libc::XATTR_REPLACE),
+            Ok(FuseResponse::ok())
+        );
 
         assert_eq!(
             getxattr_core(&fs, ino, "user.tag", 10),
-            Ok(GetxattrResult::Data(b"v2".to_vec()))
+            Ok(FuseResponse::buf(b"v2".to_vec()))
         );
     }
 
@@ -259,8 +242,8 @@ mod tests {
         setxattr_core(&fs, ino, "user.mango", b"3", 0).unwrap();
 
         match listxattr_core(&fs, ino, 100).unwrap() {
-            ListxattrResult::Data(data) => {
-                assert_eq!(data, b"user.apple\0user.mango\0user.zebra\0");
+            FuseResponse::Buf(data) => {
+                assert_eq!(data.as_slice(), b"user.apple\0user.mango\0user.zebra\0");
             }
             _ => panic!("Expected Data result"),
         }
@@ -279,7 +262,7 @@ mod tests {
         let pre_total = fs.inner.lock_count();
 
         let val = getxattr_core(&fs, ino, "user.tag", 10).unwrap();
-        assert_eq!(val, GetxattrResult::Data(b"v1".to_vec()));
+        assert_eq!(val, FuseResponse::buf(b"v1".to_vec()));
 
         let post_stats = fs.inner.op_stats();
         let post_xattr = post_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;
@@ -294,7 +277,7 @@ mod tests {
         let pre_total = fs.inner.lock_count();
 
         let keys = listxattr_core(&fs, ino, 100).unwrap();
-        assert_eq!(keys, ListxattrResult::Data(b"user.tag\0".to_vec()));
+        assert_eq!(keys, FuseResponse::buf(b"user.tag\0".to_vec()));
 
         let post_stats = fs.inner.op_stats();
         let post_xattr = post_stats.iter().find(|s| s.tag == OpTag::Xattr).unwrap().count;

@@ -161,9 +161,9 @@ mod tests {
         assert_ne!(fh1, fh2, "Handles must be distinct");
 
         // 3. Reading fh1 and fh2 via read_core yields their frozen snapshots
-        let data1 = read_core(&fs, v_ino, fh1, 0, 100).unwrap();
+        let data1 = read_core(&fs, v_ino, fh1, 0, 100).unwrap().into_bytes().unwrap();
         assert_eq!(data1, b"counter: 0\n");
-        let data2 = read_core(&fs, v_ino, fh2, 0, 100).unwrap();
+        let data2 = read_core(&fs, v_ino, fh2, 0, 100).unwrap().into_bytes().unwrap();
         assert_eq!(data2, b"counter: 1\n");
 
         // 4. Invalid handle returns EBADF
@@ -171,7 +171,7 @@ mod tests {
 
         // 5. Open a third handle: freezes counter = 2
         let fh3 = fs.open_file_handle(v_ino, 0);
-        let data3 = read_core(&fs, v_ino, fh3, 0, 100).unwrap();
+        let data3 = read_core(&fs, v_ino, fh3, 0, 100).unwrap().into_bytes().unwrap();
         assert_eq!(data3, b"counter: 2\n");
         fs.release_file_handle(fh3, v_ino).unwrap();
 
@@ -179,7 +179,10 @@ mod tests {
         fs.release_file_handle(fh1, v_ino).unwrap();
         assert_eq!(read_core(&fs, v_ino, fh1, 0, 100), Err(libc::EBADF));
         // fh2 remains untouched
-        assert_eq!(read_core(&fs, v_ino, fh2, 0, 100).unwrap(), b"counter: 1\n");
+        assert_eq!(
+            read_core(&fs, v_ino, fh2, 0, 100).unwrap().into_bytes().unwrap(),
+            b"counter: 1\n"
+        );
 
         fs.release_file_handle(fh2, v_ino).unwrap();
         assert_eq!(read_core(&fs, v_ino, fh2, 0, 100), Err(libc::EBADF));
@@ -305,7 +308,7 @@ mod tests {
         );
         assert_eq!(
             crate::operations::xattr::listxattr_core(&fs, v_ino, 0),
-            Ok(crate::operations::xattr::ListxattrResult::Size(0))
+            Ok(crate::shim::FuseResponse::xattr_size(0))
         );
 
         // 9. Status virtual file has identical mutation protections
@@ -324,7 +327,7 @@ mod tests {
 
         // Check unconfigured default via read_core
         let fh1 = fs.open_file_handle(v_ino, 0);
-        let initial_bytes = read_core(&fs, v_ino, fh1, 0, 4096).unwrap();
+        let initial_bytes = read_core(&fs, v_ino, fh1, 0, 4096).unwrap().into_bytes().unwrap();
         let initial_status = String::from_utf8(initial_bytes).unwrap();
         fs.release_file_handle(fh1, v_ino).unwrap();
         assert!(initial_status.contains("No remotes configured."));
@@ -352,7 +355,7 @@ mod tests {
         }
 
         let fh2 = fs.open_file_handle(v_ino, 0);
-        let updated_bytes = read_core(&fs, v_ino, fh2, 0, 4096).unwrap();
+        let updated_bytes = read_core(&fs, v_ino, fh2, 0, 4096).unwrap().into_bytes().unwrap();
         let updated_status = String::from_utf8(updated_bytes).unwrap();
         fs.release_file_handle(fh2, v_ino).unwrap();
 

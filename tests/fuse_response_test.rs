@@ -16,8 +16,8 @@ use appendfs::operations::special::mknod_response;
 use appendfs::operations::statfs::statfs_response;
 use appendfs::operations::xattr::{getxattr_response, listxattr_response, removexattr_response, setxattr_response};
 use appendfs::shim::{
-    DeferredResult, DeferredToken, FileAttr, FileType, Filesystem, FuseResponse, ReplyData, Request, RequestContext,
-    ShimFlock, StatfsAttr, dispatch_reply, reply_result,
+    DeferredResult, DeferredToken, FileAttr, FileType, Filesystem, FuseResponse, ReplyData, RequestContext, ShimFlock,
+    StatfsAttr,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -64,15 +64,11 @@ fn test_fuse_response_constructors() {
 
     // entry
     let entry = FuseResponse::entry(attr);
-    assert_eq!(entry, FuseResponse::Entry(attr, 1.0, 1.0));
-    let entry_custom = FuseResponse::entry_with_timeout(attr, 2.5, 3.5);
-    assert_eq!(entry_custom, FuseResponse::Entry(attr, 2.5, 3.5));
+    assert_eq!(entry, FuseResponse::Entry(attr));
 
     // attr
     let attr_resp = FuseResponse::attr(attr);
-    assert_eq!(attr_resp, FuseResponse::Attr(attr, 1.0));
-    let attr_custom = FuseResponse::attr_with_timeout(attr, 5.0);
-    assert_eq!(attr_custom, FuseResponse::Attr(attr, 5.0));
+    assert_eq!(attr_resp, FuseResponse::Attr(attr));
 
     // open
     let open = FuseResponse::open(7, true);
@@ -84,15 +80,7 @@ fn test_fuse_response_constructors() {
 
     // create
     let create = FuseResponse::create(attr, 9);
-    assert_eq!(
-        create,
-        FuseResponse::Create {
-            attr,
-            attr_timeout: 1.0,
-            entry_timeout: 1.0,
-            fh: 9,
-        }
-    );
+    assert_eq!(create, FuseResponse::Create { attr, fh: 9 });
 
     // buf
     let buf = FuseResponse::buf(b"test".as_slice());
@@ -143,12 +131,10 @@ fn test_all_fuse_response_handlers() {
     // 1. getattr
     let attr_res = getattr_response(&fs, 1);
     assert!(matches!(attr_res, Ok(FuseResponse::Attr(..))));
-    reply_result(Request::new_mock(), attr_res);
 
     // 2. lookup
     let lookup_res = lookup_response(&fs, 1, ".");
     assert!(matches!(lookup_res, Ok(FuseResponse::Entry(..))));
-    reply_result(Request::new_mock(), lookup_res);
 
     // 3. opendir
     let opendir_res = opendir_response(&fs, 1, 0);
@@ -161,62 +147,38 @@ fn test_all_fuse_response_handlers() {
     // 4. releasedir
     let releasedir_res = releasedir_response(&fs, 1, dir_fh);
     assert_eq!(releasedir_res, Ok(FuseResponse::ok()));
-    reply_result(Request::new_mock(), releasedir_res);
 
     // 6. mkdir
-    let mkdir_res = mkdir_response(&fs, 1, "testdir", 0o755, 1000, 1000);
+    let ctx = RequestContext::new(1000, 1000, 0);
+    let mkdir_res = mkdir_response(&fs, ctx, 1, "testdir", 0o755);
     assert!(matches!(mkdir_res, Ok(FuseResponse::Entry(..))));
-    reply_result(Request::new_mock(), mkdir_res);
 
     // 7. create file
     let create_res = create_response(
         &fs,
+        ctx,
         1,
         "testfile.txt",
         0o644,
         (libc::O_CREAT | libc::O_RDWR) as u32,
-        1000,
-        1000,
     );
     assert!(matches!(create_res, Ok(FuseResponse::Create { .. })));
     let (file_ino, file_fh) = match create_res.unwrap() {
         FuseResponse::Create { attr, fh, .. } => (attr.ino, fh),
         _ => unreachable!(),
     };
-    reply_result(
-        Request::new_mock(),
-        Ok(FuseResponse::create(
-            FileAttr {
-                ino: file_ino,
-                file_type: FileType::RegularFile,
-                perm: 0o644,
-                nlink: 1,
-                uid: 1000,
-                gid: 1000,
-                rdev: 0,
-                size: 0,
-                atime: mock_time(),
-                mtime: mock_time(),
-                ctime: mock_time(),
-            },
-            file_fh,
-        )),
-    );
 
     // 8. open file
     let open_res = open_response(&fs, file_ino, libc::O_RDONLY as u32);
     assert!(matches!(open_res, Ok(FuseResponse::Open { .. })));
-    reply_result(Request::new_mock(), open_res);
 
     // 9. write
     let write_res = write_response(&fs, file_ino, file_fh, b"hello world", 0);
     assert_eq!(write_res, Ok(FuseResponse::write(11)));
-    reply_result(Request::new_mock(), write_res);
 
     // 10. read
     let read_res = read_response(&fs, file_ino, file_fh, 0, 11);
     assert_eq!(read_res, Ok(FuseResponse::buf(b"hello world".as_slice())));
-    reply_result(Request::new_mock(), read_res);
 
     // 11. getlk
     let lock_query = ShimFlock {
@@ -228,95 +190,73 @@ fn test_all_fuse_response_handlers() {
     };
     let getlk_res = getlk_response(&fs, file_ino, file_fh, 1, lock_query);
     assert!(matches!(getlk_res, Ok(FuseResponse::Lock(..))));
-    reply_result(Request::new_mock(), getlk_res);
 
     // 12. release file
     let release_res = release_response(&fs, file_ino, file_fh);
     assert_eq!(release_res, Ok(FuseResponse::ok()));
-    reply_result(Request::new_mock(), release_res);
 
     // 12. setattr
     let now = mock_time();
     let setattr_res = setattr_response(&fs, file_ino, 0o777, 1001, 1001, 11, now, now, 0o7777);
     assert!(matches!(setattr_res, Ok(FuseResponse::Attr(..))));
-    reply_result(Request::new_mock(), setattr_res);
 
     // 13. fallocate
     let falloc_res = fallocate_response(&fs, file_ino, 0, 0, 1024);
     assert_eq!(falloc_res, Ok(FuseResponse::ok()));
-    reply_result(Request::new_mock(), falloc_res);
 
     // 14. mknod
-    let mknod_res = mknod_response(&fs, 1, "fifo_node", libc::S_IFIFO | 0o644, 0, 1000, 1000);
+    let mknod_res = mknod_response(&fs, ctx, 1, "fifo_node", libc::S_IFIFO | 0o644, 0);
     assert!(matches!(mknod_res, Ok(FuseResponse::Entry(..))));
-    reply_result(Request::new_mock(), mknod_res);
 
     // 15. xattr
     let setxattr_res = setxattr_response(&fs, file_ino, "user.test", b"val", 0);
     assert_eq!(setxattr_res, Ok(FuseResponse::ok()));
-    reply_result(Request::new_mock(), setxattr_res);
 
     let getxattr_res = getxattr_response(&fs, file_ino, "user.test", 100);
     assert_eq!(getxattr_res, Ok(FuseResponse::buf(b"val".as_slice())));
-    reply_result(Request::new_mock(), getxattr_res);
 
     let getxattr_size_res = getxattr_response(&fs, file_ino, "user.test", 0);
     assert_eq!(getxattr_size_res, Ok(FuseResponse::xattr_size(3)));
-    reply_result(Request::new_mock(), getxattr_size_res);
 
     let listxattr_res = listxattr_response(&fs, file_ino, 100);
     assert!(matches!(listxattr_res, Ok(FuseResponse::Buf(..))));
-    reply_result(Request::new_mock(), listxattr_res);
 
     let listxattr_size_res = listxattr_response(&fs, file_ino, 0);
     assert!(matches!(listxattr_size_res, Ok(FuseResponse::XattrSize(..))));
-    reply_result(Request::new_mock(), listxattr_size_res);
 
     let removexattr_res = removexattr_response(&fs, file_ino, "user.test");
     assert_eq!(removexattr_res, Ok(FuseResponse::ok()));
-    reply_result(Request::new_mock(), removexattr_res);
 
     // 16. symlink & readlink
-    let sym_res = symlink_response(&fs, 1, "mysym", "target_path", 1000, 1000);
+    let sym_res = symlink_response(&fs, ctx, "target_path", 1, "mysym");
     assert!(matches!(sym_res, Ok(FuseResponse::Entry(..))));
     let sym_ino = match sym_res.as_ref().unwrap() {
         FuseResponse::Entry(a, ..) => a.ino,
         _ => unreachable!(),
     };
-    reply_result(Request::new_mock(), sym_res);
 
     let readlink_res = readlink_response(&fs, sym_ino);
     assert_eq!(readlink_res, Ok(FuseResponse::readlink("target_path")));
-    reply_result(Request::new_mock(), readlink_res);
 
     // 17. link
     let link_res = link_response(&fs, file_ino, 1, "hardlink.txt");
     assert!(matches!(link_res, Ok(FuseResponse::Entry(..))));
-    reply_result(Request::new_mock(), link_res);
 
     // 18. rename
     let rename_res = rename_response(&fs, 1, "hardlink.txt", 1, "renamed.txt");
     assert_eq!(rename_res, Ok(FuseResponse::ok()));
-    reply_result(Request::new_mock(), rename_res);
 
     // 19. unlink
     let unlink_res = unlink_response(&fs, 1, "renamed.txt");
     assert_eq!(unlink_res, Ok(FuseResponse::ok()));
-    reply_result(Request::new_mock(), unlink_res);
 
     // 20. statfs
     let statfs_res = statfs_response(&fs, 1);
     assert!(matches!(statfs_res, Ok(FuseResponse::Statfs(..))));
-    reply_result(Request::new_mock(), statfs_res);
 
     // 21. rmdir
     let rmdir_res = rmdir_response(&fs, 1, "testdir");
     assert_eq!(rmdir_res, Ok(FuseResponse::ok()));
-    reply_result(Request::new_mock(), rmdir_res);
-
-    // 23. error reply
-    let err_res: Result<FuseResponse<'static>, i32> = Err(libc::ENOENT);
-    reply_result(Request::new_mock(), err_res);
 }
 
 #[test]
@@ -437,13 +377,19 @@ fn test_filesystem_trait_all_methods() {
     // 5. readdir and readdirplus via trait
     let readdir_res = fs.readdir(dir_ino, 4096, 0, dir_fh);
     assert!(readdir_res.is_ok());
-    let entries = readdir_res.unwrap();
+    let entries = match readdir_res.unwrap() {
+        FuseResponse::Readdir { entries, .. } => entries,
+        _ => unreachable!(),
+    };
     assert!(entries.iter().any(|e| e.name == "."));
     assert!(entries.iter().any(|e| e.name == ".."));
 
     let readdirplus_res = fs.readdirplus(dir_ino, 4096, 0, dir_fh);
     assert!(readdirplus_res.is_ok());
-    let entries_plus = readdirplus_res.unwrap();
+    let entries_plus = match readdirplus_res.unwrap() {
+        FuseResponse::ReaddirPlus { entries, .. } => entries,
+        _ => unreachable!(),
+    };
     assert!(entries_plus.iter().any(|e| e.name == "."));
 
     // 6. create via trait
@@ -564,8 +510,4 @@ fn test_filesystem_trait_all_methods() {
     let _ = fs.unlink(dir_ino, "sym1");
     let rmdir_ok = fs.rmdir(1, "dir1");
     assert_eq!(rmdir_ok, Ok(FuseResponse::ok()));
-
-    // 25. dispatch_reply with mock Request
-    dispatch_reply(Request::new_mock(), Ok(FuseResponse::ok()));
-    dispatch_reply(Request::new_mock(), DeferredResult::ok(FuseResponse::ok()));
 }

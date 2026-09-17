@@ -1,7 +1,7 @@
 use crate::extent_map::{Extent, ExtentMap};
 use crate::fs::{FileHandle, FlushReason, FsInner, InMemoryFS};
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
-use crate::shim::{DeferredCompletion, DeferredResult, FileAttr, FileType, FuseResponse};
+use crate::shim::{DeferredCompletion, DeferredResult, FileAttr, FileType, FuseResponse, RequestContext};
 use crate::sync::OpTag;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -22,23 +22,15 @@ pub fn getattr_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'stati
     getattr_core(fs, ino).map(FuseResponse::attr)
 }
 
-pub fn read_core(fs: &InMemoryFS, ino: u64, fh: u64, offset: i64, size: usize) -> Result<Vec<u8>, i32> {
+pub fn read_core(fs: &InMemoryFS, ino: u64, fh: u64, offset: i64, size: usize) -> Result<FuseResponse<'static>, i32> {
     log::trace!("read(ino={}, fh={}, size={}, offset={})", ino, fh, size, offset);
     if offset < 0 {
         return Err(libc::EINVAL);
     }
-    fs.read_handle(ino, fh, offset as u64, size)
+    fs.read_handle(ino, fh, offset as u64, size).map(FuseResponse::buf)
 }
 
-pub fn read_response(
-    fs: &InMemoryFS,
-    ino: u64,
-    fh: u64,
-    offset: i64,
-    size: usize,
-) -> Result<FuseResponse<'static>, i32> {
-    read_core(fs, ino, fh, offset, size).map(FuseResponse::buf)
-}
+pub use read_core as read_response;
 
 pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
     let write_requested = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0;
@@ -518,14 +510,13 @@ pub fn create_core(
 
 pub fn create_response(
     fs: &InMemoryFS,
+    ctx: RequestContext,
     parent: u64,
     name: &str,
     mode: u32,
     flags: u32,
-    uid: u32,
-    gid: u32,
 ) -> Result<FuseResponse<'static>, i32> {
-    create_internal(fs, parent, name, mode, flags, uid, gid, true)
+    create_internal(fs, parent, name, mode, flags, ctx.uid, ctx.gid, true)
         .map(|(attr, fh)| FuseResponse::create(attr, fh.unwrap()))
 }
 

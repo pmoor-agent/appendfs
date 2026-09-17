@@ -20,7 +20,7 @@ fn read_test(fs: &InMemoryFS, ino: u64, offset: u64, size: usize) -> Result<Vec<
     let fh = open_core(fs, ino, libc::O_RDONLY as u32)?;
     let res = read_core(fs, ino, fh, offset as i64, size);
     let _ = release_core(fs, ino, fh);
-    res
+    res.and_then(|r| r.into_bytes().ok_or(libc::EIO))
 }
 
 #[test]
@@ -950,7 +950,10 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     let fh = open_core(&fs_arc, remotes_ino, libc::O_RDONLY as u32).unwrap();
 
     // 5. Read .remotes content
-    let content_bytes = read_core(&fs_arc, remotes_ino, fh, 0, 4096).unwrap();
+    let content_bytes = read_core(&fs_arc, remotes_ino, fh, 0, 4096)
+        .unwrap()
+        .into_bytes()
+        .unwrap();
     let content_str = String::from_utf8(content_bytes).unwrap();
 
     assert!(content_str.contains("=== Remote Status (Volume Head Generation: 2) ==="));

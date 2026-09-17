@@ -2,7 +2,7 @@
 use crate::fs::find_parent_inode;
 use crate::fs::{DirHandle, InMemoryFS};
 use crate::node::{AttrDelta, DirectoryDelta, NodeDelta};
-use crate::shim::{DeferredResult, DirEntry, DirEntryPlus, FileAttr, FileType, FuseResponse};
+use crate::shim::{DeferredResult, DirEntry, DirEntryPlus, FileAttr, FileType, FuseResponse, RequestContext};
 use crate::sync::OpTag;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -185,13 +185,31 @@ pub fn readdirplus_entries(
                     offset: next_offset,
                     name: name.to_string(),
                     attr,
-                    attr_timeout: 1.0,
-                    entry_timeout: 1.0,
                 });
             }
         }
         Ok(items)
     })
+}
+
+pub fn readdir_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    size: usize,
+    offset: i64,
+    fh: u64,
+) -> Result<FuseResponse<'static>, i32> {
+    readdir_entries(fs, ino, size, offset, fh).map(|entries| FuseResponse::readdir(entries, size))
+}
+
+pub fn readdirplus_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    size: usize,
+    offset: i64,
+    fh: u64,
+) -> Result<FuseResponse<'static>, i32> {
+    readdirplus_entries(fs, ino, size, offset, fh).map(|entries| FuseResponse::readdirplus(entries, size))
 }
 
 pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> Result<FileAttr, i32> {
@@ -271,13 +289,12 @@ pub fn mkdir_core(fs: &InMemoryFS, parent: u64, name: &str, mode: u32, uid: u32,
 
 pub fn mkdir_response(
     fs: &InMemoryFS,
+    ctx: RequestContext,
     parent: u64,
     name: &str,
     mode: u32,
-    uid: u32,
-    gid: u32,
 ) -> Result<FuseResponse<'static>, i32> {
-    mkdir_core(fs, parent, name, mode, uid, gid).map(FuseResponse::entry)
+    mkdir_core(fs, parent, name, mode, ctx.uid, ctx.gid).map(FuseResponse::entry)
 }
 
 pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {

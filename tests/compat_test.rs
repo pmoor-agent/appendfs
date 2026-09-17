@@ -21,7 +21,10 @@ use appendfs::{InMemoryFS, LogWriter, RecoveryTarget, Storage, SummaryReader, re
 
 fn read_test(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<u8> {
     let fh = open_core(fs, ino, libc::O_RDONLY as u32).expect("open file");
-    let data = read_core(fs, ino, fh, offset, size).expect("read file");
+    let data = read_core(fs, ino, fh, offset, size)
+        .expect("read file")
+        .into_bytes()
+        .unwrap();
     release_core(fs, ino, fh).expect("release file");
     data
 }
