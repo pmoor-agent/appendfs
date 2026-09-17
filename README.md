@@ -6,67 +6,23 @@
 
 **AppendFS** is a high-performance, log-structured in-memory FUSE filesystem designed around an **append-only backing store** for personal archival storage, tamper-evident data durability, and disaster recovery.
 
-Instead of mutating files in place on disk, AppendFS stages all filesystem operations (file writes, metadata updates, directory creations, deletions, renames, extended attributes) in an in-memory Log-Structured Merge (LSM) overlay and flushes them as an append-only sequence of immutable log files ordered by a **monotonic generation sequence number**.
+Instead of mutating files in place on disk, AppendFS stages all filesystem operations (file writes, metadata updates, directory creations, deletions, renames, extended attributes) in memory and flushes changes as an append-only sequence of immutable log files ordered by a **monotonic generation sequence number**.
 
 ---
 
 ## Key Features
 
 - **Append-Only Backing Store**: Physical disk writes are 100% sequential and immutable. Existing log files are never overwritten in place, eliminating fragmentation and protecting against data corruption.
-- **In-Memory LSM Performance**: Built on a three-tier in-memory architecture (`base`, `flushing`, and `live` delta layers) that serves reads and writes at memory speed while asynchronously committing batches to disk.
+- **In-Memory Staging & Performance**: Operations are staged in memory and served at memory speed while asynchronously committing batches to disk.
 - **Instant Crash Recovery**: Power cuts or crashes mid-flush cleanly discard uncommitted trailing batches while preserving all previously committed transactions. Periodic `.summary` checkpoint files enable near-instantaneous startup.
-- **Point-in-Time Time Travel**: Mount the filesystem read-only at any past transaction ID (`--tx-id`), civil timestamp (`--at-time`), or generation (`--generation`) for auditing or backup extraction.
-- **Zero-Trust Authenticated Encryption**: AEAD encryption using **ChaCha20-Poly1305** with **Argon2id** key derivation. Volumes can be unlocked via a passphrase, a 256-bit key file, or two-factor authentication (key file + passphrase). Key Check Values (KCV) ensure immediate validation before reading records.
+- **Point-in-Time Time Travel**: Mount the filesystem read-only at any past timestamp (`--at-time`) for auditing or backup extraction.
+- **Zero-Trust Authenticated Encryption**: AEAD encryption with secure key derivation. Volumes can be unlocked via a passphrase, a 256-bit key file, or two-factor authentication (key file + passphrase), with immediate key validation before reading records.
 - **Transparent Compression**: Payloads are compressed on the fly using **Zstandard (zstd)**, saving storage space and network transfer costs.
 - **Multi-Cloud Replication**: An autonomous background replication worker fans out sealed logs and summaries to S3-compatible cloud providers (AWS S3, Backblaze B2, Cloudflare R2, MinIO, Wasabi, Google Cloud Storage) or local/NFS paths.
-- **Tiered Storage & Range Reads**: Local disk space can be reclaimed by pruning uploaded log files. Missing extents are transparently fetched on demand using S3 HTTP Range requests with concurrent request deduplication.
+- **Tiered Storage & Range Reads**: Local disk space can be reclaimed by pruning uploaded log files. Missing extents are transparently fetched on demand.
 - **POSIX Compliant**: Supports regular files, directories, symlinks, hardlinks, special files (FIFOs, Unix sockets, character/block devices), sparse files (hole punching via `fallocate`), extended attributes (`xattr`), and advisory file locking (`flock` / `fcntl`).
 - **Clean-Room Disaster Recovery**: Includes `scripts/restore.py`, an independent Python script that reconstructs the full filesystem tree directly from raw log files without requiring Rust, Cargo, or FUSE.
 - **Offline Diagnostics & Verification**: Built-in CLI commands to check filesystem tree consistency and payload checksums (`appendfs fsck`), inspect inode/storage breakdown (`appendfs stats`), and decode individual log records (`appendfs dump`).
-
----
-
-## Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              FUSE Kernel Interface                      │
-└────────────────────────────────────┬────────────────────────────────────┘
-                                     │ POSIX Operations & xattrs
-┌────────────────────────────────────▼────────────────────────────────────┐
-│                             InMemoryFS Engine                           │
-│  ┌─────────────────────────────────┐   ┌─────────────────────────────┐  │
-│  │ Inode & Directory Metadata Tree │   │ ExtentMap Fragment Allocator│  │
-│  └─────────────────────────────────┘   └─────────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │     LSM Overlay: base (read) ◄── flushing (frozen) ◄── live (dirty)│  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────┬────────────────────────────────────┘
-                                     │ Staged Flush Batch
-┌────────────────────────────────────▼────────────────────────────────────┐
-│                 Log Engine & Data Protection Layer                      │
-│  ┌─────────────────────────┐           ┌─────────────────────────────┐  │
-│  │  Payload Compression    │           │  Authenticated Encryption   │  │
-│  │  (Zstandard / zstd)     │           │  (ChaCha20-Poly1305/Argon2) │  │
-│  └─────────────────────────┘           └─────────────────────────────┘  │
-└────────────────────────────────────┬────────────────────────────────────┘
-                                     │ Monotonic Generation Append
-┌────────────────────────────────────▼────────────────────────────────────┐
-│                    Local Storage & Tiered Cache                         │
-│  ┌───────────────────┐    ┌───────────────────┐    ┌─────────────────┐  │
-│  │ 000001.log        │    │ 000002.log        │    │ 000002.summary  │  │
-│  │ (Sealed/Evictable)│    │ (Active Generation)│   │ (Checkpoint)    │  │
-│  └─────────┬─────────┘    └───────────────────┘    └─────────────────┘  │
-└────────────┼────────────────────────────────────────────────────────────┘
-             │ Multi-Cloud Fan-Out Replication Worker
-             ├──────────────────────────────────────┐
-┌────────────▼──────────────────────────┐  ┌────────▼──────────────────────────┐
-│      Primary Cloud: AWS S3            │  │     Secondary Cloud: B2 / R2      │
-│  ┌─────────────────────────────────┐  │  │  ┌──────────────────────────────┐ │
-│  │ 000001.log (Encrypted)          │  │  │  │ 000001.log (Encrypted)       │ │
-│  └─────────────────────────────────┘  │  │  └──────────────────────────────┘ │
-└───────────────────────────────────────┘  └──────────────────────────────────┘
-```
 
 ---
 
@@ -74,22 +30,9 @@ Instead of mutating files in place on disk, AppendFS stages all filesystem opera
 
 ### Prerequisites
 
-- **Linux** (FUSE 3 support required)
-- **libfuse3**, development headers, and `pkg-config`:
+- **Linux** (Fedora / RHEL):
   ```bash
-  # Debian / Ubuntu
-  sudo apt-get update
-  sudo apt-get install -y libfuse3-dev fuse3 pkg-config
-
-  # Fedora / RHEL
-  sudo dnf install -y fuse3-devel fuse3 pkgconf-pkg-config
-
-  # Arch Linux
-  sudo pacman -S fuse3 pkgconf
-  ```
-- **Rust toolchain** (stable, 2024 edition):
-  ```bash
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  sudo dnf install -y fuse3-devel fuse3 pkgconf-pkg-config rust cargo
   ```
 
 ### Building from Source
@@ -143,19 +86,16 @@ appendfs mount -f /var/lib/appendfs_logs /mnt/mydata
 
 *(If the volume is encrypted, pass `--passphrase` to prompt interactively, `--key-file <path>`, or both depending on the volume configuration).*
 
-### 3. Read and Write Data
+### 3. Using the Filesystem
 
-Interact with the mountpoint like any standard POSIX directory:
+The mounted volume is now ready to use like any standard directory. You can also inspect live runtime metrics and replication status via virtual files in the root of the mount:
 
 ```bash
-# Write files
-echo "Hello, AppendFS!" > /mnt/mydata/welcome.txt
-mkdir -p /mnt/mydata/documents
-cp -r ~/Documents/* /mnt/mydata/documents/
+# Inspect live volume runtime status and flush statistics
+cat /mnt/mydata/.status
 
-# Extended attributes
-setfattr -n user.comment -v "archival snapshot" /mnt/mydata/welcome.txt
-getfattr -d /mnt/mydata/welcome.txt
+# Inspect remote replication status (when remotes are configured)
+cat /mnt/mydata/.remotes
 ```
 
 ### 4. Unmount
@@ -172,17 +112,11 @@ fusermount3 -u /mnt/mydata
 
 ### Point-in-Time Time Travel (Read-Only Mounts)
 
-AppendFS enables instant time travel by replaying log records up to a target boundary:
+AppendFS enables instant time travel by replaying log records up to a target timestamp:
 
 ```bash
-# Mount the filesystem state as of a specific UTC/local timestamp
+# Mount the filesystem state as of a specific timestamp
 appendfs mount-ro --at-time "2026-08-17T10:00:00Z" /var/lib/appendfs_logs /mnt/snapshot
-
-# Mount as of a specific transaction ID
-appendfs mount-ro --tx-id 1520 /var/lib/appendfs_logs /mnt/snapshot
-
-# Mount as of a specific log generation
-appendfs mount-ro --generation 3 /var/lib/appendfs_logs /mnt/snapshot
 ```
 
 ### Volume Integrity & Statistics
@@ -239,47 +173,6 @@ pip install cryptography zstandard argon2-cffi blake3
 
 # Reconstruct all files to a local target directory
 python3 scripts/restore.py /var/lib/appendfs_logs /tmp/restored_data
-```
-
----
-
-## Development & Testing
-
-### Running Tests
-
-To protect against test deadlocks, tests should always be run with a timeout:
-
-```bash
-# Run standard test suite (debug)
-timeout 5m cargo test
-
-# Run standard test suite (release)
-timeout 5m cargo test --release
-
-# Run on-disk format compatibility fixtures check
-timeout 5m cargo test --test compat_test
-```
-
-### Stress & Concurrency Soak Testing
-
-AppendFS includes parameterized differential fuzzing and concurrent stress test suites:
-
-```bash
-# Quick sanity sweep (~5s)
-FUZZ_SEEDS=50 FUZZ_STEPS=2000 timeout 5m cargo test --release
-
-# Extended concurrency soak (~90s)
-FUZZ_SEEDS=300 FUZZ_STEPS=8000 timeout 5m cargo test --release --test concurrency_test -- --nocapture
-
-# Extended fuzzing & crash recovery soak (~85s)
-FUZZ_SEEDS=300 FUZZ_STEPS=10000 timeout 5m cargo test --release --test fuzz_test -- --nocapture
-```
-
-### Lints & Code Formatting
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features
 ```
 
 ---
