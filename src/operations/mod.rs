@@ -1,6 +1,7 @@
 pub mod dir;
 pub mod links;
 pub mod locks;
+pub mod op;
 pub mod read_write;
 pub mod special;
 pub mod statfs;
