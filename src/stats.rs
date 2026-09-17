@@ -586,7 +586,7 @@ mod tests {
         assert!(status.contains("[Volume]"));
         assert!(status.contains("Access Mode:        Read-Write"));
         assert!(status.contains("Active Generation:  None"));
-        assert!(status.contains("Next Generation:    2"));
+        assert!(status.contains("Next Generation:    1"));
 
         assert!(status.contains("[Inodes]"));
         assert!(status.contains("Active Inodes:      1 (1 directories, 0 files, 0 symlinks, 0 special)"));

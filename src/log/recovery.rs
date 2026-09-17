@@ -302,33 +302,17 @@ pub fn recover_fs(
 
         let log_file_len = storage.file_len(&filename).unwrap_or(0);
         let log_md5 = reader.finish_md5()?;
-        {
-            let mut manifest = fs_instance.manifest.write().unwrap();
-            if manifest.get_by_generation(gen_num).is_none() {
-                if manifest.logs.len() == 1 && manifest.logs[0].generation == 1 && min_log_gen == 0 && gen_num == 1 {
-                    let entry = &mut manifest.logs[0];
-                    entry.created_at = log_created_at;
-                    entry.record_count = committed_records_count;
-                    entry.total_data_bytes = log_data_bytes;
-                    entry.total_bytes = log_file_len;
-                    entry.md5 = Some(log_md5);
-                } else {
-                    manifest.record_roll(gen_num, log_created_at, crate::log::record::FILE_HEADER_SIZE as u64);
-                    if let Some(entry) = manifest.get_mut_by_generation(gen_num) {
-                        entry.record_count = committed_records_count;
-                        entry.total_data_bytes = log_data_bytes;
-                        entry.total_bytes = log_file_len;
-                        entry.md5 = Some(log_md5);
-                    }
-                }
-            } else if let Some(entry) = manifest.get_mut_by_generation(gen_num) {
-                entry.created_at = log_created_at;
-                entry.record_count = committed_records_count;
-                entry.total_data_bytes = log_data_bytes;
-                entry.total_bytes = log_file_len;
-                entry.md5 = Some(log_md5);
-            }
-        }
+        let log_file_info = crate::log::LogFileInfo {
+            generation: gen_num,
+            revision: parse_log_filename(&filename).map(|(_, r)| r).unwrap_or(0),
+            filename: filename.clone(),
+            created_at: log_created_at,
+            record_count: committed_records_count,
+            total_bytes: log_file_len,
+            total_data_bytes: log_data_bytes,
+            md5: Some(log_md5),
+        };
+        fs_instance.manifest.write().unwrap().record_sealed_log(log_file_info);
 
         total_recovered_data_bytes += log_data_bytes;
 

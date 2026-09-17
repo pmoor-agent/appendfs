@@ -103,27 +103,29 @@ impl LogFileInfo {
     }
 }
 
-/// Authoritative manifest of all active log generations and lineage for the filesystem.
+/// Authoritative manifest of all sealed log generations and lineage for the filesystem.
+///
+/// The active log generation is managed exclusively by `LogWriter` and is never included in
+/// `logs`. Once a generation is sealed (via log roll, idle age, or summary snapshot), it is
+/// added to `logs` complete with its authenticated MD5 checksum and final counters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogManifest {
-    /// Ordered list of active log files that back the extents in this filesystem state.
+    /// Ordered list of sealed log files that back the extents in this filesystem state.
     pub logs: Vec<LogFileInfo>,
     /// Next generation sequence number to allocate.
     pub next_generation: u64,
 }
 
 impl LogManifest {
-    pub fn new_with_time(start_generation: u64, created_at: SystemTime) -> Self {
-        let next_generation = start_generation + 1;
-
+    pub fn new(start_generation: u64) -> Self {
         Self {
-            logs: vec![LogFileInfo::new(
-                start_generation,
-                created_at,
-                crate::log::record::FILE_HEADER_SIZE as u64,
-            )],
-            next_generation,
+            logs: Vec::new(),
+            next_generation: start_generation,
         }
+    }
+
+    pub fn new_with_time(start_generation: u64, _created_at: SystemTime) -> Self {
+        Self::new(start_generation)
     }
 
     /// Returns the physical filename for the next log generation (e.g. "000002.log").
@@ -131,58 +133,20 @@ impl LogManifest {
         log_filename(self.next_generation)
     }
 
-    /// Appends a new rolled log generation and advances `next_generation`.
-    pub fn record_roll(&mut self, next_gen: u64, created_at: SystemTime, initial_header_size: u64) {
-        self.record_roll_with_revision(next_gen, 0, created_at, initial_header_size);
-    }
-
-    /// Appends a new rolled log generation with an explicit revision and advances `next_generation` if applicable.
-    pub fn record_roll_with_revision(
-        &mut self,
-        next_gen: u64,
-        revision: u32,
-        created_at: SystemTime,
-        initial_header_size: u64,
-    ) {
-        if self
+    /// Records a sealed log file entry into the manifest and advances `next_generation`.
+    pub fn record_sealed_log(&mut self, log: LogFileInfo) {
+        debug_assert!(log.md5.is_some(), "sealed log must have an MD5 digest");
+        if let Some(existing) = self
             .logs
-            .iter()
-            .any(|l| l.generation == next_gen && l.revision == revision)
+            .iter_mut()
+            .find(|l| l.generation == log.generation && l.revision == log.revision)
         {
-            return;
-        }
-        let entry = LogFileInfo::new_with_revision(next_gen, revision, created_at, initial_header_size);
-        self.logs.push(entry);
-        if next_gen >= self.next_generation {
-            self.next_generation = next_gen + 1;
-        }
-    }
-
-    /// Sets the MD5 digest for a specific sealed generation.
-    pub fn set_generation_md5(&mut self, generation: u64, md5: [u8; 16]) {
-        if let Some(entry) = self.get_mut_by_generation(generation) {
-            // A generation is sealed once, so a second digest that disagrees means the file
-            // changed under us or two sealers raced. Recording it silently would hand the
-            // integrity checker a digest matching whichever write landed last.
-            debug_assert!(
-                entry.md5.is_none_or(|existing| existing == md5),
-                "generation {} already sealed with a different md5",
-                generation
-            );
-            if let Some(existing) = entry.md5
-                && existing != md5
-            {
-                {
-                    log::error!(
-                        "Refusing to overwrite md5 of sealed generation {}: recorded {:x?}, got {:x?}",
-                        generation,
-                        existing,
-                        md5
-                    );
-                    return;
-                }
+            *existing = log;
+        } else {
+            if log.generation >= self.next_generation {
+                self.next_generation = log.generation + 1;
             }
-            entry.md5 = Some(md5);
+            self.logs.push(log);
         }
     }
 
@@ -197,15 +161,11 @@ impl LogManifest {
     }
 
     /// Ensures and validates that all sealed log entries in the manifest have an authenticated MD5.
-    ///
-    /// If `active_generation` is provided (e.g. from an active `LogWriter`), that generation is
-    /// permitted to have `md5 == None` because it is actively receiving writes. All other log entries
-    /// MUST have `md5.is_some()`.
-    pub fn ensure_sealed_md5s(&self, active_generation: Option<u64>) -> Result<(), String> {
+    pub fn ensure_sealed_md5s(&self) -> Result<(), String> {
         let missing: Vec<u64> = self
             .logs
             .iter()
-            .filter(|l| Some(l.generation) != active_generation && l.md5.is_none())
+            .filter(|l| l.md5.is_none())
             .map(|l| l.generation)
             .collect();
         if missing.is_empty() {
@@ -240,15 +200,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_log_manifest_creation_and_roll() {
-        let mut manifest = LogManifest::new_with_time(1, SystemTime::UNIX_EPOCH);
+    fn test_log_manifest_creation_and_sealed_records() {
+        let mut manifest = LogManifest::new(1);
+        assert_eq!(manifest.logs.len(), 0);
+        assert_eq!(manifest.next_generation, 1);
+        assert_eq!(manifest.next_filename(), "000001.log");
+
+        let log1 = LogFileInfo {
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 5,
+            total_bytes: 1024,
+            total_data_bytes: 512,
+            md5: Some([1u8; 16]),
+        };
+        manifest.record_sealed_log(log1);
         assert_eq!(manifest.logs.len(), 1);
         assert_eq!(manifest.logs[0].generation, 1);
-        assert_eq!(manifest.logs[0].filename, "000001.log");
         assert_eq!(manifest.next_generation, 2);
         assert_eq!(manifest.next_filename(), "000002.log");
 
-        manifest.record_roll(2, SystemTime::UNIX_EPOCH, crate::log::record::FILE_HEADER_SIZE as u64);
+        let log2 = LogFileInfo {
+            generation: 2,
+            revision: 0,
+            filename: "000002.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 3,
+            total_bytes: 2048,
+            total_data_bytes: 1024,
+            md5: Some([2u8; 16]),
+        };
+        manifest.record_sealed_log(log2);
         assert_eq!(manifest.logs.len(), 2);
         assert_eq!(manifest.logs[1].generation, 2);
         assert_eq!(manifest.next_generation, 3);
@@ -276,33 +260,44 @@ mod tests {
         assert_eq!(parse_summary_filename("/var/data/000100_r1.summary"), Some((100, 1)));
         assert_eq!(parse_summary_filename("000001.log"), None);
 
-        let mut manifest = LogManifest::new_with_time(1, SystemTime::UNIX_EPOCH);
-        manifest.record_roll_with_revision(1, 1, SystemTime::UNIX_EPOCH, 32);
-        assert_eq!(manifest.logs.len(), 2);
-        assert_eq!(manifest.logs[1].generation, 1);
-        assert_eq!(manifest.logs[1].revision, 1);
-        assert_eq!(manifest.logs[1].filename, "000001_r1.log");
+        let mut manifest = LogManifest::new(1);
+        manifest.record_sealed_log(LogFileInfo {
+            generation: 1,
+            revision: 1,
+            filename: "000001_r1.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 1,
+            total_bytes: 32,
+            total_data_bytes: 0,
+            md5: Some([42u8; 16]),
+        });
+        assert_eq!(manifest.logs.len(), 1);
+        assert_eq!(manifest.logs[0].generation, 1);
+        assert_eq!(manifest.logs[0].revision, 1);
+        assert_eq!(manifest.logs[0].filename, "000001_r1.log");
     }
 
     #[test]
     fn test_ensure_sealed_md5s() {
-        let mut manifest = LogManifest::new_with_time(1, SystemTime::UNIX_EPOCH);
-        // Generation 1 is active (md5: None)
-        assert!(manifest.ensure_sealed_md5s(Some(1)).is_ok());
-        assert!(manifest.ensure_sealed_md5s(None).is_err());
+        let mut manifest = LogManifest::new(1);
+        // Empty manifest has all sealed logs with MD5
+        assert!(manifest.ensure_sealed_md5s().is_ok());
 
-        // Roll to generation 2, sealing generation 1
-        manifest.set_generation_md5(1, [42u8; 16]);
-        manifest.record_roll(2, SystemTime::UNIX_EPOCH, 32);
+        // Add sealed log with MD5
+        manifest.record_sealed_log(LogFileInfo {
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 10,
+            total_bytes: 100,
+            total_data_bytes: 50,
+            md5: Some([42u8; 16]),
+        });
+        assert!(manifest.ensure_sealed_md5s().is_ok());
 
-        // Gen 1 has md5, Gen 2 is active without md5
-        assert!(manifest.ensure_sealed_md5s(Some(2)).is_ok());
-        assert!(manifest.ensure_sealed_md5s(Some(1)).is_err()); // Gen 2 missing md5
-        assert!(manifest.ensure_sealed_md5s(None).is_err()); // Gen 2 missing md5
-
-        // Seal Gen 2 as well
-        manifest.set_generation_md5(2, [99u8; 16]);
-        assert!(manifest.ensure_sealed_md5s(None).is_ok());
-        assert!(manifest.ensure_sealed_md5s(Some(3)).is_ok());
+        // Corrupt an entry by clearing MD5
+        manifest.logs[0].md5 = None;
+        assert!(manifest.ensure_sealed_md5s().is_err());
     }
 }

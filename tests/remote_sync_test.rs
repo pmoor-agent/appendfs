@@ -58,13 +58,9 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     fs.quiesce().unwrap();
 
     // Force roll to generation 2 (seals gen 1)
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    assert_eq!(next_gen, 2);
-    {
-        let mut manifest = fs.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs.manifest.write().unwrap().record_sealed_log(sealed);
 
     // Write file 2 (gen 2)
     let file2_attr = create_core(&fs, root, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -86,12 +82,20 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     );
     let gen1_md5 = gen1_info.md5.unwrap();
 
+    let gen2_info = manifest.get_by_generation(2).unwrap();
+    assert!(
+        gen2_info.md5.is_some(),
+        "Sealed generation 2 must have authenticated MD5 recorded"
+    );
+    let gen2_md5 = gen2_info.md5.unwrap();
+
     // 3. Setup two mock remote targets: "aws" (writable) and "b2" (writable)
     let remote_aws = Arc::new(MockRemoteStore::new());
     let remote_b2 = Arc::new(MockRemoteStore::new());
 
-    // Upload sealed 000001.log and 000002.summary to remotes
+    // Upload sealed 000001.log, 000002.log and 000002.summary to remotes
     upload_storage_file(storage.as_ref(), remote_aws.as_ref(), "000001.log", Some(&gen1_md5)).unwrap();
+    upload_storage_file(storage.as_ref(), remote_aws.as_ref(), "000002.log", Some(&gen2_md5)).unwrap();
     upload_storage_file(storage.as_ref(), remote_aws.as_ref(), "000002.summary", None).unwrap();
 
     // Verify remote_aws object matches
@@ -106,6 +110,14 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
         "000001.log",
         gen1_info.total_bytes,
         Some(&gen1_md5),
+    )
+    .unwrap();
+    cross_copy_file(
+        remote_aws.as_ref(),
+        remote_b2.as_ref(),
+        "000002.log",
+        gen2_info.total_bytes,
+        Some(&gen2_md5),
     )
     .unwrap();
     let b2_head = remote_b2.head_object("000001.log").unwrap().unwrap();
@@ -157,12 +169,9 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     fs.quiesce().unwrap();
 
     // Roll to generation 2
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    {
-        let mut manifest = fs.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs.manifest.write().unwrap().record_sealed_log(sealed);
     fs.export_summary(storage.as_ref()).unwrap();
 
     let manifest = fs.manifest.read().unwrap().clone();
@@ -288,18 +297,16 @@ fn test_read_only_remote_and_cloud_forking() {
     fs.quiesce().unwrap();
 
     // Roll to generation 2
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    {
-        let mut manifest = fs.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
-    fs.export_summary(storage.as_ref()).unwrap();
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs.manifest.write().unwrap().record_sealed_log(sealed);
+    let summary_file = fs.export_summary(storage.as_ref()).unwrap();
+    assert_eq!(summary_file, "000001.summary");
 
     // Setup an upstream read-only remote
     let upstream_remote = Arc::new(MockRemoteStore::new());
     upload_storage_file(storage.as_ref(), upstream_remote.as_ref(), "000001.log", None).unwrap();
-    upload_storage_file(storage.as_ref(), upstream_remote.as_ref(), "000002.summary", None).unwrap();
+    upload_storage_file(storage.as_ref(), upstream_remote.as_ref(), &summary_file, None).unwrap();
 
     // Setup a downstream writable remote
     let _downstream_remote = Arc::new(MockRemoteStore::new());
@@ -403,12 +410,9 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     );
 
     // 3. Roll generation: seals generation 1 into generation 2!
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    {
-        let mut manifest = fs_arc.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.export_summary(storage.as_ref()).unwrap();
 
     // Run sync cycle after roll: should upload full 000001.log and delete transient parts!
@@ -520,12 +524,10 @@ fn test_nfs_local_volume_replication_and_pruning() {
     fs.quiesce().unwrap();
 
     // Force roll to generation 2 (seals generation 1)
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    {
-        let mut manifest = fs.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    let sealed_md5 = sealed.md5.unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed);
     fs.export_summary(storage.as_ref()).unwrap();
 
     // 2. Run replication cycle: uploads 000001.log and summary to NFS share
@@ -611,13 +613,9 @@ fn test_local_read_populates_block_cache_before_purge() {
     fs.quiesce().unwrap();
 
     // 2. Force roll to generation 2 (seals generation 1)
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    assert_eq!(next_gen, 2);
-    {
-        let mut manifest = fs.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs.manifest.write().unwrap().record_sealed_log(sealed);
     fs.export_summary(storage.as_ref()).unwrap();
 
     // 3. Write file in active generation 2
@@ -698,13 +696,9 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     fs.quiesce().unwrap();
 
     // 2. Roll to generation 2 (seals generation 1)
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    assert_eq!(next_gen, 2);
-    {
-        let mut manifest = fs.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs.manifest.write().unwrap().record_sealed_log(sealed);
     fs.export_summary(storage.as_ref()).unwrap();
 
     // 3. Read raw 000001.log bytes from storage
@@ -806,13 +800,9 @@ fn test_latency_remote_store_in_tiered_reading() {
     write_core(&fs, file_attr.ino, payload, 0).unwrap();
     fs.quiesce().unwrap();
 
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    assert_eq!(next_gen, 2);
-    {
-        let mut manifest = fs.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs.manifest.write().unwrap().record_sealed_log(sealed);
     fs.export_summary(storage.as_ref()).unwrap();
 
     let raw_log_bytes = storage.get_file_bytes("000001.log").unwrap();
@@ -930,12 +920,9 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     write_core(&fs_arc, file.ino, b"data before roll", 0).unwrap();
     fs_arc.quiesce().unwrap();
 
-    let (rolled_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    {
-        let mut manifest = fs_arc.manifest.write().unwrap();
-        manifest.set_generation_md5(rolled_gen - 1, sealed_md5);
-        manifest.record_roll(rolled_gen, clock.now(), 40);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.export_summary(storage.as_ref()).unwrap();
 
     // Run replication cycle
@@ -1102,12 +1089,9 @@ fn test_event_driven_immediate_replication_on_log_roll() {
     fs_arc.quiesce().unwrap();
 
     // Force roll generation 1 -> 2. This seals generation 1 and notifies the worker via Condvar!
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    {
-        let mut manifest = fs_arc.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.notify_replication();
 
     // Poll for up to 2 seconds for the remote to receive 000001.log
@@ -1157,12 +1141,9 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     fs_arc.quiesce().unwrap();
 
     // Seal generation 1
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    {
-        let mut manifest = fs_arc.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
 
     let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
     let mut uploaded_parts = std::collections::HashMap::new();
@@ -1271,14 +1252,6 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     fs.export_summary(storage.as_ref()).unwrap();
     assert_eq!(fs.last_summary_generation.load(Ordering::SeqCst), 1);
 
-    // Roll to generation 2
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    {
-        let mut manifest = fs.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
-
     // Drop filesystem and writer, simulating a restart/remount
     drop(writer);
     drop(fs);
@@ -1368,15 +1341,11 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
 
     // Roll to generation 2 (sealing gen 1)
     clock.advance(std::time::Duration::from_secs(60));
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    assert_eq!(next_gen, 2);
-    {
-        let mut manifest = fs.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs.manifest.write().unwrap().record_sealed_log(sealed);
     let summary1 = fs.export_summary(storage.as_ref()).unwrap();
-    assert_eq!(summary1, "000002.summary");
+    assert_eq!(summary1, "000001.summary");
 
     // Timestamp after generation 1 roll and summary1 export, but before file B write
     let post_gen1_time = clock.now() + std::time::Duration::from_secs(10);
@@ -1390,15 +1359,11 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
 
     // Roll to generation 3 (sealing gen 2) and export summary 2
     clock.advance(std::time::Duration::from_secs(60));
-    let (next_gen3, sealed_md5_2) = writer.force_roll(&*clock).unwrap().unwrap();
-    assert_eq!(next_gen3, 3);
-    {
-        let mut manifest = fs.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen3 - 1, sealed_md5_2);
-        manifest.record_roll(next_gen3, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 2);
+    fs.manifest.write().unwrap().record_sealed_log(sealed);
     let summary2 = fs.export_summary(storage.as_ref()).unwrap();
-    assert_eq!(summary2, "000003.summary");
+    assert_eq!(summary2, "000002.summary");
 
     // 2. Setup mock remote store and upload all files from local storage to remote
     let mock_remote = Arc::new(MockRemoteStore::new());
@@ -1414,22 +1379,22 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     registry.save_to_storage(storage.as_ref()).unwrap();
     let remote_stores = registry.build_read_stores();
 
-    // 3. SIMULATE LOCAL PURGING: delete all but 000003.summary
+    // 3. SIMULATE LOCAL PURGING: delete all but 000002.summary
     storage.remove_file("000000.summary").unwrap();
-    storage.remove_file("000002.summary").unwrap();
+    storage.remove_file("000001.summary").unwrap();
     storage.remove_file("000001.log").unwrap();
     storage.remove_file("000002.log").unwrap();
 
     assert!(!storage.exists("000000.summary"));
-    assert!(!storage.exists("000002.summary"));
+    assert!(!storage.exists("000001.summary"));
     assert!(!storage.exists("000001.log"));
     assert!(!storage.exists("000002.log"));
-    assert!(storage.exists("000003.summary"));
+    assert!(storage.exists("000002.summary"));
 
     // =========================================================================
     // Scenario 1: Mount R/O with Latest state
     // =========================================================================
-    // prepare_remote_recovery_for_target sees 000003.summary exists and is eligible for Latest
+    // prepare_remote_recovery_for_target sees 000002.summary exists and is eligible for Latest
     let chosen = appendfs::prepare_remote_recovery_for_target(
         storage.as_ref(),
         appendfs::RecoveryTarget::Latest,
@@ -1437,9 +1402,9 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
         &remote_stores,
     )
     .unwrap();
-    assert_eq!(chosen, Some("000003.summary".to_string()));
+    assert_eq!(chosen, Some("000002.summary".to_string()));
 
-    // Fast-recover from 000003.summary
+    // Fast-recover from 000002.summary
     let mut fs_latest = appendfs::recover_fs(
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
@@ -1475,12 +1440,12 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     // =========================================================================
     // Scenario 2: Mount R/O with past timestamp target (generation 1)
     // =========================================================================
-    // 000002.summary is STILL missing locally
-    assert!(!storage.exists("000002.summary"));
+    // 000001.summary is STILL missing locally
+    assert!(!storage.exists("000001.summary"));
 
-    // prepare_remote_recovery_for_target uses 000003.summary's manifest to discover
-    // that generation 2 (which sealed gen 1) is the appropriate snapshot for post_gen1_time,
-    // and downloads 000002.summary from the remote store!
+    // prepare_remote_recovery_for_target uses 000002.summary's manifest to discover
+    // that generation 1 is the appropriate snapshot for post_gen1_time,
+    // and downloads 000001.summary from the remote store!
     let chosen_past = appendfs::prepare_remote_recovery_for_target(
         storage.as_ref(),
         appendfs::RecoveryTarget::Timestamp(post_gen1_time),
@@ -1488,10 +1453,10 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
         &remote_stores,
     )
     .unwrap();
-    assert_eq!(chosen_past, Some("000002.summary".to_string()));
+    assert_eq!(chosen_past, Some("000001.summary".to_string()));
 
-    // Verify 000002.summary was indeed downloaded from remote to local storage!
-    assert!(storage.exists("000002.summary"));
+    // Verify 000001.summary was indeed downloaded from remote to local storage!
+    assert!(storage.exists("000001.summary"));
 
     // Fast-recover with Timestamp(post_gen1_time)
     let mut fs_past = appendfs::recover_fs(
@@ -1526,42 +1491,42 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     assert_eq!(read_past_a, payload_a);
 
     // =========================================================================
-    // Scenario 3: Mount R/O with target generation 2
+    // Scenario 3: Mount R/O with target generation 1
     // =========================================================================
-    // Delete 000002.summary again
-    storage.remove_file("000002.summary").unwrap();
-    assert!(!storage.exists("000002.summary"));
+    // Delete 000001.summary again
+    storage.remove_file("000001.summary").unwrap();
+    assert!(!storage.exists("000001.summary"));
 
-    let chosen_gen2 = appendfs::prepare_remote_recovery_for_target(
+    let chosen_gen1 = appendfs::prepare_remote_recovery_for_target(
         storage.as_ref(),
-        appendfs::RecoveryTarget::Generation(2),
+        appendfs::RecoveryTarget::Generation(1),
         volume_key.clone(),
         &remote_stores,
     )
     .unwrap();
-    assert_eq!(chosen_gen2, Some("000002.summary".to_string()));
-    assert!(storage.exists("000002.summary"));
+    assert_eq!(chosen_gen1, Some("000001.summary".to_string()));
+    assert!(storage.exists("000001.summary"));
 
-    let mut fs_gen2 = appendfs::recover_fs(
+    let mut fs_gen1 = appendfs::recover_fs(
         storage.clone(),
-        appendfs::RecoveryTarget::Generation(2),
+        appendfs::RecoveryTarget::Generation(1),
         clock.clone(),
         volume_key.clone(),
     )
     .unwrap();
-    fs_gen2.set_read_only(true);
-    let log_cache_gen2 = Arc::new(LogFileCache::with_remote_support(
+    fs_gen1.set_read_only(true);
+    let log_cache_gen1 = Arc::new(LogFileCache::with_remote_support(
         storage.clone(),
         Some(block_cache),
         remote_stores,
-        Some(Arc::clone(&fs_gen2.manifest)),
+        Some(Arc::clone(&fs_gen1.manifest)),
     ));
-    fs_gen2.log_cache = Some(log_cache_gen2);
+    fs_gen1.log_cache = Some(log_cache_gen1);
 
-    assert!(fs_gen2.lookup_child(1, "file_a.txt").is_some());
-    assert!(fs_gen2.lookup_child(1, "file_b.txt").is_none());
-    let read_gen2_a = read_test(&fs_gen2, file_a.ino, 0, payload_a.len()).unwrap();
-    assert_eq!(read_gen2_a, payload_a);
+    assert!(fs_gen1.lookup_child(1, "file_a.txt").is_some());
+    assert!(fs_gen1.lookup_child(1, "file_b.txt").is_none());
+    let read_gen1_a = read_test(&fs_gen1, file_a.ino, 0, payload_a.len()).unwrap();
+    assert_eq!(read_gen1_a, payload_a);
 }
 
 #[test]
@@ -1596,17 +1561,14 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         fs_arc.quiesce().unwrap();
 
         // Roll and export summary
-        let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-        {
-            let mut manifest = fs_arc.manifest.write().unwrap();
-            manifest.set_generation_md5(next_gen - 1, sealed_md5);
-            manifest.record_roll(next_gen, clock.now(), 24);
-        }
+        let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+        assert_eq!(sealed.generation, gen_idx);
+        fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
         fs_arc.sync_and_export_summary().unwrap();
     }
 
     let manifest = fs_arc.manifest.read().unwrap().clone();
-    assert_eq!(manifest.logs.len(), 4); // Gens 1, 2, 3 sealed, Gen 4 active
+    assert_eq!(manifest.logs.len(), 3); // Gens 1, 2, 3 sealed; active Gen 4 not in manifest
 
     // Set up remote with CountingRemoteStore
     let raw_remote = Arc::new(MockRemoteStore::new());
@@ -1738,12 +1700,9 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     write_core(&fs_arc, file4.ino, b"Payload for generation 4", 0).unwrap();
     fs_arc.quiesce().unwrap();
 
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    {
-        let mut manifest = fs_arc.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 4);
+    fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.sync_and_export_summary().unwrap();
 
     // Set store to failing_counting which fails list_objects
@@ -1969,12 +1928,9 @@ fn test_per_remote_upload_partial_logs_behavior() {
     );
 
     // 3. Roll generation: seals gen 1 into gen 2 and exports summary
-    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
-    {
-        let mut manifest = fs_arc.manifest.write().unwrap();
-        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, clock.now(), 24);
-    }
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.export_summary(storage.as_ref()).unwrap();
 
     // Run cycle after seal

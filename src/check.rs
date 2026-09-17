@@ -509,7 +509,10 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
     }
 
     // Pass 3: File Extent & ExtentMap Validation
-    let active_generations: HashSet<u64> = manifest.logs.iter().map(|l| l.generation).collect();
+    let mut active_generations: HashSet<u64> = manifest.logs.iter().map(|l| l.generation).collect();
+    if let Some(ref w) = fs.log_writer {
+        active_generations.insert(w.generation());
+    }
     let cache = fs
         .log_cache
         .clone()
@@ -717,8 +720,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
         ));
     }
 
-    let active_gen = fs.log_writer.as_ref().map(|w| w.generation());
-    if let Err(err) = manifest.ensure_sealed_md5s(active_gen) {
+    if let Err(err) = manifest.ensure_sealed_md5s() {
         report
             .issues
             .push(IntegrityIssue::error("MANIFEST_SEALED_LOG_MISSING_MD5", None, err));
@@ -1271,7 +1273,16 @@ mod tests {
         // Add sealed generation without MD5 to manifest
         {
             let mut manifest = fs.manifest.write().unwrap();
-            manifest.record_roll(1, std::time::SystemTime::UNIX_EPOCH, 32);
+            manifest.logs.push(crate::log::LogFileInfo {
+                generation: 1,
+                revision: 0,
+                filename: "000001.log".to_string(),
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                record_count: 10,
+                total_bytes: 32,
+                total_data_bytes: 0,
+                md5: None,
+            });
             manifest.next_generation = 2;
         }
 

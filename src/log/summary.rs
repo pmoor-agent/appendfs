@@ -236,7 +236,7 @@ pub fn export_summary_with_iv(
         crate::wire::serialize(volume_header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     manifest
-        .ensure_sealed_md5s(None)
+        .ensure_sealed_md5s()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let mut uncompressed_body = Vec::new();

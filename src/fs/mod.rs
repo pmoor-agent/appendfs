@@ -841,7 +841,7 @@ impl InMemoryFS {
             .unwrap_or_else(|| Arc::new(crate::crypto::VolumeKey::plaintext()));
 
         let start_gen = log_writer.as_ref().map_or(1, |w| w.generation());
-        let manifest = Arc::new(RwLock::new(LogManifest::new_with_time(start_gen, now)));
+        let manifest = Arc::new(RwLock::new(LogManifest::new(start_gen)));
 
         let virtual_files = Arc::new(virtual_files::VirtualFileRegistry::new());
         let async_tracker = Arc::new(crate::async_runtime::AsyncTracker::new());
@@ -972,16 +972,8 @@ impl InMemoryFS {
         inner.staged_ops + inner.flushing_ops
     }
 
-    /// Attaches an active `LogWriter` to the filesystem instance, registering its active generation in the manifest.
+    /// Attaches an active `LogWriter` to the filesystem instance.
     pub fn attach_log_writer(&mut self, writer: Arc<LogWriter>) {
-        let generation = writer.generation();
-        let now = self.clock.now();
-        {
-            let mut manifest = self.manifest.write().unwrap();
-            if manifest.get_by_generation(generation).is_none() {
-                manifest.record_roll(generation, now, crate::log::record::FILE_HEADER_SIZE as u64);
-            }
-        }
         self.log_writer = Some(writer);
     }
 

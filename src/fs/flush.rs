@@ -8,7 +8,7 @@
 use super::{FlushReason, FsInner, InMemoryFS};
 use crate::error::FsError;
 use crate::extent_map::Extent;
-use crate::log::{GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE};
+use crate::log::{GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode, RECORD_HEADER_SIZE};
 use crate::node::{EntryDelta, NodeDelta, NodeKind};
 use crate::storage::Storage;
 use crate::sync::OpTag;
@@ -129,66 +129,52 @@ impl InMemoryFS {
         self.inner.lock(OpTag::Fold).unwrap().fold_entries(entries);
     }
 
-    /// Applies the effects of a log roll: seals the previous generation in the manifest,
+    /// Applies the effects of a log roll: records the sealed generation in the manifest,
     /// exports a periodic summary if one is due, and tells replication there is new work.
     ///
     /// Called for both kinds of roll the flusher performs - the size check that runs ahead of
     /// a batch, and the age check that runs on an idle tick - so a generation is sealed the
     /// same way whichever tripped it.
-    fn apply_roll(&self, rolled: Option<(u64, Option<[u8; 16]>)>, writer: &LogWriter) {
-        let Some((next_gen, sealed_md5)) = rolled else {
+    fn apply_roll(&self, rolled: Option<LogFileInfo>, writer: &LogWriter) {
+        let Some(sealed_info) = rolled else {
             return;
         };
-        if let Some(md5) = sealed_md5 {
-            let sealed_gen = next_gen - 1;
-            {
-                let mut manifest = self.manifest.write().unwrap();
-                manifest.set_generation_md5(sealed_gen, md5);
-                if writer.is_open() {
-                    manifest.record_roll(next_gen, self.clock.now(), crate::log::record::FILE_HEADER_SIZE as u64);
+        let sealed_gen = sealed_info.generation;
+        self.manifest.write().unwrap().record_sealed_log(sealed_info);
+
+        self.generations_since_last_summary.fetch_add(1, Ordering::SeqCst);
+
+        let bytes_interval = self.summary_interval_bytes.load(Ordering::SeqCst);
+        let gen_interval = self.summary_interval_generations.load(Ordering::SeqCst);
+        let bytes_since = self.bytes_since_last_summary.load(Ordering::SeqCst);
+        let gens_since = self.generations_since_last_summary.load(Ordering::SeqCst);
+
+        let should_emit_summary =
+            (bytes_interval > 0 && bytes_since >= bytes_interval) || (gen_interval > 0 && gens_since >= gen_interval);
+
+        if should_emit_summary {
+            let storage = writer.storage();
+            let last_batch_id = writer.last_batch_id();
+            match self.export_summary_for_base(storage.as_ref(), sealed_gen, last_batch_id) {
+                Ok(filename) => {
+                    self.bytes_since_last_summary.store(0, Ordering::SeqCst);
+                    self.generations_since_last_summary.store(0, Ordering::SeqCst);
+                    self.last_summary_generation.store(sealed_gen, Ordering::SeqCst);
+                    log::info!(
+                        "Exported periodic summary snapshot {} for sealed generation {} (last_batch_id: {})",
+                        filename,
+                        sealed_gen,
+                        last_batch_id
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to export periodic summary for sealed generation {}: {}",
+                        sealed_gen,
+                        e
+                    );
                 }
             }
-
-            self.generations_since_last_summary.fetch_add(1, Ordering::SeqCst);
-
-            let bytes_interval = self.summary_interval_bytes.load(Ordering::SeqCst);
-            let gen_interval = self.summary_interval_generations.load(Ordering::SeqCst);
-            let bytes_since = self.bytes_since_last_summary.load(Ordering::SeqCst);
-            let gens_since = self.generations_since_last_summary.load(Ordering::SeqCst);
-
-            let should_emit_summary = (bytes_interval > 0 && bytes_since >= bytes_interval)
-                || (gen_interval > 0 && gens_since >= gen_interval);
-
-            if should_emit_summary {
-                let storage = writer.storage();
-                let last_batch_id = writer.last_batch_id();
-                match self.export_summary_for_base(storage.as_ref(), sealed_gen, last_batch_id) {
-                    Ok(filename) => {
-                        self.bytes_since_last_summary.store(0, Ordering::SeqCst);
-                        self.generations_since_last_summary.store(0, Ordering::SeqCst);
-                        self.last_summary_generation.store(sealed_gen, Ordering::SeqCst);
-                        log::info!(
-                            "Exported periodic summary snapshot {} for sealed generation {} (last_batch_id: {})",
-                            filename,
-                            sealed_gen,
-                            last_batch_id
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to export periodic summary for sealed generation {}: {}",
-                            sealed_gen,
-                            e
-                        );
-                    }
-                }
-            }
-        } else {
-            // No sealed digest means nothing was sealed: `roll_if_needed` reports the lazy
-            // open of an unopened log file (the initial generation or a successor left lazy
-            // after an idle age rollover), so `next_gen` is freshly opened on disk now.
-            let mut manifest = self.manifest.write().unwrap();
-            manifest.record_roll(next_gen, self.clock.now(), crate::log::record::FILE_HEADER_SIZE as u64);
         }
         self.notify_replication();
     }
@@ -302,24 +288,9 @@ impl InMemoryFS {
             // 3. Emit FlushCommit trailer
             writer.emit_flush_commit(written_count, &*self.clock)?;
             writer.flush()?;
+            writer.record_batch_flushed(written_count + 1, flushed_data_bytes);
 
-            let active_gen = writer.generation();
             let active_offset = writer.current_offset();
-            {
-                let mut manifest = self.manifest.write().unwrap();
-                if manifest.get_by_generation(active_gen).is_none() {
-                    manifest.record_roll(
-                        active_gen,
-                        self.clock.now(),
-                        crate::log::record::FILE_HEADER_SIZE as u64,
-                    );
-                }
-                if let Some(entry) = manifest.get_mut_by_generation(active_gen) {
-                    entry.record_count += written_count + 1; // including FlushCommit
-                    entry.total_data_bytes += flushed_data_bytes;
-                    entry.total_bytes = active_offset;
-                }
-            }
             let disk_bytes = active_offset.saturating_sub(batch_start_offset);
             Ok((flushed_data_bytes, disk_bytes))
         })();
@@ -422,7 +393,7 @@ impl InMemoryFS {
             // On rollover, `roll_if_aged` leaves the successor generation lazy (unopened) so
             // that an idle filesystem does not waste empty log files during prolonged inactivity.
             let rolled = writer.roll_if_aged(&*self.clock)?;
-            self.apply_roll(rolled.map(|(next_gen, md5)| (next_gen, Some(md5))), writer);
+            self.apply_roll(rolled, writer);
             Ok(())
         })
     }
@@ -478,7 +449,7 @@ impl InMemoryFS {
     }
 
     /// Rolls the active log generation, draining pending batches first.
-    pub fn force_roll_active_log(&self) -> std::io::Result<Option<(u64, [u8; 16])>> {
+    pub fn force_roll_active_log(&self) -> std::io::Result<Option<LogFileInfo>> {
         let Some(ref writer) = self.log_writer else {
             return Ok(None);
         };
@@ -487,17 +458,12 @@ impl InMemoryFS {
         // Excludes the flusher for the roll itself. C3 moves age-based rolling into the
         // flusher's idle tick, at which point this exclusion goes away with it.
         self.flusher.run_locked(|| {
-            let Some((next_gen, sealed_md5)) = writer.force_roll(&*self.clock)? else {
+            let Some(sealed_info) = writer.force_roll(&*self.clock)? else {
                 return Ok(None);
             };
-            let sealed_gen = next_gen - 1;
-            {
-                let mut manifest = self.manifest.write().unwrap();
-                manifest.set_generation_md5(sealed_gen, sealed_md5);
-                manifest.record_roll(next_gen, self.clock.now(), crate::log::record::FILE_HEADER_SIZE as u64);
-            }
+            self.manifest.write().unwrap().record_sealed_log(sealed_info.clone());
             self.notify_replication();
-            Ok(Some((next_gen, sealed_md5)))
+            Ok(Some(sealed_info))
         })
     }
 
@@ -580,6 +546,28 @@ impl InMemoryFS {
                 live_ratio,
             });
         }
+        if let Some(ref writer) = self.log_writer {
+            let writer_gen = writer.generation();
+            if writer.is_open() && manifest.get_by_generation(writer_gen).is_none() {
+                let (live_bytes, live_extents) = live_map.get(&writer_gen).copied().unwrap_or((0, 0));
+                let total_data_bytes = writer.total_data_bytes();
+                let live_ratio = if total_data_bytes > 0 {
+                    live_bytes as f64 / total_data_bytes as f64
+                } else {
+                    0.0
+                };
+                result.push(GenerationLiveStats {
+                    generation: writer_gen,
+                    filename: writer.filename(),
+                    record_count: writer.record_count(),
+                    total_bytes: writer.current_offset(),
+                    total_data_bytes,
+                    live_bytes,
+                    live_extents,
+                    live_ratio,
+                });
+            }
+        }
         result
     }
 
@@ -600,45 +588,26 @@ impl InMemoryFS {
         explicit_iv: Option<[u8; 12]>,
     ) -> std::io::Result<String> {
         self.quiesce()?;
+
+        // Seal the active generation before taking the summary snapshot
+        if let Some(ref writer) = self.log_writer
+            && let Some(sealed_info) = writer.seal_active()?
+        {
+            self.manifest.write().unwrap().record_sealed_log(sealed_info);
+        }
+
         let snapshot = self.inner.lock(OpTag::Flush).unwrap().snapshot_all();
-        let generation = self.log_writer.as_ref().map_or_else(
-            || {
-                self.manifest
-                    .read()
-                    .unwrap()
-                    .logs
-                    .last()
-                    .map(|l| l.generation)
-                    .unwrap_or(1)
-            },
-            |w| w.generation(),
-        );
+        let manifest = self.manifest.read().unwrap().clone();
+        manifest
+            .ensure_sealed_md5s()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let generation = manifest.logs.last().map(|l| l.generation).unwrap_or(0);
         let last_batch_id = self
             .log_writer
             .as_ref()
             .map_or_else(|| self.last_batch_id.load(Ordering::SeqCst), |w| w.last_batch_id());
         let next_inode = self.next_inode.load(Ordering::SeqCst);
-
-        let mut manifest = self.manifest.read().unwrap().clone();
-        manifest.logs.retain(|l| l.generation <= generation);
-
-        // Seal the active generation's MD5 into the manifest snapshot for the summary file
-        if let Some(ref writer) = self.log_writer
-            && writer.generation() == generation
-            && let Some(md5) = writer.current_md5()
-        {
-            if manifest.get_by_generation(generation).is_none() {
-                manifest.record_roll(
-                    generation,
-                    self.clock.now(),
-                    crate::log::record::FILE_HEADER_SIZE as u64,
-                );
-            }
-            if let Some(entry) = manifest.get_mut_by_generation(generation) {
-                entry.md5 = Some(md5);
-                entry.total_bytes = writer.current_offset();
-            }
-        }
         let now = self.clock.now();
 
         // The header goes into the summary in plaintext while the key encrypts its body, so
@@ -731,7 +700,9 @@ impl InMemoryFS {
     pub fn sync_and_export_summary_with_iv(&self, explicit_iv: Option<[u8; 12]>) -> std::io::Result<Option<String>> {
         self.quiesce()?;
         if let Some(ref writer) = self.log_writer {
-            if !writer.is_open() {
+            if writer.current_offset() <= crate::log::record::FILE_HEADER_SIZE as u64
+                && self.manifest.read().unwrap().logs.is_empty()
+            {
                 // Read-only session where no log records were ever flushed or written
                 return Ok(None);
             }
@@ -1482,14 +1453,14 @@ mod tests {
             crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
         }
         assert_eq!(fs.staged_ops(), 4);
-        assert_eq!(fs.manifest.read().unwrap().logs[0].record_count, 0);
+        assert_eq!(fs.log_writer.as_ref().unwrap().record_count(), 0);
 
         // 5th operation reaches threshold and triggers automatic flush!
         crate::operations::read_write::create_core(&fs, 1, "file_4.txt", 0o644, 0, 1000, 1000).unwrap();
 
         // Staged ops reset to 0 after automatic flush
         assert_eq!(fs.staged_ops(), 0);
-        assert_eq!(fs.manifest.read().unwrap().logs[0].record_count, 7); // 5 files + 1 root dir + 1 FlushCommit
+        assert_eq!(fs.log_writer.as_ref().unwrap().record_count(), 7); // 5 files + 1 root dir + 1 FlushCommit
     }
 
     #[test]

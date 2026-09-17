@@ -80,8 +80,8 @@ impl LogFileCache {
 
         let (filename, is_sealed, mut expected_len) = if let Some(ref m) = self.manifest {
             let man = m.read().unwrap();
-            let is_sealed = generation < man.next_generation - 1;
             let log_entry = man.get_by_generation(generation);
+            let is_sealed = log_entry.is_some();
             let expected_len = log_entry.map(|l| l.total_bytes).unwrap_or(0);
             let filename = log_entry
                 .map(|l| l.filename.clone())
