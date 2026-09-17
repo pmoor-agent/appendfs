@@ -184,11 +184,49 @@ pub enum OpTier {
     Write,
 }
 
-/// Cumulative telemetry tracking invocations, active operations, and execution latency across all FUSE operations.
+/// Decision produced by operational pushback throttling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrottleDecision {
+    /// No backpressure applied; response can be sent immediately.
+    NoDelay,
+    /// Soft delay calculated via asymptotic saturation formula.
+    Delay(Duration),
+    /// Hard stall: staged buffer has reached 100% capacity; caller is paused indefinitely
+    /// until disk flush commits capacity or the filesystem unmounts.
+    Stall,
+}
+
+impl ThrottleDecision {
+    /// Returns true if this decision causes any form of backpressure (delay or stall).
+    #[inline]
+    pub const fn is_throttled(self) -> bool {
+        !matches!(self, Self::NoDelay)
+    }
+
+    /// Returns true if this decision is a hard indefinite stall.
+    #[inline]
+    pub const fn is_stalled(self) -> bool {
+        matches!(self, Self::Stall)
+    }
+
+    /// Expected maximum delay duration (or zero if unthrottled).
+    #[inline]
+    pub const fn delay(self) -> Duration {
+        match self {
+            Self::NoDelay => Duration::ZERO,
+            Self::Delay(d) => d,
+            Self::Stall => Duration::MAX,
+        }
+    }
+}
+
+/// Cumulative telemetry tracking invocations, active operations, throttling, and execution latency across all FUSE operations.
 #[derive(Debug, Default)]
 pub struct FuseOpMetrics {
     calls: [AtomicU64; FUSE_OP_COUNT],
     active: [AtomicU64; FUSE_OP_COUNT],
+    throttled: [AtomicU64; FUSE_OP_COUNT],
+    stalled: [AtomicU64; FUSE_OP_COUNT],
     total_nanos: [AtomicU64; FUSE_OP_COUNT],
     max_nanos: [AtomicU64; FUSE_OP_COUNT],
 }
@@ -204,6 +242,20 @@ impl FuseOpMetrics {
     pub fn record_call(&self, op: FuseOp) {
         self.calls[op.index()].fetch_add(1, Ordering::Relaxed);
         self.active[op.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a throttle decision applied to the given FUSE operation.
+    #[inline]
+    pub fn record_throttle(&self, op: FuseOp, decision: ThrottleDecision) {
+        match decision {
+            ThrottleDecision::NoDelay => {}
+            ThrottleDecision::Delay(_) => {
+                self.throttled[op.index()].fetch_add(1, Ordering::Relaxed);
+            }
+            ThrottleDecision::Stall => {
+                self.stalled[op.index()].fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Records the elapsed execution duration for `op` and decrements the active count.
@@ -225,6 +277,18 @@ impl FuseOpMetrics {
     #[inline]
     pub fn active(&self, op: FuseOp) -> u64 {
         self.active[op.index()].load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of soft-throttled invocations for `op`.
+    #[inline]
+    pub fn throttled(&self, op: FuseOp) -> u64 {
+        self.throttled[op.index()].load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of hard-stalled invocations for `op`.
+    #[inline]
+    pub fn stalled(&self, op: FuseOp) -> u64 {
+        self.stalled[op.index()].load(Ordering::Relaxed)
     }
 
     /// Average execution latency for `op`.
@@ -251,6 +315,16 @@ impl FuseOpMetrics {
     /// Sum of all currently active (in-flight) operations across all FUSE operations.
     pub fn total_active(&self) -> u64 {
         self.active.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Sum of all soft-throttled operations across all FUSE operations.
+    pub fn total_throttled(&self) -> u64 {
+        self.throttled.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Sum of all hard-stalled operations across all FUSE operations.
+    pub fn total_stalled(&self) -> u64 {
+        self.stalled.iter().map(|c| c.load(Ordering::Relaxed)).sum()
     }
 
     /// Total cumulative execution duration across all operations.

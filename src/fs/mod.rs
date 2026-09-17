@@ -11,6 +11,7 @@
 //! - [`flush`] - freezing `live`, synthesizing log records, and folding batches into `base`.
 
 pub mod arena;
+pub mod delayed_queue;
 mod flush;
 mod flusher;
 mod handles;
@@ -19,8 +20,9 @@ mod overlay;
 pub mod virtual_files;
 
 pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
-pub use crate::operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics, OpTier};
+pub use crate::operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics, OpTier, ThrottleDecision};
 pub use arena::WriteArena;
+pub use delayed_queue::DelayedResponseQueue;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use overlay::{InnerStatsSnapshot, InodeCounts};
 pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry, is_virtual_ino};
@@ -764,14 +766,17 @@ impl<'a> DerefMut for FsInnerGuard<'a> {
 
 impl<'a> Drop for FsInnerGuard<'a> {
     fn drop(&mut self) {
-        if !self.mutation_occurred || !self.fs.staged_threshold_reached(&self.guard) {
+        if !self.mutation_occurred {
             return;
         }
-        let froze = self.fs.freeze_now_locked(&mut self.guard);
-        if froze || !self.guard.flushing.is_empty() {
-            let fs = self.fs;
-            self.guard.defer(move || fs.wake_flusher());
+        if self.fs.staged_threshold_reached(&self.guard) {
+            let froze = self.fs.freeze_now_locked(&mut self.guard);
+            if froze || !self.guard.flushing.is_empty() {
+                let fs = self.fs;
+                self.guard.defer(move || fs.wake_flusher());
+            }
         }
+        self.fs.sync_pushback_saturation(&self.guard);
     }
 }
 
@@ -834,6 +839,8 @@ pub struct InMemoryFS {
     pub async_tracker: Arc<crate::async_runtime::AsyncTracker>,
     /// Cumulative FUSE operation telemetry tracking calls and execution latency.
     pub op_metrics: Arc<FuseOpMetrics>,
+    /// Asynchronous queue delaying FUSE responses during buffer saturation.
+    pub delayed_queue: Arc<DelayedResponseQueue>,
     /// Optional fixed IV for exported summary files (used for deterministic golden fixture generation and testing).
     pub deterministic_summary_iv: Option<[u8; 12]>,
 }
@@ -884,6 +891,7 @@ impl InMemoryFS {
 
         let virtual_files = Arc::new(virtual_files::VirtualFileRegistry::new());
         let async_tracker = Arc::new(crate::async_runtime::AsyncTracker::new());
+        let delayed_queue = Arc::new(DelayedResponseQueue::new(clock.clone()));
 
         let inner = FsInner {
             base: map,
@@ -935,6 +943,7 @@ impl InMemoryFS {
             replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
             async_tracker,
             op_metrics: Arc::new(FuseOpMetrics::new()),
+            delayed_queue,
             deterministic_summary_iv: None,
         };
         fs.register_runtime_status();
@@ -1146,7 +1155,44 @@ impl InMemoryFS {
         self.async_tracker.drain();
     }
 
-    /// Dispatches a FUSE response with declarative operation categorization and latency tracking.
+    /// Synchronizes the cached pushback saturation status and ratio in the delayed queue.
+    pub(crate) fn sync_pushback_saturation(&self, inner: &FsInner) {
+        let saturated = inner.flushing_at_capacity(
+            self.max_flush_queue_depth,
+            self.max_flush_queue_bytes,
+            self.max_flush_queue_ops,
+        );
+        let ratio = if !saturated || self.max_buffer_size == 0 || self.max_staged_ops == 0 {
+            0.0
+        } else {
+            let byte_ratio = inner.staged_bytes as f64 / self.max_buffer_size as f64;
+            let op_ratio = inner.staged_ops as f64 / self.max_staged_ops as f64;
+            byte_ratio.max(op_ratio)
+        };
+        self.delayed_queue.update_saturation(saturated, ratio);
+    }
+
+    /// Synchronizes the cached pushback saturation status and ratio atomics from current inner state.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn refresh_pushback_saturation(&self) {
+        let inner = self.inner.lock(OpTag::Stats).unwrap();
+        self.sync_pushback_saturation(&inner);
+    }
+
+    /// Calculates the throttle decision for an operation tier using cached lock-free saturation state.
+    #[cfg(any(test, feature = "testing"))]
+    #[inline]
+    pub fn calculate_throttle_for_tier(&self, tier: OpTier) -> ThrottleDecision {
+        self.delayed_queue.tier_decision(tier)
+    }
+
+    /// Calculates the throttle decision for an incoming FUSE operation.
+    #[inline]
+    pub fn calculate_throttle(&self, op: FuseOp) -> ThrottleDecision {
+        self.delayed_queue.tier_decision(op.tier())
+    }
+
+    /// Dispatches a FUSE response with declarative operation categorization, pushback throttling, and latency tracking.
     #[inline]
     pub fn dispatch_reply(
         &self,
@@ -1156,20 +1202,24 @@ impl InMemoryFS {
         start: Duration,
     ) {
         self.op_metrics.record_call(op);
+        let decision = self.calculate_throttle(op);
+        self.op_metrics.record_throttle(op, decision);
+
         let res = res.into();
         match res {
             DeferredResult::Ready(ready) => {
                 let duration = self.clock.elapsed_since(start);
                 self.op_metrics.record_duration(op, duration);
-                crate::shim::reply_result(req, ready);
+                self.delayed_queue.delay_response(decision, req, ready);
             }
             DeferredResult::Deferred(completion) => {
                 let op_metrics = self.op_metrics.clone();
                 let clock = self.clock.clone();
+                let delayed_queue = self.delayed_queue.clone();
                 completion.on_complete(Box::new(move |final_res| {
                     let duration = clock.elapsed_since(start);
                     op_metrics.record_duration(op, duration);
-                    crate::shim::reply_result(req, final_res);
+                    delayed_queue.delay_response(decision, req, final_res);
                 }));
             }
         }

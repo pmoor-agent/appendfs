@@ -545,27 +545,49 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         }
     }
 
-    // 7. FUSE Operations
+    // 7. Pushback Throttling (if active or throttled)
+    let total_delayed = fs.delayed_queue.total_delayed();
+    let total_stalled = fs.delayed_queue.total_stalled();
+    let active_delayed = fs.delayed_queue.active_delayed();
+    if total_delayed > 0 || active_delayed > 0 {
+        out.push('\n');
+        out.push_str("[Pushback Throttling]\n");
+        out.push_str(&format!("  Active Waiters:     {}\n", active_delayed));
+        out.push_str(&format!("  Total Throttled:    {}\n", total_delayed));
+        out.push_str(&format!("  Hard Stalled:       {}\n", total_stalled));
+        out.push_str(&format!(
+            "  Total Delay Time:   {}\n",
+            format_duration(fs.delayed_queue.total_delay_duration())
+        ));
+        out.push_str(&format!(
+            "  Avg Delay / Waiter: {}\n",
+            format_duration(fs.delayed_queue.avg_delay_duration())
+        ));
+    }
+
+    // 8. FUSE Operations
     let op_calls = fs.op_metrics.total_calls();
     if op_calls > 0 {
         out.push('\n');
         out.push_str("[FUSE Operations]\n");
         out.push_str(&format!(
-            "  {:<12} {:>8} {:>8} {:>12} {:>12}\n",
-            "OPERATION", "ACTIVE", "CALLS", "AVG LAT", "MAX LAT"
+            "  {:<12} {:>8} {:>8} {:>10} {:>8} {:>12} {:>12}\n",
+            "OPERATION", "ACTIVE", "CALLS", "THROTTLED", "STALLED", "AVG LAT", "MAX LAT"
         ));
         out.push_str(&format!(
-            "  {:-<12} {:-<8} {:-<8} {:-<12} {:-<12}\n",
-            "", "", "", "", ""
+            "  {:-<12} {:-<8} {:-<8} {:-<10} {:-<8} {:-<12} {:-<12}\n",
+            "", "", "", "", "", "", ""
         ));
         for op in &crate::operations::op::ALL_FUSE_OPS {
             let calls = fs.op_metrics.calls(*op);
             if calls > 0 {
                 out.push_str(&format!(
-                    "  {:<12} {:>8} {:>8} {:>12} {:>12}\n",
+                    "  {:<12} {:>8} {:>8} {:>10} {:>8} {:>12} {:>12}\n",
                     op.as_str(),
                     fs.op_metrics.active(*op),
                     calls,
+                    fs.op_metrics.throttled(*op),
+                    fs.op_metrics.stalled(*op),
                     format_duration(fs.op_metrics.avg_latency(*op)),
                     format_duration(fs.op_metrics.max_latency(*op)),
                 ));
@@ -573,7 +595,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         }
     }
 
-    // 8. Replication Remotes (if configured)
+    // 9. Replication Remotes (if configured)
     let remotes_count = fs
         .remote_registry
         .read()
