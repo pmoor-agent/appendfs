@@ -5,6 +5,7 @@
 //! layer locks in a safe order - see [`super::layers`] for why the order matters.
 
 use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, ReadPlan};
+use crate::error::FsError;
 use crate::extent_map::ExtentMap;
 use crate::node::{
     AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, NodeKind, SpecialDelta, SymlinkDelta,
@@ -481,7 +482,7 @@ impl InMemoryFS {
         self.inner.lock(OpTag::Xattr).unwrap().list_xattrs(ino)
     }
 
-    pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
+    pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, FsError> {
         self.with_inner(OpTag::ReadPlan, |inner| {
             let plan = inner.with_inode_layers(ino, |layers| {
                 layers.plan_read_file_data(offset, size, self.log_cache.as_deref())
@@ -503,7 +504,7 @@ impl InMemoryFS {
         })
     }
 
-    pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+    pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, FsError> {
         let plan = self.plan_read_file_data(ino, offset, size)?;
         self.execute_read_plan_sync(plan)
     }

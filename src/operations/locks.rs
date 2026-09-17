@@ -1,3 +1,4 @@
+use crate::error::FsError;
 use crate::fs::{FsInner, FsInnerGuard, InMemoryFS};
 use crate::shim::{DeferredResult, DeferredToken, FuseResponse, ShimFlock};
 use crate::sync::OpTag;
@@ -342,7 +343,7 @@ impl LockManager {
         if !canceled.is_empty() {
             inner.defer(move || {
                 for r in canceled {
-                    r.complete(Err(libc::EBADF));
+                    r.complete(Err(FsError::EBADF));
                 }
             });
         }
@@ -354,7 +355,7 @@ impl LockManager {
         Self::defer_replies(inner, canceled, ready);
     }
 
-    /// Releases locks associated with `fh` on `ino` (canceling waiters, releasing flock, and releasing range locks if `is_last_handle`) and defers replies.
+    /// Releases all locks held by a file handle when the handle is closed.
     pub fn release_file_handle(inner: &mut FsInnerGuard<'_>, is_last_handle: bool, ino: u64, fh: u64) {
         let (canceled, ready) = inner.locks.release_file_handle_state(is_last_handle, ino, fh);
         Self::defer_replies(inner, canceled, ready);
@@ -398,7 +399,7 @@ impl LockManager {
         if !canceled.is_empty() || !ready.is_empty() {
             inner.defer(move || {
                 for r in canceled {
-                    r.complete(Err(libc::EBADF));
+                    r.complete(Err(FsError::EBADF));
                 }
                 for r in ready {
                     r.complete(Ok(FuseResponse::ok()));
@@ -425,7 +426,7 @@ pub fn flock_response(
     let base_op = op & !libc::LOCK_NB;
 
     if base_op != libc::LOCK_UN && base_op != libc::LOCK_SH && base_op != libc::LOCK_EX {
-        return DeferredResult::err(libc::EINVAL);
+        return DeferredResult::err(FsError::EINVAL);
     }
 
     let mut inner = fs.lock_inner(OpTag::Lock);
@@ -446,7 +447,7 @@ pub fn flock_response(
     }
 
     if non_blocking {
-        return DeferredResult::err(libc::EWOULDBLOCK);
+        return DeferredResult::err(FsError::EWOULDBLOCK);
     }
 
     // Blocking request with contention: park token in the waiter queue (0 threads used)
@@ -471,7 +472,7 @@ pub fn getlk_response(
     fh: u64,
     lock_owner: u64,
     lock: ShimFlock,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     getlk_core(fs, ino, fh, lock_owner, lock).map(FuseResponse::lock)
 }
 
@@ -572,7 +573,7 @@ pub fn setlk_response(
     }
 
     if req_type != libc::F_RDLCK as i16 && req_type != libc::F_WRLCK as i16 {
-        return DeferredResult::err(libc::EINVAL);
+        return DeferredResult::err(FsError::EINVAL);
     }
 
     let conflict = {
@@ -600,7 +601,7 @@ pub fn setlk_response(
     }
 
     if !sleep {
-        return DeferredResult::err(libc::EWOULDBLOCK);
+        return DeferredResult::err(FsError::EWOULDBLOCK);
     }
 
     let (token, rx) = DeferredToken::new();
@@ -620,11 +621,11 @@ pub fn setlk_response(
     DeferredResult::deferred(rx)
 }
 
-pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32) -> Result<(), i32> {
+pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32) -> Result<(), FsError> {
     let base_op = op & !libc::LOCK_NB;
 
     if base_op != libc::LOCK_UN && base_op != libc::LOCK_SH && base_op != libc::LOCK_EX {
-        return Err(libc::EINVAL);
+        return Err(FsError::EINVAL);
     }
 
     fs.with_inner(OpTag::Lock, |inner| {
@@ -640,33 +641,33 @@ pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32)
             return Ok(());
         }
 
-        Err(libc::EWOULDBLOCK)
+        Err(FsError::EWOULDBLOCK)
     })
 }
 
-fn normalize_range(inner: &FsInner, ino: u64, lock: &ShimFlock) -> Result<(u64, u64), i32> {
+fn normalize_range(inner: &FsInner, ino: u64, lock: &ShimFlock) -> Result<(u64, u64), FsError> {
     let start_offset = match lock.whence as i32 {
         libc::SEEK_SET => lock.start,
         libc::SEEK_CUR | libc::SEEK_END => {
-            let attr = inner.get_attr(ino).ok_or(libc::ENOENT)?;
+            let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
             attr.size.saturating_add(lock.start)
         }
-        _ => return Err(libc::EINVAL),
+        _ => return Err(FsError::EINVAL),
     };
 
     if start_offset < 0 {
-        return Err(libc::EINVAL);
+        return Err(FsError::EINVAL);
     }
     let start = start_offset as u64;
 
     if lock.len < 0 {
-        return Err(libc::EINVAL);
+        return Err(FsError::EINVAL);
     }
 
     let end = if lock.len == 0 {
         u64::MAX
     } else {
-        start.checked_add(lock.len as u64).ok_or(libc::EINVAL)?
+        start.checked_add(lock.len as u64).ok_or(FsError::EINVAL)?
     };
 
     Ok((start, end))
@@ -695,7 +696,7 @@ fn coalesce_ranges(ranges: &mut Vec<RangeLock>) {
     *ranges = merged;
 }
 
-pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<ShimFlock, i32> {
+pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<ShimFlock, FsError> {
     let inner = fs.inner.lock(OpTag::Lock).unwrap();
     inner.validate_file_handle(ino, fh)?;
     let (start, end) = normalize_range(&inner, ino, &lock)?;
@@ -703,7 +704,7 @@ pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: Shi
     let req_type = lock.lock_type;
 
     if req_type != libc::F_RDLCK as i16 && req_type != libc::F_WRLCK as i16 {
-        return Err(libc::EINVAL);
+        return Err(FsError::EINVAL);
     }
 
     if let Some(ranges) = inner.locks.range_lock_table.get(&ino) {
@@ -741,7 +742,7 @@ pub fn setlk_core(
     lock_owner: u64,
     lock: ShimFlock,
     _sleep: bool,
-) -> Result<(), i32> {
+) -> Result<(), FsError> {
     fs.with_inner(OpTag::Lock, |inner| {
         inner.validate_file_handle(ino, fh)?;
         let (start, end) = normalize_range(inner, ino, &lock)?;
@@ -751,7 +752,7 @@ pub fn setlk_core(
         if req_type == libc::F_RDLCK as i16 || req_type == libc::F_WRLCK as i16 {
             let ranges = inner.locks.range_lock_table.entry(ino).or_default();
             if check_range_conflict(ranges, lock_owner, start, end, req_type) {
-                return Err(libc::EWOULDBLOCK);
+                return Err(FsError::EWOULDBLOCK);
             }
 
             grant_range_lock(ranges, lock_owner, start, end, req_type, lock.pid);
@@ -760,7 +761,7 @@ pub fn setlk_core(
             LockManager::unlock_range(inner, ino, lock_owner, start, end);
             Ok(())
         } else {
-            Err(libc::EINVAL)
+            Err(FsError::EINVAL)
         }
     })
 }
@@ -785,11 +786,11 @@ mod tests {
         // 2. Exclusive lock fails with non-blocking while shared locks held
         assert_eq!(
             flock_core(&fs, ino, fh1, 100, libc::LOCK_EX | libc::LOCK_NB),
-            Err(libc::EWOULDBLOCK)
+            Err(FsError::EWOULDBLOCK)
         );
         assert_eq!(
             flock_core(&fs, ino, fh2, 200, libc::LOCK_EX | libc::LOCK_NB),
-            Err(libc::EWOULDBLOCK)
+            Err(FsError::EWOULDBLOCK)
         );
 
         // 3. Unlock fh2 -> fh1 can now upgrade to exclusive!
@@ -799,11 +800,11 @@ mod tests {
         // 4. fh2 cannot acquire shared or exclusive while fh1 holds exclusive
         assert_eq!(
             flock_core(&fs, ino, fh2, 200, libc::LOCK_SH | libc::LOCK_NB),
-            Err(libc::EWOULDBLOCK)
+            Err(FsError::EWOULDBLOCK)
         );
         assert_eq!(
             flock_core(&fs, ino, fh2, 200, libc::LOCK_EX | libc::LOCK_NB),
-            Err(libc::EWOULDBLOCK)
+            Err(FsError::EWOULDBLOCK)
         );
 
         // 5. Downgrade fh1 from exclusive to shared
@@ -859,7 +860,10 @@ mod tests {
             len: 50,
             pid: 200,
         };
-        assert_eq!(setlk_core(&fs, ino, fh2, owner2, wlock2, false), Err(libc::EWOULDBLOCK));
+        assert_eq!(
+            setlk_core(&fs, ino, fh2, owner2, wlock2, false),
+            Err(FsError::EWOULDBLOCK)
+        );
 
         // 4. Query conflict with getlk
         let qlock = getlk_core(&fs, ino, fh2, owner2, wlock2).unwrap();

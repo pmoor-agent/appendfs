@@ -6,6 +6,7 @@
 //! paginated `readdir` is isolated from concurrent mutations.
 
 use super::{DirHandle, FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
+use crate::error::FsError;
 use crate::node::AttrDelta;
 use crate::operations::locks::LockManager;
 use crate::sync::OpTag;
@@ -38,7 +39,7 @@ impl InMemoryFS {
     ///
     /// Not available in production builds to prevent re-introducing two-lock handle access patterns.
     #[cfg(any(test, feature = "testing"))]
-    pub fn extract_file_handle(&self, ino: u64, fh: u64) -> Result<FileHandle, i32> {
+    pub fn extract_file_handle(&self, ino: u64, fh: u64) -> Result<FileHandle, FsError> {
         self.with_inner(OpTag::Handle, |inner| inner.get_file_handle(ino, fh).cloned())
     }
 
@@ -46,11 +47,11 @@ impl InMemoryFS {
     ///
     /// Not available in production builds to prevent re-introducing two-lock handle access patterns.
     #[cfg(any(test, feature = "testing"))]
-    pub fn extract_dir_handle(&self, ino: u64, fh: u64) -> Result<DirHandle, i32> {
+    pub fn extract_dir_handle(&self, ino: u64, fh: u64) -> Result<DirHandle, FsError> {
         self.with_inner(OpTag::Handle, |inner| inner.get_dir_handle(ino, fh).cloned())
     }
 
-    pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
+    pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, FsError> {
         self.with_inner(OpTag::ReadPlan, |inner| {
             let handle = inner.get_file_handle(ino, fh)?;
             match handle {
@@ -99,18 +100,18 @@ impl InMemoryFS {
         })
     }
 
-    pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+    pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<Vec<u8>, FsError> {
         let plan = self.plan_read_handle(ino, fh, offset, size)?;
         self.execute_read_plan_sync(plan)
     }
 
-    pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
+    pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), FsError> {
         self.with_inner(OpTag::Handle, |inner| {
             match inner.handles.get(&fh) {
                 Some(h) if h.ino() == ino && !h.is_dir() => {
                     inner.handles.remove(&fh);
                 }
-                _ => return Err(libc::EBADF),
+                _ => return Err(FsError::EBADF),
             }
 
             let is_last_handle = if let Some(count) = inner.open_counts.get_mut(&ino) {
@@ -123,10 +124,12 @@ impl InMemoryFS {
                     {
                         inner.tombstone(ino);
                     }
+                    true
+                } else {
+                    false
                 }
-                rem == 0
             } else {
-                true
+                false
             };
 
             LockManager::release_file_handle(inner, is_last_handle, ino, fh);
@@ -174,13 +177,13 @@ impl InMemoryFS {
         })
     }
 
-    pub fn release_dir_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
+    pub fn release_dir_handle(&self, fh: u64, ino: u64) -> Result<(), FsError> {
         self.with_inner(OpTag::Handle, |inner| match inner.handles.get(&fh) {
             Some(h) if h.ino() == ino && h.is_dir() => {
                 inner.handles.remove(&fh);
                 Ok(())
             }
-            _ => Err(libc::EBADF),
+            _ => Err(FsError::EBADF),
         })
     }
 }
@@ -237,21 +240,21 @@ mod tests {
         assert_eq!(snap2[2].0, "charlie.txt");
 
         // 6. Release fh1
-        assert_eq!(fs.release_dir_handle(fh1, 999), Err(libc::EBADF));
+        assert_eq!(fs.release_dir_handle(fh1, 999), Err(FsError::EBADF));
         assert_eq!(fs.release_dir_handle(fh1, 1), Ok(()));
-        assert_eq!(fs.extract_dir_handle(1, fh1), Err(libc::EBADF));
+        assert_eq!(fs.extract_dir_handle(1, fh1), Err(FsError::EBADF));
         assert!(fs.extract_dir_handle(1, fh2).is_ok());
-        assert_eq!(fs.release_dir_handle(fh1, 1), Err(libc::EBADF));
+        assert_eq!(fs.release_dir_handle(fh1, 1), Err(FsError::EBADF));
 
         // 7. Release fh2
         assert_eq!(fs.release_dir_handle(fh2, 1), Ok(()));
-        assert_eq!(fs.extract_dir_handle(1, fh2), Err(libc::EBADF));
+        assert_eq!(fs.extract_dir_handle(1, fh2), Err(FsError::EBADF));
 
         // 8. opendir_core on a non-directory returns ENOTDIR
         let alpha_ino = snap1[0].1;
         assert_eq!(
             crate::operations::dir::opendir_core(&fs, alpha_ino, 0),
-            Err(libc::ENOTDIR)
+            Err(FsError::ENOTDIR)
         );
     }
 
@@ -280,15 +283,15 @@ mod tests {
 
         // 4. Release first handle
         assert_eq!(fs.release_file_handle(fh1, ino), Ok(()));
-        assert_eq!(fs.extract_file_handle(ino, fh1), Err(libc::EBADF));
+        assert_eq!(fs.extract_file_handle(ino, fh1), Err(FsError::EBADF));
         assert!(fs.extract_file_handle(ino, fh2).is_ok());
         assert_eq!(fs.open_count(ino), 1);
         assert!(fs.get_attr(ino).is_some());
-        assert_eq!(fs.release_file_handle(fh1, ino), Err(libc::EBADF));
+        assert_eq!(fs.release_file_handle(fh1, ino), Err(FsError::EBADF));
 
         // 5. Release second handle -> count drops to 0, inode gets tombstoned
         assert_eq!(fs.release_file_handle(fh2, ino), Ok(()));
-        assert_eq!(fs.extract_file_handle(ino, fh2), Err(libc::EBADF));
+        assert_eq!(fs.extract_file_handle(ino, fh2), Err(FsError::EBADF));
         assert_eq!(fs.open_count(ino), 0);
         assert!(
             fs.get_attr(ino).is_none(),
@@ -346,11 +349,11 @@ mod tests {
         assert_eq!(fs.open_count(v_ino), 1);
 
         // Directory handle fails extract_file_handle with EISDIR
-        assert_eq!(fs.extract_file_handle(1, fh_dir).unwrap_err(), libc::EISDIR);
+        assert_eq!(fs.extract_file_handle(1, fh_dir).unwrap_err(), FsError::EISDIR);
         // Inode mismatch fails with EBADF
-        assert_eq!(fs.extract_file_handle(999, fh_reg).unwrap_err(), libc::EBADF);
+        assert_eq!(fs.extract_file_handle(999, fh_reg).unwrap_err(), FsError::EBADF);
         // Unknown handle ID fails with EBADF
-        assert_eq!(fs.extract_file_handle(reg_ino, 99999).unwrap_err(), libc::EBADF);
+        assert_eq!(fs.extract_file_handle(reg_ino, 99999).unwrap_err(), FsError::EBADF);
 
         // --- extract_dir_handle validation ---
         let dir_h = fs
@@ -358,11 +361,11 @@ mod tests {
             .expect("extract_dir_handle must succeed");
         assert_eq!(dir_h.ino, 1);
         assert!(!dir_h.entries.is_empty());
-        assert_eq!(fs.extract_dir_handle(999, fh_dir).unwrap_err(), libc::EBADF);
+        assert_eq!(fs.extract_dir_handle(999, fh_dir).unwrap_err(), FsError::EBADF);
         // File handles fail extract_dir_handle with ENOTDIR
-        assert_eq!(fs.extract_dir_handle(reg_ino, fh_reg).unwrap_err(), libc::ENOTDIR);
-        assert_eq!(fs.extract_dir_handle(v_ino, fh_virt).unwrap_err(), libc::ENOTDIR);
-        assert_eq!(fs.extract_dir_handle(1, 99999).unwrap_err(), libc::EBADF);
+        assert_eq!(fs.extract_dir_handle(reg_ino, fh_reg).unwrap_err(), FsError::ENOTDIR);
+        assert_eq!(fs.extract_dir_handle(v_ino, fh_virt).unwrap_err(), FsError::ENOTDIR);
+        assert_eq!(fs.extract_dir_handle(1, 99999).unwrap_err(), FsError::EBADF);
 
         // --- flock on virtual file handles is supported ---
         assert_eq!(
@@ -376,41 +379,41 @@ mod tests {
         // Locking a directory handle fails with EISDIR
         assert_eq!(
             crate::operations::locks::flock_core(&fs, 1, fh_dir, 1001, libc::LOCK_SH),
-            Err(libc::EISDIR)
+            Err(FsError::EISDIR)
         );
 
         // Reading directory handle via plan_read_handle fails with EISDIR
-        assert_eq!(fs.plan_read_handle(1, fh_dir, 0, 100).unwrap_err(), libc::EISDIR);
+        assert_eq!(fs.plan_read_handle(1, fh_dir, 0, 100).unwrap_err(), FsError::EISDIR);
 
         // Releasing dir handle via release_file_handle fails with EBADF
-        assert_eq!(fs.release_file_handle(fh_dir, 1), Err(libc::EBADF));
+        assert_eq!(fs.release_file_handle(fh_dir, 1), Err(FsError::EBADF));
 
         // Releasing file handle via release_dir_handle fails with EBADF
-        assert_eq!(fs.release_dir_handle(fh_reg, reg_ino), Err(libc::EBADF));
-        assert_eq!(fs.release_dir_handle(fh_virt, v_ino), Err(libc::EBADF));
+        assert_eq!(fs.release_dir_handle(fh_reg, reg_ino), Err(FsError::EBADF));
+        assert_eq!(fs.release_dir_handle(fh_virt, v_ino), Err(FsError::EBADF));
 
         // Inode mismatch on release must fail with EBADF for both
-        assert_eq!(fs.release_file_handle(fh_virt, reg_ino), Err(libc::EBADF));
-        assert_eq!(fs.release_file_handle(fh_reg, v_ino), Err(libc::EBADF));
-        assert_eq!(fs.release_dir_handle(fh_dir, 999), Err(libc::EBADF));
+        assert_eq!(fs.release_file_handle(fh_virt, reg_ino), Err(FsError::EBADF));
+        assert_eq!(fs.release_file_handle(fh_reg, v_ino), Err(FsError::EBADF));
+        assert_eq!(fs.release_dir_handle(fh_dir, 999), Err(FsError::EBADF));
 
         // Releasing virtual handle with correct inode succeeds and clears open count
         assert_eq!(fs.release_file_handle(fh_virt, v_ino), Ok(()));
         assert_eq!(fs.open_count(v_ino), 0);
-        assert_eq!(fs.extract_file_handle(v_ino, fh_virt), Err(libc::EBADF));
-        assert_eq!(fs.release_file_handle(fh_virt, v_ino), Err(libc::EBADF));
+        assert_eq!(fs.extract_file_handle(v_ino, fh_virt), Err(FsError::EBADF));
+        assert_eq!(fs.release_file_handle(fh_virt, v_ino), Err(FsError::EBADF));
 
         // Release directory handle
         assert_eq!(fs.release_dir_handle(fh_dir, 1), Ok(()));
-        assert_eq!(fs.extract_dir_handle(1, fh_dir), Err(libc::EBADF));
-        assert_eq!(fs.release_dir_handle(fh_dir, 1), Err(libc::EBADF));
+        assert_eq!(fs.extract_dir_handle(1, fh_dir), Err(FsError::EBADF));
+        assert_eq!(fs.release_dir_handle(fh_dir, 1), Err(FsError::EBADF));
 
         // Regular handle is still present and functional
         assert!(fs.extract_file_handle(reg_ino, fh_reg).is_ok());
         assert_eq!(fs.open_count(reg_ino), 1);
         assert_eq!(fs.release_file_handle(fh_reg, reg_ino), Ok(()));
         assert_eq!(fs.open_count(reg_ino), 0);
-        assert_eq!(fs.extract_file_handle(reg_ino, fh_reg), Err(libc::EBADF));
+        assert_eq!(fs.extract_file_handle(reg_ino, fh_reg), Err(FsError::EBADF));
 
         // Unified map is now empty
         {

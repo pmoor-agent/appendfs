@@ -116,6 +116,7 @@ impl VirtualFileRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::FsError;
     use crate::operations::dir::{iter_dir_entries, list_dir_core};
     use crate::operations::links::{rename_core, unlink_core};
     use crate::operations::read_write::{create_core, fallocate_core, read_core, setattr_core, write_core};
@@ -158,16 +159,15 @@ mod tests {
         // 2. Open second handle: freezes counter = 1
         let fh2 = fs.open_file_handle(v_ino, 0);
         assert!(fh2 > 0);
-        assert_ne!(fh1, fh2, "Handles must be distinct");
 
-        // 3. Reading fh1 and fh2 via read_core yields their frozen snapshots
+        // 3. Read sequentially through each handle: yields frozen content
         let data1 = read_core(&fs, v_ino, fh1, 0, 100).unwrap().into_bytes().unwrap();
         assert_eq!(data1, b"counter: 0\n");
         let data2 = read_core(&fs, v_ino, fh2, 0, 100).unwrap().into_bytes().unwrap();
         assert_eq!(data2, b"counter: 1\n");
 
         // 4. Invalid handle returns EBADF
-        assert_eq!(read_core(&fs, v_ino, 9999, 0, 100), Err(libc::EBADF));
+        assert_eq!(read_core(&fs, v_ino, 9999, 0, 100), Err(FsError::EBADF));
 
         // 5. Open a third handle: freezes counter = 2
         let fh3 = fs.open_file_handle(v_ino, 0);
@@ -177,7 +177,7 @@ mod tests {
 
         // 5. Release fh1: handle is freed and subsequent read returns EBADF
         fs.release_file_handle(fh1, v_ino).unwrap();
-        assert_eq!(read_core(&fs, v_ino, fh1, 0, 100), Err(libc::EBADF));
+        assert_eq!(read_core(&fs, v_ino, fh1, 0, 100), Err(FsError::EBADF));
         // fh2 remains untouched
         assert_eq!(
             read_core(&fs, v_ino, fh2, 0, 100).unwrap().into_bytes().unwrap(),
@@ -185,7 +185,7 @@ mod tests {
         );
 
         fs.release_file_handle(fh2, v_ino).unwrap();
-        assert_eq!(read_core(&fs, v_ino, fh2, 0, 100), Err(libc::EBADF));
+        assert_eq!(read_core(&fs, v_ino, fh2, 0, 100), Err(FsError::EBADF));
     }
 
     #[test]
@@ -258,12 +258,12 @@ mod tests {
         let v_ino = fs.virtual_files.get_ino_by_name(".remotes").unwrap();
 
         // 1. Writes are rejected with EPERM
-        assert_eq!(write_core(&fs, v_ino, b"mutate", 0), Err(libc::EPERM));
+        assert_eq!(write_core(&fs, v_ino, b"mutate", 0), Err(FsError::EPERM));
 
         // 2. Setattr is rejected with EPERM
         assert_eq!(
             setattr_core(&fs, v_ino, 0o777, 0, 0, 0, fs.clock.now(), fs.clock.now(), 0x1),
-            Err(libc::EPERM)
+            Err(FsError::EPERM)
         );
 
         // 3. Fallocate is rejected with EPERM
@@ -275,36 +275,39 @@ mod tests {
                 0,
                 100
             ),
-            Err(libc::EPERM)
+            Err(FsError::EPERM)
         );
 
         // 4. Unlink is rejected with EPERM
-        assert_eq!(unlink_core(&fs, 1, ".remotes"), Err(libc::EPERM));
+        assert_eq!(unlink_core(&fs, 1, ".remotes"), Err(FsError::EPERM));
 
         // 5. Rename is rejected with EPERM
-        assert_eq!(rename_core(&fs, 1, ".remotes", 1, "renamed.txt"), Err(libc::EPERM));
+        assert_eq!(rename_core(&fs, 1, ".remotes", 1, "renamed.txt"), Err(FsError::EPERM));
 
         // 6. Creating over an existing virtual file returns EEXIST
-        assert_eq!(create_core(&fs, 1, ".remotes", 0o644, 0, 1000, 1000), Err(libc::EEXIST));
+        assert_eq!(
+            create_core(&fs, 1, ".remotes", 0o644, 0, 1000, 1000),
+            Err(FsError::EEXIST)
+        );
 
         // 7. Hardlinking a virtual file is rejected with EPERM
         assert_eq!(
             crate::operations::links::link_core(&fs, v_ino, 1, "link.txt"),
-            Err(libc::EPERM)
+            Err(FsError::EPERM)
         );
 
         // 8. Xattr operations on virtual files are rejected / empty
         assert_eq!(
             crate::operations::xattr::setxattr_core(&fs, v_ino, "user.v", b"val", 0),
-            Err(libc::EPERM)
+            Err(FsError::EPERM)
         );
         assert_eq!(
             crate::operations::xattr::removexattr_core(&fs, v_ino, "user.v"),
-            Err(libc::EPERM)
+            Err(FsError::EPERM)
         );
         assert_eq!(
             crate::operations::xattr::getxattr_core(&fs, v_ino, "user.v", 0),
-            Err(libc::ENODATA)
+            Err(FsError::ENODATA)
         );
         assert_eq!(
             crate::operations::xattr::listxattr_core(&fs, v_ino, 0),
@@ -313,9 +316,9 @@ mod tests {
 
         // 9. Status virtual file has identical mutation protections
         let status_ino = fs.virtual_files.get_ino_by_name(".status").unwrap();
-        assert_eq!(write_core(&fs, status_ino, b"mutate", 0), Err(libc::EPERM));
-        assert_eq!(unlink_core(&fs, 1, ".status"), Err(libc::EPERM));
-        assert_eq!(rename_core(&fs, 1, ".status", 1, "renamed.txt"), Err(libc::EPERM));
+        assert_eq!(write_core(&fs, status_ino, b"mutate", 0), Err(FsError::EPERM));
+        assert_eq!(unlink_core(&fs, 1, ".status"), Err(FsError::EPERM));
+        assert_eq!(rename_core(&fs, 1, ".status", 1, "renamed.txt"), Err(FsError::EPERM));
     }
 
     #[test]

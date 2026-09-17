@@ -1,11 +1,12 @@
+use crate::error::FsError;
 use crate::fs::InMemoryFS;
 use crate::node::{AttrDelta, NodeDelta, SymlinkDelta};
 use crate::shim::{FileAttr, FileType, FuseResponse, RequestContext};
 use crate::sync::OpTag;
 
-pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> {
+pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), FsError> {
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
 
     fs.with_inner(OpTag::Unlink, |inner| {
@@ -13,22 +14,22 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
         log::trace!("unlink(parent={}, name={})", parent, name);
 
         if name.len() > 255 {
-            return Err(libc::ENAMETOOLONG);
+            return Err(FsError::ENAMETOOLONG);
         }
 
-        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(FsError::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
 
-        let child_ino = fs.lookup_child_locked(inner, parent, name).ok_or(libc::ENOENT)?;
+        let child_ino = fs.lookup_child_locked(inner, parent, name).ok_or(FsError::ENOENT)?;
         if fs.is_virtual_ino(child_ino) {
-            return Err(libc::EPERM);
+            return Err(FsError::EPERM);
         }
-        let child_attr = fs.get_attr_locked(inner, child_ino).ok_or(libc::ENOENT)?;
+        let child_attr = fs.get_attr_locked(inner, child_ino).ok_or(FsError::ENOENT)?;
 
         if child_attr.file_type == FileType::Directory {
-            return Err(libc::EISDIR);
+            return Err(FsError::EISDIR);
         }
 
         inner.remove_dir_entry(parent, name, now);
@@ -52,7 +53,7 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
     })
 }
 
-pub fn unlink_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+pub fn unlink_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
     unlink_core(fs, parent, name).map(|()| FuseResponse::ok())
 }
 
@@ -63,9 +64,9 @@ pub fn symlink_core(
     target: &str,
     uid: u32,
     gid: u32,
-) -> Result<FileAttr, i32> {
+) -> Result<FileAttr, FsError> {
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
 
     fs.with_inner(OpTag::Symlink, |inner| {
@@ -80,16 +81,16 @@ pub fn symlink_core(
         );
 
         if name.len() > 255 {
-            return Err(libc::ENAMETOOLONG);
+            return Err(FsError::ENAMETOOLONG);
         }
 
-        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(FsError::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
 
         if fs.lookup_child_locked(inner, parent, name).is_some() {
-            return Err(libc::EEXIST);
+            return Err(FsError::EEXIST);
         }
 
         let new_ino = fs.allocate_inode();
@@ -134,24 +135,24 @@ pub fn symlink_response(
     link: &str,
     parent: u64,
     name: &str,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     symlink_core(fs, parent, name, link, ctx.uid, ctx.gid).map(FuseResponse::entry)
 }
 
-pub fn readlink_core(fs: &InMemoryFS, ino: u64) -> Result<String, i32> {
+pub fn readlink_core(fs: &InMemoryFS, ino: u64) -> Result<String, FsError> {
     log::trace!("readlink(ino={})", ino);
-    fs.read_link(ino).ok_or(libc::EINVAL)
+    fs.read_link(ino).ok_or(FsError::EINVAL)
 }
 
-pub fn readlink_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, i32> {
+pub fn readlink_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, FsError> {
     readlink_core(fs, ino).map(FuseResponse::readlink)
 }
 
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
-pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), i32> {
+pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), FsError> {
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
 
     fs.with_inner(OpTag::Rename, |inner| {
@@ -165,29 +166,29 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
         );
 
         if name.len() > 255 || newname.len() > 255 {
-            return Err(libc::ENAMETOOLONG);
+            return Err(FsError::ENAMETOOLONG);
         }
 
-        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(FsError::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
-        let newparent_attr = inner.get_attr(newparent).ok_or(libc::ENOENT)?;
+        let newparent_attr = inner.get_attr(newparent).ok_or(FsError::ENOENT)?;
         if newparent_attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
 
-        let source_ino = fs.lookup_child_locked(inner, parent, name).ok_or(libc::ENOENT)?;
+        let source_ino = fs.lookup_child_locked(inner, parent, name).ok_or(FsError::ENOENT)?;
         if fs.is_virtual_ino(source_ino) {
-            return Err(libc::EPERM);
+            return Err(FsError::EPERM);
         }
-        let source_attr = fs.get_attr_locked(inner, source_ino).ok_or(libc::ENOENT)?;
+        let source_attr = fs.get_attr_locked(inner, source_ino).ok_or(FsError::ENOENT)?;
 
         if source_attr.file_type == FileType::Directory {
             let mut curr = newparent;
             while curr != 1 {
                 if curr == source_ino {
-                    return Err(libc::EINVAL);
+                    return Err(FsError::EINVAL);
                 }
                 if let Some(p) = inner.get_parent_dir_inode(curr) {
                     curr = p;
@@ -206,7 +207,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
         let mut dest_was_dir = false;
         if let Some(dest_ino) = fs.lookup_child_locked(inner, newparent, newname) {
             if fs.is_virtual_ino(dest_ino) {
-                return Err(libc::EPERM);
+                return Err(FsError::EPERM);
             }
             // POSIX: when old and new resolve to different directory entries for the same
             // file - two hardlinks to one inode - rename succeeds and does nothing. Without
@@ -217,17 +218,17 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
                 return Ok(());
             }
 
-            let dest_attr = fs.get_attr_locked(inner, dest_ino).ok_or(libc::ENOENT)?;
+            let dest_attr = fs.get_attr_locked(inner, dest_ino).ok_or(FsError::ENOENT)?;
             let dest_is_dir = dest_attr.file_type == FileType::Directory;
 
             if src_is_dir != dest_is_dir {
-                return Err(if src_is_dir { libc::ENOTDIR } else { libc::EISDIR });
+                return Err(if src_is_dir { FsError::ENOTDIR } else { FsError::EISDIR });
             }
 
             if dest_is_dir {
-                let dest_entries = inner.list_directory(dest_ino).ok_or(libc::ENOENT)?;
+                let dest_entries = inner.list_directory(dest_ino).ok_or(FsError::ENOENT)?;
                 if !dest_entries.is_empty() {
-                    return Err(libc::ENOTEMPTY);
+                    return Err(FsError::ENOTEMPTY);
                 }
                 dest_was_dir = true;
                 inner.remove_dir_entry(newparent, newname, now);
@@ -308,13 +309,13 @@ pub fn rename_response(
     name: &str,
     newparent: u64,
     newname: &str,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     rename_core(fs, parent, name, newparent, newname).map(|()| FuseResponse::ok())
 }
 
-pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Result<FileAttr, i32> {
+pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Result<FileAttr, FsError> {
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
 
     fs.with_inner(OpTag::Link, |inner| {
@@ -322,24 +323,24 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
         log::trace!("link(ino={}, newparent={}, newname={})", ino, newparent, newname);
 
         if newname.len() > 255 {
-            return Err(libc::ENAMETOOLONG);
+            return Err(FsError::ENAMETOOLONG);
         }
 
-        let target_attr = fs.get_attr_locked(inner, ino).ok_or(libc::ENOENT)?;
+        let target_attr = fs.get_attr_locked(inner, ino).ok_or(FsError::ENOENT)?;
         if target_attr.file_type == FileType::Directory || fs.is_virtual_ino(ino) {
-            return Err(libc::EPERM);
+            return Err(FsError::EPERM);
         }
         if target_attr.nlink == 0 {
-            return Err(libc::ENOENT);
+            return Err(FsError::ENOENT);
         }
 
-        let newparent_attr = inner.get_attr(newparent).ok_or(libc::ENOENT)?;
+        let newparent_attr = inner.get_attr(newparent).ok_or(FsError::ENOENT)?;
         if newparent_attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
 
         if fs.lookup_child_locked(inner, newparent, newname).is_some() {
-            return Err(libc::EEXIST);
+            return Err(FsError::EEXIST);
         }
 
         let new_nlink = target_attr.nlink + 1;
@@ -361,20 +362,23 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
     })
 }
 
-pub fn link_response(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, i32> {
+pub fn link_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    newparent: u64,
+    newname: &str,
+) -> Result<FuseResponse<'static>, FsError> {
     link_core(fs, ino, newparent, newname).map(FuseResponse::entry)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::InMemoryFS;
-    use crate::operations::read_write::create_core;
 
     #[test]
-    fn test_links_and_rename_name_length_boundaries() {
+    fn test_link_operations_name_length_boundaries() {
         let fs = InMemoryFS::new();
-        let file = create_core(&fs, 1, "orig.txt", 0o644, 0, 1000, 1000).unwrap();
+        let file = crate::operations::read_write::create_core(&fs, 1, "orig.txt", 0o644, 0, 1000, 1000).unwrap();
 
         let name_255 = "l".repeat(255);
         let name_256 = "l".repeat(256);
@@ -384,26 +388,32 @@ mod tests {
         assert_eq!(sym_attr.file_type, FileType::Symlink);
         assert_eq!(
             symlink_core(&fs, 1, &name_256, "orig.txt", 1000, 1000),
-            Err(libc::ENAMETOOLONG)
+            Err(FsError::ENAMETOOLONG)
         );
 
         // Hardlink: 255 bytes succeeds, 256 bytes fails with ENAMETOOLONG
         let hard_name_255 = "h".repeat(255);
         let hard_attr = link_core(&fs, file.ino, 1, &hard_name_255).unwrap();
         assert_eq!(hard_attr.nlink, 2);
-        assert_eq!(link_core(&fs, file.ino, 1, &name_256), Err(libc::ENAMETOOLONG));
+        assert_eq!(link_core(&fs, file.ino, 1, &name_256), Err(FsError::ENAMETOOLONG));
 
         // Rename:
         // Source 256 bytes fails
-        assert_eq!(rename_core(&fs, 1, &name_256, 1, "dest.txt"), Err(libc::ENAMETOOLONG));
+        assert_eq!(
+            rename_core(&fs, 1, &name_256, 1, "dest.txt"),
+            Err(FsError::ENAMETOOLONG)
+        );
         // Target 256 bytes fails
-        assert_eq!(rename_core(&fs, 1, "orig.txt", 1, &name_256), Err(libc::ENAMETOOLONG));
+        assert_eq!(
+            rename_core(&fs, 1, "orig.txt", 1, &name_256),
+            Err(FsError::ENAMETOOLONG)
+        );
         // Target 255 bytes succeeds
         let ren_name_255 = "r".repeat(255);
         assert_eq!(rename_core(&fs, 1, &hard_name_255, 1, &ren_name_255), Ok(()));
 
         // Unlink: 256 bytes fails with ENAMETOOLONG
-        assert_eq!(unlink_core(&fs, 1, &name_256), Err(libc::ENAMETOOLONG));
+        assert_eq!(unlink_core(&fs, 1, &name_256), Err(FsError::ENAMETOOLONG));
 
         // Unlink: 255 bytes succeeds
         assert_eq!(unlink_core(&fs, 1, &name_255), Ok(()));

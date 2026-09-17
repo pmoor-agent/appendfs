@@ -6,6 +6,7 @@
 //! records directly onto `base`, guaranteeing identical state transitions across crash recovery.
 
 use super::{FlushReason, FsInner, InMemoryFS};
+use crate::error::FsError;
 use crate::extent_map::Extent;
 use crate::log::{GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE};
 use crate::node::{EntryDelta, NodeDelta, NodeKind};
@@ -94,7 +95,7 @@ impl InMemoryFS {
         ino: u64,
         fh: u64,
         reason: FlushReason,
-    ) -> Result<Option<super::BatchCompletion>, i32> {
+    ) -> Result<Option<super::BatchCompletion>, FsError> {
         let mut inner = self.inner.lock(OpTag::Flush).unwrap();
         if fh != 0 {
             inner.validate_regular_handle(ino, fh)?;

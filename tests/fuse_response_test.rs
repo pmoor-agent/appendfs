@@ -1,5 +1,6 @@
 use appendfs::async_runtime::block_on;
 use appendfs::clock::MockClock;
+use appendfs::error::FsError;
 use appendfs::fs::InMemoryFS;
 use appendfs::operations::dir::{
     lookup_response, mkdir_response, opendir_response, releasedir_response, rmdir_response,
@@ -270,9 +271,9 @@ fn test_deferred_result_mechanics() {
     assert_eq!(ready_ok.into_ready(), Some(Ok(FuseResponse::ok())));
 
     // 2. Ready result err
-    let ready_err: DeferredResult<FuseResponse<'static>> = DeferredResult::err(libc::EACCES);
+    let ready_err: DeferredResult<FuseResponse<'static>> = DeferredResult::err(FsError::EACCES);
     assert!(ready_err.is_ready());
-    assert_eq!(ready_err.into_ready(), Some(Err(libc::EACCES)));
+    assert_eq!(ready_err.into_ready(), Some(Err(FsError::EACCES)));
 
     // 3. on_complete for ready result runs synchronously
     let ran = Arc::new(AtomicBool::new(false));
@@ -301,7 +302,7 @@ fn test_deferred_result_mechanics() {
     let (token2, receiver2) = DeferredToken::<FuseResponse<'static>>::new();
     let deferred2 = DeferredResult::deferred(receiver2);
     drop(token2);
-    assert_eq!(deferred2.wait(), Err(libc::ECANCELED));
+    assert_eq!(deferred2.wait(), Err(FsError::ECANCELED));
 
     // 6. Callback registered before token completion
     let (token3, receiver3) = DeferredToken::new();
@@ -502,7 +503,7 @@ fn test_filesystem_trait_all_methods() {
 
     // 24. rmdir via trait
     let rmdir_fail = fs.rmdir(1, "dir1");
-    assert_eq!(rmdir_fail, Err(libc::ENOTEMPTY));
+    assert_eq!(rmdir_fail, Err(FsError::ENOTEMPTY));
 
     // Cleanup children to allow rmdir
     let _ = fs.unlink(dir_ino, "file1.txt");

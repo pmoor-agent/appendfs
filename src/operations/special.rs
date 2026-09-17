@@ -1,3 +1,4 @@
+use crate::error::FsError;
 use crate::extent_map::ExtentMap;
 use crate::fs::InMemoryFS;
 use crate::node::{AttrDelta, FileDelta, NodeDelta, SpecialDelta};
@@ -12,9 +13,9 @@ pub fn mknod_core(
     rdev: u32,
     uid: u32,
     gid: u32,
-) -> Result<FileAttr, i32> {
+) -> Result<FileAttr, FsError> {
     if fs.is_read_only() {
-        return Err(libc::EROFS);
+        return Err(FsError::EROFS);
     }
 
     fs.with_inner(OpTag::Mknod, |inner| {
@@ -30,16 +31,16 @@ pub fn mknod_core(
         );
 
         if name.len() > 255 {
-            return Err(libc::ENAMETOOLONG);
+            return Err(FsError::ENAMETOOLONG);
         }
 
-        let parent_attr = inner.get_attr(parent).ok_or(libc::ENOENT)?;
+        let parent_attr = inner.get_attr(parent).ok_or(FsError::ENOENT)?;
         if parent_attr.file_type != FileType::Directory {
-            return Err(libc::ENOTDIR);
+            return Err(FsError::ENOTDIR);
         }
 
         if fs.lookup_child_locked(inner, parent, name).is_some() {
-            return Err(libc::EEXIST);
+            return Err(FsError::EEXIST);
         }
 
         let file_type_bits = mode & libc::S_IFMT;
@@ -117,7 +118,7 @@ pub fn mknod_response(
     name: &str,
     mode: u32,
     rdev: u32,
-) -> Result<FuseResponse<'static>, i32> {
+) -> Result<FuseResponse<'static>, FsError> {
     mknod_core(fs, parent, name, mode, rdev, ctx.uid, ctx.gid).map(FuseResponse::entry)
 }
 
@@ -185,7 +186,7 @@ mod tests {
         // 256-byte FIFO fails with ENAMETOOLONG
         assert_eq!(
             mknod_core(&fs, 1, &name_256, libc::S_IFIFO | 0o644, 0, 1000, 1000),
-            Err(libc::ENAMETOOLONG)
+            Err(FsError::ENAMETOOLONG)
         );
     }
 }

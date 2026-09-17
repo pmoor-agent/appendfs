@@ -7,40 +7,41 @@ pub mod special;
 pub mod statfs;
 pub mod xattr;
 
+use crate::error::FsError;
 use crate::fs::InMemoryFS;
 use crate::shim::{DeferredResult, Filesystem, FuseResponse, RequestContext, ShimFlock};
 use std::time::SystemTime;
 
 impl Filesystem for InMemoryFS {
-    fn lookup(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+    fn lookup(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
         dir::lookup_response(self, parent, name)
     }
 
-    fn getattr(&self, ino: u64) -> Result<FuseResponse<'static>, i32> {
+    fn getattr(&self, ino: u64) -> Result<FuseResponse<'static>, FsError> {
         read_write::getattr_response(self, ino)
     }
 
-    fn opendir(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32> {
+    fn opendir(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
         dir::opendir_response(self, ino, flags)
     }
 
-    fn readdir(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+    fn readdir(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
         dir::readdir_response(self, ino, size, offset, fh)
     }
 
-    fn readdirplus(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+    fn readdirplus(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
         dir::readdirplus_response(self, ino, size, offset, fh)
     }
 
-    fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+    fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
         read_write::read_core(self, ino, fh, offset, size)
     }
 
-    fn open(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, i32> {
+    fn open(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
         read_write::open_response(self, ino, flags)
     }
 
-    fn write(&self, ino: u64, buf: &[u8], offset: i64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+    fn write(&self, ino: u64, buf: &[u8], offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
         read_write::write_response(self, ino, fh, buf, offset)
     }
 
@@ -54,7 +55,7 @@ impl Filesystem for InMemoryFS {
         atime: SystemTime,
         mtime: SystemTime,
         to_set: u32,
-    ) -> Result<FuseResponse<'static>, i32> {
+    ) -> Result<FuseResponse<'static>, FsError> {
         read_write::setattr_response(self, ino, mode, uid, gid, size, atime, mtime, to_set)
     }
 
@@ -65,7 +66,7 @@ impl Filesystem for InMemoryFS {
         name: &str,
         mode: u32,
         flags: u32,
-    ) -> Result<FuseResponse<'static>, i32> {
+    ) -> Result<FuseResponse<'static>, FsError> {
         read_write::create_response(self, ctx, parent, name, mode, flags)
     }
 
@@ -76,35 +77,41 @@ impl Filesystem for InMemoryFS {
         name: &str,
         mode: u32,
         rdev: u32,
-    ) -> Result<FuseResponse<'static>, i32> {
+    ) -> Result<FuseResponse<'static>, FsError> {
         special::mknod_response(self, ctx, parent, name, mode, rdev)
     }
 
-    fn unlink(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+    fn unlink(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
         links::unlink_response(self, parent, name)
     }
 
-    fn mkdir(&self, ctx: RequestContext, parent: u64, name: &str, mode: u32) -> Result<FuseResponse<'static>, i32> {
+    fn mkdir(&self, ctx: RequestContext, parent: u64, name: &str, mode: u32) -> Result<FuseResponse<'static>, FsError> {
         dir::mkdir_response(self, ctx, parent, name, mode)
     }
 
-    fn rmdir(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+    fn rmdir(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
         dir::rmdir_response(self, parent, name)
     }
 
-    fn symlink(&self, ctx: RequestContext, link: &str, parent: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+    fn symlink(
+        &self,
+        ctx: RequestContext,
+        link: &str,
+        parent: u64,
+        name: &str,
+    ) -> Result<FuseResponse<'static>, FsError> {
         links::symlink_response(self, ctx, link, parent, name)
     }
 
-    fn readlink(&self, ino: u64) -> Result<FuseResponse<'static>, i32> {
+    fn readlink(&self, ino: u64) -> Result<FuseResponse<'static>, FsError> {
         links::readlink_response(self, ino)
     }
 
-    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, i32> {
+    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, FsError> {
         links::rename_response(self, parent, name, newparent, newname)
     }
 
-    fn link(&self, ino: u64, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, i32> {
+    fn link(&self, ino: u64, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, FsError> {
         links::link_response(self, ino, newparent, newname)
     }
 
@@ -113,16 +120,23 @@ impl Filesystem for InMemoryFS {
         read_write::fsync_response(self, ino, fh, crate::fs::FlushReason::Fsync)
     }
 
-    fn fallocate(&self, ino: u64, mode: i32, offset: i64, length: i64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+    fn fallocate(
+        &self,
+        ino: u64,
+        mode: i32,
+        offset: i64,
+        length: i64,
+        fh: u64,
+    ) -> Result<FuseResponse<'static>, FsError> {
         let _ = fh;
         read_write::fallocate_response(self, ino, mode, offset, length)
     }
 
-    fn release(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+    fn release(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
         read_write::release_response(self, ino, fh)
     }
 
-    fn releasedir(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, i32> {
+    fn releasedir(&self, ino: u64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
         dir::releasedir_response(self, ino, fh)
     }
 
@@ -130,7 +144,7 @@ impl Filesystem for InMemoryFS {
         dir::fsyncdir_response(self, ino, datasync)
     }
 
-    fn statfs(&self, ino: u64) -> Result<FuseResponse<'static>, i32> {
+    fn statfs(&self, ino: u64) -> Result<FuseResponse<'static>, FsError> {
         statfs::statfs_response(self, ino)
     }
 
@@ -138,7 +152,7 @@ impl Filesystem for InMemoryFS {
         locks::flock_response(self, ino, fh, lock_owner, op)
     }
 
-    fn getlk(&self, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<FuseResponse<'static>, i32> {
+    fn getlk(&self, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<FuseResponse<'static>, FsError> {
         locks::getlk_response(self, ino, fh, lock_owner, lock)
     }
 
@@ -153,19 +167,19 @@ impl Filesystem for InMemoryFS {
         locks::setlk_response(self, ino, fh, lock_owner, lock, sleep)
     }
 
-    fn getxattr(&self, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, i32> {
+    fn getxattr(&self, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, FsError> {
         xattr::getxattr_core(self, ino, name, size)
     }
 
-    fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<FuseResponse<'static>, i32> {
+    fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<FuseResponse<'static>, FsError> {
         xattr::setxattr_core(self, ino, name, value, flags)
     }
 
-    fn listxattr(&self, ino: u64, size: usize) -> Result<FuseResponse<'static>, i32> {
+    fn listxattr(&self, ino: u64, size: usize) -> Result<FuseResponse<'static>, FsError> {
         xattr::listxattr_core(self, ino, size)
     }
 
-    fn removexattr(&self, ino: u64, name: &str) -> Result<FuseResponse<'static>, i32> {
+    fn removexattr(&self, ino: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
         xattr::removexattr_core(self, ino, name)
     }
 }

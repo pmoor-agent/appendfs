@@ -26,6 +26,7 @@ pub use overlay::{InnerStatsSnapshot, InodeCounts};
 pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};
+use crate::error::FsError;
 use crate::log::{LogFileCache, LogManifest, LogWriter};
 use crate::node::{EntryDelta, Node};
 use crate::shim::{DeferredResult, FuseResponse, Request};
@@ -594,39 +595,39 @@ impl FsInner {
     }
 
     #[inline]
-    pub fn get_file_handle(&self, ino: u64, fh: u64) -> Result<&FileHandle, i32> {
-        let handle = self.handles.get(&fh).ok_or(libc::EBADF)?;
+    pub fn get_file_handle(&self, ino: u64, fh: u64) -> Result<&FileHandle, FsError> {
+        let handle = self.handles.get(&fh).ok_or(FsError::EBADF)?;
         if handle.ino() != ino {
-            return Err(libc::EBADF);
+            return Err(FsError::EBADF);
         }
         match handle {
             Handle::File(f) => Ok(f),
-            Handle::Directory(_) => Err(libc::EISDIR),
+            Handle::Directory(_) => Err(FsError::EISDIR),
         }
     }
 
     #[inline]
-    pub fn validate_file_handle(&self, ino: u64, fh: u64) -> Result<(), i32> {
+    pub fn validate_file_handle(&self, ino: u64, fh: u64) -> Result<(), FsError> {
         self.get_file_handle(ino, fh).map(|_| ())
     }
 
     #[inline]
-    pub fn validate_regular_handle(&self, ino: u64, fh: u64) -> Result<(), i32> {
+    pub fn validate_regular_handle(&self, ino: u64, fh: u64) -> Result<(), FsError> {
         match self.get_file_handle(ino, fh)? {
             FileHandle::Regular { .. } => Ok(()),
-            FileHandle::Virtual { .. } => Err(libc::EBADF),
+            FileHandle::Virtual { .. } => Err(FsError::EBADF),
         }
     }
 
     #[inline]
-    pub fn get_dir_handle(&self, ino: u64, fh: u64) -> Result<&DirHandle, i32> {
-        let handle = self.handles.get(&fh).ok_or(libc::EBADF)?;
+    pub fn get_dir_handle(&self, ino: u64, fh: u64) -> Result<&DirHandle, FsError> {
+        let handle = self.handles.get(&fh).ok_or(FsError::EBADF)?;
         if handle.ino() != ino {
-            return Err(libc::EBADF);
+            return Err(FsError::EBADF);
         }
         match handle {
             Handle::Directory(d) => Ok(d),
-            Handle::File(_) => Err(libc::ENOTDIR),
+            Handle::File(_) => Err(FsError::ENOTDIR),
         }
     }
 
