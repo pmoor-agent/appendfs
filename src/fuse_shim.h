@@ -97,7 +97,7 @@ int shim_reply_err(fuse_req_t req, int err);
 int shim_reply_attr(fuse_req_t req, const shim_file_attr *attr, double attr_timeout);
 int shim_reply_entry(fuse_req_t req, const shim_file_attr *attr, double attr_timeout, double entry_timeout);
 int shim_reply_buf(fuse_req_t req, const char *buf, size_t size);
-int shim_reply_open(fuse_req_t req, uint64_t fh, bool direct_io);
+int shim_reply_open(fuse_req_t req, uint64_t fh, bool direct_io, bool keep_cache);
 int shim_reply_write(fuse_req_t req, size_t count);
 int shim_reply_create(fuse_req_t req, const shim_file_attr *attr, double attr_timeout, double entry_timeout,
                       uint64_t fh);

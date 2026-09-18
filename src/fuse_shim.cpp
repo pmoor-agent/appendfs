@@ -689,11 +689,14 @@ int shim_reply_buf(fuse_req_t req, const char *buf, size_t size) {
   return fuse_reply_buf(req, buf, size);
 }
 
-int shim_reply_open(fuse_req_t req, uint64_t fh, bool direct_io) {
+int shim_reply_open(fuse_req_t req, uint64_t fh, bool direct_io, bool keep_cache) {
   struct fuse_file_info fi = {};
   fi.fh = fh;
   if (direct_io) {
     fi.direct_io = 1;
+  }
+  if (keep_cache) {
+    fi.keep_cache = 1;
   }
   return fuse_reply_open(req, &fi);
 }
