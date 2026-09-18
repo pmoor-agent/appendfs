@@ -4,7 +4,7 @@
 //! into them. Reads go through [`InMemoryFS::with_layer_stack`], which takes all three
 //! layer locks in a safe order - see [`super::layers`] for why the order matters.
 
-use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, ReadPlan};
+use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, ReadPlan, is_virtual_ino};
 use crate::error::FsError;
 use crate::extent_map::ExtentMap;
 use crate::node::{
@@ -443,7 +443,7 @@ impl InMemoryFS {
     }
 
     pub fn get_attr_locked(&self, inner: &FsInner, ino: u64) -> Option<FileAttr> {
-        if self.virtual_files.is_virtual_ino(ino) {
+        if is_virtual_ino(ino) {
             return Some(self.virtual_files.file_attr(ino, 0, self.clock.now()));
         }
         inner.get_attr(ino)

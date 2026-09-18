@@ -10,6 +10,10 @@ AppendFS is a high-performance append-only log-structured filesystem with FUSE s
    - Prefer determinism across the entire codebase.
    - Use injected testable clocks (`Arc<dyn Clock>` / `Clock` trait) rather than unmocked calls to `SystemTime::now()`.
    - Use injected randomness with fixed or reproducible seeds (e.g. `ChaCha8Rng::seed_from_u64(...)`) in tests, fuzzers, and stress suites so every failure can be reliably reproduced and investigated.
+3. **Clean API Evolution & No Deprecated Shims**:
+   - When refactoring and introducing a new function, method, helper, or type (e.g. replacing an instance method with a standalone helper, updating a method signature, or renaming a type without keeping a legacy type alias), do not keep the superseded version around as an unnecessary forwarding shim, alias, or duplicate wrapper.
+   - Fully remove the old variant and migrate all callers across the codebase—including internal modules, call sites, and test suites—even if updating callers is tedious.
+   - Avoid accumulating duplicate entry points, alias cruft, and method variations to prevent API ambiguity and technical debt.
 
 ## Development & Review Workflow
 

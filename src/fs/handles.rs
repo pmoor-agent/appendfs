@@ -5,7 +5,7 @@
 //! Directory handles hold an immutable snapshot of the listing taken at `opendir`, so a
 //! paginated `readdir` is isolated from concurrent mutations.
 
-use super::{DirHandle, FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
+use super::{DirHandle, FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource, is_virtual_ino};
 use crate::error::FsError;
 use crate::node::AttrDelta;
 use crate::operations::locks::LockManager;
@@ -16,7 +16,7 @@ impl InMemoryFS {
     // --- POSIX File & Directory Handle Tracking ---
 
     pub fn open_file_handle(&self, ino: u64, flags: u32) -> u64 {
-        let is_virtual = self.virtual_files.is_virtual_ino(ino);
+        let is_virtual = is_virtual_ino(ino);
         let file_handle = if is_virtual {
             let content = self.virtual_files.generate_content(ino, self).unwrap_or_default();
             FileHandle::Virtual {

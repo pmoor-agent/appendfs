@@ -1005,11 +1005,6 @@ impl InMemoryFS {
             .register(".status", crate::stats::format_runtime_status);
     }
 
-    /// Returns true if `ino` is a synthesized virtual file.
-    pub fn is_virtual_ino(&self, ino: u64) -> bool {
-        self.virtual_files.is_virtual_ino(ino)
-    }
-
     /// Returns all registered root directory virtual entries `(name, ino)`.
     pub fn list_virtual_entries(&self) -> Vec<(String, u64)> {
         self.virtual_files.list_entries()

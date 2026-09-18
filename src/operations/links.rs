@@ -1,5 +1,5 @@
 use crate::error::FsError;
-use crate::fs::InMemoryFS;
+use crate::fs::{InMemoryFS, is_virtual_ino};
 use crate::node::{AttrDelta, NodeDelta, SymlinkDelta};
 use crate::shim::{FileAttr, FileType, FuseResponse, RequestContext};
 use crate::sync::OpTag;
@@ -23,7 +23,7 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), FsErr
         }
 
         let child_ino = fs.lookup_child_locked(inner, parent, name).ok_or(FsError::ENOENT)?;
-        if fs.is_virtual_ino(child_ino) {
+        if is_virtual_ino(child_ino) {
             return Err(FsError::EPERM);
         }
         let child_attr = fs.get_attr_locked(inner, child_ino).ok_or(FsError::ENOENT)?;
@@ -179,7 +179,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
         }
 
         let source_ino = fs.lookup_child_locked(inner, parent, name).ok_or(FsError::ENOENT)?;
-        if fs.is_virtual_ino(source_ino) {
+        if is_virtual_ino(source_ino) {
             return Err(FsError::EPERM);
         }
         let source_attr = fs.get_attr_locked(inner, source_ino).ok_or(FsError::ENOENT)?;
@@ -206,7 +206,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
 
         let mut dest_was_dir = false;
         if let Some(dest_ino) = fs.lookup_child_locked(inner, newparent, newname) {
-            if fs.is_virtual_ino(dest_ino) {
+            if is_virtual_ino(dest_ino) {
                 return Err(FsError::EPERM);
             }
             // POSIX: when old and new resolve to different directory entries for the same
@@ -327,7 +327,7 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
         }
 
         let target_attr = fs.get_attr_locked(inner, ino).ok_or(FsError::ENOENT)?;
-        if target_attr.file_type == FileType::Directory || fs.is_virtual_ino(ino) {
+        if target_attr.file_type == FileType::Directory || is_virtual_ino(ino) {
             return Err(FsError::EPERM);
         }
         if target_attr.nlink == 0 {
