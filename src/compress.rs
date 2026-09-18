@@ -75,6 +75,27 @@ pub fn compress_zstd(payload: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Inspects the zstd frame header to determine the uncompressed content size
+/// without decompressing the payload.
+pub fn zstd_frame_content_size(compressed: &[u8]) -> io::Result<usize> {
+    let frame_size = zstd::zstd_safe::get_frame_content_size(compressed)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zstd frame error: {}", e)))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed frame missing content size"))?
+        as usize;
+
+    if frame_size > MAX_DECOMPRESSED_RECORD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compressed payload claims to expand to {} bytes, beyond the {} byte limit",
+                frame_size, MAX_DECOMPRESSED_RECORD
+            ),
+        ));
+    }
+
+    Ok(frame_size)
+}
+
 /// Decompresses a raw zstd frame verifying that its decompressed size matches `expected_len`.
 pub fn decompress_zstd_exact(compressed: &[u8], expected_len: usize) -> io::Result<Vec<u8>> {
     if expected_len > MAX_DECOMPRESSED_RECORD {
@@ -87,10 +108,7 @@ pub fn decompress_zstd_exact(compressed: &[u8], expected_len: usize) -> io::Resu
         ));
     }
 
-    let frame_size = zstd::zstd_safe::get_frame_content_size(compressed)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zstd frame error: {}", e)))?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed frame missing content size"))?
-        as usize;
+    let frame_size = zstd_frame_content_size(compressed)?;
 
     if frame_size != expected_len {
         return Err(io::Error::new(
@@ -121,10 +139,7 @@ pub fn decompress_zstd_exact(compressed: &[u8], expected_len: usize) -> io::Resu
 
 /// Decompresses a raw zstd frame with a maximum decompressed size limit.
 pub fn decompress_zstd_with_limit(compressed: &[u8], max_len: usize) -> io::Result<Vec<u8>> {
-    let original_len = zstd::zstd_safe::get_frame_content_size(compressed)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zstd frame error: {}", e)))?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed frame missing content size"))?
-        as usize;
+    let original_len = zstd_frame_content_size(compressed)?;
 
     if original_len > max_len {
         return Err(io::Error::new(
@@ -223,5 +238,16 @@ mod tests {
         let err = decompress_zstd_exact(&compressed, MAX_DECOMPRESSED_RECORD + 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("beyond the"));
+    }
+
+    #[test]
+    fn test_zstd_frame_content_size() {
+        let text = b"test payload for frame content size inspection";
+        let compressed = compress_zstd_unconditional(text).unwrap();
+        assert_eq!(zstd_frame_content_size(&compressed).unwrap(), text.len());
+
+        // Corrupt / empty / truncated frame
+        assert!(zstd_frame_content_size(&[]).is_err());
+        assert!(zstd_frame_content_size(&[0x28, 0xb5, 0x2f, 0xfd, 0x00]).is_err());
     }
 }
