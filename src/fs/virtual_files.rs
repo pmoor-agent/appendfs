@@ -82,12 +82,6 @@ impl VirtualFileRegistry {
         self.name_to_ino.read().unwrap().get(name).copied()
     }
 
-    /// Checks if an inode falls into the virtual inode range.
-    #[inline]
-    pub fn is_virtual_ino(&self, ino: u64) -> bool {
-        is_virtual_ino(ino)
-    }
-
     /// Generates content for a virtual file by inode.
     pub fn generate_content(&self, ino: u64, fs: &InMemoryFS) -> Option<String> {
         let idx = *self.ino_to_idx.read().unwrap().get(&ino)?;
@@ -133,7 +127,8 @@ mod tests {
         let registry = VirtualFileRegistry::new();
         let ino = registry.register(".status", |_| "status: ok\n".to_string());
 
-        assert!(registry.is_virtual_ino(ino));
+        assert!(is_virtual_ino(ino));
+        assert!(!is_virtual_ino(1));
         assert_eq!(registry.get_ino_by_name(".status"), Some(ino));
         assert_eq!(registry.get_ino_by_name(".nonexistent"), None);
 

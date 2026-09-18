@@ -1,6 +1,6 @@
 use crate::error::FsError;
 use crate::extent_map::{Extent, ExtentMap};
-use crate::fs::{FileHandle, FlushReason, FsInner, InMemoryFS};
+use crate::fs::{FileHandle, FlushReason, FsInner, InMemoryFS, is_virtual_ino};
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
 use crate::shim::{DeferredCompletion, DeferredResult, FileAttr, FileType, FuseResponse, RequestContext};
 use crate::sync::OpTag;
@@ -45,7 +45,7 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> 
         return Err(FsError::EROFS);
     }
 
-    if fs.is_virtual_ino(ino) {
+    if is_virtual_ino(ino) {
         if write_requested {
             return Err(FsError::EACCES);
         }
@@ -99,7 +99,7 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> 
 }
 
 pub fn open_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
-    let is_virtual = fs.is_virtual_ino(ino);
+    let is_virtual = is_virtual_ino(ino);
     open_core(fs, ino, flags).map(|fh| {
         FuseResponse::open(
             fh,
@@ -114,7 +114,7 @@ pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset:
     if fs.is_read_only() {
         return Err(FsError::EROFS);
     }
-    if fs.is_virtual_ino(ino) {
+    if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
 
@@ -162,7 +162,7 @@ pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset:
 
 #[cfg(any(test, feature = "testing"))]
 pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
-    if fs.is_virtual_ino(ino) {
+    if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
     let fh = open_core(fs, ino, libc::O_RDWR as u32)?;
@@ -206,7 +206,7 @@ pub fn setattr_core(
     if fs.is_read_only() {
         return Err(FsError::EROFS);
     }
-    if fs.is_virtual_ino(ino) {
+    if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
 
@@ -348,7 +348,7 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
     if fs.is_read_only() {
         return Err(FsError::EROFS);
     }
-    if fs.is_virtual_ino(ino) {
+    if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
     if offset < 0 || length <= 0 {

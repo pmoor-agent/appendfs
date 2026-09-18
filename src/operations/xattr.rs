@@ -1,5 +1,5 @@
 use crate::error::FsError;
-use crate::fs::InMemoryFS;
+use crate::fs::{InMemoryFS, is_virtual_ino};
 use crate::node::AttrDelta;
 use crate::shim::FuseResponse;
 use crate::sync::OpTag;
@@ -13,7 +13,7 @@ pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Resu
     if fs.get_attr_locked(&inner, ino).is_none() {
         return Err(FsError::ENOENT);
     }
-    if fs.is_virtual_ino(ino) {
+    if is_virtual_ino(ino) {
         return Err(FsError::ENODATA);
     }
 
@@ -38,7 +38,7 @@ pub fn setxattr_core(
     if fs.is_read_only() {
         return Err(FsError::EROFS);
     }
-    if fs.is_virtual_ino(ino) {
+    if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
 
@@ -83,7 +83,7 @@ pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResp
     if fs.get_attr_locked(&inner, ino).is_none() {
         return Err(FsError::ENOENT);
     }
-    if fs.is_virtual_ino(ino) {
+    if is_virtual_ino(ino) {
         return Ok(if size == 0 {
             FuseResponse::xattr_size(0)
         } else {
@@ -112,7 +112,7 @@ pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<FuseRes
     if fs.is_read_only() {
         return Err(FsError::EROFS);
     }
-    if fs.is_virtual_ino(ino) {
+    if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
 
