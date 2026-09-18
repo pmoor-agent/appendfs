@@ -100,6 +100,8 @@ pub enum DumpRecordEntry {
 pub struct OpCodeStats {
     pub count: usize,
     pub payload_bytes: u64,
+    pub uncompressed_bytes: u64,
+    pub decompressed_count: usize,
 }
 
 /// Reads and analyzes a single `.log` generation file, formatting the output based on `verbosity`:
@@ -267,6 +269,7 @@ pub fn dump_log_reader_with_path(
 
         let unwrapped =
             crate::log::codec::decode(volume_key.unwrap_or(&plaintext_key), id, &raw_payload, &header.auth_tag).ok();
+        let was_decompressed = unwrapped.is_some();
 
         // Falling back to the raw bytes keeps a keyless or corrupt dump useful: seeing what
         // is physically on disk is the point of this tool.
@@ -287,6 +290,14 @@ pub fn dump_log_reader_with_path(
         if op_idx < op_counts.len() {
             op_counts[op_idx].count += 1;
             op_counts[op_idx].payload_bytes += header.payload_len as u64;
+            if header.op_code == OpCode::DataZstd {
+                if was_decompressed {
+                    op_counts[op_idx].uncompressed_bytes += payload.len() as u64;
+                    op_counts[op_idx].decompressed_count += 1;
+                }
+            } else {
+                op_counts[op_idx].uncompressed_bytes += payload.len() as u64;
+            }
         }
 
         if header.op_code == OpCode::Data || header.op_code == OpCode::DataZstd {
@@ -406,6 +417,69 @@ pub fn dump_log_reader_with_path(
             .unwrap();
         }
     }
+
+    let zstd_stats = &op_counts[OpCode::DataZstd as usize];
+    if zstd_stats.count > 0 {
+        writeln!(out).unwrap();
+        if zstd_stats.decompressed_count == zstd_stats.count {
+            let uncompressed = zstd_stats.uncompressed_bytes;
+            let compressed = zstd_stats.payload_bytes;
+            let saved = uncompressed.saturating_sub(compressed);
+            let pct = if uncompressed > 0 {
+                (saved as f64 / uncompressed as f64) * 100.0
+            } else {
+                0.0
+            };
+            let ratio = if compressed > 0 {
+                uncompressed as f64 / compressed as f64
+            } else {
+                0.0
+            };
+            writeln!(
+                out,
+                "DataZstd Compression: {} -> {}, saved {} / {:.1}%, {:.2}x",
+                format_bytes(uncompressed),
+                format_bytes(compressed),
+                format_bytes(saved),
+                pct,
+                ratio
+            )
+            .unwrap();
+        } else if zstd_stats.decompressed_count > 0 {
+            let uncompressed = zstd_stats.uncompressed_bytes;
+            let compressed = zstd_stats.payload_bytes;
+            let saved = uncompressed.saturating_sub(compressed);
+            let pct = if uncompressed > 0 {
+                (saved as f64 / uncompressed as f64) * 100.0
+            } else {
+                0.0
+            };
+            let ratio = if compressed > 0 {
+                uncompressed as f64 / compressed as f64
+            } else {
+                0.0
+            };
+            writeln!(
+                out,
+                "DataZstd Compression ({} of {} records decompressed): {} -> {}, saved {} / {:.1}%, {:.2}x",
+                zstd_stats.decompressed_count,
+                zstd_stats.count,
+                format_bytes(uncompressed),
+                format_bytes(compressed),
+                format_bytes(saved),
+                pct,
+                ratio
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                out,
+                "DataZstd Compression: {} records encrypted (unlock with volume key to view savings)",
+                zstd_stats.count
+            )
+            .unwrap();
+        }
+    }
     writeln!(out).unwrap();
 
     // Write size histogram
@@ -473,7 +547,7 @@ pub fn dump_log_reader_with_path(
                     .unwrap();
 
                     // Decode payload details
-                    format_payload_details(&mut out, header.op_code, payload, verbosity >= 2);
+                    format_payload_details(&mut out, header.op_code, header.payload_len, payload, verbosity >= 2);
                 }
                 DumpRecordEntry::TornRecord {
                     offset,
@@ -1077,7 +1151,7 @@ pub fn dump_summary_reader_with_path(
     Ok(out)
 }
 
-fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump_data_hex: bool) {
+fn format_payload_details(out: &mut String, opcode: OpCode, stored_len: u32, payload: &[u8], dump_data_hex: bool) {
     let dummy_header = crate::log::record::RecordHeader {
         op_code: opcode,
         inode: 0,
@@ -1091,7 +1165,22 @@ fn format_payload_details(out: &mut String, opcode: OpCode, payload: &[u8], dump
     };
     match dummy_record.decode() {
         Ok(crate::log::record::DecodedPayload::Data(data)) => {
-            writeln!(out, "      data_len: {}", format_bytes(data.len() as u64)).unwrap();
+            if opcode == OpCode::DataZstd && data.len() as u64 > stored_len as u64 {
+                let uncompressed = data.len() as u64;
+                let compressed = stored_len as u64;
+                let saved = uncompressed - compressed;
+                let pct = (saved as f64 / uncompressed as f64) * 100.0;
+                writeln!(
+                    out,
+                    "      data_len: {} (saved {} / {:.1}%)",
+                    format_bytes(uncompressed),
+                    format_bytes(saved),
+                    pct
+                )
+                .unwrap();
+            } else {
+                writeln!(out, "      data_len: {}", format_bytes(data.len() as u64)).unwrap();
+            }
 
             if dump_data_hex && !data.is_empty() {
                 out.push_str(&format_hexdump(data, 256));
@@ -1707,5 +1796,98 @@ mod tests {
 
         let empty_file = LogEntryDelta::Node(LogNodeDelta::File(Default::default()));
         assert_eq!(format_log_entry_delta(&empty_file), "File {}");
+    }
+
+    #[test]
+    fn test_dump_log_file_compression_savings_display() {
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(OsStorage::new(dir.path()));
+        let clock = SystemClock;
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            &clock,
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap()
+        .with_compression(crate::compress::Compression::Zstd);
+
+        // Highly compressible payload: 16 KiB of repeating text
+        let compressible_data = "Hello compression savings test! ".repeat(512).into_bytes();
+        let uncompressed_len = compressible_data.len() as u64;
+        writer.append_record(OpCode::Data, 2, &compressible_data).unwrap();
+
+        // Small / incompressible payload that stays OpCode::Data
+        let small_data = vec![0x42; 8];
+        writer.append_record(OpCode::Data, 3, &small_data).unwrap();
+
+        writer
+            .emit_flush_commit_and_flush(2, uncompressed_len + 8, &clock)
+            .unwrap();
+        drop(writer);
+
+        // Level 0: verify summary table and dedicated compression line
+        let v0_dump = dump_log_file(storage.as_ref(), "000001.log", 0, None).unwrap();
+        assert!(v0_dump.contains("--- Record Breakdown by OpCode ---"));
+        assert!(v0_dump.contains("DataZstd"));
+        assert!(v0_dump.contains("DataZstd Compression:"));
+        assert!(v0_dump.contains("saved"));
+
+        // Level 1: verify sequential stream has per-record savings for DataZstd
+        let v1_dump = dump_log_file(storage.as_ref(), "000001.log", 1, None).unwrap();
+        assert!(v1_dump.contains("DataZstd"));
+        assert!(v1_dump.contains("(saved "));
+        // Data record should not show (saved ...)
+        assert!(v1_dump.contains("data_len: 8 B\n"));
+    }
+
+    #[test]
+    fn test_dump_log_file_compression_encrypted_without_key() {
+        use crate::crypto::{KeySource, MasterKey, VolumeHeader};
+
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(OsStorage::new(dir.path()));
+        let clock = SystemClock;
+
+        let master = MasterKey::new([0x33u8; 32]);
+        let (_header, vol_key) = VolumeHeader::new_encrypted(
+            &master,
+            [0x11u8; 16],
+            KeySource::KeyFile,
+            crate::compress::Compression::Zstd,
+        )
+        .unwrap();
+
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            &clock,
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            Arc::new(vol_key.clone()),
+        )
+        .unwrap()
+        .with_compression(crate::compress::Compression::Zstd);
+
+        let compressible_data = "Repeating encrypted log data line. ".repeat(300).into_bytes();
+        writer.append_record(OpCode::Data, 2, &compressible_data).unwrap();
+        writer
+            .emit_flush_commit_and_flush(1, compressible_data.len() as u64, &clock)
+            .unwrap();
+        drop(writer);
+
+        // Keyless dump: should recognize encrypted DataZstd and report key needed for savings
+        let keyless_dump = dump_log_file(storage.as_ref(), "000001.log", 0, None).unwrap();
+        assert!(
+            keyless_dump.contains("DataZstd Compression: 1 records encrypted (unlock with volume key to view savings)")
+        );
+
+        // Dump with key: should show actual savings
+        let unlocked_dump = dump_log_file(storage.as_ref(), "000001.log", 0, Some(&vol_key)).unwrap();
+        assert!(unlocked_dump.contains("DataZstd Compression:"));
+        assert!(unlocked_dump.contains("saved"));
+        assert!(!unlocked_dump.contains("encrypted (unlock with volume key"));
     }
 }
