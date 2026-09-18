@@ -91,10 +91,6 @@ impl LogManifest {
         }
     }
 
-    pub fn new_with_time(start_generation: u64, _created_at: SystemTime) -> Self {
-        Self::new(start_generation)
-    }
-
     /// Returns the physical filename for the next log generation (e.g. "000002.log").
     pub fn next_filename(&self) -> String {
         log_filename(self.next_generation)
@@ -102,7 +98,8 @@ impl LogManifest {
 
     /// Records a sealed log file entry into the manifest and advances `next_generation`.
     ///
-    /// Panics if an entry for `(generation, revision)` has already been recorded in the manifest.
+    /// Panics if an entry for `(generation, revision)` has already been recorded in the manifest,
+    /// or if a generation greater than `log.generation` already exists in the manifest.
     pub fn record_sealed_log(&mut self, log: LogFileInfo) {
         assert!(
             !self
@@ -112,6 +109,11 @@ impl LogManifest {
             "generation {} revision {} already recorded in manifest",
             log.generation,
             log.revision
+        );
+        assert!(
+            !self.logs.iter().any(|l| l.generation > log.generation),
+            "generation {} cannot be recorded: manifest already contains a greater generation",
+            log.generation
         );
         if log.generation >= self.next_generation {
             self.next_generation = log.generation + 1;
@@ -239,5 +241,33 @@ mod tests {
         };
         manifest.record_sealed_log(log.clone());
         manifest.record_sealed_log(log);
+    }
+
+    #[test]
+    #[should_panic(expected = "manifest already contains a greater generation")]
+    fn test_record_sealed_log_out_of_order_panics() {
+        let mut manifest = LogManifest::new(1);
+        let log2 = LogFileInfo {
+            generation: 2,
+            revision: 0,
+            filename: "000002.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 5,
+            total_bytes: 1024,
+            total_data_bytes: 512,
+            md5: [2u8; 16],
+        };
+        let log1 = LogFileInfo {
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 5,
+            total_bytes: 1024,
+            total_data_bytes: 512,
+            md5: [1u8; 16],
+        };
+        manifest.record_sealed_log(log2);
+        manifest.record_sealed_log(log1);
     }
 }

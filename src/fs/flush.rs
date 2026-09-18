@@ -285,10 +285,8 @@ impl InMemoryFS {
                 }
             }
 
-            // 3. Emit FlushCommit trailer
-            writer.emit_flush_commit(written_count, &*self.clock)?;
-            writer.flush()?;
-            writer.record_batch_flushed(written_count + 1, flushed_data_bytes);
+            // 3. Emit FlushCommit trailer and flush through to durable media
+            writer.emit_flush_commit_and_flush(written_count, flushed_data_bytes, &*self.clock)?;
 
             let active_offset = writer.current_offset();
             let disk_bytes = active_offset.saturating_sub(batch_start_offset);

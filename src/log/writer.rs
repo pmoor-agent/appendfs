@@ -562,9 +562,15 @@ impl LogWriter {
         Ok(())
     }
 
-    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records.
+    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records, flushes
+    /// to persistent media, and updates active log record and data byte counters.
     /// Assigns and returns the next monotonic `batch_id`.
-    pub fn emit_flush_commit(&self, record_count: u32, clock: &dyn Clock) -> io::Result<u64> {
+    pub fn emit_flush_commit_and_flush(
+        &self,
+        record_count: u32,
+        data_bytes: u64,
+        clock: &dyn Clock,
+    ) -> io::Result<u64> {
         let batch_id = self.batch_id.fetch_add(1, Ordering::SeqCst);
         let now = clock.now();
         let commit_payload = FlushCommitPayload {
@@ -580,7 +586,25 @@ impl LogWriter {
             self.batch_id.store(batch_id, Ordering::SeqCst);
             return Err(e);
         }
+
+        self.flush()?;
+
+        let mut state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if let ActiveLogState::Open(active) = &mut *state {
+            active.record_count += record_count + 1;
+            active.total_data_bytes += data_bytes;
+        }
+
         Ok(batch_id)
+    }
+
+    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records and flushes to disk.
+    /// Convenience wrapper around [`LogWriter::emit_flush_commit_and_flush`] with 0 data bytes.
+    pub fn emit_flush_commit(&self, record_count: u32, clock: &dyn Clock) -> io::Result<u64> {
+        self.emit_flush_commit_and_flush(record_count, 0, clock)
     }
 
     /// Flushes unwritten internal buffers through to persistent media.
@@ -666,18 +690,6 @@ impl LogWriter {
         match &*state {
             ActiveLogState::Unopened { .. } => None,
             ActiveLogState::Open(active) => Some(active.md5_hasher.clone().compute().0),
-        }
-    }
-
-    /// Updates record count and data bytes of the active log file upon successful flush of a batch.
-    pub fn record_batch_flushed(&self, records: u32, data_bytes: u64) {
-        let mut state = match self.active_state.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-        if let ActiveLogState::Open(active) = &mut *state {
-            active.record_count += records;
-            active.total_data_bytes += data_bytes;
         }
     }
 
@@ -825,13 +837,14 @@ mod tests {
         writer
             .append_record(OpCode::InodeDelta, 1, b"second record payload")
             .unwrap();
-        writer.emit_flush_commit(2, &clock).unwrap();
-        writer.record_batch_flushed(3, 20);
+        writer.emit_flush_commit_and_flush(2, 20, &clock).unwrap();
 
         // Roll to generation 2 -> returns sealed LogFileInfo
         let roll_res = writer.roll_if_needed(1000, &clock).unwrap();
         let sealed_info = roll_res.unwrap();
         assert_eq!(sealed_info.generation, 1);
+        assert_eq!(sealed_info.record_count, 3);
+        assert_eq!(sealed_info.total_data_bytes, 20);
         assert_eq!(writer.generation(), 2);
         let sealed_md5 = sealed_info.md5;
 
