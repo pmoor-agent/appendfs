@@ -86,6 +86,7 @@ pub enum DumpRecordEntry {
         offset: u64,
         header: RecordHeader,
         payload: Vec<u8>,
+        uncompressed_len: Option<u64>,
         is_committed: bool,
     },
     TornRecord {
@@ -149,10 +150,6 @@ pub fn dump_log_reader_with_path(
     reader.read_exact_at(0, &mut header_buf)?;
     let file_header = FileHeader::from_bytes(&header_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    // A keyless dump still has to unwrap the compression envelope, so it decodes with a
-    // pass-through key rather than skipping the codec - that asymmetry is what previously
-    // left keyless dumps showing every payload shifted by the envelope's tag byte.
-    let plaintext_key = VolumeKey::plaintext();
     let mut records: Vec<DumpRecordEntry> = Vec::new();
     let mut current_offset = FILE_HEADER_SIZE as u64;
 
@@ -237,15 +234,7 @@ pub fn dump_log_reader_with_path(
             break;
         }
 
-        let id = crate::log::codec::RecordId {
-            generation: file_header.generation,
-            revision: file_header.revision,
-            record_offset,
-            op_code: header.op_code as u8,
-            inode: header.inode,
-        };
-
-        if let Some(key) = volume_key {
+        let decrypted = if let Some(key) = volume_key {
             match key.decrypt_record(
                 file_header.generation,
                 file_header.revision,
@@ -255,7 +244,7 @@ pub fn dump_log_reader_with_path(
                 &raw_payload,
                 &header.auth_tag,
             ) {
-                Ok(_) => {}
+                Ok(plain) => Some(plain),
                 Err(e) => {
                     records.push(DumpRecordEntry::TornRecord {
                         offset: record_offset,
@@ -265,22 +254,49 @@ pub fn dump_log_reader_with_path(
                     break;
                 }
             }
-        }
+        } else {
+            None
+        };
 
-        let unwrapped =
-            crate::log::codec::decode(volume_key.unwrap_or(&plaintext_key), id, &raw_payload, &header.auth_tag).ok();
-        let was_decompressed = unwrapped.is_some();
-
-        // Falling back to the raw bytes keeps a keyless or corrupt dump useful: seeing what
-        // is physically on disk is the point of this tool.
-        let payload = unwrapped.unwrap_or(raw_payload);
+        let mut uncompressed_len = None;
+        let payload = match header.op_code {
+            OpCode::DataZstd => {
+                let zstd_slice: &[u8] = if let Some(ref plain) = decrypted {
+                    plain
+                } else {
+                    &raw_payload
+                };
+                if let Ok(sz) = crate::compress::zstd_frame_content_size(zstd_slice) {
+                    uncompressed_len = Some(sz as u64);
+                }
+                if verbosity >= 2 {
+                    if uncompressed_len.is_some() {
+                        crate::compress::decompress_zstd(zstd_slice).unwrap_or(raw_payload)
+                    } else {
+                        raw_payload
+                    }
+                } else {
+                    Vec::new()
+                }
+            }
+            OpCode::Data => {
+                uncompressed_len = Some(header.payload_len as u64);
+                if verbosity >= 2 {
+                    decrypted.unwrap_or(raw_payload)
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => decrypted.unwrap_or(raw_payload),
+        };
 
         let is_commit = header.op_code == OpCode::FlushCommit;
         let rec_idx = records.len();
         records.push(DumpRecordEntry::Valid {
             offset: record_offset,
             header,
-            payload: payload.clone(),
+            payload,
+            uncompressed_len,
             is_committed: false, // will update below
         });
 
@@ -291,17 +307,17 @@ pub fn dump_log_reader_with_path(
             op_counts[op_idx].count += 1;
             op_counts[op_idx].payload_bytes += header.payload_len as u64;
             if header.op_code == OpCode::DataZstd {
-                if was_decompressed {
-                    op_counts[op_idx].uncompressed_bytes += payload.len() as u64;
+                if let Some(uncompressed) = uncompressed_len {
+                    op_counts[op_idx].uncompressed_bytes += uncompressed;
                     op_counts[op_idx].decompressed_count += 1;
                 }
             } else {
-                op_counts[op_idx].uncompressed_bytes += payload.len() as u64;
+                op_counts[op_idx].uncompressed_bytes += header.payload_len as u64;
             }
         }
 
         if header.op_code == OpCode::Data || header.op_code == OpCode::DataZstd {
-            let data_len = payload.len() as u64;
+            let data_len = uncompressed_len.unwrap_or(header.payload_len as u64);
             for b in &mut write_buckets {
                 if b.matches(data_len) {
                     b.add(data_len);
@@ -521,6 +537,7 @@ pub fn dump_log_reader_with_path(
                     offset,
                     header,
                     payload,
+                    uncompressed_len,
                     is_committed,
                 } => {
                     let commit_tag = if *is_committed {
@@ -547,7 +564,14 @@ pub fn dump_log_reader_with_path(
                     .unwrap();
 
                     // Decode payload details
-                    format_payload_details(&mut out, header.op_code, header.payload_len, payload, verbosity >= 2);
+                    format_payload_details(
+                        &mut out,
+                        header.op_code,
+                        header.payload_len,
+                        *uncompressed_len,
+                        payload,
+                        verbosity >= 2,
+                    );
                 }
                 DumpRecordEntry::TornRecord {
                     offset,
@@ -1151,56 +1175,94 @@ pub fn dump_summary_reader_with_path(
     Ok(out)
 }
 
-fn format_payload_details(out: &mut String, opcode: OpCode, stored_len: u32, payload: &[u8], dump_data_hex: bool) {
-    let dummy_header = crate::log::record::RecordHeader {
-        op_code: opcode,
-        inode: 0,
-        payload_len: payload.len() as u32,
-        auth_tag: [0; crate::log::record::AUTH_TAG_SIZE],
-    };
-    let dummy_record = crate::log::reader::LogRecord {
-        header: dummy_header,
-        payload: payload.to_vec(),
-        record_log_offset: 0,
-    };
-    match dummy_record.decode() {
-        Ok(crate::log::record::DecodedPayload::Data(data)) => {
-            if opcode == OpCode::DataZstd && data.len() as u64 > stored_len as u64 {
-                let uncompressed = data.len() as u64;
-                let compressed = stored_len as u64;
-                let saved = uncompressed - compressed;
-                let pct = (saved as f64 / uncompressed as f64) * 100.0;
-                writeln!(
-                    out,
-                    "      data_len: {} (saved {} / {:.1}%)",
-                    format_bytes(uncompressed),
-                    format_bytes(saved),
-                    pct
-                )
-                .unwrap();
+fn format_payload_details(
+    out: &mut String,
+    opcode: OpCode,
+    stored_len: u32,
+    uncompressed_len: Option<u64>,
+    payload: &[u8],
+    dump_data_hex: bool,
+) {
+    match opcode {
+        OpCode::Data => {
+            writeln!(out, "      data_len: {}", format_bytes(stored_len as u64)).unwrap();
+            if dump_data_hex && !payload.is_empty() {
+                out.push_str(&format_hexdump(payload, 256));
+            }
+        }
+        OpCode::DataZstd => {
+            if let Some(uncompressed) = uncompressed_len {
+                if uncompressed > stored_len as u64 {
+                    let compressed = stored_len as u64;
+                    let saved = uncompressed - compressed;
+                    let pct = (saved as f64 / uncompressed as f64) * 100.0;
+                    writeln!(
+                        out,
+                        "      data_len: {} (saved {} / {:.1}%)",
+                        format_bytes(uncompressed),
+                        format_bytes(saved),
+                        pct
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(out, "      data_len: {}", format_bytes(uncompressed)).unwrap();
+                }
             } else {
-                writeln!(out, "      data_len: {}", format_bytes(data.len() as u64)).unwrap();
+                writeln!(out, "      data_len: {}", format_bytes(stored_len as u64)).unwrap();
             }
 
-            if dump_data_hex && !data.is_empty() {
-                out.push_str(&format_hexdump(data, 256));
+            if dump_data_hex && !payload.is_empty() {
+                out.push_str(&format_hexdump(payload, 256));
             }
         }
-        Ok(crate::log::record::DecodedPayload::InodeDelta(delta)) => {
-            writeln!(out, "      delta: {}", format_log_entry_delta(&delta)).unwrap();
+        OpCode::InodeDelta => {
+            let dummy_header = crate::log::record::RecordHeader {
+                op_code: opcode,
+                inode: 0,
+                payload_len: payload.len() as u32,
+                auth_tag: [0; crate::log::record::AUTH_TAG_SIZE],
+            };
+            let dummy_record = crate::log::reader::LogRecord {
+                header: dummy_header,
+                payload: payload.to_vec(),
+                record_log_offset: 0,
+            };
+            match dummy_record.decode() {
+                Ok(crate::log::record::DecodedPayload::InodeDelta(delta)) => {
+                    writeln!(out, "      delta: {}", format_log_entry_delta(&delta)).unwrap();
+                }
+                _ => {
+                    writeln!(out, "      [Failed to deserialize {}Payload]", opcode).unwrap();
+                }
+            }
         }
-        Ok(crate::log::record::DecodedPayload::FlushCommit(b)) => {
-            writeln!(
-                out,
-                "      batch_id: {}, batch_record_count: {}, commit_timestamp: {}",
-                b.batch_id,
-                b.record_count,
-                format_system_time(b.timestamp)
-            )
-            .unwrap();
-        }
-        Err(_) => {
-            writeln!(out, "      [Failed to deserialize {}Payload]", opcode).unwrap();
+        OpCode::FlushCommit => {
+            let dummy_header = crate::log::record::RecordHeader {
+                op_code: opcode,
+                inode: 0,
+                payload_len: payload.len() as u32,
+                auth_tag: [0; crate::log::record::AUTH_TAG_SIZE],
+            };
+            let dummy_record = crate::log::reader::LogRecord {
+                header: dummy_header,
+                payload: payload.to_vec(),
+                record_log_offset: 0,
+            };
+            match dummy_record.decode() {
+                Ok(crate::log::record::DecodedPayload::FlushCommit(b)) => {
+                    writeln!(
+                        out,
+                        "      batch_id: {}, batch_record_count: {}, commit_timestamp: {}",
+                        b.batch_id,
+                        b.record_count,
+                        format_system_time(b.timestamp)
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    writeln!(out, "      [Failed to deserialize {}Payload]", opcode).unwrap();
+                }
+            }
         }
     }
 }
@@ -1841,6 +1903,10 @@ mod tests {
         assert!(v1_dump.contains("(saved "));
         // Data record should not show (saved ...)
         assert!(v1_dump.contains("data_len: 8 B\n"));
+
+        // Level 2: verify sequential stream with hex dump has decompressed data
+        let v2_dump = dump_log_file(storage.as_ref(), "000001.log", 2, None).unwrap();
+        assert!(v2_dump.contains("Hello compressio"));
     }
 
     #[test]
@@ -1889,5 +1955,9 @@ mod tests {
         assert!(unlocked_dump.contains("DataZstd Compression:"));
         assert!(unlocked_dump.contains("saved"));
         assert!(!unlocked_dump.contains("encrypted (unlock with volume key"));
+
+        // Level 2 dump with key: should decrypt, decompress, and hex dump
+        let v2_unlocked = dump_log_file(storage.as_ref(), "000001.log", 2, Some(&vol_key)).unwrap();
+        assert!(v2_unlocked.contains("Repeating encryp"));
     }
 }
