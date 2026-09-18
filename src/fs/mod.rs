@@ -23,7 +23,7 @@ pub use crate::operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetri
 pub use arena::WriteArena;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use overlay::{InnerStatsSnapshot, InodeCounts};
-pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry};
+pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry, is_virtual_ino};
 
 use crate::clock::{Clock, SystemClock};
 use crate::error::FsError;

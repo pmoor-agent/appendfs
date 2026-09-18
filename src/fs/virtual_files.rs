@@ -29,6 +29,12 @@ pub struct VirtualFileRegistry {
     next_ino: AtomicU64,
 }
 
+/// Checks if an inode falls into the virtual inode range.
+#[inline]
+pub fn is_virtual_ino(ino: u64) -> bool {
+    ino >= VIRTUAL_INO_BASE
+}
+
 impl VirtualFileRegistry {
     pub fn new() -> Self {
         Self {
@@ -77,8 +83,9 @@ impl VirtualFileRegistry {
     }
 
     /// Checks if an inode falls into the virtual inode range.
+    #[inline]
     pub fn is_virtual_ino(&self, ino: u64) -> bool {
-        ino >= VIRTUAL_INO_BASE
+        is_virtual_ino(ino)
     }
 
     /// Generates content for a virtual file by inode.

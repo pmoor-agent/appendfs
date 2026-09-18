@@ -72,8 +72,15 @@ fn test_fuse_response_constructors() {
     assert_eq!(attr_resp, FuseResponse::Attr(attr));
 
     // open
-    let open = FuseResponse::open(7, true);
-    assert_eq!(open, FuseResponse::Open { fh: 7, direct_io: true });
+    let open = FuseResponse::open(7, /* direct_io = */ true, /* keep_cache = */ false);
+    assert_eq!(
+        open,
+        FuseResponse::Open {
+            fh: 7,
+            direct_io: true,
+            keep_cache: false
+        }
+    );
 
     // write
     let write = FuseResponse::write(128);
@@ -511,4 +518,66 @@ fn test_filesystem_trait_all_methods() {
     let _ = fs.unlink(dir_ino, "sym1");
     let rmdir_ok = fs.rmdir(1, "dir1");
     assert_eq!(rmdir_ok, Ok(FuseResponse::ok()));
+}
+
+#[test]
+fn test_open_cache_flags_and_timeout_delineation() {
+    let fs = InMemoryFS::new();
+
+    // Create a regular file
+    let ctx = RequestContext::new(1000, 1000, 0);
+    let create_res = create_response(&fs, ctx, 1, "test.txt", 0o644, (libc::O_CREAT | libc::O_RDWR) as u32).unwrap();
+    let regular_ino = match create_res {
+        FuseResponse::Create { attr, .. } => attr.ino,
+        _ => panic!("expected FuseResponse::Create"),
+    };
+
+    // 1. Regular file open: direct_io = false, keep_cache = true
+    let reg_open = open_response(&fs, regular_ino, libc::O_RDONLY as u32).unwrap();
+    assert!(
+        matches!(
+            reg_open,
+            FuseResponse::Open {
+                direct_io: false,
+                keep_cache: true,
+                ..
+            }
+        ),
+        "Regular files must have direct_io=false and keep_cache=true"
+    );
+
+    // 2. Virtual file open (.status): direct_io = true, keep_cache = false
+    let status_ino = fs.lookup_child(1, ".status").expect(".status must exist");
+    let virt_open = open_response(&fs, status_ino, libc::O_RDONLY as u32).unwrap();
+    assert!(
+        matches!(
+            virt_open,
+            FuseResponse::Open {
+                direct_io: true,
+                keep_cache: false,
+                ..
+            }
+        ),
+        "Virtual files must have direct_io=true and keep_cache=false"
+    );
+
+    // 3. Directory open: direct_io = false, keep_cache = false
+    let dir_open = opendir_response(&fs, 1, 0).unwrap();
+    assert!(
+        matches!(
+            dir_open,
+            FuseResponse::Open {
+                direct_io: false,
+                keep_cache: false,
+                ..
+            }
+        ),
+        "Directory handles must have direct_io=false and keep_cache=false"
+    );
+
+    // 4. Timeouts: 1 hour (3600s) for regular inodes, 0.0s for virtual inodes
+    assert_eq!(FuseResponse::DEFAULT_TIMEOUT, 3600.0);
+    assert_eq!(FuseResponse::timeout_for_ino(1), 3600.0);
+    assert_eq!(FuseResponse::timeout_for_ino(regular_ino), 3600.0);
+    assert_eq!(FuseResponse::timeout_for_ino(status_ino), 0.0);
 }

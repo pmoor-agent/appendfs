@@ -136,7 +136,8 @@ pub fn opendir_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsErro
 }
 
 pub fn opendir_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
-    opendir_core(fs, ino, flags).map(|fh| FuseResponse::open(fh, false))
+    opendir_core(fs, ino, flags)
+        .map(|fh| FuseResponse::open(fh, /* direct_io = */ false, /* keep_cache = */ false))
 }
 
 pub fn readdir_entries(

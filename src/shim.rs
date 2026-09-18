@@ -168,7 +168,7 @@ unsafe extern "C" {
     fn shim_reply_entry(req: FuseReqT, attr: *const ShimFileAttr, attr_timeout: f64, entry_timeout: f64) -> c_int;
     fn shim_reply_attr(req: FuseReqT, attr: *const ShimFileAttr, attr_timeout: f64) -> c_int;
     fn shim_reply_buf(req: FuseReqT, buf: *const u8, size: usize) -> c_int;
-    fn shim_reply_open(req: FuseReqT, fh: u64, direct_io: bool) -> c_int;
+    fn shim_reply_open(req: FuseReqT, fh: u64, direct_io: bool, keep_cache: bool) -> c_int;
     fn shim_reply_write(req: FuseReqT, count: usize) -> c_int;
     fn shim_reply_create(
         req: FuseReqT,
@@ -281,13 +281,9 @@ impl Request {
             return;
         }
         let shim_attr = convert_file_attr(attr);
+        let timeout = FuseResponse::timeout_for_ino(attr.ino);
         unsafe {
-            shim_reply_entry(
-                self.req,
-                &shim_attr,
-                FuseResponse::DEFAULT_TIMEOUT,
-                FuseResponse::DEFAULT_TIMEOUT,
-            );
+            shim_reply_entry(self.req, &shim_attr, timeout, timeout);
         }
     }
 
@@ -296,8 +292,9 @@ impl Request {
             return;
         }
         let shim_attr = convert_file_attr(attr);
+        let timeout = FuseResponse::timeout_for_ino(attr.ino);
         unsafe {
-            shim_reply_attr(self.req, &shim_attr, FuseResponse::DEFAULT_TIMEOUT);
+            shim_reply_attr(self.req, &shim_attr, timeout);
         }
     }
 
@@ -310,12 +307,12 @@ impl Request {
         }
     }
 
-    pub(crate) fn reply_open(self, fh: u64, direct_io: bool) {
+    pub(crate) fn reply_open(self, fh: u64, direct_io: bool, keep_cache: bool) {
         if self.req.is_null() {
             return;
         }
         unsafe {
-            shim_reply_open(self.req, fh, direct_io);
+            shim_reply_open(self.req, fh, direct_io, keep_cache);
         }
     }
 
@@ -333,14 +330,9 @@ impl Request {
             return;
         }
         let shim_attr = convert_file_attr(attr);
+        let timeout = FuseResponse::timeout_for_ino(attr.ino);
         unsafe {
-            shim_reply_create(
-                self.req,
-                &shim_attr,
-                FuseResponse::DEFAULT_TIMEOUT,
-                FuseResponse::DEFAULT_TIMEOUT,
-                fh,
-            );
+            shim_reply_create(self.req, &shim_attr, timeout, timeout, fh);
         }
     }
 
@@ -509,8 +501,8 @@ pub enum FuseResponse<'a> {
     Entry(FileAttr),
     /// File attributes (using default cache timeout).
     Attr(FileAttr),
-    /// File or directory handle allocation with direct_io flag.
-    Open { fh: u64, direct_io: bool },
+    /// File or directory handle allocation with direct_io and keep_cache flags.
+    Open { fh: u64, direct_io: bool, keep_cache: bool },
     /// Number of bytes written.
     Write(usize),
     /// Atomic create reply: entry attributes and allocated file handle (using default cache timeout).
@@ -535,7 +527,16 @@ pub enum FuseResponse<'a> {
 }
 
 impl<'a> FuseResponse<'a> {
-    pub const DEFAULT_TIMEOUT: f64 = 1.0;
+    pub const DEFAULT_TIMEOUT: f64 = 3600.0;
+
+    #[inline]
+    pub fn timeout_for_ino(ino: u64) -> f64 {
+        if crate::fs::is_virtual_ino(ino) {
+            0.0
+        } else {
+            Self::DEFAULT_TIMEOUT
+        }
+    }
 
     #[inline]
     pub fn ok() -> Self {
@@ -553,8 +554,12 @@ impl<'a> FuseResponse<'a> {
     }
 
     #[inline]
-    pub fn open(fh: u64, direct_io: bool) -> Self {
-        FuseResponse::Open { fh, direct_io }
+    pub fn open(fh: u64, direct_io: bool, keep_cache: bool) -> Self {
+        FuseResponse::Open {
+            fh,
+            direct_io,
+            keep_cache,
+        }
     }
 
     #[inline]
@@ -634,9 +639,14 @@ impl<'a> FuseResponse<'a> {
             FuseResponse::Ok => FuseResponse::Ok,
             FuseResponse::Entry(a) => FuseResponse::Entry(*a),
             FuseResponse::Attr(a) => FuseResponse::Attr(*a),
-            FuseResponse::Open { fh, direct_io } => FuseResponse::Open {
+            FuseResponse::Open {
+                fh,
+                direct_io,
+                keep_cache,
+            } => FuseResponse::Open {
                 fh: *fh,
                 direct_io: *direct_io,
+                keep_cache: *keep_cache,
             },
             FuseResponse::Write(c) => FuseResponse::Write(*c),
             FuseResponse::Create { attr, fh } => FuseResponse::Create { attr: *attr, fh: *fh },
@@ -662,7 +672,11 @@ impl<'a> FuseResponse<'a> {
             FuseResponse::Ok => req.reply_ok(),
             FuseResponse::Entry(attr) => req.reply_entry(&attr),
             FuseResponse::Attr(attr) => req.reply_attr(&attr),
-            FuseResponse::Open { fh, direct_io } => req.reply_open(fh, direct_io),
+            FuseResponse::Open {
+                fh,
+                direct_io,
+                keep_cache,
+            } => req.reply_open(fh, direct_io, keep_cache),
             FuseResponse::Write(count) => req.reply_write(count),
             FuseResponse::Create { attr, fh } => req.reply_create(&attr, fh),
             FuseResponse::Buf(buf) => req.reply_buf(buf.as_slice()),
@@ -966,16 +980,10 @@ impl DirectoryBufferPlus {
 
     pub fn add(&mut self, name: &str, attr: &FileAttr, next_off: i64) -> bool {
         let shim_attr = convert_file_attr(attr);
+        let timeout = FuseResponse::timeout_for_ino(attr.ino);
         self.0.fill(name, |req, buf_ptr, remaining, c_name_ptr| unsafe {
             shim_add_direntry_plus(
-                req,
-                buf_ptr,
-                remaining,
-                c_name_ptr,
-                &shim_attr,
-                FuseResponse::DEFAULT_TIMEOUT,
-                FuseResponse::DEFAULT_TIMEOUT,
-                next_off,
+                req, buf_ptr, remaining, c_name_ptr, &shim_attr, timeout, timeout, next_off,
             )
         })
     }
@@ -1439,10 +1447,11 @@ mod tests {
         assert_eq!(FuseResponse::ok(), FuseResponse::Ok);
         assert_eq!(FuseResponse::write(42), FuseResponse::Write(42));
         assert_eq!(
-            FuseResponse::open(10, false),
+            FuseResponse::open(10, /* direct_io = */ false, /* keep_cache = */ true),
             FuseResponse::Open {
                 fh: 10,
-                direct_io: false
+                direct_io: false,
+                keep_cache: true,
             }
         );
         assert_eq!(
@@ -1453,6 +1462,12 @@ mod tests {
 
         let buf_resp = FuseResponse::buf(b"test data".as_slice());
         assert_eq!(buf_resp.to_static(), FuseResponse::buf(b"test data".to_vec()));
+
+        // Check timeout_for_ino
+        assert_eq!(FuseResponse::DEFAULT_TIMEOUT, 3600.0);
+        assert_eq!(FuseResponse::timeout_for_ino(1), 3600.0);
+        assert_eq!(FuseResponse::timeout_for_ino(crate::fs::VIRTUAL_INO_BASE), 0.0);
+        assert_eq!(FuseResponse::timeout_for_ino(crate::fs::VIRTUAL_INO_BASE + 5), 0.0);
     }
 
     #[test]
@@ -1460,7 +1475,12 @@ mod tests {
         let req = Request::new_mock();
         reply_result(req, Ok(FuseResponse::ok()));
         reply_result(req, Ok(FuseResponse::write(10)));
-        reply_result(req, Ok(FuseResponse::open(1, false)));
+        reply_result(
+            req,
+            Ok(FuseResponse::open(
+                1, /* direct_io = */ false, /* keep_cache = */ true,
+            )),
+        );
         reply_result(req, Ok(FuseResponse::readlink("dest")));
         reply_result(req, Ok(FuseResponse::buf(b"abc".as_slice())));
         reply_result(req, Ok(FuseResponse::xattr_size(10)));

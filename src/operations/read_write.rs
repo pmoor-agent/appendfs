@@ -99,7 +99,14 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> 
 }
 
 pub fn open_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
-    open_core(fs, ino, flags).map(|fh| FuseResponse::open(fh, fs.is_virtual_ino(ino)))
+    let is_virtual = fs.is_virtual_ino(ino);
+    open_core(fs, ino, flags).map(|fh| {
+        FuseResponse::open(
+            fh,
+            /* direct_io = */ is_virtual,
+            /* keep_cache = */ !is_virtual,
+        )
+    })
 }
 
 pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
