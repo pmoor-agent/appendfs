@@ -1369,7 +1369,7 @@ mod tests {
         writer.append_record(OpCode::Data, 2, &data_bytes).unwrap();
 
         // Commit batch
-        writer.emit_flush_commit(2, &clock).unwrap();
+        writer.emit_flush_commit_and_flush(2, 100, &clock).unwrap();
         drop(writer);
 
         assert!(storage.exists("000001.log"));

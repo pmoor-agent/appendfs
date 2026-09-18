@@ -601,12 +601,6 @@ impl LogWriter {
         Ok(batch_id)
     }
 
-    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records and flushes to disk.
-    /// Convenience wrapper around [`LogWriter::emit_flush_commit_and_flush`] with 0 data bytes.
-    pub fn emit_flush_commit(&self, record_count: u32, clock: &dyn Clock) -> io::Result<u64> {
-        self.emit_flush_commit_and_flush(record_count, 0, clock)
-    }
-
     /// Flushes unwritten internal buffers through to persistent media.
     ///
     /// This is a physical sync, not a buffer hand-off: the flusher calls it on every batch,
@@ -778,14 +772,14 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_flush_commit_round_trip() {
+    fn test_emit_flush_commit_and_flush_round_trip() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
         let writer = LogWriter::create(
             storage.clone(),
             1,
             &clock,
-            DEFAULT_MAX_LOG_SIZE,
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
             VolumeKey::plaintext_arc(),
         )
@@ -793,7 +787,7 @@ mod tests {
 
         writer.append_record(OpCode::InodeDelta, 1, b"payload").unwrap();
         writer.append_record(OpCode::Data, 1, b"more").unwrap();
-        let committed_batch_id = writer.emit_flush_commit(2, &clock).unwrap();
+        let committed_batch_id = writer.emit_flush_commit_and_flush(2, 4, &clock).unwrap();
         assert_eq!(committed_batch_id, 1);
 
         let records: Vec<_> = LogReader::open(storage.as_ref(), &writer.filename(), VolumeKey::plaintext_arc())
@@ -946,7 +940,7 @@ mod tests {
 
         // Write some records and emit flush commit
         writer.append_record(OpCode::Data, 1, b"batch data").unwrap();
-        let committed_id = writer.emit_flush_commit(1, &clock).unwrap();
+        let committed_id = writer.emit_flush_commit_and_flush(1, 10, &clock).unwrap();
         assert_eq!(committed_id, 1);
         assert_eq!(writer.last_batch_id(), 1);
 
@@ -957,7 +951,7 @@ mod tests {
         // Retrying the batch should re-use batch_id 1
         writer.checkpoint_batch_start();
         writer.append_record(OpCode::Data, 1, b"batch data retry").unwrap();
-        let retried_id = writer.emit_flush_commit(1, &clock).unwrap();
+        let retried_id = writer.emit_flush_commit_and_flush(1, 16, &clock).unwrap();
         assert_eq!(retried_id, 1);
         assert_eq!(writer.last_batch_id(), 1);
     }
