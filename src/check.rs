@@ -509,7 +509,10 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
     }
 
     // Pass 3: File Extent & ExtentMap Validation
-    let active_generations: HashSet<u64> = manifest.logs.iter().map(|l| l.generation).collect();
+    let mut active_generations: HashSet<u64> = manifest.logs.iter().map(|l| l.generation).collect();
+    if let Some(ref w) = fs.log_writer {
+        active_generations.insert(w.generation());
+    }
     let cache = fs
         .log_cache
         .clone()
@@ -786,10 +789,7 @@ pub fn check_remote_integrity(
     };
 
     for log_entry in &manifest.logs {
-        // Only verify sealed generations that have an authenticated MD5 ledger entry
-        let Some(expected_md5) = log_entry.md5 else {
-            continue;
-        };
+        let expected_md5 = log_entry.md5;
 
         match listed_objects.get(&log_entry.filename) {
             Some(remote_obj) => {

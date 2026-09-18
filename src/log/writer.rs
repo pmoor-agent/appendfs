@@ -13,8 +13,30 @@ struct ActiveLogFile {
     current_offset: u64,
     filename: String,
     created_at: std::time::SystemTime,
+    record_count: u32,
+    total_data_bytes: u64,
     md5_hasher: md5::Context,
     batch_checkpoint_hasher: Option<md5::Context>,
+    batch_checkpoint_record_count: u32,
+    batch_checkpoint_data_bytes: u64,
+}
+
+impl ActiveLogFile {
+    fn seal(mut self) -> io::Result<super::manifest::LogFileInfo> {
+        self.writer.sync()?;
+        drop(self.writer);
+        let sealed_md5 = self.md5_hasher.compute().0;
+        Ok(super::manifest::LogFileInfo {
+            generation: self.generation,
+            revision: 0,
+            filename: self.filename,
+            created_at: self.created_at,
+            record_count: self.record_count,
+            total_bytes: self.current_offset,
+            total_data_bytes: self.total_data_bytes,
+            md5: sealed_md5,
+        })
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -31,14 +53,13 @@ enum ActiveLogState {
 /// Shared by the three ways a generation ends - size, age, and an explicit force-roll - so
 /// they cannot drift on how a log file is closed out.
 fn seal_and_open_next(
-    active: &mut ActiveLogFile,
+    active: ActiveLogFile,
     storage: &Arc<dyn Storage>,
     clock: &dyn Clock,
     reason: &str,
-) -> io::Result<(u64, [u8; 16])> {
-    active.writer.sync()?;
-    let sealed_md5 = active.md5_hasher.clone().compute().0;
+) -> io::Result<(ActiveLogFile, super::manifest::LogFileInfo)> {
     let next_gen = active.generation + 1;
+    let sealed_info = active.seal()?;
     let next_active = open_generation_file(storage, next_gen, clock.now())?;
     log::info!(
         "{} log file to generation {} ({})",
@@ -46,8 +67,7 @@ fn seal_and_open_next(
         next_gen,
         next_active.filename
     );
-    *active = next_active;
-    Ok((next_gen, sealed_md5))
+    Ok((next_active, sealed_info))
 }
 
 fn open_generation_file(
@@ -71,8 +91,12 @@ fn open_generation_file(
         current_offset: FILE_HEADER_SIZE as u64,
         filename,
         created_at,
+        record_count: 0,
+        total_data_bytes: 0,
         md5_hasher,
         batch_checkpoint_hasher: None,
+        batch_checkpoint_record_count: 0,
+        batch_checkpoint_data_bytes: 0,
     })
 }
 
@@ -82,6 +106,7 @@ use crate::crypto::VolumeKey;
 pub struct LogWriter {
     active_state: Mutex<ActiveLogState>,
     batch_id: AtomicU64,
+    batch_checkpoint_batch_id: AtomicU64,
     storage: Arc<dyn Storage>,
     max_log_size: u64,
     max_log_age: Option<std::time::Duration>,
@@ -118,6 +143,7 @@ impl LogWriter {
         Ok(Self {
             active_state: Mutex::new(ActiveLogState::Open(active_file)),
             batch_id: AtomicU64::new(start_batch_id),
+            batch_checkpoint_batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
@@ -143,6 +169,34 @@ impl LogWriter {
                 created_at: None,
             }),
             batch_id: AtomicU64::new(start_batch_id),
+            batch_checkpoint_batch_id: AtomicU64::new(start_batch_id),
+            storage,
+            max_log_size,
+            max_log_age: None,
+            volume_key,
+            compression: crate::compress::Compression::None,
+            _lock: Some(lock),
+        })
+    }
+
+    /// Creates a lazy log writer with an injected clock whose initial creation timestamp
+    /// is used when the active log file is eventually opened.
+    pub fn create_lazy_with_clock(
+        storage: Arc<dyn Storage>,
+        generation: u64,
+        clock: &dyn Clock,
+        max_log_size: u64,
+        start_batch_id: u64,
+        volume_key: Arc<VolumeKey>,
+    ) -> io::Result<Self> {
+        let lock = storage.acquire_exclusive_lock()?;
+        Ok(Self {
+            active_state: Mutex::new(ActiveLogState::Unopened {
+                generation,
+                created_at: Some(clock.now()),
+            }),
+            batch_id: AtomicU64::new(start_batch_id),
+            batch_checkpoint_batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
@@ -184,25 +238,19 @@ impl LogWriter {
     }
 
     /// Rolls to a new generation log file (or opens the initial lazy log file) if needed.
+    /// Returns the sealed `LogFileInfo` if a rollover occurred.
     pub fn roll_if_needed(
         &self,
         estimated_additional_bytes: u64,
         clock: &dyn Clock,
-    ) -> io::Result<Option<(u64, Option<[u8; 16]>)>> {
+    ) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
 
-        match &mut *state {
-            ActiveLogState::Unopened { generation, created_at } => {
-                let gen_num = *generation;
-                let c_time = created_at.unwrap_or_else(|| clock.now());
-                let active_file = open_generation_file(&self.storage, gen_num, c_time)?;
-                *state = ActiveLogState::Open(active_file);
-                log::info!("Lazily opened log file for generation {}", gen_num);
-                Ok(Some((gen_num, None)))
-            }
+        match &*state {
+            ActiveLogState::Unopened { .. } => {}
             ActiveLogState::Open(active) => {
                 let size_exceeded = active.current_offset > FILE_HEADER_SIZE as u64
                     && active.current_offset + estimated_additional_bytes > self.max_log_size;
@@ -217,9 +265,51 @@ impl LogWriter {
                 if !size_exceeded && !age_exceeded {
                     return Ok(None);
                 }
+            }
+        }
 
-                let (next_gen, sealed_md5) = seal_and_open_next(active, &self.storage, clock, "Rolled")?;
-                Ok(Some((next_gen, Some(sealed_md5))))
+        let old_state = std::mem::replace(
+            &mut *state,
+            ActiveLogState::Unopened {
+                generation: 0,
+                created_at: None,
+            },
+        );
+
+        match old_state {
+            ActiveLogState::Unopened { generation, created_at } => {
+                let gen_num = generation;
+                let c_time = created_at.unwrap_or_else(|| clock.now());
+                match open_generation_file(&self.storage, gen_num, c_time) {
+                    Ok(active_file) => {
+                        *state = ActiveLogState::Open(active_file);
+                        log::info!("Lazily opened log file for generation {}", gen_num);
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        *state = ActiveLogState::Unopened {
+                            generation: gen_num,
+                            created_at,
+                        };
+                        Err(e)
+                    }
+                }
+            }
+            ActiveLogState::Open(active) => {
+                let next_gen = active.generation + 1;
+                match seal_and_open_next(active, &self.storage, clock, "Rolled") {
+                    Ok((next_active, sealed_info)) => {
+                        *state = ActiveLogState::Open(next_active);
+                        Ok(Some(sealed_info))
+                    }
+                    Err(e) => {
+                        *state = ActiveLogState::Unopened {
+                            generation: next_gen,
+                            created_at: None,
+                        };
+                        Err(e)
+                    }
+                }
             }
         }
     }
@@ -231,7 +321,7 @@ impl LogWriter {
     /// The flusher runs this at the end of every cycle, including the idle ones, so an
     /// untouched filesystem still seals its generation on schedule. Leaving the successor
     /// unopened (lazy) ensures an idle filesystem does not generate empty log files over time.
-    pub fn roll_if_aged(&self, clock: &dyn Clock) -> io::Result<Option<(u64, [u8; 16])>> {
+    pub fn roll_if_aged(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let Some(max_age) = self.max_log_age else {
             return Ok(None);
         };
@@ -240,7 +330,7 @@ impl LogWriter {
             Err(e) => e.into_inner(),
         };
 
-        let (next_gen, sealed_md5) = match &mut *state {
+        match &*state {
             // Nothing written yet, so there is nothing to seal.
             ActiveLogState::Unopened { .. } => return Ok(None),
             ActiveLogState::Open(active) => {
@@ -249,54 +339,133 @@ impl LogWriter {
                 {
                     return Ok(None);
                 }
-
-                active.writer.sync()?;
-                let sealed_md5 = active.md5_hasher.clone().compute().0;
-                let next_gen = active.generation + 1;
-                (next_gen, sealed_md5)
             }
+        }
+
+        let old_state = std::mem::replace(
+            &mut *state,
+            ActiveLogState::Unopened {
+                generation: 0,
+                created_at: None,
+            },
+        );
+        let ActiveLogState::Open(active) = old_state else {
+            unreachable!();
         };
 
+        let next_gen = active.generation + 1;
+        let sealed_info = active.seal()?;
         log::info!(
             "Age-rolled log file: sealed generation {}, next generation {} is lazy (unopened)",
-            next_gen - 1,
+            sealed_info.generation,
             next_gen
         );
         *state = ActiveLogState::Unopened {
             generation: next_gen,
             created_at: None,
         };
-        Ok(Some((next_gen, sealed_md5)))
+        Ok(Some(sealed_info))
     }
 
     /// Forcefully rolls the active generation file to `generation + 1` if it has committed data,
-    /// returning the next generation number and the authenticated MD5 digest of the sealed generation.
-    pub fn force_roll(&self, clock: &dyn Clock) -> io::Result<Option<(u64, [u8; 16])>> {
+    /// returning the sealed `LogFileInfo`.
+    pub fn force_roll(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
 
-        match &mut *state {
-            ActiveLogState::Unopened { .. } => Ok(None),
+        match &*state {
+            ActiveLogState::Unopened { .. } => return Ok(None),
             ActiveLogState::Open(active) => {
                 if active.current_offset <= FILE_HEADER_SIZE as u64 {
                     return Ok(None);
                 }
+            }
+        }
 
-                Ok(Some(seal_and_open_next(active, &self.storage, clock, "Force-rolled")?))
+        let old_state = std::mem::replace(
+            &mut *state,
+            ActiveLogState::Unopened {
+                generation: 0,
+                created_at: None,
+            },
+        );
+        let ActiveLogState::Open(active) = old_state else {
+            unreachable!();
+        };
+
+        let next_gen = active.generation + 1;
+        match seal_and_open_next(active, &self.storage, clock, "Force-rolled") {
+            Ok((next_active, sealed_info)) => {
+                *state = ActiveLogState::Open(next_active);
+                Ok(Some(sealed_info))
+            }
+            Err(e) => {
+                *state = ActiveLogState::Unopened {
+                    generation: next_gen,
+                    created_at: None,
+                };
+                Err(e)
             }
         }
     }
 
-    /// Checkpoints the running MD5 hasher at the beginning of a flush batch for rollback safety.
+    /// If the active log file is currently open and has committed data, syncs and seals it,
+    /// transitioning writer state to `Unopened { generation: next_gen, created_at: None }`.
+    /// Returns the sealed `LogFileInfo` if sealed.
+    pub fn seal_active(&self) -> io::Result<Option<super::manifest::LogFileInfo>> {
+        let mut state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+
+        match &*state {
+            ActiveLogState::Unopened { .. } => return Ok(None),
+            ActiveLogState::Open(active) => {
+                if active.current_offset <= FILE_HEADER_SIZE as u64 {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let old_state = std::mem::replace(
+            &mut *state,
+            ActiveLogState::Unopened {
+                generation: 0,
+                created_at: None,
+            },
+        );
+        let ActiveLogState::Open(active) = old_state else {
+            unreachable!();
+        };
+
+        let next_gen = active.generation + 1;
+        let sealed_info = active.seal()?;
+        log::info!(
+            "Sealed active log generation {}, next generation {} is lazy (unopened)",
+            sealed_info.generation,
+            next_gen
+        );
+        *state = ActiveLogState::Unopened {
+            generation: next_gen,
+            created_at: None,
+        };
+        Ok(Some(sealed_info))
+    }
+
+    /// Checkpoints the running MD5 hasher, counters, and batch_id at the beginning of a flush batch for rollback safety.
     pub fn checkpoint_batch_start(&self) {
+        self.batch_checkpoint_batch_id
+            .store(self.batch_id.load(Ordering::SeqCst), Ordering::SeqCst);
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
         if let ActiveLogState::Open(active) = &mut *state {
             active.batch_checkpoint_hasher = Some(active.md5_hasher.clone());
+            active.batch_checkpoint_record_count = active.record_count;
+            active.batch_checkpoint_data_bytes = active.total_data_bytes;
         }
     }
 
@@ -385,13 +554,23 @@ impl LogWriter {
             if let Some(ref checkpoint) = active.batch_checkpoint_hasher {
                 active.md5_hasher = checkpoint.clone();
             }
+            active.record_count = active.batch_checkpoint_record_count;
+            active.total_data_bytes = active.batch_checkpoint_data_bytes;
         }
+        self.batch_id
+            .store(self.batch_checkpoint_batch_id.load(Ordering::SeqCst), Ordering::SeqCst);
         Ok(())
     }
 
-    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records.
+    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records, flushes
+    /// to persistent media, and updates active log record and data byte counters.
     /// Assigns and returns the next monotonic `batch_id`.
-    pub fn emit_flush_commit(&self, record_count: u32, clock: &dyn Clock) -> io::Result<u64> {
+    pub fn emit_flush_commit_and_flush(
+        &self,
+        record_count: u32,
+        data_bytes: u64,
+        clock: &dyn Clock,
+    ) -> io::Result<u64> {
         let batch_id = self.batch_id.fetch_add(1, Ordering::SeqCst);
         let now = clock.now();
         let commit_payload = FlushCommitPayload {
@@ -403,7 +582,22 @@ impl LogWriter {
         let payload_bytes =
             crate::wire::serialize(&commit_payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        self.append_record(OpCode::FlushCommit, 0, &payload_bytes)?;
+        if let Err(e) = self.append_record(OpCode::FlushCommit, 0, &payload_bytes) {
+            self.batch_id.store(batch_id, Ordering::SeqCst);
+            return Err(e);
+        }
+
+        self.flush()?;
+
+        let mut state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if let ActiveLogState::Open(active) = &mut *state {
+            active.record_count += record_count + 1;
+            active.total_data_bytes += data_bytes;
+        }
+
         Ok(batch_id)
     }
 
@@ -480,6 +674,42 @@ impl LogWriter {
     pub fn last_batch_id(&self) -> u64 {
         self.batch_id.load(Ordering::SeqCst).saturating_sub(1)
     }
+
+    /// Returns the streaming MD5 digest of all bytes written to the active log file so far.
+    pub fn current_md5(&self) -> Option<[u8; 16]> {
+        let state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match &*state {
+            ActiveLogState::Unopened { .. } => None,
+            ActiveLogState::Open(active) => Some(active.md5_hasher.clone().compute().0),
+        }
+    }
+
+    /// Returns the number of records committed in the active log file.
+    pub fn record_count(&self) -> u32 {
+        let state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match &*state {
+            ActiveLogState::Unopened { .. } => 0,
+            ActiveLogState::Open(active) => active.record_count,
+        }
+    }
+
+    /// Returns the total uncompressed data bytes written to the active log file.
+    pub fn total_data_bytes(&self) -> u64 {
+        let state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match &*state {
+            ActiveLogState::Unopened { .. } => 0,
+            ActiveLogState::Open(active) => active.total_data_bytes,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -542,14 +772,14 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_flush_commit_round_trip() {
+    fn test_emit_flush_commit_and_flush_round_trip() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
         let writer = LogWriter::create(
             storage.clone(),
             1,
             &clock,
-            DEFAULT_MAX_LOG_SIZE,
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
             VolumeKey::plaintext_arc(),
         )
@@ -557,7 +787,7 @@ mod tests {
 
         writer.append_record(OpCode::InodeDelta, 1, b"payload").unwrap();
         writer.append_record(OpCode::Data, 1, b"more").unwrap();
-        let committed_batch_id = writer.emit_flush_commit(2, &clock).unwrap();
+        let committed_batch_id = writer.emit_flush_commit_and_flush(2, 4, &clock).unwrap();
         assert_eq!(committed_batch_id, 1);
 
         let records: Vec<_> = LogReader::open(storage.as_ref(), &writer.filename(), VolumeKey::plaintext_arc())
@@ -583,7 +813,7 @@ mod tests {
         assert!(!storage.exists("000001.log"));
 
         let opened_gen = writer.roll_if_needed(100, &clock).unwrap();
-        assert_eq!(opened_gen, Some((1, None)));
+        assert_eq!(opened_gen, None);
         assert!(writer.is_open());
         assert!(storage.exists("000001.log"));
 
@@ -601,13 +831,16 @@ mod tests {
         writer
             .append_record(OpCode::InodeDelta, 1, b"second record payload")
             .unwrap();
-        writer.emit_flush_commit(2, &clock).unwrap();
+        writer.emit_flush_commit_and_flush(2, 20, &clock).unwrap();
 
-        // Roll to generation 2 -> returns (next_gen, Some(sealed_md5))
+        // Roll to generation 2 -> returns sealed LogFileInfo
         let roll_res = writer.roll_if_needed(1000, &clock).unwrap();
-        let (next_gen, sealed_md5_opt) = roll_res.unwrap();
-        assert_eq!(next_gen, 2);
-        let sealed_md5 = sealed_md5_opt.unwrap();
+        let sealed_info = roll_res.unwrap();
+        assert_eq!(sealed_info.generation, 1);
+        assert_eq!(sealed_info.record_count, 3);
+        assert_eq!(sealed_info.total_data_bytes, 20);
+        assert_eq!(writer.generation(), 2);
+        let sealed_md5 = sealed_info.md5;
 
         // Check against MD5 computed by reading back 000001.log from disk
         let disk_bytes = storage.get_file_bytes("000001.log").unwrap();
@@ -649,8 +882,10 @@ mod tests {
         // Aged out now: rolls, seals generation 1, and leaves generation 2 in lazy mode
         let rolled = writer.roll_if_aged(&clock).unwrap();
         assert!(rolled.is_some());
-        let (next_gen, sealed_md5) = rolled.unwrap();
-        assert_eq!(next_gen, 2);
+        let sealed_info = rolled.unwrap();
+        assert_eq!(sealed_info.generation, 1);
+        assert_eq!(writer.generation(), 2);
+        let sealed_md5 = sealed_info.md5;
 
         // Verify sealed generation MD5 matches storage bytes
         let disk_bytes = storage.get_file_bytes("000001.log").unwrap();
@@ -674,5 +909,50 @@ mod tests {
         assert_eq!(offset, FILE_HEADER_SIZE as u64);
         assert!(writer.is_open());
         assert!(storage.exists("000002.log"));
+    }
+
+    #[test]
+    fn test_seal_active_seals_and_switches_to_lazy() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = SystemClock;
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 1000, 1, VolumeKey::plaintext_arc()).unwrap();
+
+        // When nothing written, seal_active returns None
+        assert!(writer.seal_active().unwrap().is_none());
+
+        writer.append_record(OpCode::Data, 1, b"active data").unwrap();
+        let sealed = writer.seal_active().unwrap().unwrap();
+        assert_eq!(sealed.generation, 1);
+        assert_ne!(sealed.md5, [0u8; 16]);
+        assert_eq!(writer.generation(), 2);
+        assert!(!writer.is_open());
+    }
+
+    #[test]
+    fn test_batch_checkpoint_and_rollback_restores_batch_id() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = SystemClock;
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 1000, 1, VolumeKey::plaintext_arc()).unwrap();
+        let initial_offset = writer.current_offset();
+
+        // Checkpoint before batch starts at batch_id = 1
+        writer.checkpoint_batch_start();
+
+        // Write some records and emit flush commit
+        writer.append_record(OpCode::Data, 1, b"batch data").unwrap();
+        let committed_id = writer.emit_flush_commit_and_flush(1, 10, &clock).unwrap();
+        assert_eq!(committed_id, 1);
+        assert_eq!(writer.last_batch_id(), 1);
+
+        // Simulate flush failure: rollback to initial_offset
+        writer.rollback_to(1, initial_offset).unwrap();
+        assert_eq!(writer.last_batch_id(), 0);
+
+        // Retrying the batch should re-use batch_id 1
+        writer.checkpoint_batch_start();
+        writer.append_record(OpCode::Data, 1, b"batch data retry").unwrap();
+        let retried_id = writer.emit_flush_commit_and_flush(1, 16, &clock).unwrap();
+        assert_eq!(retried_id, 1);
+        assert_eq!(writer.last_batch_id(), 1);
     }
 }

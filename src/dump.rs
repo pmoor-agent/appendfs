@@ -1369,7 +1369,7 @@ mod tests {
         writer.append_record(OpCode::Data, 2, &data_bytes).unwrap();
 
         // Commit batch
-        writer.emit_flush_commit(2, &clock).unwrap();
+        writer.emit_flush_commit_and_flush(2, 100, &clock).unwrap();
         drop(writer);
 
         assert!(storage.exists("000001.log"));
@@ -1511,7 +1511,7 @@ mod tests {
                     record_count: 50,
                     total_bytes: 5000,
                     total_data_bytes: 4096,
-                    md5: None,
+                    md5: [1u8; 16],
                 },
                 crate::log::LogFileInfo {
                     generation: 2,
@@ -1521,7 +1521,7 @@ mod tests {
                     record_count: 50,
                     total_bytes: 5000,
                     total_data_bytes: 4096,
-                    md5: None,
+                    md5: [2u8; 16],
                 },
             ],
             next_generation: 3,

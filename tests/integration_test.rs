@@ -1072,12 +1072,10 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
     }
     appendfs::operations::dir::rmdir_core(&fs, 1, "bigdir").unwrap();
 
-    // Verify that the manifest records flushes triggered automatically by operation count!
-    let manifest = fs.manifest.read().unwrap();
-    assert!(!manifest.logs.is_empty());
-    let total_records: u32 = manifest.logs.iter().map(|l| l.record_count).sum();
+    // Verify that the active log writer records flushes triggered automatically by operation count!
+    let writer = fs.log_writer.as_ref().unwrap();
     assert!(
-        total_records > 0,
+        writer.record_count() > 0,
         "metadata unlinks must have been automatically flushed to log"
     );
 }
@@ -1135,9 +1133,8 @@ fn test_background_flusher_in_mount_session() {
         "Dirty ops ({}) must be flushed to 0 by the background flusher",
         fs.total_dirty_ops()
     );
-    let manifest = fs.manifest.read().unwrap();
-    assert!(!manifest.logs.is_empty());
-    assert!(manifest.logs[0].record_count > 0);
+    let writer = fs.log_writer.as_ref().unwrap();
+    assert!(writer.record_count() > 0);
 
     fs.destroy();
 }

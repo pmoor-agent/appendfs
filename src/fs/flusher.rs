@@ -408,16 +408,28 @@ mod tests {
         assert!(storage.exists("000002.log"));
 
         let manifest = fs.manifest.read().unwrap();
+        assert!(
+            !manifest.logs.iter().any(|l| l.generation == 2),
+            "active generation 2 must remain in the log writer and not in the manifest until sealed"
+        );
+        drop(manifest);
+
+        // Sealing/rolling generation 2 records it into the manifest with its creation time and md5
+        let sealed2 = fs.force_roll_active_log().unwrap().unwrap();
+        assert_eq!(sealed2.generation, 2);
+        assert_eq!(
+            sealed2.created_at,
+            clock.now(),
+            "creation time must match the time generation 2 was actually opened"
+        );
+        let manifest = fs.manifest.read().unwrap();
         let gen2 = manifest
             .logs
             .iter()
             .find(|l| l.generation == 2)
-            .expect("generation 2 must be recorded in the manifest after being opened");
-        assert_eq!(
-            gen2.created_at,
-            clock.now(),
-            "manifest creation time must match the time generation 2 was actually opened"
-        );
+            .expect("generation 2 must be recorded in the manifest after being sealed");
+        assert_eq!(gen2.created_at, clock.now());
+        assert_ne!(gen2.md5, [0u8; 16]);
     }
 
     #[test]

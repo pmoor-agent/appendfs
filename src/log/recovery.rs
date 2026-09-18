@@ -171,9 +171,9 @@ pub fn recover_fs(
         let mut committed_records_count = 0u32;
         let mut log_data_bytes = 0u64;
 
-        let reader = LogReader::open(storage.as_ref(), &filename, volume_key.clone())?;
+        let mut reader = LogReader::open(storage.as_ref(), &filename, volume_key.clone())?;
         let log_created_at = reader.file_header().created_at;
-        for record_res in reader {
+        for record_res in &mut reader {
             let record = match record_res {
                 Ok(r) => r,
                 Err(e) => {
@@ -301,30 +301,18 @@ pub fn recover_fs(
         }
 
         let log_file_len = storage.file_len(&filename).unwrap_or(0);
-        {
-            let mut manifest = fs_instance.manifest.write().unwrap();
-            if manifest.get_by_generation(gen_num).is_none() {
-                if manifest.logs.len() == 1 && manifest.logs[0].generation == 1 && min_log_gen == 0 && gen_num == 1 {
-                    let entry = &mut manifest.logs[0];
-                    entry.created_at = log_created_at;
-                    entry.record_count = committed_records_count;
-                    entry.total_data_bytes = log_data_bytes;
-                    entry.total_bytes = log_file_len;
-                } else {
-                    manifest.record_roll(gen_num, log_created_at, crate::log::record::FILE_HEADER_SIZE as u64);
-                    if let Some(entry) = manifest.get_mut_by_generation(gen_num) {
-                        entry.record_count = committed_records_count;
-                        entry.total_data_bytes = log_data_bytes;
-                        entry.total_bytes = log_file_len;
-                    }
-                }
-            } else if let Some(entry) = manifest.get_mut_by_generation(gen_num) {
-                entry.created_at = log_created_at;
-                entry.record_count = committed_records_count;
-                entry.total_data_bytes = log_data_bytes;
-                entry.total_bytes = log_file_len;
-            }
-        }
+        let log_md5 = reader.finish_md5()?;
+        let log_file_info = crate::log::LogFileInfo {
+            generation: gen_num,
+            revision: parse_log_filename(&filename).map(|(_, r)| r).unwrap_or(0),
+            filename: filename.clone(),
+            created_at: log_created_at,
+            record_count: committed_records_count,
+            total_bytes: log_file_len,
+            total_data_bytes: log_data_bytes,
+            md5: log_md5,
+        };
+        fs_instance.manifest.write().unwrap().record_sealed_log(log_file_info);
 
         total_recovered_data_bytes += log_data_bytes;
 
@@ -477,8 +465,9 @@ mod tests {
         writer1
             .append_record(crate::log::record::OpCode::Data, 1, b"batch1 data")
             .unwrap();
-        writer1.emit_flush_commit(1, &*clock).unwrap();
-        writer1.flush().unwrap();
+        writer1
+            .emit_flush_commit_and_flush(1, b"batch1 data".len() as u64, &*clock)
+            .unwrap();
         assert_eq!(writer1.last_batch_id(), 1);
         drop(writer1);
 
@@ -497,8 +486,9 @@ mod tests {
         writer2
             .append_record(crate::log::record::OpCode::Data, 1, b"batch3 data")
             .unwrap();
-        writer2.emit_flush_commit(1, &*clock).unwrap();
-        writer2.flush().unwrap();
+        writer2
+            .emit_flush_commit_and_flush(1, b"batch3 data".len() as u64, &*clock)
+            .unwrap();
         assert_eq!(writer2.last_batch_id(), 3);
         drop(writer2);
 
@@ -577,5 +567,78 @@ mod tests {
         .unwrap();
         assert!(fs_t2500.lookup_child(1, "early_dir").is_some());
         assert!(fs_t2500.lookup_child(1, "late_dir").is_some());
+    }
+
+    #[test]
+    fn test_recovery_computes_manifest_md5_on_the_fly() {
+        let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
+        let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        fs.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage.clone());
+
+        // Create dir "step1" and quiesce (flushes and commits to 000001.log)
+        crate::operations::dir::mkdir_core(&fs, 1, "step1", 0o755, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        // 1. Recover without exporting summary - generation 1 should immediately have its MD5 populated in manifest
+        let recovered = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        let expected_md5_1 = *md5::compute(mem_storage.get_file_bytes("000001.log").unwrap());
+        let manifest = recovered.manifest.read().unwrap();
+        let entry = manifest.get_by_generation(1).expect("generation 1 in manifest");
+        assert_eq!(entry.md5, expected_md5_1);
+        drop(manifest);
+        drop(recovered);
+
+        // 2. Append trailing torn bytes at EOF of 000001.log to simulate crash mid-write
+        let mut bytes = mem_storage.get_file_bytes("000001.log").unwrap();
+        bytes.extend_from_slice(b"trailing torn bytes");
+        mem_storage.insert_file("000001.log", bytes);
+
+        let recovered_torn = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        let expected_md5_torn = *md5::compute(mem_storage.get_file_bytes("000001.log").unwrap());
+        let manifest = recovered_torn.manifest.read().unwrap();
+        let entry = manifest.get_by_generation(1).expect("generation 1 in manifest");
+        assert_eq!(entry.md5, expected_md5_torn);
     }
 }
