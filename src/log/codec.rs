@@ -19,6 +19,7 @@ use std::io;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordId {
     pub generation: u64,
+    pub revision: u32,
     pub record_offset: u64,
     pub op_code: u8,
     pub inode: u64,
@@ -44,6 +45,7 @@ pub fn encode(
     let (ciphertext, auth_tag) = key
         .encrypt_record(
             id.generation,
+            id.revision,
             id.record_offset,
             actual_op as u8,
             id.inode,
@@ -56,7 +58,15 @@ pub fn encode(
 /// Recovers the original payload from bytes read out of the log.
 pub fn decode(key: &VolumeKey, id: RecordId, stored: &[u8], auth_tag: &[u8; 16]) -> io::Result<Vec<u8>> {
     let plain = key
-        .decrypt_record(id.generation, id.record_offset, id.op_code, id.inode, stored, auth_tag)
+        .decrypt_record(
+            id.generation,
+            id.revision,
+            id.record_offset,
+            id.op_code,
+            id.inode,
+            stored,
+            auth_tag,
+        )
         .map_err(io::Error::from)?;
     if id.op_code == OpCode::DataZstd as u8 {
         crate::compress::decompress_zstd(&plain)
@@ -72,6 +82,7 @@ mod tests {
 
     const ID: RecordId = RecordId {
         generation: 3,
+        revision: 0,
         record_offset: 128,
         op_code: 1,
         inode: 42,
@@ -167,5 +178,10 @@ mod tests {
             ..actual_id
         };
         assert!(decode(&key, other_offset, &stored, &tag).is_err());
+        let other_revision = RecordId {
+            revision: ID.revision + 1,
+            ..actual_id
+        };
+        assert!(decode(&key, other_revision, &stored, &tag).is_err());
     }
 }

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 struct ActiveLogFile {
     writer: Box<dyn StorageWriter>,
     generation: u64,
+    revision: u32,
     current_offset: u64,
     filename: String,
     created_at: std::time::SystemTime,
@@ -68,6 +69,7 @@ fn open_generation_file(
     Ok(ActiveLogFile {
         writer,
         generation,
+        revision: file_header.revision,
         current_offset: FILE_HEADER_SIZE as u64,
         filename,
         created_at,
@@ -324,12 +326,14 @@ impl LogWriter {
         };
 
         let generation = active.generation;
+        let revision = active.revision;
         let record_log_offset = active.current_offset;
         let (actual_op, cipher_payload, auth_tag) = crate::log::codec::encode(
             &self.volume_key,
             self.compression,
             crate::log::codec::RecordId {
                 generation,
+                revision,
                 record_offset: record_log_offset,
                 op_code: op_code as u8,
                 inode,
