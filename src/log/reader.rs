@@ -144,6 +144,7 @@ impl Iterator for LogReader {
             &self.volume_key,
             crate::log::codec::RecordId {
                 generation: self.header.generation,
+                revision: self.header.revision,
                 record_offset,
                 op_code: header.op_code as u8,
                 inode: header.inode,

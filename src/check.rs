@@ -576,7 +576,15 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                     }
 
                     if verify_data && let Some(ref c) = cache {
-                        let log_filename = crate::log::log_filename(generation);
+                        let (log_filename, revision) = fs
+                            .manifest
+                            .read()
+                            .ok()
+                            .and_then(|m| {
+                                m.get_by_generation(generation)
+                                    .map(|l| (l.filename.clone(), l.revision))
+                            })
+                            .unwrap_or_else(|| (crate::log::log_filename(generation), 0));
                         if !c.storage().exists(&log_filename) {
                             report.issues.push(IntegrityIssue::error(
                                     "MISSING_LOG_FILE",
@@ -678,6 +686,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                                             ));
                                                         } else if let Err(e) = fs.volume_key.decrypt_record(
                                                             generation,
+                                                            revision,
                                                             record_log_offset,
                                                             rec_header.op_code as u8,
                                                             rec_ino,

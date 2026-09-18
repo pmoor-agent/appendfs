@@ -191,10 +191,11 @@ def parse_entry_delta(payload: bytes) -> tuple:
         raise ValueError(f"Unknown LogEntryDelta tag: {tag}")
 
 
-def derive_record_nonce(generation: int, record_offset: int) -> bytes:
-    """Derives a deterministic 12-byte nonce matching AppendFS's derive_record_nonce."""
-    gen_u32 = generation & 0xFFFFFFFF
-    return struct.pack(">IQ", gen_u32, record_offset)
+def derive_record_nonce(generation: int, revision: int, record_offset: int) -> bytes:
+    """Derives a deterministic 12-byte nonce matching AppendFS's derive_record_nonce.
+    Format: [generation (4 bytes BE) || revision (4 bytes BE) || record_offset (4 bytes BE)]
+    """
+    return struct.pack(">III", generation & 0xFFFFFFFF, revision & 0xFFFFFFFF, record_offset & 0xFFFFFFFF)
 
 
 def derive_record_aad(op_code: int, record_offset: int, inode: int) -> bytes:
@@ -255,10 +256,10 @@ class VolumeDecryptor:
         self.cipher = ChaCha20Poly1305(key_bytes) if key_bytes else None
 
     def decode_record(
-        self, generation: int, record_offset: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
+        self, generation: int, revision: int, record_offset: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
     ) -> bytes:
         if self.cipher is not None:
-            nonce = derive_record_nonce(generation, record_offset)
+            nonce = derive_record_nonce(generation, revision, record_offset)
             aad = derive_record_aad(op_code, record_offset, inode)
             ciphertext_with_tag = payload + auth_tag
             try:
@@ -462,7 +463,7 @@ class Restorer:
                         )
 
                 try:
-                    payload = self.decryptor.decode_record(gen, rec_log_offset, op, ino, raw_payload, tag)
+                    payload = self.decryptor.decode_record(gen, rev, rec_log_offset, op, ino, raw_payload, tag)
                 except Exception as e:
                     raise ValueError(
                         f"Failed to decode/decrypt record in {log_path.name} @ offset 0x{rec_log_offset:x}: {e}"

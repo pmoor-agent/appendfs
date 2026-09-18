@@ -237,6 +237,7 @@ pub fn dump_log_reader_with_path(
 
         let id = crate::log::codec::RecordId {
             generation: file_header.generation,
+            revision: file_header.revision,
             record_offset,
             op_code: header.op_code as u8,
             inode: header.inode,
@@ -245,6 +246,7 @@ pub fn dump_log_reader_with_path(
         if let Some(key) = volume_key {
             match key.decrypt_record(
                 file_header.generation,
+                file_header.revision,
                 record_offset,
                 header.op_code as u8,
                 header.inode,

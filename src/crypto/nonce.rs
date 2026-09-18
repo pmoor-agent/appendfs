@@ -1,18 +1,20 @@
 use rand::RngCore;
 
 /// Derives a deterministic 96-bit (12-byte) nonce for a log record.
-/// Format: `[generation (4 bytes BE) || record_offset (8 bytes BE)]`
+/// Format: `[generation (4 bytes BE) || revision (4 bytes BE) || record_offset (4 bytes BE)]`
 ///
-/// Uniqueness rests on `(generation, record_offset)`. Within a single generation file,
-/// records are strictly append-only, so every record starts at a unique, monotonically
-/// increasing byte offset. Across generation rolls, `generation` increases monotonically,
-/// ensuring nonces never repeat across the volume's lifetime.
+/// Uniqueness rests on `(generation, revision, record_offset)`. Within a single generation file
+/// revision, records are strictly append-only, so every record starts at a unique, monotonically
+/// increasing byte offset. Across generation rolls, `generation` increases monotonically.
+/// When a generation is rewritten, compacted, or purged into a new revision, `revision` advances,
+/// ensuring nonces never repeat across the volume's lifetime even if records reside at identical
+/// byte offsets under the same generation.
 #[inline]
-pub fn derive_record_nonce(generation: u64, record_offset: u64) -> [u8; 12] {
+pub fn derive_record_nonce(generation: u64, revision: u32, record_offset: u64) -> [u8; 12] {
     let mut nonce = [0u8; 12];
-    let gen_u32 = (generation & 0xFFFF_FFFF) as u32;
-    nonce[0..4].copy_from_slice(&gen_u32.to_be_bytes());
-    nonce[4..12].copy_from_slice(&record_offset.to_be_bytes());
+    nonce[0..4].copy_from_slice(&(generation as u32).to_be_bytes());
+    nonce[4..8].copy_from_slice(&revision.to_be_bytes());
+    nonce[8..12].copy_from_slice(&(record_offset as u32).to_be_bytes());
     nonce
 }
 
@@ -36,16 +38,24 @@ mod tests {
 
     #[test]
     fn test_record_nonce_derivation() {
-        let n1 = derive_record_nonce(1, 32);
-        let n2 = derive_record_nonce(1, 100);
-        let n3 = derive_record_nonce(2, 32);
+        let n1 = derive_record_nonce(1, 0, 32);
+        let n2 = derive_record_nonce(1, 0, 100);
+        let n3 = derive_record_nonce(2, 0, 32);
+        let n4 = derive_record_nonce(1, 1, 32);
 
         assert_ne!(n1, n2);
         assert_ne!(n1, n3);
         assert_ne!(n2, n3);
+        assert_ne!(n1, n4);
+        assert_ne!(n3, n4);
 
         assert_eq!(&n1[0..4], &1u32.to_be_bytes());
-        assert_eq!(&n1[4..12], &32u64.to_be_bytes());
+        assert_eq!(&n1[4..8], &0u32.to_be_bytes());
+        assert_eq!(&n1[8..12], &32u32.to_be_bytes());
+
+        assert_eq!(&n4[0..4], &1u32.to_be_bytes());
+        assert_eq!(&n4[4..8], &1u32.to_be_bytes());
+        assert_eq!(&n4[8..12], &32u32.to_be_bytes());
     }
 
     #[test]
