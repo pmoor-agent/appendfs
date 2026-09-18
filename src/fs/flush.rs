@@ -495,15 +495,18 @@ impl InMemoryFS {
         // `destroy` callback never fires (standalone binaries, tests); on a FUSE mount that
         // means this runs twice. Bail out on the second call so it doesn't re-export an
         // unchanged summary or re-notify replication for nothing.
-        let already_stopped = self.with_inner(OpTag::Other, |inner| {
-            if inner.shutdown_state == ShutdownState::Stopped {
-                true
-            } else {
+        //
+        // The state on entry also says *why* the filesystem is read-only, which the rest of
+        // this sequence needs: `Running` means this shutdown is what made it read-only,
+        // whereas `ReadOnly` means it was mounted that way.
+        let entry_state = self.with_inner(OpTag::Other, |inner| {
+            let entry_state = inner.shutdown_state;
+            if entry_state != ShutdownState::Stopped {
                 inner.shutdown_state = ShutdownState::ReadOnly;
-                false
             }
+            entry_state
         });
-        if already_stopped {
+        if entry_state == ShutdownState::Stopped {
             return;
         }
 
@@ -516,9 +519,16 @@ impl InMemoryFS {
 
         // Drains `live`/`flushing` and exports the final summary before anything is torn
         // down, so unmount never strands a write the way discarding queued completions used
-        // to. A no-op if there's no log (in-memory-only session) or the session was already
-        // fully read-only (nothing was ever staged).
-        let _ = self.sync_and_export_summary();
+        // to.
+        //
+        // Skipped entirely for a filesystem that was already read-only on entry - it was
+        // mounted that way (`mount_ro_arc`), and such a mount may be pointed at a historical
+        // recovery target (`--at-time` / `--batch-id`). Exporting from one would publish that
+        // historical state as the volume's newest summary, and a later recovery picking it up
+        // would roll the volume back. A read-only mount has nothing staged to drain anyway.
+        if entry_state == ShutdownState::Running {
+            let _ = self.sync_and_export_summary();
+        }
 
         self.with_inner(OpTag::Other, |inner| {
             inner.shutdown_state = ShutdownState::Stopped;
@@ -2016,6 +2026,83 @@ mod tests {
         drop(guard);
         handle.join().unwrap();
         assert!(destroyed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A filesystem mounted read-only must not write a summary on unmount, even though
+    /// shutdown's own first phase also puts the filesystem into `ShutdownState::ReadOnly`.
+    ///
+    /// This matters most for a time-travel read-only mount (`--at-time` / `--batch-id`), whose
+    /// in-memory state is historical: exporting it would publish that older state as the
+    /// volume's newest summary, and a later recovery preferring it would roll the volume back.
+    #[test]
+    fn test_destroy_on_read_only_mount_does_not_export_a_summary() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+
+        // Staged and flushed before the mount goes read-only, so the writer is genuinely open -
+        // the export path is reachable and only the read-only entry state suppresses it.
+        crate::operations::read_write::create_core(&fs, 1, "before_ro.bin", 0o644, 0, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        let summaries_before = summary_count(storage.as_ref());
+        fs.set_read_only(true);
+        fs.destroy();
+
+        assert_eq!(
+            summary_count(storage.as_ref()),
+            summaries_before,
+            "a read-only mount must not export a summary on unmount"
+        );
+    }
+
+    /// The read-write counterpart of the test above: a normal mount must still export on
+    /// unmount, so the guard above cannot be satisfied by simply never exporting.
+    #[test]
+    fn test_destroy_on_read_write_mount_exports_a_final_summary() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+        crate::operations::read_write::create_core(&fs, 1, "rw.bin", 0o644, 0, 1000, 1000).unwrap();
+
+        let summaries_before = summary_count(storage.as_ref());
+        fs.destroy();
+
+        assert!(
+            summary_count(storage.as_ref()) > summaries_before,
+            "a read-write unmount must export a final summary"
+        );
+    }
+
+    fn summary_count(storage: &dyn Storage) -> usize {
+        storage
+            .list_files()
+            .unwrap()
+            .iter()
+            .filter(|f| f.ends_with(".summary"))
+            .count()
     }
 
     #[test]
