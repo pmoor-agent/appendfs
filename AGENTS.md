@@ -72,6 +72,7 @@ All code contributions follow a standard fork-and-pull-request workflow:
    - Fetch `upstream/main`, fast-forward local `main`, and push `main` to `origin/main`.
    - Delete the local feature branch (`git branch -d <branch-name>`).
    - Delete / prune the merged remote branch on `origin` (`git remote prune origin`).
+   - Clean build artifacts in the worktree to reclaim disk space (`cargo clean`).
 
 ## Common Commands
 
