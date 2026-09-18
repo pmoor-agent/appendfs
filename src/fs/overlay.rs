@@ -389,6 +389,29 @@ pub struct InodeCounts {
 }
 
 impl InodeCounts {
+    /// Computes active inode counts and total logical byte size directly from an iterator of nodes.
+    pub fn from_nodes<'a, I>(nodes: I) -> Self
+    where
+        I: IntoIterator<Item = &'a crate::node::Node>,
+    {
+        let mut counts = Self::default();
+        for node in nodes {
+            match &node.kind {
+                crate::node::NodeKind::Directory { .. } => counts.directories += 1,
+                crate::node::NodeKind::File { size, .. } => {
+                    counts.files += 1;
+                    counts.total_logical_bytes += *size;
+                }
+                crate::node::NodeKind::Symlink { .. } => counts.symlinks += 1,
+                crate::node::NodeKind::Fifo => counts.named_pipes += 1,
+                crate::node::NodeKind::CharDevice { .. } => counts.char_devices += 1,
+                crate::node::NodeKind::BlockDevice { .. } => counts.block_devices += 1,
+                crate::node::NodeKind::Socket => counts.sockets += 1,
+            }
+        }
+        counts
+    }
+
     /// Total number of active inodes across all types.
     pub fn total_active(&self) -> usize {
         self.directories + self.files + self.symlinks + self.special()
