@@ -3941,3 +3941,168 @@ fn test_longest_allowed_file_and_directory_names() {
 
     mount.unmount();
 }
+
+#[test]
+fn test_fuse_non_utf8_access_vectors() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let log_dir = tempfile::Builder::new()
+        .prefix("appendfs_non_utf8_log_")
+        .tempdir()
+        .unwrap();
+    let mount_dir = tempfile::Builder::new()
+        .prefix("appendfs_non_utf8_mount_")
+        .tempdir()
+        .unwrap();
+    let mut mount = TestMount::mount_custom(log_dir, mount_dir, appendfs::InMemoryFS::new(), false);
+    let mount_path = mount.path().to_path_buf();
+
+    let make_c_path = |name_bytes: &[u8]| -> CString {
+        let mut p = mount_path.as_os_str().as_bytes().to_vec();
+        p.push(b'/');
+        p.extend_from_slice(name_bytes);
+        CString::new(p).unwrap()
+    };
+
+    let c_bad_file = make_c_path(b"bad_\xff\xfe_file.txt");
+    let c_bad_dir = make_c_path(b"bad_\xff\xfe_dir");
+    let c_bad_fifo = make_c_path(b"bad_\xff\xfe_fifo");
+    let c_bad_symlink = make_c_path(b"bad_\xff\xfe_symlink");
+    let c_bad_hardlink = make_c_path(b"bad_\xff\xfe_hardlink");
+    let c_bad_rename_dst = make_c_path(b"bad_\xff\xfe_renamed");
+
+    // 1. Stat / lookup of non-UTF8 filename returns ENOENT
+    {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let res = unsafe { libc::stat(c_bad_file.as_ptr(), st.as_mut_ptr()) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOENT));
+    }
+
+    // 2. Open with O_CREAT (create) of non-UTF8 filename returns EINVAL
+    {
+        let fd = unsafe { libc::open(c_bad_file.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644) };
+        assert_eq!(fd, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    // 3. Mkdir with non-UTF8 directory name returns EINVAL
+    {
+        let res = unsafe { libc::mkdir(c_bad_dir.as_ptr(), 0o755) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    // 4. Mknod / mkfifo with non-UTF8 name returns EINVAL
+    {
+        let res = unsafe { libc::mkfifo(c_bad_fifo.as_ptr(), 0o644) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    // 5. Symlink with non-UTF8 link name returns EINVAL
+    {
+        let c_valid_target = CString::new("target.txt").unwrap();
+        let res = unsafe { libc::symlink(c_valid_target.as_ptr(), c_bad_symlink.as_ptr()) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    // 6. Symlink with non-UTF8 target returns EINVAL
+    {
+        let c_bad_target = CString::new(b"target_\xff\xfe.txt".to_vec()).unwrap();
+        let c_valid_symlink = make_c_path(b"valid_symlink");
+        let res = unsafe { libc::symlink(c_bad_target.as_ptr(), c_valid_symlink.as_ptr()) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    // Create a valid file for hard link, rename, and xattr tests
+    let valid_file = mount_path.join("valid.txt");
+    fs::write(&valid_file, b"content for utf8 tests").unwrap();
+    let c_valid_file = CString::new(valid_file.as_os_str().as_bytes().to_vec()).unwrap();
+
+    // 7. Hard link with non-UTF8 destination name returns EINVAL
+    {
+        let res = unsafe { libc::link(c_valid_file.as_ptr(), c_bad_hardlink.as_ptr()) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    // 8. Rename with non-UTF8 destination name returns EINVAL
+    {
+        let res = unsafe { libc::rename(c_valid_file.as_ptr(), c_bad_rename_dst.as_ptr()) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    // 9. Rename with non-UTF8 source name returns ENOENT
+    {
+        let c_valid_rename_dst = make_c_path(b"renamed_target.txt");
+        let res = unsafe { libc::rename(c_bad_file.as_ptr(), c_valid_rename_dst.as_ptr()) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOENT));
+    }
+
+    // 10. Unlink with non-UTF8 filename returns ENOENT
+    {
+        let res = unsafe { libc::unlink(c_bad_file.as_ptr()) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOENT));
+    }
+
+    // 11. Rmdir with non-UTF8 directory name returns ENOENT
+    {
+        let res = unsafe { libc::rmdir(c_bad_dir.as_ptr()) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOENT));
+    }
+
+    // 12. Setxattr / getxattr / removexattr with non-UTF8 attribute name returns EINVAL
+    {
+        let c_bad_xattr = CString::new(b"user.bad_\xff\xfe".to_vec()).unwrap();
+        let val = b"xattr_val";
+        let res = unsafe {
+            libc::setxattr(
+                c_valid_file.as_ptr(),
+                c_bad_xattr.as_ptr(),
+                val.as_ptr() as *const libc::c_void,
+                val.len(),
+                0,
+            )
+        };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+
+        let res = unsafe { libc::getxattr(c_valid_file.as_ptr(), c_bad_xattr.as_ptr(), std::ptr::null_mut(), 0) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+
+        let res = unsafe { libc::removexattr(c_valid_file.as_ptr(), c_bad_xattr.as_ptr()) };
+        assert_eq!(res, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    // 13. Verify filesystem state integrity after all rejected non-UTF8 attempts
+    assert_eq!(fs::read(&valid_file).unwrap(), b"content for utf8 tests");
+
+    let entries: Vec<String> = fs::read_dir(&mount_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
+        .collect();
+    // Only valid.txt and the virtual .status file should exist
+    assert!(entries.contains(&"valid.txt".to_string()));
+    assert!(entries.contains(&".status".to_string()));
+    assert_eq!(entries.len(), 2);
+
+    // Verify creating and reading another valid file succeeds normally
+    let valid_file_2 = mount_path.join("valid_2.txt");
+    fs::write(&valid_file_2, b"subsequent valid file").unwrap();
+    assert_eq!(fs::read(&valid_file_2).unwrap(), b"subsequent valid file");
+
+    fs::remove_file(&valid_file).unwrap();
+    fs::remove_file(&valid_file_2).unwrap();
+
+    mount.unmount();
+}
