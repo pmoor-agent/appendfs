@@ -603,8 +603,6 @@ fn cmd_mount_ro(args: MountRoArgs) {
         }
     };
 
-    let storage: Arc<dyn Storage> = Arc::new(appendfs::storage::ReadOnlyStorage::new(storage));
-
     let registry = load_remote_registry(storage.as_ref());
     let remote_stores = registry.build_read_stores();
 
@@ -613,6 +611,8 @@ fn cmd_mount_ro(args: MountRoArgs) {
     {
         log::warn!("Remote recovery preparation warning: {}", e);
     }
+
+    let storage: Arc<dyn Storage> = Arc::new(appendfs::storage::ReadOnlyStorage::new(storage));
 
     let mut fs_instance = match recover_fs(storage.clone(), target, Arc::new(SystemClock), volume_key) {
         Ok(fs) => fs,
