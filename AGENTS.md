@@ -138,8 +138,11 @@ Golden fixtures are produced deterministically via the `generate_compat_fixture`
 
 - **Regenerate existing v1 fixtures**:
   ```bash
+  cargo run --bin generate_compat_fixture
+  # Or individually:
   cargo run --bin generate_compat_fixture tests/fixtures/v1
-  cargo run --bin generate_compat_fixture tests/fixtures/v1_encrypted
+  cargo run --bin generate_compat_fixture tests/fixtures/v1_passphrase_compressed
+  cargo run --bin generate_compat_fixture tests/fixtures/v1_secret_key_passphrase_compressed
   ```
 
 - **Generate fixtures for a new format version (e.g. v2)**:

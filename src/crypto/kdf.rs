@@ -150,6 +150,18 @@ impl MasterKey {
         Ok(Self { key })
     }
 
+    /// Derives a key that requires *both* a 32-byte secret key and a passphrase.
+    pub fn from_key_bytes_and_passphrase(
+        key_bytes: &[u8; 32],
+        passphrase: &str,
+        salt: &[u8; 16],
+    ) -> Result<Self, CryptoError> {
+        let mut material = combined_material(key_bytes, passphrase);
+        let derived = derive_master_key_argon2id(&material, salt);
+        material.zeroize();
+        Ok(Self { key: derived? })
+    }
+
     /// Derives a key that requires *both* a key file and a passphrase.
     ///
     /// Both secrets go in as Argon2id password material with the volume's random salt kept
@@ -164,16 +176,9 @@ impl MasterKey {
     /// would concatenate identically and collide.
     pub fn from_file_and_passphrase(path: impl AsRef<Path>, passphrase: &str, salt: &[u8; 16]) -> io::Result<Self> {
         let mut key_bytes = load_key_from_file(path)?;
-        let mut material = combined_material(&key_bytes, passphrase);
+        let res = Self::from_key_bytes_and_passphrase(&key_bytes, passphrase, salt).map_err(io::Error::from);
         key_bytes.zeroize();
-
-        // Derive before propagating, so the combined secret is wiped on the error path too.
-        let derived = derive_master_key_argon2id(&material, salt);
-        material.zeroize();
-
-        Ok(Self {
-            key: derived.map_err(io::Error::from)?,
-        })
+        res
     }
 }
 
@@ -298,6 +303,13 @@ mod tests {
         let both = MasterKey::from_file_and_passphrase(temp.path(), "correct horse", &salt).unwrap();
         let again = MasterKey::from_file_and_passphrase(temp.path(), "correct horse", &salt).unwrap();
         assert_eq!(both.key, again.key, "same credentials must reproduce the same key");
+
+        let hex_bytes = load(HEX.as_bytes()).unwrap();
+        let from_bytes = MasterKey::from_key_bytes_and_passphrase(&hex_bytes, "correct horse", &salt).unwrap();
+        assert_eq!(
+            both.key, from_bytes.key,
+            "derivation from in-memory key bytes must match file derivation"
+        );
 
         // Presenting only the key file must not open a two-factor volume. (`from_file` does
         // no derivation, so this comparison is free.)

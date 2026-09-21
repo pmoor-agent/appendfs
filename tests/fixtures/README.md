@@ -4,14 +4,20 @@ This directory contains checked-in golden on-disk storage fixtures used by `test
 
 ## Fixture Versions
 
-- `v1/`: Plaintext golden files for format version 1 (`RecordHeader` version 1, `SummaryHeader` version 1).
+- `v1/`: Plaintext uncompressed golden files for format version 1 (`RecordHeader` version 1, `SummaryHeader` version 1).
   - `000000.summary`: Initial volume summary snapshot.
   - `000001.log`: 3 flushed commit batches covering directories, files, symlinks, special files, and extended attributes.
   - `000001.summary`: Exported snapshot of all populated inodes.
 
-- `v1_encrypted/`: ChaCha20-Poly1305 encrypted golden files derived with Argon2id from canonical passphrase `"passphrase"`.
+- `v1_passphrase_compressed/`: ChaCha20-Poly1305 encrypted golden files derived with Argon2id from canonical passphrase `"passphrase"` with Zstd record compression.
   - `000000.summary`: Initial volume summary snapshot (encrypted with explicit deterministic IV).
-  - `000001.log`: 3 flushed encrypted commit batches.
+  - `000001.log`: 3 flushed encrypted and compressed commit batches.
+  - `000001.summary`: Exported snapshot of all populated inodes (encrypted with explicit deterministic IV).
+
+- `v1_secret_key_passphrase_compressed/`: ChaCha20-Poly1305 encrypted golden files derived with Argon2id from canonical secret key file (`key.hex`) and passphrase `"passphrase"` with Zstd record compression.
+  - `key.hex`: Canonical 32-byte hex key file.
+  - `000000.summary`: Initial volume summary snapshot (encrypted with explicit deterministic IV).
+  - `000001.log`: 3 flushed encrypted and compressed commit batches.
   - `000001.summary`: Exported snapshot of all populated inodes (encrypted with explicit deterministic IV).
 
 ## Generating or Updating Fixtures
@@ -19,11 +25,13 @@ This directory contains checked-in golden on-disk storage fixtures used by `test
 Fixtures are generated deterministically using a fixed mock timestamp and explicit IVs via `generate_compat_fixture`:
 
 ```bash
-# Regenerate v1 plaintext fixtures:
-cargo run --bin generate_compat_fixture tests/fixtures/v1
+# Regenerate all golden fixtures:
+cargo run --bin generate_compat_fixture
 
-# Regenerate v1 encrypted fixtures:
-cargo run --bin generate_compat_fixture tests/fixtures/v1_encrypted
+# Regenerate specific golden fixtures:
+cargo run --bin generate_compat_fixture tests/fixtures/v1
+cargo run --bin generate_compat_fixture tests/fixtures/v1_passphrase_compressed
+cargo run --bin generate_compat_fixture tests/fixtures/v1_secret_key_passphrase_compressed
 
 # Generate fixtures for a new format version (e.g. v2):
 cargo run --bin generate_compat_fixture tests/fixtures/v2
