@@ -365,14 +365,14 @@ fn test_fs_destroy_drains_stalled_waiters_and_completes_cleanly() {
     let start = fs.clock.monotonic();
     fs.dispatch_reply(req, appendfs::FuseOp::Write, response, start);
 
-    assert_eq!(fs.delayed_queue.active_delayed(), 1);
-    assert_eq!(fs.delayed_queue.total_stalled(), 1);
+    assert_eq!(fs.op_metrics.total_active_delayed(), 1);
+    assert_eq!(fs.op_metrics.total_stalled(), 1);
 
     // destroy() must drain the delayed queue before drain_async_ops(),
     // allowing the stalled writer to complete rather than deadlocking unmount.
     fs.destroy();
 
-    assert_eq!(fs.delayed_queue.active_delayed(), 0);
+    assert_eq!(fs.op_metrics.total_active_delayed(), 0);
 }
 
 #[test]

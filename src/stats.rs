@@ -546,9 +546,9 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     }
 
     // 7. Pushback Throttling (if active or throttled)
-    let total_delayed = fs.delayed_queue.total_delayed();
-    let total_stalled = fs.delayed_queue.total_stalled();
-    let active_delayed = fs.delayed_queue.active_delayed();
+    let total_delayed = fs.op_metrics.total_delayed();
+    let total_stalled = fs.op_metrics.total_stalled();
+    let active_delayed = fs.op_metrics.total_active_delayed();
     if total_delayed > 0 || active_delayed > 0 {
         out.push('\n');
         out.push_str("[Pushback Throttling]\n");
@@ -557,11 +557,11 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         out.push_str(&format!("  Hard Stalled:       {}\n", total_stalled));
         out.push_str(&format!(
             "  Total Delay Time:   {}\n",
-            format_duration(fs.delayed_queue.total_delay_duration())
+            format_duration(fs.op_metrics.total_delay_duration())
         ));
         out.push_str(&format!(
             "  Avg Delay / Waiter: {}\n",
-            format_duration(fs.delayed_queue.avg_delay_duration())
+            format_duration(fs.op_metrics.avg_delay_duration())
         ));
     }
 

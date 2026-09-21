@@ -183,12 +183,8 @@ fn test_runtime_status_fuse_operations_throttled_formatting() {
     let req3 = Request::new_mock();
     let start3 = fs.clock.monotonic();
     clock.advance(Duration::from_millis(5));
-    // Manually record throttle and delay via delayed_queue
+    // Delay via delayed_queue (which automatically records throttle and delay queue metrics)
     fs.op_metrics.record_call(FuseOp::Write);
-    fs.op_metrics.record_throttle(
-        FuseOp::Write,
-        appendfs::operations::op::ThrottleDecision::Delay(Duration::from_millis(15)),
-    );
     let dur3 = fs.clock.elapsed_since(start3);
     fs.op_metrics.record_duration(FuseOp::Write, dur3);
     fs.delayed_queue.delay_response(

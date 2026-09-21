@@ -14,7 +14,7 @@ use crate::error::FsError;
 use crate::operations::op::{FuseOp, FuseOpMetrics, OpTier};
 use crate::shim::{FuseResponse, Request, reply_result};
 use std::collections::{BinaryHeap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -62,19 +62,9 @@ struct QueueState {
     stopped: bool,
 }
 
-fn dispatch_item(
-    item: DelayedItem,
-    now: Duration,
-    total_delay_nanos: &AtomicU64,
-    active_delayed: &AtomicUsize,
-    op_metrics: &FuseOpMetrics,
-) {
+fn dispatch_item(item: DelayedItem, now: Duration, op_metrics: &FuseOpMetrics) {
     let elapsed = now.saturating_sub(item.enqueued_at);
-    total_delay_nanos.fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
-    active_delayed.fetch_sub(1, Ordering::SeqCst);
-    if !item.is_stalled {
-        op_metrics.record_throttled_duration(item.op, elapsed);
-    }
+    op_metrics.record_delayed_dispatch(item.op, item.is_stalled, elapsed);
     reply_result(item.req, item.res);
 }
 
@@ -84,10 +74,6 @@ pub struct DelayedResponseQueue {
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     flushing_saturated: AtomicBool,
     cached_ratio_bits: AtomicU64,
-    active_delayed: Arc<AtomicUsize>,
-    total_delayed: Arc<AtomicU64>,
-    total_stalled: Arc<AtomicU64>,
-    total_delay_nanos: Arc<AtomicU64>,
     clock: Arc<dyn Clock>,
     op_metrics: Arc<FuseOpMetrics>,
     base_throttle_delay: Duration,
@@ -99,10 +85,10 @@ impl std::fmt::Debug for DelayedResponseQueue {
         f.debug_struct("DelayedResponseQueue")
             .field("flushing_saturated", &self.is_flushing_saturated())
             .field("cached_saturation_ratio", &self.cached_saturation_ratio())
-            .field("active_delayed", &self.active_delayed())
-            .field("total_delayed", &self.total_delayed())
-            .field("total_stalled", &self.total_stalled())
-            .field("total_delay_duration", &self.total_delay_duration())
+            .field("active_delayed", &self.op_metrics.total_active_delayed())
+            .field("total_delayed", &self.op_metrics.total_delayed())
+            .field("total_stalled", &self.op_metrics.total_stalled())
+            .field("total_delay_duration", &self.op_metrics.total_delay_duration())
             .field("base_throttle_delay", &self.base_throttle_delay)
             .field("max_throttle_delay", &self.max_throttle_delay)
             .finish()
@@ -128,27 +114,15 @@ impl DelayedResponseQueue {
         max_throttle_delay: Duration,
     ) -> Self {
         let state = Arc::new((Mutex::new(QueueState::default()), Condvar::new()));
-        let active_delayed = Arc::new(AtomicUsize::new(0));
-        let total_delayed = Arc::new(AtomicU64::new(0));
-        let total_stalled = Arc::new(AtomicU64::new(0));
-        let total_delay_nanos = Arc::new(AtomicU64::new(0));
 
         let thread_state = Arc::clone(&state);
         let thread_clock = Arc::clone(&clock);
-        let thread_total_delay_nanos = Arc::clone(&total_delay_nanos);
-        let thread_active_delayed = Arc::clone(&active_delayed);
         let thread_op_metrics = Arc::clone(&op_metrics);
 
         let thread = std::thread::Builder::new()
             .name("appendfs-delayed-queue".to_string())
             .spawn(move || {
-                Self::worker_loop(
-                    thread_state,
-                    thread_clock,
-                    thread_total_delay_nanos,
-                    thread_active_delayed,
-                    thread_op_metrics,
-                );
+                Self::worker_loop(thread_state, thread_clock, thread_op_metrics);
             })
             .expect("failed to spawn delayed response queue worker thread");
 
@@ -157,10 +131,6 @@ impl DelayedResponseQueue {
             thread: Mutex::new(Some(thread)),
             flushing_saturated: AtomicBool::new(false),
             cached_ratio_bits: AtomicU64::new(0.0f64.to_bits()),
-            active_delayed,
-            total_delayed,
-            total_stalled,
-            total_delay_nanos,
             clock,
             op_metrics,
             base_throttle_delay,
@@ -171,8 +141,6 @@ impl DelayedResponseQueue {
     fn worker_loop(
         state_pair: Arc<(Mutex<QueueState>, Condvar)>,
         clock: Arc<dyn Clock>,
-        total_delay_nanos: Arc<AtomicU64>,
-        active_delayed: Arc<AtomicUsize>,
         op_metrics: Arc<FuseOpMetrics>,
     ) {
         let (lock, cvar) = &*state_pair;
@@ -195,7 +163,7 @@ impl DelayedResponseQueue {
             if !to_reply.is_empty() {
                 drop(state);
                 for item in to_reply {
-                    dispatch_item(item, now, &total_delay_nanos, &active_delayed, &op_metrics);
+                    dispatch_item(item, now, &op_metrics);
                 }
                 state = lock.lock().unwrap();
                 continue;
@@ -300,34 +268,9 @@ impl DelayedResponseQueue {
         self.calculate_tier_decision(tier, ratio)
     }
 
-    /// Number of responses currently waiting in the delayed queue.
-    pub fn active_delayed(&self) -> usize {
-        self.active_delayed.load(Ordering::SeqCst)
-    }
-
-    /// Total number of responses that have been throttled (delayed or stalled) across filesystem lifetime.
-    pub fn total_delayed(&self) -> u64 {
-        self.total_delayed.load(Ordering::SeqCst)
-    }
-
-    /// Total number of responses that encountered a hard stall across filesystem lifetime.
-    pub fn total_stalled(&self) -> u64 {
-        self.total_stalled.load(Ordering::SeqCst)
-    }
-
-    /// Total cumulative duration that operations were delayed due to write pushback.
-    pub fn total_delay_duration(&self) -> Duration {
-        Duration::from_nanos(self.total_delay_nanos.load(Ordering::SeqCst))
-    }
-
-    /// Average pushback delay duration per delayed operation.
-    pub fn avg_delay_duration(&self) -> Duration {
-        let total = self.total_delayed();
-        if total == 0 {
-            Duration::ZERO
-        } else {
-            self.total_delay_duration() / (total as u32)
-        }
+    /// Returns the metrics collector associated with this delayed response queue.
+    pub fn op_metrics(&self) -> &Arc<FuseOpMetrics> {
+        &self.op_metrics
     }
 
     /// Wakes up any operations waiting on capacity (e.g. after a batch is committed to disk).
@@ -347,13 +290,7 @@ impl DelayedResponseQueue {
 
         let now = self.clock.monotonic();
         for item in to_reply {
-            dispatch_item(
-                item,
-                now,
-                &self.total_delay_nanos,
-                &self.active_delayed,
-                &self.op_metrics,
-            );
+            dispatch_item(item, now, &self.op_metrics);
         }
     }
 
@@ -375,13 +312,7 @@ impl DelayedResponseQueue {
             cvar.notify_all();
         }
         for item in to_reply {
-            dispatch_item(
-                item,
-                now,
-                &self.total_delay_nanos,
-                &self.active_delayed,
-                &self.op_metrics,
-            );
+            dispatch_item(item, now, &self.op_metrics);
         }
     }
 
@@ -406,13 +337,7 @@ impl DelayedResponseQueue {
 
         let now = self.clock.monotonic();
         for item in to_reply {
-            dispatch_item(
-                item,
-                now,
-                &self.total_delay_nanos,
-                &self.active_delayed,
-                &self.op_metrics,
-            );
+            dispatch_item(item, now, &self.op_metrics);
         }
 
         if let Some(thread) = self.thread.lock().unwrap().take() {
@@ -451,8 +376,7 @@ impl DelayedResponseQueue {
                 let deadline = enqueued_at + delay;
                 let id = state.next_id;
                 state.next_id += 1;
-                self.active_delayed.fetch_add(1, Ordering::SeqCst);
-                self.total_delayed.fetch_add(1, Ordering::SeqCst);
+                self.op_metrics.record_delayed_enqueue(op, decision);
                 state.delayed.push(DelayedItem {
                     op,
                     deadline,
@@ -475,9 +399,7 @@ impl DelayedResponseQueue {
                 let enqueued_at = self.clock.monotonic();
                 let id = state.next_id;
                 state.next_id += 1;
-                self.active_delayed.fetch_add(1, Ordering::SeqCst);
-                self.total_delayed.fetch_add(1, Ordering::SeqCst);
-                self.total_stalled.fetch_add(1, Ordering::SeqCst);
+                self.op_metrics.record_delayed_enqueue(op, decision);
                 state.stalled.push_back(DelayedItem {
                     op,
                     deadline: Duration::MAX,
@@ -523,11 +445,11 @@ mod tests {
         let metrics = Arc::new(FuseOpMetrics::new());
         let queue = DelayedResponseQueue::new(clock, metrics);
 
-        assert_eq!(queue.active_delayed(), 0);
-        assert_eq!(queue.total_delayed(), 0);
+        assert_eq!(queue.op_metrics().total_active_delayed(), 0);
+        assert_eq!(queue.op_metrics().total_delayed(), 0);
 
         queue.drain();
-        assert_eq!(queue.active_delayed(), 0);
+        assert_eq!(queue.op_metrics().total_active_delayed(), 0);
     }
 
     #[test]
@@ -539,14 +461,14 @@ mod tests {
         // Schedule with Stall (hard indefinite wait)
         queue.delay_response(FuseOp::Write, ThrottleDecision::Stall, req, response);
 
-        assert_eq!(queue.active_delayed(), 1);
-        assert_eq!(queue.total_delayed(), 1);
-        assert_eq!(queue.total_stalled(), 1);
+        assert_eq!(queue.op_metrics().total_active_delayed(), 1);
+        assert_eq!(queue.op_metrics().total_delayed(), 1);
+        assert_eq!(queue.op_metrics().total_stalled(), 1);
 
         // Drain on unmount
         queue.drain();
 
-        assert_eq!(queue.active_delayed(), 0);
+        assert_eq!(queue.op_metrics().total_active_delayed(), 0);
     }
 
     #[test]
@@ -589,9 +511,9 @@ mod tests {
         fs.dispatch_reply(req, crate::operations::op::FuseOp::Write, response, start);
 
         // It should now be queued, active, and tracked in op_metrics
-        assert_eq!(fs.delayed_queue.active_delayed(), 1);
-        assert_eq!(fs.delayed_queue.total_delayed(), 1);
-        assert_eq!(fs.delayed_queue.total_stalled(), 1);
+        assert_eq!(fs.op_metrics.total_active_delayed(), 1);
+        assert_eq!(fs.op_metrics.total_delayed(), 1);
+        assert_eq!(fs.op_metrics.total_stalled(), 1);
         assert_eq!(fs.op_metrics.calls(crate::operations::op::FuseOp::Write), 1);
         assert_eq!(fs.op_metrics.stalled(crate::operations::op::FuseOp::Write), 1);
 
@@ -599,7 +521,7 @@ mod tests {
         let _ = fs.pop_flushing_batch();
 
         // Hard-stalled waiter should have been unblocked and finished immediately!
-        assert_eq!(fs.delayed_queue.active_delayed(), 0);
+        assert_eq!(fs.op_metrics.total_active_delayed(), 0);
     }
 
     #[test]
@@ -615,8 +537,8 @@ mod tests {
         fs.max_flush_queue_depth = 1;
 
         // Initially, zero delay
-        assert_eq!(fs.delayed_queue.total_delay_duration(), Duration::ZERO);
-        assert_eq!(fs.delayed_queue.avg_delay_duration(), Duration::ZERO);
+        assert_eq!(fs.op_metrics.total_delay_duration(), Duration::ZERO);
+        assert_eq!(fs.op_metrics.avg_delay_duration(), Duration::ZERO);
 
         // Dispatch a normal request with start time to record op execution latency
         let req = Request::new_mock();
@@ -634,26 +556,22 @@ mod tests {
         // Delay a response to verify aggregate backpressure delay tracking
         let req2 = Request::new_mock();
         let resp2 = Ok(FuseResponse::write(50));
-        fs.op_metrics.record_throttle(
-            crate::operations::op::FuseOp::Write,
-            ThrottleDecision::Delay(Duration::from_millis(20)),
-        );
         fs.delayed_queue.delay_response(
             crate::operations::op::FuseOp::Write,
             ThrottleDecision::Delay(Duration::from_millis(20)),
             req2,
             resp2,
         );
-        assert_eq!(fs.delayed_queue.active_delayed(), 1);
-        assert_eq!(fs.delayed_queue.total_delayed(), 1);
+        assert_eq!(fs.op_metrics.total_active_delayed(), 1);
+        assert_eq!(fs.op_metrics.total_delayed(), 1);
 
         // Advance mock clock to simulate the passage of delay time deterministically
         adv_clock.advance(Duration::from_millis(20));
         fs.delayed_queue.wake_expired();
 
-        assert_eq!(fs.delayed_queue.active_delayed(), 0);
-        assert_eq!(fs.delayed_queue.total_delay_duration(), Duration::from_millis(20));
-        assert_eq!(fs.delayed_queue.avg_delay_duration(), Duration::from_millis(20));
+        assert_eq!(fs.op_metrics.total_active_delayed(), 0);
+        assert_eq!(fs.op_metrics.total_delay_duration(), Duration::from_millis(20));
+        assert_eq!(fs.op_metrics.avg_delay_duration(), Duration::from_millis(20));
         assert_eq!(fs.op_metrics.throttled(crate::operations::op::FuseOp::Write), 1);
         assert_eq!(
             fs.op_metrics
@@ -687,7 +605,6 @@ mod tests {
         let resp = Ok(FuseResponse::write(42));
 
         // Decision was to sleep for 50ms (e.g. calculated delay)
-        metrics.record_throttle(FuseOp::Write, ThrottleDecision::Delay(Duration::from_millis(50)));
         queue.delay_response(
             FuseOp::Write,
             ThrottleDecision::Delay(Duration::from_millis(50)),
@@ -695,15 +612,15 @@ mod tests {
             resp,
         );
 
-        assert_eq!(queue.active_delayed(), 1);
+        assert_eq!(metrics.total_active_delayed(), 1);
 
         // Advance clock only 10ms before a background flush commits and frees capacity
         clock.advance(Duration::from_millis(10));
         queue.notify_capacity();
 
-        assert_eq!(queue.active_delayed(), 0);
+        assert_eq!(metrics.total_active_delayed(), 0);
         // Verify actual time spent waiting (10ms) was captured, NOT the decided sleep time (50ms)
         assert_eq!(metrics.avg_throttled_duration(FuseOp::Write), Duration::from_millis(10));
-        assert_eq!(queue.total_delay_duration(), Duration::from_millis(10));
+        assert_eq!(metrics.total_delay_duration(), Duration::from_millis(10));
     }
 }

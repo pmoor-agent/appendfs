@@ -1193,7 +1193,6 @@ impl InMemoryFS {
     ) {
         self.op_metrics.record_call(op);
         let decision = self.calculate_throttle(op);
-        self.op_metrics.record_throttle(op, decision);
 
         let res = res.into();
         match res {
