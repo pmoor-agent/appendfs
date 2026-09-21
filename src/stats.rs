@@ -267,7 +267,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     // 1. Volume & Manifest Info
     let (head_gen, next_gen, total_gens, total_disk_bytes) = {
         let manifest = fs.manifest.read().unwrap();
-        let head = fs.log_writer.as_ref().map(|w| w.generation());
+        let head = fs.log_writer.as_ref().filter(|w| w.is_open()).map(|w| w.generation());
         let total_gens = manifest.logs.len();
         let total_disk: u64 = manifest.logs.iter().map(|l| l.total_bytes).sum();
         (head, fs.next_generation(), total_gens, total_disk)
@@ -305,6 +305,8 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
             head,
             crate::log::log_filename(head)
         ));
+    } else if fs.log_writer.as_ref().is_some_and(|w| !w.is_open()) {
+        out.push_str("  Active Generation:  None (lazy / unopened)\n");
     } else {
         out.push_str("  Active Generation:  None (read-only / detached log writer)\n");
     }
@@ -803,6 +805,34 @@ mod tests {
         let status = format_runtime_status(&fs);
         assert!(status.contains("Active Generation:  5 (000005.log)"));
         assert!(status.contains("Next Generation:    6 (000006.log)"));
+    }
+
+    #[test]
+    fn test_format_runtime_status_with_lazy_writer() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::SystemClock);
+        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage.clone());
+        let writer = Arc::new(
+            crate::log::LogWriter::create_lazy(
+                storage,
+                1,
+                1024 * 1024,
+                1,
+                Arc::new(crate::crypto::VolumeKey::plaintext()),
+            )
+            .unwrap(),
+        );
+        fs.attach_log_writer(writer);
+        let status = format_runtime_status(&fs);
+        assert!(status.contains("Active Generation:  None (lazy / unopened)"));
+        assert!(status.contains("Next Generation:    1 (000001.log)"));
+
+        // After writing and flushing, the generation file is opened and active
+        crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+        let status_after_write = format_runtime_status(&fs);
+        assert!(status_after_write.contains("Active Generation:  1 (000001.log)"));
+        assert!(status_after_write.contains("Next Generation:    2 (000002.log)"));
     }
 
     #[test]
