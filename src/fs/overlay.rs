@@ -4,7 +4,11 @@
 //! into them. Reads go through [`InMemoryFS::with_layer_stack`], which takes all three
 //! layer locks in a safe order - see [`super::layers`] for why the order matters.
 
-use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, ReadPlan, is_virtual_ino};
+use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, is_virtual_ino};
+// Only the test-only by-inode read helpers at the bottom of this file return these.
+#[cfg(any(test, feature = "testing"))]
+use super::ReadPlan;
+#[cfg(any(test, feature = "testing"))]
 use crate::error::FsError;
 use crate::extent_map::ExtentMap;
 use crate::node::{
@@ -482,13 +486,20 @@ impl InMemoryFS {
         self.inner.lock(OpTag::Xattr).unwrap().list_xattrs(ino)
     }
 
+    /// Plans a read by inode alone, without an open handle.
+    ///
+    /// Test-only. Real reads arrive with a file handle and go through
+    /// [`InMemoryFS::plan_read_handle`], which additionally validates the handle and serves
+    /// virtual files; this exists so tests can read an inode without opening it first.
+    #[cfg(any(test, feature = "testing"))]
     pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, FsError> {
         self.with_inner(OpTag::ReadPlan, |inner| {
+            inner.check_shutdown(false)?;
             let plan = inner.with_inode_layers(ino, |layers| {
                 layers.plan_read_file_data(offset, size, self.log_cache.as_deref())
             })?;
 
-            if self.track_atime && plan.total_len > 0 {
+            if self.track_atime && plan.total_len > 0 && inner.shutdown_state == super::ShutdownState::Running {
                 let now = self.clock.now();
                 inner.update_attr_delta(
                     ino,
@@ -504,6 +515,9 @@ impl InMemoryFS {
         })
     }
 
+    /// Reads file contents by inode alone, without an open handle. Test-only; see
+    /// [`InMemoryFS::plan_read_file_data`].
+    #[cfg(any(test, feature = "testing"))]
     pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, FsError> {
         let plan = self.plan_read_file_data(ino, offset, size)?;
         self.execute_read_plan_sync(plan)

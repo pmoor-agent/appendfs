@@ -16,7 +16,10 @@ pub const FUSE_SET_ATTR_MTIME: u32 = 1 << 5;
 
 pub fn getattr_core(fs: &InMemoryFS, ino: u64) -> Result<FileAttr, FsError> {
     log::trace!("getattr(ino={})", ino);
-    fs.get_attr(ino).ok_or(FsError::ENOENT)
+    fs.with_inner(OpTag::GetAttr, |inner| {
+        inner.check_shutdown(false)?;
+        fs.get_attr_locked(inner, ino).ok_or(FsError::ENOENT)
+    })
 }
 
 pub fn getattr_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, FsError> {
@@ -41,9 +44,6 @@ pub use read_core as read_response;
 
 pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> {
     let write_requested = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0;
-    if write_requested && fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
 
     if is_virtual_ino(ino) {
         if write_requested {
@@ -53,6 +53,7 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> 
         // or self-deadlocks (since status generators query filesystem layer state).
         let content = fs.virtual_files.generate_content(ino, fs).unwrap_or_default();
         fs.with_inner(OpTag::Open, |inner| {
+            inner.check_shutdown(write_requested)?;
             let attr = fs.get_attr_locked(inner, ino).ok_or(FsError::ENOENT)?;
             if attr.file_type != FileType::RegularFile {
                 return Err(FsError::EISDIR);
@@ -73,6 +74,7 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> 
         let now = fs.clock.now();
         let trunc = (flags & libc::O_TRUNC as u32) != 0;
         fs.with_inner(OpTag::Open, |inner| {
+            inner.check_shutdown(write_requested)?;
             let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
             if attr.file_type != FileType::RegularFile {
                 return Err(FsError::EISDIR);
@@ -111,9 +113,6 @@ pub fn open_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseRespon
 
 pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
     log::trace!("write(ino={}, fh={}, len={}, offset={})", ino, fh, buf.len(), offset);
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
     if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
@@ -127,6 +126,7 @@ pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset:
     let write_len = buf.len() as u64;
 
     fs.with_inner(OpTag::Write, |inner| {
+        inner.check_shutdown(true)?;
         inner.validate_regular_handle(ino, fh)?;
         let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
@@ -203,9 +203,6 @@ pub fn setattr_core(
         to_set
     );
 
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
     if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
@@ -236,6 +233,7 @@ pub fn setattr_core(
     }
 
     fs.with_inner(OpTag::SetAttr, |inner| {
+        inner.check_shutdown(true)?;
         let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
 
         if (to_set & FUSE_SET_ATTR_SIZE) != 0 && attr.file_type == FileType::RegularFile {
@@ -298,11 +296,9 @@ fn punch_hole_locked(inner: &mut FsInner, ino: u64, offset: u64, len: u64, now: 
 /// explicit `ExtentState::Zero` that masks whatever lies below.
 pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Result<(), FsError> {
     log::trace!("punch_hole(ino={}, offset={}, len={})", ino, offset, len);
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
     let now = fs.clock.now();
     fs.with_inner(OpTag::Fallocate, |inner| {
+        inner.check_shutdown(true)?;
         punch_hole_locked(inner, ino, offset, len, now)
     })
 }
@@ -345,9 +341,6 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
         offset,
         length
     );
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
     if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
@@ -373,6 +366,7 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
     let now = fs.clock.now();
 
     fs.with_inner(OpTag::Fallocate, |inner| {
+        inner.check_shutdown(true)?;
         let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
             return Err(FsError::EISDIR);
@@ -433,11 +427,8 @@ fn create_internal(
     gid: u32,
     open_handle: bool,
 ) -> Result<(FileAttr, Option<u64>), FsError> {
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
-
     fs.with_inner(OpTag::Create, |inner| {
+        inner.check_shutdown(true)?;
         let now = fs.clock.now();
         log::trace!(
             "create(parent={}, name={}, mode=0o{:o}, flags=0x{:x}, uid={}, gid={})",
@@ -672,7 +663,7 @@ mod tests {
     fn test_fallocate_rejected_on_read_only_mount() {
         let fs = InMemoryFS::new();
         let ino = file_with(&fs, &[0xEF; 128]);
-        fs.set_read_only(true);
+        fs.set_read_only();
         assert_eq!(
             fallocate_core(&fs, ino, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, 0, 64),
             Err(FsError::EROFS)

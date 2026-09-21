@@ -217,7 +217,7 @@ impl TestMount {
         )
         .unwrap();
         fs.set_log_dir(&self.log_path);
-        fs.set_read_only(true);
+        fs.set_read_only();
 
         let initial_dev = fs::metadata(&self.mount_path).unwrap().dev();
         let mount_path_clone = self.mount_path.clone();

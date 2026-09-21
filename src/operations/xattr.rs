@@ -10,6 +10,7 @@ pub const XATTR_SIZE_MAX: usize = 65536;
 
 pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, FsError> {
     let inner = fs.inner.lock(OpTag::Xattr).unwrap();
+    inner.check_shutdown(false)?;
     if fs.get_attr_locked(&inner, ino).is_none() {
         return Err(FsError::ENOENT);
     }
@@ -35,9 +36,6 @@ pub fn setxattr_core(
     value: &[u8],
     flags: i32,
 ) -> Result<FuseResponse<'static>, FsError> {
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
     if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
@@ -60,6 +58,7 @@ pub fn setxattr_core(
     };
 
     fs.with_inner(OpTag::Xattr, |inner| {
+        inner.check_shutdown(true)?;
         if fs.get_attr_locked(inner, ino).is_none() {
             return Err(FsError::ENOENT);
         }
@@ -80,6 +79,7 @@ pub fn setxattr_core(
 
 pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResponse<'static>, FsError> {
     let inner = fs.inner.lock(OpTag::Xattr).unwrap();
+    inner.check_shutdown(false)?;
     if fs.get_attr_locked(&inner, ino).is_none() {
         return Err(FsError::ENOENT);
     }
@@ -109,9 +109,6 @@ pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResp
 }
 
 pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
     if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
@@ -126,6 +123,7 @@ pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<FuseRes
     };
 
     fs.with_inner(OpTag::Xattr, |inner| {
+        inner.check_shutdown(true)?;
         if fs.get_attr_locked(inner, ino).is_none() {
             return Err(FsError::ENOENT);
         }

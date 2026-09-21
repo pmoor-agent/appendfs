@@ -5,7 +5,7 @@
 //! Directory handles hold an immutable snapshot of the listing taken at `opendir`, so a
 //! paginated `readdir` is isolated from concurrent mutations.
 
-use super::{DirHandle, FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource, is_virtual_ino};
+use super::{DirHandle, FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource, ShutdownState, is_virtual_ino};
 use crate::error::FsError;
 use crate::node::AttrDelta;
 use crate::operations::locks::LockManager;
@@ -53,6 +53,7 @@ impl InMemoryFS {
 
     pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, FsError> {
         self.with_inner(OpTag::ReadPlan, |inner| {
+            inner.check_shutdown(false)?;
             let handle = inner.get_file_handle(ino, fh)?;
             match handle {
                 FileHandle::Virtual { data, .. } => {
@@ -82,7 +83,7 @@ impl InMemoryFS {
                         layers.plan_read_file_data(offset, size, self.log_cache.as_deref())
                     })?;
 
-                    if self.track_atime && plan.total_len > 0 {
+                    if self.track_atime && plan.total_len > 0 && inner.shutdown_state == ShutdownState::Running {
                         let now = self.clock.now();
                         inner.update_attr_delta(
                             ino,

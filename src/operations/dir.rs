@@ -14,6 +14,7 @@ pub fn lookup_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FileAttr,
         return Err(FsError::ENAMETOOLONG);
     }
     let inner = fs.inner.lock(OpTag::Lookup).unwrap();
+    inner.check_shutdown(false)?;
     let parent_attr = fs.get_attr_locked(&inner, parent).ok_or(FsError::ENOENT)?;
     if parent_attr.file_type != FileType::Directory {
         return Err(FsError::ENOTDIR);
@@ -41,6 +42,7 @@ pub fn lookup_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseR
 
 pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, FsError> {
     let inner = fs.inner.lock(OpTag::ReadDir).unwrap();
+    inner.check_shutdown(false)?;
     let attr = fs.get_attr_locked(&inner, ino).ok_or(FsError::ENOENT)?;
     if attr.file_type != FileType::Directory {
         return Err(FsError::ENOTDIR);
@@ -110,6 +112,7 @@ pub fn iter_dir_entries<'a>(
 
 pub fn opendir_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> {
     fs.with_inner(OpTag::OpenDir, |inner| {
+        inner.check_shutdown(false)?;
         let attr = fs.get_attr_locked(inner, ino).ok_or(FsError::ENOENT)?;
         if attr.file_type != FileType::Directory {
             return Err(FsError::ENOTDIR);
@@ -149,6 +152,7 @@ pub fn readdir_entries(
 ) -> Result<Vec<DirEntry>, FsError> {
     log::trace!("readdir(ino={}, offset={}, fh={})", ino, offset, fh);
     fs.with_inner(OpTag::ReadDir, |inner| {
+        inner.check_shutdown(false)?;
         let dir = inner.get_dir_handle(ino, fh)?;
         let parent_ino = if ino == 1 {
             1
@@ -179,6 +183,7 @@ pub fn readdirplus_entries(
 ) -> Result<Vec<DirEntryPlus>, FsError> {
     log::trace!("readdirplus(ino={}, offset={}, fh={})", ino, offset, fh);
     fs.with_inner(OpTag::ReadDir, |inner| {
+        inner.check_shutdown(false)?;
         let dir = inner.get_dir_handle(ino, fh)?;
         let parent_ino = if ino == 1 {
             1
@@ -228,11 +233,8 @@ pub fn mkdir_core(
     uid: u32,
     gid: u32,
 ) -> Result<FileAttr, FsError> {
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
-
     fs.with_inner(OpTag::Mkdir, |inner| {
+        inner.check_shutdown(true)?;
         let now = fs.clock.now();
         log::trace!(
             "mkdir(parent={}, name={}, mode=0o{:o}, uid={}, gid={})",
@@ -313,11 +315,8 @@ pub fn mkdir_response(
 }
 
 pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), FsError> {
-    if fs.is_read_only() {
-        return Err(FsError::EROFS);
-    }
-
     fs.with_inner(OpTag::Rmdir, |inner| {
+        inner.check_shutdown(true)?;
         let now = fs.clock.now();
         log::trace!("rmdir(parent={}, name={})", parent, name);
 
