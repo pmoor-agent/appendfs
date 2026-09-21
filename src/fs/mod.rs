@@ -11,6 +11,7 @@
 //! - [`flush`] - freezing `live`, synthesizing log records, and folding batches into `base`.
 
 pub mod arena;
+pub mod async_tracker;
 pub mod delayed_queue;
 mod flush;
 mod flusher;
@@ -22,6 +23,7 @@ pub mod virtual_files;
 pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
 pub use crate::operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics, OpTier, ThrottleDecision};
 pub use arena::WriteArena;
+pub use async_tracker::{AsyncOpGuard, AsyncTracker};
 pub use delayed_queue::DelayedResponseQueue;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use overlay::{InnerStatsSnapshot, InodeCounts};
@@ -240,21 +242,8 @@ impl BatchCompletion {
         }
     }
 
-    /// Asynchronously waits until the batch completes and yields its result.
-    pub async fn wait(&self) -> std::io::Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.add_callback(Box::new(move |res| {
-            let _ = tx.send(res);
-        }));
-        rx.await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Interrupted, "batch cancelled"))?
-    }
-
     /// Blocks until the batch completes and yields its result.
-    ///
-    /// The async `wait` is what FUSE's fsync uses; this is for synchronous callers like
-    /// `quiesce` and unmount, which have no runtime to await on.
-    pub fn wait_blocking(&self) -> std::io::Result<()> {
+    pub fn wait(&self) -> std::io::Result<()> {
         let signal = Arc::new((Mutex::new(None::<std::io::Result<()>>), Condvar::new()));
         let signal_clone = Arc::clone(&signal);
         self.add_callback(Box::new(move |res| {
@@ -836,7 +825,7 @@ pub struct InMemoryFS {
     /// Condition variable and flag to immediately notify the background replication worker of new logs/summaries.
     pub replication_notifier: Arc<(Mutex<bool>, Condvar)>,
     /// Tracks in-flight asynchronous operations (e.g. cold reads, async fsyncs) to ensure safe unmount without use-after-free.
-    pub async_tracker: Arc<crate::async_runtime::AsyncTracker>,
+    pub async_tracker: Arc<AsyncTracker>,
     /// Cumulative FUSE operation telemetry tracking calls and execution latency.
     pub op_metrics: Arc<FuseOpMetrics>,
     /// Asynchronous queue delaying FUSE responses during buffer saturation.
@@ -890,7 +879,7 @@ impl InMemoryFS {
         let manifest = Arc::new(RwLock::new(LogManifest::new(start_gen)));
 
         let virtual_files = Arc::new(virtual_files::VirtualFileRegistry::new());
-        let async_tracker = Arc::new(crate::async_runtime::AsyncTracker::new());
+        let async_tracker = Arc::new(AsyncTracker::new());
         let delayed_queue = Arc::new(DelayedResponseQueue::new(clock.clone()));
 
         let inner = FsInner {
@@ -1141,7 +1130,7 @@ impl InMemoryFS {
     }
 
     /// Increments the in-flight asynchronous operation count and returns an RAII guard.
-    pub fn begin_async_op(&self) -> crate::async_runtime::AsyncOpGuard {
+    pub fn begin_async_op(&self) -> AsyncOpGuard {
         self.async_tracker.begin()
     }
 

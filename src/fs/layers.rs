@@ -519,21 +519,6 @@ impl InMemoryFS {
     pub fn execute_read_plan_sync(&self, plan: ReadPlan) -> Result<Vec<u8>, FsError> {
         execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key)
     }
-
-    /// Executes a [`ReadPlan`] asynchronously, offloading cold disk I/O and large memory copies
-    /// to the Tokio thread pool with zero locks on [`InMemoryFS`].
-    ///
-    /// Memory slices from live/flushing layers are copied out first into the destination buffer
-    /// and their backing memory references dropped *before* any cold disk or remote I/O begins.
-    pub async fn execute_read_plan_async(
-        plan: ReadPlan,
-        log_cache: Option<Arc<crate::log::LogFileCache>>,
-        volume_key: Arc<crate::crypto::VolumeKey>,
-    ) -> Result<Vec<u8>, FsError> {
-        tokio::task::spawn_blocking(move || execute_read_plan(plan, log_cache.as_deref(), &volume_key))
-            .await
-            .map_err(|_| FsError::EIO)?
-    }
 }
 
 /// Core execution helper for [`ReadPlan`] completely decoupled from [`InMemoryFS`].
@@ -999,25 +984,20 @@ mod tests {
         assert_eq!(&read_buf[400..600], &data3[..]);
         assert_eq!(&read_buf[600..800], &data4[..]);
 
-        // Also execute asynchronously via Tokio
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
+        // Also execute on a background worker thread
+        let plan_bg = plan.clone();
+        let log_cache_bg = fs.log_cache.clone();
+        let volume_key_bg = fs.volume_key.clone();
+        let thread_buf =
+            std::thread::spawn(move || execute_read_plan(plan_bg, log_cache_bg.as_deref(), &volume_key_bg))
+                .join()
+                .unwrap()
+                .unwrap();
 
-        let async_buf = rt
-            .block_on(InMemoryFS::execute_read_plan_async(
-                plan,
-                fs.log_cache.clone(),
-                fs.volume_key.clone(),
-            ))
-            .unwrap();
-
-        assert_eq!(&async_buf[0..200], &data1[..]);
-        assert_eq!(&async_buf[200..400], &data2[..]);
-        assert_eq!(&async_buf[400..600], &data3[..]);
-        assert_eq!(&async_buf[600..800], &data4[..]);
+        assert_eq!(&thread_buf[0..200], &data1[..]);
+        assert_eq!(&thread_buf[200..400], &data2[..]);
+        assert_eq!(&thread_buf[400..600], &data3[..]);
+        assert_eq!(&thread_buf[600..800], &data4[..]);
     }
 
     #[test]

@@ -463,7 +463,7 @@ impl InMemoryFS {
             // cycle could not write.
             self.run_flush_cycle()?;
         }
-        pending.wait_blocking()
+        pending.wait()
     }
 
     /// Rolls the active log generation, draining pending batches first.

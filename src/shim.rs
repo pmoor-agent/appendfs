@@ -796,19 +796,6 @@ impl<T: Send + 'static> DeferredResult<T> {
             }
         }
     }
-
-    pub async fn wait_async(self) -> Result<T, FsError> {
-        match self {
-            DeferredResult::Ready(res) => res,
-            DeferredResult::Deferred(completion) => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                completion.on_complete(Box::new(move |res| {
-                    let _ = tx.send(res);
-                }));
-                rx.await.unwrap_or(Err(FsError::EIO))
-            }
-        }
-    }
 }
 
 impl DeferredResult<FuseResponse<'static>> {

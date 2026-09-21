@@ -368,8 +368,8 @@ pub fn releasedir_response(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<FuseRes
 }
 
 #[cfg(any(test, feature = "testing"))]
-pub async fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), FsError> {
-    crate::operations::read_write::fsync_core_with_reason(fs, 0, 0, crate::fs::FlushReason::Fsyncdir).await
+pub fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), FsError> {
+    crate::operations::read_write::fsync_core_with_reason(fs, 0, 0, crate::fs::FlushReason::Fsyncdir)
 }
 
 pub fn fsyncdir_response(fs: &InMemoryFS, ino: u64, datasync: bool) -> DeferredResult<FuseResponse<'static>> {
