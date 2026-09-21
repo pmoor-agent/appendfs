@@ -1392,23 +1392,4 @@ mod tests {
             "atime should update on read when track_atime is true"
         );
     }
-
-    #[test]
-    #[should_panic(expected = "cannot attach a log writer to a read-only filesystem")]
-    fn test_attach_log_writer_panics_on_read_only_fs() {
-        let mut fs = InMemoryFS::new();
-        fs.set_read_only();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let writer = Arc::new(
-            crate::log::LogWriter::create_lazy(
-                storage,
-                1,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        fs.attach_log_writer(writer);
-    }
 }

@@ -747,6 +747,16 @@ mod tests {
     }
 
     #[test]
+    fn test_log_writer_creation_fails_on_read_only_storage() {
+        let mem: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let ro_storage: Arc<dyn Storage> = Arc::new(crate::storage::ReadOnlyStorage::new(mem));
+
+        let res = LogWriter::create_lazy(ro_storage, 1, DEFAULT_MAX_LOG_SIZE, 1, VolumeKey::plaintext_arc());
+        assert!(res.is_err(), "LogWriter creation must fail on ReadOnlyStorage");
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
     fn test_append_record_never_rolls_mid_batch() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
