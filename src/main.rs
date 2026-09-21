@@ -518,8 +518,12 @@ fn cmd_mount(args: MountArgs) {
 
     let cache_dir = log_dir.join(".cache");
     let block_cache = Arc::new(
-        appendfs::remote::OnDiskBlockCache::new(&cache_dir, registry.policy.local_cache_max_gb * 1024 * 1024 * 1024)
-            .unwrap(),
+        appendfs::remote::OnDiskBlockCache::new(
+            &cache_dir,
+            registry.policy.local_cache_max_gb * 1024 * 1024 * 1024,
+            Arc::new(SystemClock),
+        )
+        .unwrap(),
     );
 
     let log_cache = Arc::new(appendfs::log::LogFileCache::with_remote_support(
@@ -624,8 +628,12 @@ fn cmd_mount_ro(args: MountRoArgs) {
 
     let cache_dir = log_dir.join(".cache");
     let block_cache = Arc::new(
-        appendfs::remote::OnDiskBlockCache::new(&cache_dir, registry.policy.local_cache_max_gb * 1024 * 1024 * 1024)
-            .unwrap(),
+        appendfs::remote::OnDiskBlockCache::new(
+            &cache_dir,
+            registry.policy.local_cache_max_gb * 1024 * 1024 * 1024,
+            Arc::new(SystemClock),
+        )
+        .unwrap(),
     );
     let log_cache = Arc::new(appendfs::log::LogFileCache::with_remote_support(
         storage.clone(),

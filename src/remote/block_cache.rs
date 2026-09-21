@@ -1,9 +1,11 @@
+use crate::clock::Clock;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// 1 MiB aligned block chunk size for remote over-fetching and on-disk caching.
 pub const BLOCK_SIZE: u64 = 1024 * 1024;
@@ -18,7 +20,11 @@ pub fn block_start_offset(block_idx: u64) -> u64 {
     block_idx * BLOCK_SIZE
 }
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+/// Monotonically increasing nonce for unique temporary cache file generation.
+static NEXT_TMP_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// Maximum age of orphaned temporary block cache files (`*.tmp.*`) before being purged by `prune_if_needed`.
+pub const TMP_FILE_MAX_AGE: Duration = Duration::from_secs(3600);
 
 /// Default in-memory decrypted record cache size (128 MiB).
 pub const DEFAULT_DECRYPTED_CACHE_SIZE: usize = 128 * 1024 * 1024;
@@ -144,22 +150,33 @@ impl DecryptedRecordCache {
 }
 
 /// Persistent on-disk LRU block cache storing raw encrypted 1 MiB chunks in `<log_dir>/.cache/`.
-#[derive(Debug)]
 pub struct OnDiskBlockCache {
     cache_dir: PathBuf,
     max_bytes: u64,
     access_lock: Mutex<()>,
     coalescer: Arc<super::RemoteReadCoalescer>,
+    clock: Arc<dyn Clock>,
+}
+
+impl std::fmt::Debug for OnDiskBlockCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnDiskBlockCache")
+            .field("cache_dir", &self.cache_dir)
+            .field("max_bytes", &self.max_bytes)
+            .field("coalescer", &self.coalescer)
+            .finish()
+    }
 }
 
 impl OnDiskBlockCache {
-    pub fn new(cache_dir: impl AsRef<Path>, max_bytes: u64) -> io::Result<Self> {
-        Self::with_coalescer(cache_dir, max_bytes, Arc::new(super::RemoteReadCoalescer::new()))
+    pub fn new(cache_dir: impl AsRef<Path>, max_bytes: u64, clock: Arc<dyn Clock>) -> io::Result<Self> {
+        Self::with_coalescer(cache_dir, max_bytes, clock, Arc::new(super::RemoteReadCoalescer::new()))
     }
 
     pub fn with_coalescer(
         cache_dir: impl AsRef<Path>,
         max_bytes: u64,
+        clock: Arc<dyn Clock>,
         coalescer: Arc<super::RemoteReadCoalescer>,
     ) -> io::Result<Self> {
         let p = cache_dir.as_ref().to_path_buf();
@@ -169,11 +186,16 @@ impl OnDiskBlockCache {
             max_bytes,
             access_lock: Mutex::new(()),
             coalescer,
+            clock,
         })
     }
 
     pub fn coalescer(&self) -> &Arc<super::RemoteReadCoalescer> {
         &self.coalescer
+    }
+
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
     }
 
     fn block_path(&self, file_stem: &str, block_idx: u64) -> PathBuf {
@@ -202,11 +224,16 @@ impl OnDiskBlockCache {
         let _guard = self.access_lock.lock().unwrap();
         let target_path = self.block_path(file_stem, block_idx);
         let stem = clean_file_stem(file_stem);
-        let tmp_path = self
-            .cache_dir
-            .join(format!("{}_{:06}.tmp.{}", stem, block_idx, std::process::id()));
+        let nonce = NEXT_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = self.cache_dir.join(format!(
+            "{}_{:06}.tmp.{}.{}",
+            stem,
+            block_idx,
+            std::process::id(),
+            nonce
+        ));
 
-        {
+        let write_res = (|| -> io::Result<()> {
             let mut file = OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -214,9 +241,15 @@ impl OnDiskBlockCache {
                 .open(&tmp_path)?;
             file.write_all(data)?;
             file.flush()?;
+            fs::rename(&tmp_path, &target_path)?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_res {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
         }
 
-        fs::rename(tmp_path, target_path)?;
         self.prune_if_needed()?;
         Ok(())
     }
@@ -240,9 +273,12 @@ impl OnDiskBlockCache {
             let chunk_len = (BLOCK_SIZE as usize).min(data.len() - offset);
             let chunk = &data[offset..offset + chunk_len];
             let target_path = self.block_path(file_stem, block_idx);
-            let tmp_path = self.cache_dir.join(format!("{}_{:06}.tmp.{}", stem, block_idx, pid));
+            let nonce = NEXT_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+            let tmp_path = self
+                .cache_dir
+                .join(format!("{}_{:06}.tmp.{}.{}", stem, block_idx, pid, nonce));
 
-            {
+            let write_res = (|| -> io::Result<()> {
                 let mut file = OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -250,9 +286,15 @@ impl OnDiskBlockCache {
                     .open(&tmp_path)?;
                 file.write_all(chunk)?;
                 file.flush()?;
+                fs::rename(&tmp_path, &target_path)?;
+                Ok(())
+            })();
+
+            if let Err(err) = write_res {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err);
             }
 
-            fs::rename(tmp_path, target_path)?;
             offset += chunk_len;
             block_idx += 1;
         }
@@ -264,11 +306,21 @@ impl OnDiskBlockCache {
     fn prune_if_needed(&self) -> io::Result<()> {
         let mut entries = Vec::new();
         let mut total_size = 0u64;
+        let now = self.clock.now();
 
         for entry in fs::read_dir(&self.cache_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("bin")
+            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
+            if file_name.contains(".tmp.") || file_name.ends_with(".tmp") {
+                if let Ok(meta) = entry.metadata()
+                    && let Ok(mtime) = meta.modified()
+                    && now.duration_since(mtime).unwrap_or_default() > TMP_FILE_MAX_AGE
+                {
+                    let _ = fs::remove_file(&path);
+                }
+            } else if path.extension().and_then(|s| s.to_str()) == Some("bin")
                 && let Ok(meta) = entry.metadata()
             {
                 let len = meta.len();
@@ -481,8 +533,13 @@ pub struct TieredCache {
 }
 
 impl TieredCache {
-    pub fn new(cache_dir: impl AsRef<Path>, max_disk_bytes: u64, max_decrypted_bytes: usize) -> io::Result<Self> {
-        let on_disk = OnDiskBlockCache::new(cache_dir, max_disk_bytes)?;
+    pub fn new(
+        cache_dir: impl AsRef<Path>,
+        max_disk_bytes: u64,
+        max_decrypted_bytes: usize,
+        clock: Arc<dyn Clock>,
+    ) -> io::Result<Self> {
+        let on_disk = OnDiskBlockCache::new(cache_dir, max_disk_bytes, clock)?;
         let decrypted = DecryptedRecordCache::new(max_decrypted_bytes);
         Ok(Self { on_disk, decrypted })
     }
@@ -518,7 +575,42 @@ mod tests {
         // Oversized payload (> 6 bytes) is rejected and not cached
         cache.insert(1, 0, 400, Arc::new(vec![0u8; 10]));
         assert!(cache.get(1, 0, 400).is_none());
-        assert_eq!(cache.current_bytes(), 6);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(1, 0, 3).is_none());
+
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.current_bytes(), 0);
+    }
+
+    #[test]
+    fn test_decrypted_lru_cache_zero_limit_is_noop() {
+        let cache = DecryptedRecordCache::new(0);
+        cache.insert(1, 0, 1, Arc::new(vec![1, 2, 3]));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.current_bytes(), 0);
+        assert!(cache.get(1, 0, 1).is_none());
+    }
+
+    #[test]
+    fn test_decrypted_lru_cache_resize() {
+        let cache = DecryptedRecordCache::new(10);
+        cache.insert(1, 0, 1, Arc::new(vec![1; 4]));
+        cache.insert(1, 0, 2, Arc::new(vec![2; 4]));
+        assert_eq!(cache.current_bytes(), 8);
+
+        // Resize smaller evicts LRU (key 1)
+        cache.set_max_bytes(5);
+        assert_eq!(cache.current_bytes(), 4);
+        assert!(cache.get(1, 0, 1).is_none());
+        assert!(cache.get(1, 0, 2).is_some());
+
+        // Resize larger allows more elements
+        cache.set_max_bytes(20);
+        cache.insert(1, 0, 3, Arc::new(vec![3; 10]));
+        assert_eq!(cache.current_bytes(), 14);
+        assert!(cache.get(1, 0, 2).is_some());
+        assert!(cache.get(1, 0, 3).is_some());
     }
 
     #[test]
@@ -543,7 +635,8 @@ mod tests {
     #[test]
     fn test_on_disk_block_cache_write_read_and_prune() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = OnDiskBlockCache::new(dir.path(), 2500).unwrap(); // max 2500 bytes
+        let clock = Arc::new(crate::clock::SystemClock);
+        let cache = OnDiskBlockCache::new(dir.path(), 2500, clock).unwrap(); // max 2500 bytes
 
         assert_eq!(cache.read_block("000001", 0).unwrap(), None);
 
@@ -570,7 +663,8 @@ mod tests {
     #[test]
     fn test_revision_block_cache_separation() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = OnDiskBlockCache::new(dir.path(), 50000).unwrap();
+        let clock = Arc::new(crate::clock::SystemClock);
+        let cache = OnDiskBlockCache::new(dir.path(), 50000, clock).unwrap();
 
         let base_data = vec![0x11; 512];
         let r1_data = vec![0x22; 512];
@@ -584,6 +678,37 @@ mod tests {
         // Must read distinct data without aliasing or collision
         assert_eq!(cache.read_block("000001", 0).unwrap().unwrap(), base_data);
         assert_eq!(cache.read_block("000001_r1", 0).unwrap().unwrap(), r1_data);
+    }
+
+    #[test]
+    fn test_on_disk_block_cache_tmp_file_pruning_with_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(crate::clock::AdvancingClock::new(SystemTime::now()));
+        let cache = OnDiskBlockCache::new(dir.path(), 100_000, clock.clone()).unwrap();
+
+        // Write a valid block
+        let data = vec![0x42; 100];
+        cache.write_block("000001", 0, &data).unwrap();
+        assert!(dir.path().join("000001_000000.bin").exists());
+
+        // Create an orphaned temporary file
+        let orphaned_tmp = dir.path().join("000001_000001.tmp.12345.1");
+        fs::write(&orphaned_tmp, b"incomplete write").unwrap();
+        assert!(orphaned_tmp.exists());
+
+        // Right now, age < TMP_FILE_MAX_AGE, so pruning will NOT remove it
+        cache.prune_if_needed().unwrap();
+        assert!(orphaned_tmp.exists(), "fresh tmp file must not be pruned");
+
+        // Advance clock past TMP_FILE_MAX_AGE (1 hour)
+        clock.advance(TMP_FILE_MAX_AGE + Duration::from_secs(10));
+
+        // Now prune should remove the orphaned tmp file
+        cache.prune_if_needed().unwrap();
+        assert!(!orphaned_tmp.exists(), "aged tmp file must be pruned");
+
+        // The valid block should still be intact
+        assert_eq!(cache.read_block("000001", 0).unwrap().unwrap(), data);
     }
 
     #[test]

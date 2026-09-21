@@ -53,7 +53,7 @@ pub use remote::{
     BatchLeaderGuard, BlockCache, ConcurrencyLimiter, ConcurrencyPermit, ConfiguredRemote,
     DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, FollowerBlock, MemoryBlockCache, OnDiskBlockCache,
     RemoteObject, RemoteReadCoalescer, RemoteReadTarget, RemoteRegistry, RemoteReplicationWorker, RemoteStore,
-    RemoteTargetConfig, ReplicationPolicy, S3RemoteStore, TieredCache, TieredStorageReader,
+    RemoteTargetConfig, ReplicationPolicy, S3RemoteStore, TMP_FILE_MAX_AGE, TieredCache, TieredStorageReader,
     prepare_remote_recovery_for_target,
 };
 #[cfg(any(test, feature = "testing"))]
