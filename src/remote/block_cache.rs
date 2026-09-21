@@ -220,8 +220,7 @@ impl OnDiskBlockCache {
         Ok(Some(buf))
     }
 
-    pub fn write_block(&self, file_stem: &str, block_idx: u64, data: &[u8]) -> io::Result<()> {
-        let _guard = self.access_lock.lock().unwrap();
+    fn write_and_rename_block(&self, file_stem: &str, block_idx: u64, data: &[u8]) -> io::Result<()> {
         let target_path = self.block_path(file_stem, block_idx);
         let stem = clean_file_stem(file_stem);
         let nonce = NEXT_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
@@ -250,6 +249,12 @@ impl OnDiskBlockCache {
             return Err(err);
         }
 
+        Ok(())
+    }
+
+    pub fn write_block(&self, file_stem: &str, block_idx: u64, data: &[u8]) -> io::Result<()> {
+        let _guard = self.access_lock.lock().unwrap();
+        self.write_and_rename_block(file_stem, block_idx, data)?;
         self.prune_if_needed()?;
         Ok(())
     }
@@ -264,37 +269,13 @@ impl OnDiskBlockCache {
 
     pub fn write_blocks(&self, file_stem: &str, start_block: u64, data: &[u8]) -> io::Result<()> {
         let _guard = self.access_lock.lock().unwrap();
-        let stem = clean_file_stem(file_stem);
-        let pid = std::process::id();
         let mut offset = 0;
         let mut block_idx = start_block;
 
         while offset < data.len() {
             let chunk_len = (BLOCK_SIZE as usize).min(data.len() - offset);
             let chunk = &data[offset..offset + chunk_len];
-            let target_path = self.block_path(file_stem, block_idx);
-            let nonce = NEXT_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
-            let tmp_path = self
-                .cache_dir
-                .join(format!("{}_{:06}.tmp.{}.{}", stem, block_idx, pid, nonce));
-
-            let write_res = (|| -> io::Result<()> {
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&tmp_path)?;
-                file.write_all(chunk)?;
-                file.flush()?;
-                fs::rename(&tmp_path, &target_path)?;
-                Ok(())
-            })();
-
-            if let Err(err) = write_res {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(err);
-            }
-
+            self.write_and_rename_block(file_stem, block_idx, chunk)?;
             offset += chunk_len;
             block_idx += 1;
         }
