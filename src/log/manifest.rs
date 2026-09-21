@@ -86,16 +86,6 @@ impl LogManifest {
         Self { logs: Vec::new() }
     }
 
-    /// Sequence number for the next generation relative to sealed logs in this manifest (e.g. 1 if empty, max + 1).
-    pub fn next_generation(&self) -> u64 {
-        self.logs.iter().map(|l| l.generation).max().map_or(1, |max| max + 1)
-    }
-
-    /// Returns the physical filename for the next log generation (e.g. "000002.log").
-    pub fn next_filename(&self) -> String {
-        log_filename(self.next_generation())
-    }
-
     /// Records a sealed log file entry into the manifest.
     ///
     /// Panics if an entry for `(generation, revision)` has already been recorded in the manifest,
@@ -148,8 +138,6 @@ mod tests {
     fn test_log_manifest_creation_and_sealed_records() {
         let mut manifest = LogManifest::new();
         assert_eq!(manifest.logs.len(), 0);
-        assert_eq!(manifest.next_generation(), 1);
-        assert_eq!(manifest.next_filename(), "000001.log");
 
         let log1 = LogFileInfo {
             generation: 1,
@@ -164,8 +152,6 @@ mod tests {
         manifest.record_sealed_log(log1);
         assert_eq!(manifest.logs.len(), 1);
         assert_eq!(manifest.logs[0].generation, 1);
-        assert_eq!(manifest.next_generation(), 2);
-        assert_eq!(manifest.next_filename(), "000002.log");
 
         let log2 = LogFileInfo {
             generation: 2,
@@ -180,8 +166,6 @@ mod tests {
         manifest.record_sealed_log(log2);
         assert_eq!(manifest.logs.len(), 2);
         assert_eq!(manifest.logs[1].generation, 2);
-        assert_eq!(manifest.next_generation(), 3);
-        assert_eq!(manifest.next_filename(), "000003.log");
 
         let bytes = crate::wire::serialize(&manifest).unwrap();
         let deserialized: LogManifest = crate::wire::deserialize(&bytes).unwrap();

@@ -35,7 +35,6 @@ INODE            SIZE   EXTENTS  AVG EXTENT SIZE   PATH
 4                40 B         2             20 B   /dir_b/hello_hardlink.txt
 
 --- Tracked Log Generations Manifest ---
-Next Generation:     2 (000002.log)
 Tracked Logs:        1 log generation files
 
 LOG FILE          RECORDS     LOG SIZE    DATA SIZE    LIVE DATA  EXTENTS   LIVE RATIO  STATUS

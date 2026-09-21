@@ -914,13 +914,6 @@ pub fn dump_summary_reader_with_path(
 
     // Log Manifest Section
     writeln!(out, "--- Tracked Log Generations Manifest ---").unwrap();
-    writeln!(
-        out,
-        "Next Generation:     {} ({})",
-        reader.manifest.next_generation(),
-        reader.manifest.next_filename()
-    )
-    .unwrap();
     if reader.manifest.logs.is_empty() {
         writeln!(out, "Tracked Logs:        0 active log generation files").unwrap();
     } else {

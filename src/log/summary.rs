@@ -851,8 +851,7 @@ mod tests {
         assert_eq!(reader.header.generation, 0);
         assert_eq!(reader.header.last_batch_id, 0);
         assert_eq!(reader.header.next_inode, 2);
-        assert_eq!(reader.manifest.next_generation(), 1);
-        assert_eq!(reader.manifest.next_filename(), "000001.log");
+        assert!(reader.manifest.logs.is_empty());
 
         let root = reader.read_inode(1).unwrap().unwrap();
         match root.kind {

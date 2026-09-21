@@ -75,7 +75,12 @@ impl VolumeStats {
     pub fn collect_from_snapshot(inodes: &HashMap<u64, Arc<Node>>, manifest: &LogManifest) -> Self {
         let counts = InodeCounts::from_nodes(inodes.values().map(|a| a.as_ref()));
         let generations = calculate_generation_live_stats_from_nodes(inodes.values().map(|a| a.as_ref()), manifest);
-        let next_generation = manifest.logs.iter().map(|l| l.generation).max().map_or(1, |max| max + 1);
+        let next_generation = manifest
+            .logs
+            .iter()
+            .map(|l| l.generation)
+            .max()
+            .map_or(1, |max| max + 1);
         Self::from_parts(next_generation, &counts, generations)
     }
 

@@ -19,7 +19,6 @@ Avg Extents / File:  0.00
 Max Extents in File: 0
 
 --- Tracked Log Generations Manifest ---
-Next Generation:     1 (000001.log)
 Tracked Logs:        0 active log generation files
 
 === Summary Inode Records ===

@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn test_remotes_virtual_file_formatting_and_telemetry() {
-        let fs = InMemoryFS::new();
+        let mut fs = InMemoryFS::new();
         fs.register_remote_status();
 
         let v_ino = fs.lookup_child(1, ".remotes").unwrap();
@@ -336,7 +336,21 @@ mod tests {
         let initial_status = String::from_utf8(initial_bytes).unwrap();
         fs.release_file_handle(fh1, v_ino).unwrap();
         assert!(initial_status.contains("No remotes configured."));
-        assert!(initial_status.contains("Volume Head Generation: 1"));
+        assert!(initial_status.contains("Volume Head Generation: None (read-only / detached log writer)"));
+
+        // Attach active log writer for generation 1
+        let storage = Arc::new(crate::storage::MemoryStorage::new());
+        let writer = Arc::new(
+            crate::log::LogWriter::create_lazy(
+                storage,
+                1,
+                100 * 1024 * 1024,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.attach_log_writer(writer);
 
         // Configure remotes
         let mut registry = crate::remote::config::RemoteRegistry::new();
