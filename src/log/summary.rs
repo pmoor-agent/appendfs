@@ -352,10 +352,7 @@ pub fn init_volume_with_clock_uids_and_iv(
 
     let fs = InMemoryFS::with_clock_and_uids(clock.clone(), uid, gid);
     let snapshot = fs.inner.lock(OpTag::Flush).unwrap().snapshot_all();
-    let manifest = crate::log::LogManifest {
-        logs: Vec::new(),
-        next_generation: 1,
-    };
+    let manifest = crate::log::LogManifest::new();
 
     export_summary_with_iv(
         &SummarySnapshot {
@@ -747,10 +744,7 @@ mod tests {
             }),
         );
 
-        let manifest = crate::log::LogManifest {
-            logs: Vec::new(),
-            next_generation: 2,
-        };
+        let manifest = crate::log::LogManifest::new();
 
         let filename = export_summary(
             &SummarySnapshot {
@@ -814,10 +808,7 @@ mod tests {
             );
         }
 
-        let manifest = crate::log::LogManifest {
-            logs: Vec::new(),
-            next_generation: 5,
-        };
+        let manifest = crate::log::LogManifest::new();
 
         let filename = export_summary(
             &SummarySnapshot {
@@ -860,8 +851,7 @@ mod tests {
         assert_eq!(reader.header.generation, 0);
         assert_eq!(reader.header.last_batch_id, 0);
         assert_eq!(reader.header.next_inode, 2);
-        assert_eq!(reader.manifest.next_generation, 1);
-        assert_eq!(reader.manifest.next_filename(), "000001.log");
+        assert!(reader.manifest.logs.is_empty());
 
         let root = reader.read_inode(1).unwrap().unwrap();
         match root.kind {
@@ -989,10 +979,7 @@ mod tests {
             }),
         );
 
-        let manifest = crate::log::LogManifest {
-            logs: Vec::new(),
-            next_generation: 2,
-        };
+        let manifest = crate::log::LogManifest::new();
 
         // A first export dies partway, leaving a partial 000001.summary.tmp behind.
         storage.fail_writes_after_bytes(16, true);

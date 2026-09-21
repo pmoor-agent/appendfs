@@ -4,9 +4,9 @@ Generation:          0
 Format Version:      1
 Last Batch ID:       0
 Next Inode:          2
-File Size:           256 B
+File Size:           253 B
 Encryption:          Plaintext (None)
-Checksum (BLAKE3):   6061e6229bab7c526521b2a3664140e9daee0be6ab2941e700dd4cb7b8982184 (VERIFIED)
+Checksum (BLAKE3):   964bc2443e085366d13c065a54e0d12ffbbf06d9d3271c927427f4a264f70b64 (VERIFIED)
 
 --- Inode Breakdown ---
 Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)
@@ -19,7 +19,6 @@ Avg Extents / File:  0.00
 Max Extents in File: 0
 
 --- Tracked Log Generations Manifest ---
-Next Generation:     1 (000001.log)
 Tracked Logs:        0 active log generation files
 
 === Summary Inode Records ===

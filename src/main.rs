@@ -481,10 +481,7 @@ fn cmd_mount(args: MountArgs) {
         }
     };
 
-    let next_gen = {
-        let manifest = fs_instance.manifest.read().unwrap();
-        manifest.next_generation
-    };
+    let next_gen = fs_instance.next_generation();
 
     let start_batch_id = fs_instance.last_batch_id.load(Ordering::SeqCst) + 1;
 

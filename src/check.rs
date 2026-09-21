@@ -721,25 +721,25 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
     }
 
     // Pass 4: Manifest & Physical File Consistency
-    if manifest.next_generation == 0 {
-        report.issues.push(IntegrityIssue::error(
-            "MANIFEST_INVALID_NEXT_GEN",
-            None,
-            "Manifest next_generation cannot be 0",
-        ));
-    }
-
+    let mut prev_gen = 0u64;
     for info in &manifest.logs {
-        if info.generation >= manifest.next_generation {
+        if info.generation == 0 {
             report.issues.push(IntegrityIssue::error(
-                "MANIFEST_GEN_EXCEEDS_NEXT",
+                "MANIFEST_INVALID_GEN",
+                None,
+                format!("Log generation in manifest cannot be 0: {}", info.filename),
+            ));
+        } else if info.generation <= prev_gen {
+            report.issues.push(IntegrityIssue::error(
+                "MANIFEST_OUT_OF_ORDER",
                 None,
                 format!(
-                    "Log generation {} is >= manifest next_generation {}",
-                    info.generation, manifest.next_generation
+                    "Log generation {} in manifest is not strictly greater than previous generation {}",
+                    info.generation, prev_gen
                 ),
             ));
         }
+        prev_gen = info.generation;
 
         if let Some(ref c) = cache
             && c.storage().exists(&info.filename)

@@ -658,10 +658,10 @@ impl InMemoryFS {
             "manifest must not contain generations beyond sealed_gen {}",
             sealed_gen
         );
-        debug_assert_eq!(
-            manifest.next_generation,
-            sealed_gen + 1,
-            "manifest next_generation must equal sealed_gen + 1"
+        debug_assert!(
+            manifest.logs.iter().any(|l| l.generation == sealed_gen),
+            "manifest must contain sealed_gen {}",
+            sealed_gen
         );
         let now = self.clock.now();
 

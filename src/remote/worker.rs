@@ -168,13 +168,13 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
     let mut out = String::new();
 
     let manifest = fs.manifest.read().unwrap().clone();
-    let head_gen = fs
-        .log_writer
-        .as_ref()
-        .map(|w| w.generation())
-        .unwrap_or_else(|| manifest.next_generation.saturating_sub(1).max(1));
-    let sealed_gens: Vec<_> = manifest.logs.iter().filter(|l| l.generation < head_gen).collect();
-    let last_sealed_gen = sealed_gens.iter().map(|l| l.generation).max().unwrap_or(0);
+    let head_gen = fs.log_writer.as_ref().map(|w| w.generation());
+    let last_sealed_gen = manifest.logs.iter().map(|l| l.generation).max().unwrap_or(0);
+
+    let head_gen_str = match head_gen {
+        Some(head) => head.to_string(),
+        None => "None (read-only / detached log writer)".to_string(),
+    };
 
     let remotes_info = {
         let reg_lock = fs.remote_registry.read().unwrap();
@@ -189,7 +189,7 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
 
     if remotes_info.is_empty() {
         out.push_str("No remotes configured.\n\n");
-        out.push_str(&format!("Volume Head Generation: {}\n", head_gen));
+        out.push_str(&format!("Volume Head Generation: {}\n", head_gen_str));
         out.push_str(&format!("Sealed Generations:     {}\n", last_sealed_gen));
         return out;
     }
@@ -199,7 +199,7 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
 
     out.push_str(&format!(
         "=== Remote Status (Volume Head Generation: {}) ===\n\n",
-        head_gen
+        head_gen_str
     ));
 
     for (name, config) in &remotes_info {

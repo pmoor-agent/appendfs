@@ -784,7 +784,7 @@ fn test_volume_init_mount_and_stats_flow() {
         appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
-    let next_gen = fs_instance.manifest.read().unwrap().next_generation;
+    let next_gen = fs_instance.next_generation();
     assert_eq!(next_gen, 1);
 
     let writer = Arc::new(
@@ -3213,7 +3213,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
     // 3. Mount RW for Session 2 on generation 4 with summary_interval_bytes = 2500
     // Because 2000 bytes were already recovered from logs, writing 1000 bytes in gen 4
     // will push bytes_since to 3000 >= 2500, triggering an early summary on gen 4's roll!
-    let next_gen = recovered_fs.manifest.read().unwrap().next_generation;
+    let next_gen = recovered_fs.next_generation();
     assert_eq!(next_gen, 4);
 
     let start_batch_id = recovered_fs.last_batch_id.load(Ordering::SeqCst) + 1;
@@ -3311,7 +3311,7 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
     );
 
     // 3. Mount Session 2 with summary_interval_generations = 3 (and 0 byte trigger)
-    let next_gen = recovered_fs.manifest.read().unwrap().next_generation;
+    let next_gen = recovered_fs.next_generation();
     assert_eq!(next_gen, 4);
 
     let start_batch_id = recovered_fs.last_batch_id.load(Ordering::SeqCst) + 1;
