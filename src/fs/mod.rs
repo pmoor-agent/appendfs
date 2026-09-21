@@ -1016,8 +1016,10 @@ impl InMemoryFS {
 
     /// Returns the sequence number for the next log generation to be allocated.
     ///
-    /// Computed dynamically as `max(existing) + 1`, considering all sealed logs in the
-    /// manifest, the generation of the latest summary snapshot, and the active log writer (if any).
+    /// Computed dynamically considering all sealed logs in the manifest, the generation
+    /// of the latest summary snapshot, and the active log writer (if any). If the active
+    /// log writer is open, the next generation is `active + 1`. If the writer is lazy
+    /// (unopened), the next generation reflects the unopened generation waiting to be created.
     pub fn next_generation(&self) -> u64 {
         let manifest_max = self
             .manifest
@@ -1029,8 +1031,12 @@ impl InMemoryFS {
             .max()
             .unwrap_or(0);
         let summary_gen = self.last_summary_generation.load(Ordering::SeqCst);
-        let active_gen = self.log_writer.as_ref().map_or(0, |w| w.generation());
-        manifest_max.max(summary_gen).max(active_gen) + 1
+        let base_next = manifest_max.max(summary_gen) + 1;
+        match self.log_writer.as_ref() {
+            Some(w) if w.is_open() => base_next.max(w.generation() + 1),
+            Some(w) => base_next.max(w.generation()),
+            None => base_next,
+        }
     }
 
     /// Returns the physical filename for the next log generation (e.g. "000002.log").
