@@ -227,8 +227,11 @@ pub struct FuseOpMetrics {
     active: [AtomicU64; FUSE_OP_COUNT],
     throttled: [AtomicU64; FUSE_OP_COUNT],
     stalled: [AtomicU64; FUSE_OP_COUNT],
+    active_delayed: [AtomicU64; FUSE_OP_COUNT],
     total_nanos: [AtomicU64; FUSE_OP_COUNT],
     max_nanos: [AtomicU64; FUSE_OP_COUNT],
+    throttled_nanos: [AtomicU64; FUSE_OP_COUNT],
+    stalled_nanos: [AtomicU64; FUSE_OP_COUNT],
 }
 
 impl FuseOpMetrics {
@@ -258,6 +261,24 @@ impl FuseOpMetrics {
         }
     }
 
+    /// Records that an operation was enqueued into the delayed response queue with the given throttle decision.
+    #[inline]
+    pub fn record_delayed_enqueue(&self, op: FuseOp, decision: ThrottleDecision) {
+        self.record_throttle(op, decision);
+        self.active_delayed[op.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records the dispatch of a delayed or stalled operation response and updates wait duration.
+    #[inline]
+    pub fn record_delayed_dispatch(&self, op: FuseOp, is_stalled: bool, elapsed: Duration) {
+        self.active_delayed[op.index()].fetch_sub(1, Ordering::Relaxed);
+        if is_stalled {
+            self.record_stalled_duration(op, elapsed);
+        } else {
+            self.record_throttled_duration(op, elapsed);
+        }
+    }
+
     /// Records the elapsed execution duration for `op` and decrements the active count.
     #[inline]
     pub fn record_duration(&self, op: FuseOp, duration: Duration) {
@@ -265,6 +286,20 @@ impl FuseOpMetrics {
         let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
         self.total_nanos[op.index()].fetch_add(nanos, Ordering::Relaxed);
         self.max_nanos[op.index()].fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    /// Records the actual duration that `op` was throttled (waiting in pushback delay queue).
+    #[inline]
+    pub fn record_throttled_duration(&self, op: FuseOp, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.throttled_nanos[op.index()].fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// Records the actual duration that `op` was stalled (waiting in pushback stall queue).
+    #[inline]
+    pub fn record_stalled_duration(&self, op: FuseOp, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.stalled_nanos[op.index()].fetch_add(nanos, Ordering::Relaxed);
     }
 
     /// Cumulative count of invocations for `op`.
@@ -279,6 +314,12 @@ impl FuseOpMetrics {
         self.active[op.index()].load(Ordering::Relaxed)
     }
 
+    /// Number of currently active (queued) delayed/stalled operations for `op`.
+    #[inline]
+    pub fn active_delayed(&self, op: FuseOp) -> u64 {
+        self.active_delayed[op.index()].load(Ordering::Relaxed)
+    }
+
     /// Cumulative count of soft-throttled invocations for `op`.
     #[inline]
     pub fn throttled(&self, op: FuseOp) -> u64 {
@@ -289,6 +330,38 @@ impl FuseOpMetrics {
     #[inline]
     pub fn stalled(&self, op: FuseOp) -> u64 {
         self.stalled[op.index()].load(Ordering::Relaxed)
+    }
+
+    /// Cumulative duration that `op` was soft-throttled.
+    pub fn throttled_duration(&self, op: FuseOp) -> Duration {
+        let nanos = self.throttled_nanos[op.index()].load(Ordering::Relaxed);
+        Duration::from_nanos(nanos)
+    }
+
+    /// Cumulative duration that `op` was hard-stalled.
+    pub fn stalled_duration(&self, op: FuseOp) -> Duration {
+        let nanos = self.stalled_nanos[op.index()].load(Ordering::Relaxed);
+        Duration::from_nanos(nanos)
+    }
+
+    /// Average throttled duration for `op` when the operation was actually throttled.
+    pub fn avg_throttled_duration(&self, op: FuseOp) -> Duration {
+        let throttled = self.throttled(op);
+        if throttled == 0 {
+            return Duration::ZERO;
+        }
+        let nanos = self.throttled_nanos[op.index()].load(Ordering::Relaxed);
+        Duration::from_nanos(nanos / throttled)
+    }
+
+    /// Average stalled duration for `op` when the operation encountered a hard stall.
+    pub fn avg_stalled_duration(&self, op: FuseOp) -> Duration {
+        let stalled = self.stalled(op);
+        if stalled == 0 {
+            return Duration::ZERO;
+        }
+        let nanos = self.stalled_nanos[op.index()].load(Ordering::Relaxed);
+        Duration::from_nanos(nanos / stalled)
     }
 
     /// Average execution latency for `op`.
@@ -317,6 +390,11 @@ impl FuseOpMetrics {
         self.active.iter().map(|c| c.load(Ordering::Relaxed)).sum()
     }
 
+    /// Sum of all currently active delayed/stalled operations across all FUSE operations.
+    pub fn total_active_delayed(&self) -> u64 {
+        self.active_delayed.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+    }
+
     /// Sum of all soft-throttled operations across all FUSE operations.
     pub fn total_throttled(&self) -> u64 {
         self.throttled.iter().map(|c| c.load(Ordering::Relaxed)).sum()
@@ -327,9 +405,42 @@ impl FuseOpMetrics {
         self.stalled.iter().map(|c| c.load(Ordering::Relaxed)).sum()
     }
 
+    /// Total number of operations that encountered any form of pushback backpressure (delayed or stalled).
+    pub fn total_delayed(&self) -> u64 {
+        self.total_throttled() + self.total_stalled()
+    }
+
     /// Total cumulative execution duration across all operations.
     pub fn total_duration(&self) -> Duration {
         let nanos: u64 = self.total_nanos.iter().map(|c| c.load(Ordering::Relaxed)).sum();
         Duration::from_nanos(nanos)
+    }
+
+    /// Total cumulative soft-throttled duration across all operations.
+    pub fn total_throttled_duration(&self) -> Duration {
+        let nanos: u64 = self.throttled_nanos.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        Duration::from_nanos(nanos)
+    }
+
+    /// Total cumulative hard-stalled duration across all operations.
+    pub fn total_stalled_duration(&self) -> Duration {
+        let nanos: u64 = self.stalled_nanos.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        Duration::from_nanos(nanos)
+    }
+
+    /// Total cumulative pushback delay duration (soft delays + hard stalls) across all operations.
+    pub fn total_delay_duration(&self) -> Duration {
+        self.total_throttled_duration() + self.total_stalled_duration()
+    }
+
+    /// Average pushback delay duration per delayed/stalled operation across all operations.
+    pub fn avg_delay_duration(&self) -> Duration {
+        let total = self.total_delayed();
+        if total == 0 {
+            Duration::ZERO
+        } else {
+            let total_nanos = self.total_delay_duration().as_nanos();
+            Duration::from_nanos((total_nanos / total as u128) as u64)
+        }
     }
 }

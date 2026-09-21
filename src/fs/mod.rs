@@ -880,7 +880,8 @@ impl InMemoryFS {
 
         let virtual_files = Arc::new(virtual_files::VirtualFileRegistry::new());
         let async_tracker = Arc::new(AsyncTracker::new());
-        let delayed_queue = Arc::new(DelayedResponseQueue::new(clock.clone()));
+        let op_metrics = Arc::new(FuseOpMetrics::new());
+        let delayed_queue = Arc::new(DelayedResponseQueue::new(clock.clone(), op_metrics.clone()));
 
         let inner = FsInner {
             base: map,
@@ -931,7 +932,7 @@ impl InMemoryFS {
             last_summary_generation: AtomicU64::new(0),
             replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
             async_tracker,
-            op_metrics: Arc::new(FuseOpMetrics::new()),
+            op_metrics,
             delayed_queue,
             deterministic_summary_iv: None,
         };
@@ -1192,14 +1193,13 @@ impl InMemoryFS {
     ) {
         self.op_metrics.record_call(op);
         let decision = self.calculate_throttle(op);
-        self.op_metrics.record_throttle(op, decision);
 
         let res = res.into();
         match res {
             DeferredResult::Ready(ready) => {
                 let duration = self.clock.elapsed_since(start);
                 self.op_metrics.record_duration(op, duration);
-                self.delayed_queue.delay_response(decision, req, ready);
+                self.delayed_queue.delay_response(op, decision, req, ready);
             }
             DeferredResult::Deferred(completion) => {
                 let op_metrics = self.op_metrics.clone();
@@ -1208,7 +1208,7 @@ impl InMemoryFS {
                 completion.on_complete(Box::new(move |final_res| {
                     let duration = clock.elapsed_since(start);
                     op_metrics.record_duration(op, duration);
-                    delayed_queue.delay_response(decision, req, final_res);
+                    delayed_queue.delay_response(op, decision, req, final_res);
                 }));
             }
         }
