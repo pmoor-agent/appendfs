@@ -20,16 +20,6 @@ impl ReadOnlyStorage {
     pub fn new(inner: Arc<dyn Storage>) -> Self {
         Self { inner }
     }
-
-    /// Returns a reference to the inner storage.
-    pub fn inner(&self) -> &Arc<dyn Storage> {
-        &self.inner
-    }
-
-    /// Consumes the wrapper and returns the inner storage.
-    pub fn into_inner(self) -> Arc<dyn Storage> {
-        self.inner
-    }
 }
 
 impl Storage for ReadOnlyStorage {
