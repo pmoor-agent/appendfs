@@ -41,8 +41,8 @@ pub use dump::{dump_file, dump_log_file, dump_log_reader, dump_summary_file, dum
 pub use error::FsError;
 pub use extent_map::{Extent, ExtentEntry, ExtentMap};
 pub use fs::{
-    BatchCompletion, FLUSH_HISTORY_CAPACITY, FlushReason, FlushRecord, FlushStats, InMemoryFS, InnerStatsSnapshot,
-    InodeCounts, OpTier,
+    BatchCompletion, DelayedResponseQueue, FLUSH_HISTORY_CAPACITY, FlushReason, FlushRecord, FlushStats, InMemoryFS,
+    InnerStatsSnapshot, InodeCounts, OpTier, ThrottleDecision,
 };
 pub use log::{
     ExtentState, LogFileCache, LogReader, LogRecord, LogWriter, RecoveryTarget, SharedExtentState, SummaryFooter,

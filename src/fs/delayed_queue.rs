@@ -1,0 +1,616 @@
+//! Delayed response queue for write pushback throttling and hard stalls.
+//!
+//! Provides two-phase pushback:
+//! 1. Soft pushback: asymptotic delay formula ($r < 1.0$) scaling smoothly from `base_throttle_delay`
+//!    to `max_throttle_delay` based on buffer saturation, racing against background flush commits and unmount.
+//! 2. Hard stall: indefinite hold ($r \ge 1.0$) when buffer is at 100% capacity, waking immediately
+//!    as soon as flush commits to disk or filesystem unmounts.
+//!
+//! Implemented with a mutex-protected priority queue (min-heap) and a dedicated worker thread
+//! that sleeps and waits on a condition variable, eliminating asynchronous runtime overhead.
+
+use crate::clock::Clock;
+use crate::error::FsError;
+use crate::operations::op::OpTier;
+use crate::shim::{FuseResponse, Request, reply_result};
+use std::collections::{BinaryHeap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+pub use crate::operations::op::ThrottleDecision;
+
+pub const DEFAULT_BASE_THROTTLE_DELAY: Duration = Duration::from_millis(10);
+pub const DEFAULT_MAX_THROTTLE_DELAY: Duration = Duration::from_secs(10);
+
+struct DelayedItem {
+    deadline: Duration,
+    id: u64,
+    req: Request,
+    res: Result<FuseResponse<'static>, FsError>,
+    enqueued_at: Duration,
+}
+
+impl PartialEq for DelayedItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.id == other.id
+    }
+}
+
+impl Eq for DelayedItem {}
+
+impl PartialOrd for DelayedItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DelayedItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering so that BinaryHeap acts as a min-heap (earliest deadline has highest priority)
+        other.deadline.cmp(&self.deadline).then_with(|| other.id.cmp(&self.id))
+    }
+}
+
+#[derive(Default)]
+struct QueueState {
+    next_id: u64,
+    delayed: BinaryHeap<DelayedItem>,
+    stalled: VecDeque<DelayedItem>,
+    stopped: bool,
+}
+
+/// Priority-queued response manager that delays FUSE replies without blocking kernel worker threads.
+pub struct DelayedResponseQueue {
+    state: Arc<(Mutex<QueueState>, Condvar)>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    flushing_saturated: AtomicBool,
+    cached_ratio_bits: AtomicU64,
+    active_delayed: Arc<AtomicUsize>,
+    total_delayed: Arc<AtomicU64>,
+    total_stalled: Arc<AtomicU64>,
+    total_delay_nanos: Arc<AtomicU64>,
+    clock: Arc<dyn Clock>,
+    base_throttle_delay: Duration,
+    max_throttle_delay: Duration,
+}
+
+impl std::fmt::Debug for DelayedResponseQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelayedResponseQueue")
+            .field("flushing_saturated", &self.is_flushing_saturated())
+            .field("cached_saturation_ratio", &self.cached_saturation_ratio())
+            .field("active_delayed", &self.active_delayed())
+            .field("total_delayed", &self.total_delayed())
+            .field("total_stalled", &self.total_stalled())
+            .field("total_delay_duration", &self.total_delay_duration())
+            .field("base_throttle_delay", &self.base_throttle_delay)
+            .field("max_throttle_delay", &self.max_throttle_delay)
+            .finish()
+    }
+}
+
+impl DelayedResponseQueue {
+    /// Creates a new delayed response queue with default base (10ms) and max (10s) throttle delays.
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self::with_delays(clock, DEFAULT_BASE_THROTTLE_DELAY, DEFAULT_MAX_THROTTLE_DELAY)
+    }
+
+    /// Creates a new delayed response queue with custom base and max throttle delays.
+    pub fn with_delays(clock: Arc<dyn Clock>, base_throttle_delay: Duration, max_throttle_delay: Duration) -> Self {
+        let state = Arc::new((Mutex::new(QueueState::default()), Condvar::new()));
+        let active_delayed = Arc::new(AtomicUsize::new(0));
+        let total_delayed = Arc::new(AtomicU64::new(0));
+        let total_stalled = Arc::new(AtomicU64::new(0));
+        let total_delay_nanos = Arc::new(AtomicU64::new(0));
+
+        let thread_state = Arc::clone(&state);
+        let thread_clock = Arc::clone(&clock);
+        let thread_total_delay_nanos = Arc::clone(&total_delay_nanos);
+        let thread_active_delayed = Arc::clone(&active_delayed);
+
+        let thread = std::thread::Builder::new()
+            .name("appendfs-delayed-queue".to_string())
+            .spawn(move || {
+                Self::worker_loop(
+                    thread_state,
+                    thread_clock,
+                    thread_total_delay_nanos,
+                    thread_active_delayed,
+                );
+            })
+            .expect("failed to spawn delayed response queue worker thread");
+
+        Self {
+            state,
+            thread: Mutex::new(Some(thread)),
+            flushing_saturated: AtomicBool::new(false),
+            cached_ratio_bits: AtomicU64::new(0.0f64.to_bits()),
+            active_delayed,
+            total_delayed,
+            total_stalled,
+            total_delay_nanos,
+            clock,
+            base_throttle_delay,
+            max_throttle_delay,
+        }
+    }
+
+    fn worker_loop(
+        state_pair: Arc<(Mutex<QueueState>, Condvar)>,
+        clock: Arc<dyn Clock>,
+        total_delay_nanos: Arc<AtomicU64>,
+        active_delayed: Arc<AtomicUsize>,
+    ) {
+        let (lock, cvar) = &*state_pair;
+        let mut state = lock.lock().unwrap();
+        loop {
+            if state.stopped {
+                break;
+            }
+
+            let now = clock.monotonic();
+            let mut to_reply = Vec::new();
+            while let Some(top) = state.delayed.peek() {
+                if top.deadline <= now {
+                    to_reply.push(state.delayed.pop().unwrap());
+                } else {
+                    break;
+                }
+            }
+
+            if !to_reply.is_empty() {
+                drop(state);
+                for item in to_reply {
+                    let elapsed = now.saturating_sub(item.enqueued_at);
+                    total_delay_nanos.fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+                    active_delayed.fetch_sub(1, Ordering::SeqCst);
+                    reply_result(item.req, item.res);
+                }
+                state = lock.lock().unwrap();
+                continue;
+            }
+
+            let wait_timeout = state.delayed.peek().map(|item| item.deadline.saturating_sub(now));
+
+            state = match wait_timeout {
+                Some(timeout) => cvar.wait_timeout(state, timeout).unwrap().0,
+                None => cvar.wait(state).unwrap(),
+            };
+        }
+    }
+
+    /// Base delay for soft backpressure formula.
+    pub fn base_throttle_delay(&self) -> Duration {
+        self.base_throttle_delay
+    }
+
+    /// Maximum delay for soft backpressure formula and timeout for stalls.
+    pub fn max_throttle_delay(&self) -> Duration {
+        self.max_throttle_delay
+    }
+
+    /// Computes the asymptotic delay for a given buffer/queue saturation ratio (0.0 to 1.0+).
+    ///
+    /// Formula:
+    /// $$\text{delay} = \text{base\_delay} \times \frac{r^2}{1.0 - r}$$
+    /// clamped to `max_throttle_delay`.
+    pub fn compute_delay(&self, ratio: f64) -> Duration {
+        if ratio <= 0.0 {
+            return Duration::ZERO;
+        }
+        if ratio >= 1.0 {
+            return self.max_throttle_delay;
+        }
+        let factor = (ratio * ratio) / (1.0 - ratio);
+        let delay_nanos = (self.base_throttle_delay.as_nanos() as f64 * factor) as u128;
+        Duration::from_nanos(delay_nanos as u64).min(self.max_throttle_delay)
+    }
+
+    /// Computes the throttling decision for an operation tier based on saturation ratio.
+    pub fn calculate_tier_decision(&self, tier: OpTier, ratio: f64) -> ThrottleDecision {
+        match tier {
+            OpTier::ReadOnly => ThrottleDecision::NoDelay,
+            OpTier::Write => {
+                if ratio >= 1.0 {
+                    ThrottleDecision::Stall
+                } else {
+                    let delay = self.compute_delay(ratio);
+                    if delay.is_zero() {
+                        ThrottleDecision::NoDelay
+                    } else {
+                        ThrottleDecision::Delay(delay)
+                    }
+                }
+            }
+            OpTier::Metadata => {
+                const METADATA_THRESHOLD: f64 = 0.75;
+                if ratio < METADATA_THRESHOLD {
+                    ThrottleDecision::NoDelay
+                } else if ratio >= 1.0 {
+                    ThrottleDecision::Stall
+                } else {
+                    let normalized_r = (ratio - METADATA_THRESHOLD) / (1.0 - METADATA_THRESHOLD);
+                    let delay = self.compute_delay(normalized_r);
+                    if delay.is_zero() {
+                        ThrottleDecision::NoDelay
+                    } else {
+                        ThrottleDecision::Delay(delay)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the flushing queue is currently saturated (at capacity).
+    #[inline]
+    pub fn is_flushing_saturated(&self) -> bool {
+        self.flushing_saturated.load(Ordering::Relaxed)
+    }
+
+    /// The latest cached buffer/queue saturation ratio.
+    #[inline]
+    pub fn cached_saturation_ratio(&self) -> f64 {
+        f64::from_bits(self.cached_ratio_bits.load(Ordering::Relaxed))
+    }
+
+    /// Updates the cached saturation status and ratio in a lock-free manner.
+    pub fn update_saturation(&self, saturated: bool, ratio: f64) {
+        self.cached_ratio_bits.store(ratio.to_bits(), Ordering::Relaxed);
+        self.flushing_saturated.store(saturated, Ordering::Release);
+    }
+
+    /// Computes the throttling decision for an operation tier using cached saturation state without locks.
+    #[inline]
+    pub fn tier_decision(&self, tier: OpTier) -> ThrottleDecision {
+        if tier == OpTier::ReadOnly || !self.flushing_saturated.load(Ordering::Acquire) {
+            return ThrottleDecision::NoDelay;
+        }
+        let ratio = self.cached_saturation_ratio();
+        self.calculate_tier_decision(tier, ratio)
+    }
+
+    /// Number of responses currently waiting in the delayed queue.
+    pub fn active_delayed(&self) -> usize {
+        self.active_delayed.load(Ordering::SeqCst)
+    }
+
+    /// Total number of responses that have been throttled (delayed or stalled) across filesystem lifetime.
+    pub fn total_delayed(&self) -> u64 {
+        self.total_delayed.load(Ordering::SeqCst)
+    }
+
+    /// Total number of responses that encountered a hard stall across filesystem lifetime.
+    pub fn total_stalled(&self) -> u64 {
+        self.total_stalled.load(Ordering::SeqCst)
+    }
+
+    /// Total cumulative duration that operations were delayed due to write pushback.
+    pub fn total_delay_duration(&self) -> Duration {
+        Duration::from_nanos(self.total_delay_nanos.load(Ordering::SeqCst))
+    }
+
+    /// Average pushback delay duration per delayed operation.
+    pub fn avg_delay_duration(&self) -> Duration {
+        let total = self.total_delayed();
+        if total == 0 {
+            Duration::ZERO
+        } else {
+            self.total_delay_duration() / (total as u32)
+        }
+    }
+
+    /// Wakes up any operations waiting on capacity (e.g. after a batch is committed to disk).
+    pub fn notify_capacity(&self) {
+        let (lock, cvar) = &*self.state;
+        let mut to_reply = Vec::new();
+        {
+            let mut state = lock.lock().unwrap();
+            while let Some(item) = state.stalled.pop_front() {
+                to_reply.push(item);
+            }
+            while let Some(item) = state.delayed.pop() {
+                to_reply.push(item);
+            }
+            cvar.notify_all();
+        }
+
+        let now = self.clock.monotonic();
+        for item in to_reply {
+            let elapsed = now.saturating_sub(item.enqueued_at);
+            self.total_delay_nanos
+                .fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+            self.active_delayed.fetch_sub(1, Ordering::SeqCst);
+            reply_result(item.req, item.res);
+        }
+    }
+
+    /// Wakes and processes any delayed operations whose deadline has expired according to the clock.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn wake_expired(&self) {
+        let (lock, cvar) = &*self.state;
+        let mut to_reply = Vec::new();
+        let now = self.clock.monotonic();
+        {
+            let mut state = lock.lock().unwrap();
+            while let Some(top) = state.delayed.peek() {
+                if top.deadline <= now {
+                    to_reply.push(state.delayed.pop().unwrap());
+                } else {
+                    break;
+                }
+            }
+            cvar.notify_all();
+        }
+        for item in to_reply {
+            let elapsed = now.saturating_sub(item.enqueued_at);
+            self.total_delay_nanos
+                .fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+            self.active_delayed.fetch_sub(1, Ordering::SeqCst);
+            reply_result(item.req, item.res);
+        }
+    }
+
+    /// Drains the queue immediately on unmount, waking all parked and delayed responses so they reply before exit.
+    pub fn drain(&self) {
+        let (lock, cvar) = &*self.state;
+        let mut to_reply = Vec::new();
+        {
+            let mut state = lock.lock().unwrap();
+            if state.stopped {
+                return;
+            }
+            state.stopped = true;
+            while let Some(item) = state.delayed.pop() {
+                to_reply.push(item);
+            }
+            while let Some(item) = state.stalled.pop_front() {
+                to_reply.push(item);
+            }
+            cvar.notify_all();
+        }
+
+        let now = self.clock.monotonic();
+        for item in to_reply {
+            let elapsed = now.saturating_sub(item.enqueued_at);
+            self.total_delay_nanos
+                .fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+            self.active_delayed.fetch_sub(1, Ordering::SeqCst);
+            reply_result(item.req, item.res);
+        }
+
+        if let Some(thread) = self.thread.lock().unwrap().take() {
+            let _ = thread.join();
+        }
+    }
+
+    /// Dispatches a FUSE response according to `decision`.
+    ///
+    /// - `ThrottleDecision::NoDelay` or zero duration: sent immediately.
+    /// - `ThrottleDecision::Delay(d)`: delayed asynchronously, racing against capacity wakeup and unmount.
+    /// - `ThrottleDecision::Stall`: stalled indefinitely, waking only when capacity is freed or unmount occurs.
+    pub fn delay_response(
+        &self,
+        decision: ThrottleDecision,
+        req: Request,
+        res: Result<FuseResponse<'static>, FsError>,
+    ) {
+        match decision {
+            ThrottleDecision::NoDelay => {
+                reply_result(req, res);
+            }
+            ThrottleDecision::Delay(delay) if delay.is_zero() => {
+                reply_result(req, res);
+            }
+            ThrottleDecision::Delay(delay) => {
+                let (lock, cvar) = &*self.state;
+                let mut state = lock.lock().unwrap();
+                if state.stopped {
+                    drop(state);
+                    reply_result(req, res);
+                    return;
+                }
+                let enqueued_at = self.clock.monotonic();
+                let deadline = enqueued_at + delay;
+                let id = state.next_id;
+                state.next_id += 1;
+                self.active_delayed.fetch_add(1, Ordering::SeqCst);
+                self.total_delayed.fetch_add(1, Ordering::SeqCst);
+                state.delayed.push(DelayedItem {
+                    deadline,
+                    id,
+                    req,
+                    res,
+                    enqueued_at,
+                });
+                cvar.notify_one();
+            }
+            ThrottleDecision::Stall => {
+                let (lock, _cvar) = &*self.state;
+                let mut state = lock.lock().unwrap();
+                if state.stopped {
+                    drop(state);
+                    reply_result(req, res);
+                    return;
+                }
+                let enqueued_at = self.clock.monotonic();
+                let id = state.next_id;
+                state.next_id += 1;
+                self.active_delayed.fetch_add(1, Ordering::SeqCst);
+                self.total_delayed.fetch_add(1, Ordering::SeqCst);
+                self.total_stalled.fetch_add(1, Ordering::SeqCst);
+                state.stalled.push_back(DelayedItem {
+                    deadline: Duration::MAX,
+                    id,
+                    req,
+                    res,
+                    enqueued_at,
+                });
+            }
+        }
+    }
+}
+
+impl Drop for DelayedResponseQueue {
+    fn drop(&mut self) {
+        self.drain();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_asymptotic_delay_curve() {
+        let clock = Arc::new(crate::clock::SystemClock);
+        let queue = DelayedResponseQueue::with_delays(clock, Duration::from_millis(10), Duration::from_secs(10));
+
+        assert_eq!(queue.compute_delay(-0.1), Duration::ZERO);
+        assert_eq!(queue.compute_delay(0.0), Duration::ZERO);
+        assert_eq!(queue.compute_delay(0.5), Duration::from_millis(5));
+        assert_eq!(queue.compute_delay(0.8), Duration::from_millis(32));
+        assert_eq!(queue.compute_delay(1.0), Duration::from_secs(10));
+        assert_eq!(queue.compute_delay(1.5), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_delayed_queue_drain_unblocks() {
+        let clock = Arc::new(crate::clock::SystemClock);
+        let queue = DelayedResponseQueue::new(clock);
+
+        assert_eq!(queue.active_delayed(), 0);
+        assert_eq!(queue.total_delayed(), 0);
+
+        queue.drain();
+        assert_eq!(queue.active_delayed(), 0);
+    }
+
+    #[test]
+    fn test_delayed_response_queue_drain_on_unmount() {
+        let queue = DelayedResponseQueue::new(Arc::new(crate::clock::SystemClock));
+
+        let req = Request::new_mock();
+        let response = Ok(FuseResponse::ok());
+        // Schedule with Stall (hard indefinite wait)
+        queue.delay_response(ThrottleDecision::Stall, req, response);
+
+        assert_eq!(queue.active_delayed(), 1);
+        assert_eq!(queue.total_delayed(), 1);
+        assert_eq!(queue.total_stalled(), 1);
+
+        // Drain on unmount
+        queue.drain();
+
+        assert_eq!(queue.active_delayed(), 0);
+    }
+
+    #[test]
+    fn test_delayed_queue_wake_stalled_waiter_on_batch_commit() {
+        let mut fs = crate::fs::InMemoryFS::new();
+        fs.max_buffer_size = 1000;
+        fs.max_flush_queue_depth = 1;
+
+        // Artificially set flushing_ops > 0 and staged_bytes >= max_staging_bytes
+        {
+            let mut inner = fs.inner.lock(crate::sync::OpTag::Other).unwrap();
+            let completion = inner.live_completion.clone();
+            inner.flushing.push_back(std::sync::Arc::new(crate::fs::FlushBatch::new(
+                1,
+                std::iter::once((
+                    1,
+                    crate::node::EntryDelta::Node(crate::node::NodeDelta::Directory(Default::default())),
+                ))
+                .collect(),
+                crate::fs::WriteArena::new(),
+                100,
+                1,
+                completion,
+                crate::fs::FlushReason::Threshold,
+            )));
+            inner.flushing_bytes = 100;
+            inner.flushing_ops = 1;
+            // Stage 1000 bytes -> hard stall
+            inner.staged_bytes = 1000;
+        }
+        fs.refresh_pushback_saturation();
+
+        let decision = fs.calculate_throttle(crate::operations::op::FuseOp::Write);
+        assert_eq!(decision, ThrottleDecision::Stall);
+
+        // Dispatch delayed response via dispatch_reply
+        let req = Request::new_mock();
+        let response = Ok(FuseResponse::write(100));
+        let start = fs.clock.monotonic();
+        fs.dispatch_reply(req, crate::operations::op::FuseOp::Write, response, start);
+
+        // It should now be queued, active, and tracked in op_metrics
+        assert_eq!(fs.delayed_queue.active_delayed(), 1);
+        assert_eq!(fs.delayed_queue.total_delayed(), 1);
+        assert_eq!(fs.delayed_queue.total_stalled(), 1);
+        assert_eq!(fs.op_metrics.calls(crate::operations::op::FuseOp::Write), 1);
+        assert_eq!(fs.op_metrics.stalled(crate::operations::op::FuseOp::Write), 1);
+
+        // Pop the batch -> this notifies capacity immediately
+        let _ = fs.pop_flushing_batch();
+
+        // Hard-stalled waiter should have been unblocked and finished immediately!
+        assert_eq!(fs.delayed_queue.active_delayed(), 0);
+    }
+
+    #[test]
+    fn test_delayed_queue_aggregate_latency_and_runtime_status() {
+        use crate::clock::AdvancingClock;
+        use crate::stats::format_runtime_status;
+        use std::time::SystemTime;
+
+        let mock_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let adv_clock = Arc::new(AdvancingClock::new(mock_time));
+        let mut fs = crate::fs::InMemoryFS::with_clock(adv_clock.clone());
+        fs.max_buffer_size = 1000;
+        fs.max_flush_queue_depth = 1;
+
+        // Initially, zero delay
+        assert_eq!(fs.delayed_queue.total_delay_duration(), Duration::ZERO);
+        assert_eq!(fs.delayed_queue.avg_delay_duration(), Duration::ZERO);
+
+        // Dispatch a normal request with start time to record op execution latency
+        let req = Request::new_mock();
+        let resp = Ok(FuseResponse::ok());
+        let start = fs.clock.monotonic();
+        adv_clock.advance(Duration::from_millis(5));
+
+        fs.dispatch_reply(req, crate::operations::op::FuseOp::Write, resp, start);
+        assert_eq!(fs.op_metrics.calls(crate::operations::op::FuseOp::Write), 1);
+        assert_eq!(
+            fs.op_metrics.avg_latency(crate::operations::op::FuseOp::Write),
+            Duration::from_millis(5)
+        );
+
+        // Delay a response to verify aggregate backpressure delay tracking
+        let req2 = Request::new_mock();
+        let resp2 = Ok(FuseResponse::write(50));
+        fs.delayed_queue
+            .delay_response(ThrottleDecision::Delay(Duration::from_millis(20)), req2, resp2);
+        assert_eq!(fs.delayed_queue.active_delayed(), 1);
+        assert_eq!(fs.delayed_queue.total_delayed(), 1);
+
+        // Advance mock clock to simulate the passage of delay time deterministically
+        adv_clock.advance(Duration::from_millis(20));
+        fs.delayed_queue.wake_expired();
+
+        assert_eq!(fs.delayed_queue.active_delayed(), 0);
+        assert_eq!(fs.delayed_queue.total_delay_duration(), Duration::from_millis(20));
+        assert_eq!(fs.delayed_queue.avg_delay_duration(), Duration::from_millis(20));
+
+        // Check runtime status text
+        let status = format_runtime_status(&fs);
+        assert!(status.contains("[Pushback Throttling]"));
+        assert!(status.contains("Total Throttled:    1"));
+        assert!(status.contains("Total Delay Time:"));
+        assert!(status.contains("Avg Delay / Waiter:"));
+        assert!(status.contains("[FUSE Operations]"));
+        assert!(status.contains("AVG LAT"));
+        assert!(status.contains("MAX LAT"));
+    }
+}

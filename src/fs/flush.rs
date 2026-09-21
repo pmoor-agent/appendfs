@@ -34,11 +34,15 @@ impl InMemoryFS {
     /// The sole entry point for moving mutations out of `live`: capacity policy lives here and
     /// nowhere else. Returns `true` if a batch was frozen.
     pub(crate) fn freeze_now_locked(&self, inner: &mut FsInner) -> bool {
-        inner.freeze_live(
+        let froze = inner.freeze_live(
             self.max_flush_queue_depth,
             self.max_flush_queue_bytes,
             self.max_flush_queue_ops,
-        )
+        );
+        if froze {
+            self.sync_pushback_saturation(inner);
+        }
+        froze
     }
 
     /// Freezes `live` if someone asked for it, or if staged mutations have reached the flush
@@ -60,7 +64,19 @@ impl InMemoryFS {
     /// Pops the front batch from the flushing queue, if any.
     #[cfg(any(test, feature = "testing"))]
     pub fn pop_flushing_batch(&self) -> Option<Arc<super::FlushBatch>> {
-        self.inner.lock(OpTag::Flush).unwrap().pop_flushing_batch()
+        let (batch, had_batch) = {
+            let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+            let batch = inner.pop_flushing_batch();
+            let had_batch = batch.is_some();
+            if had_batch {
+                self.sync_pushback_saturation(&inner);
+            }
+            (batch, had_batch)
+        };
+        if had_batch {
+            self.delayed_queue.notify_capacity();
+        }
+        batch
     }
 
     /// Folds every queued batch straight into `base`, bypassing the log entirely.
@@ -79,6 +95,7 @@ impl InMemoryFS {
             };
             inner.fold_entries(entries);
         }
+        self.sync_pushback_saturation(&inner);
     }
 
     /// Returns the completion that fires once everything currently staged or queued is
@@ -356,9 +373,11 @@ impl InMemoryFS {
                     let mut inner = self.inner.lock(OpTag::Fold).unwrap();
                     let popped = inner.pop_flushed_batch(batch.id);
                     inner.fold_entries(entries);
+                    self.sync_pushback_saturation(&inner);
                     popped
                 };
                 let finished = self.clock.monotonic();
+                self.delayed_queue.notify_capacity();
 
                 let record = super::FlushRecord {
                     id: popped.id,
@@ -534,6 +553,8 @@ impl InMemoryFS {
             LockManager::cancel_all_waiters(inner);
         });
 
+        // Drain the delayed response queue before drain_async_ops(): stalls have no timeout.
+        self.delayed_queue.drain();
         self.drain_async_ops();
     }
 
