@@ -4,10 +4,12 @@ use std::sync::Arc;
 pub mod fault;
 pub mod memory;
 pub mod os;
+pub mod readonly;
 
 pub use fault::FaultStorage;
 pub use memory::MemoryStorage;
 pub use os::OsStorage;
+pub use readonly::ReadOnlyStorage;
 
 /// Read-only access to a stored file. Completely stateless and thread-safe.
 pub trait StorageReader: Send + Sync {

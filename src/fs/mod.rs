@@ -1010,7 +1010,15 @@ impl InMemoryFS {
     }
 
     /// Attaches an active `LogWriter` to the filesystem instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the filesystem is in read-only mode or stopped.
     pub fn attach_log_writer(&mut self, writer: Arc<LogWriter>) {
+        assert!(
+            !self.is_read_only(),
+            "cannot attach a log writer to a read-only filesystem"
+        );
         self.log_writer = Some(writer);
     }
 

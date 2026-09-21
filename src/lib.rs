@@ -66,7 +66,9 @@ pub use stats::{
     VolumeStats, calculate_generation_live_stats_from_nodes, format_generation_status, format_generations_table,
     format_runtime_status,
 };
-pub use storage::{FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter, WriteMode};
+pub use storage::{
+    FaultStorage, MemoryStorage, OsStorage, ReadOnlyStorage, Storage, StorageReader, StorageWriter, WriteMode,
+};
 pub use sync::{ActionGuard, ActionMutex, OpStatSnapshot, OpTag, PostUnlockQueue};
 #[cfg(any(test, feature = "testing"))]
 pub use test_utils::wait_until;

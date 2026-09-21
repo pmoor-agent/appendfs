@@ -616,6 +616,8 @@ fn cmd_mount_ro(args: MountRoArgs) {
         log::warn!("Remote recovery preparation warning: {}", e);
     }
 
+    let storage: Arc<dyn Storage> = Arc::new(appendfs::storage::ReadOnlyStorage::new(storage));
+
     let mut fs_instance = match recover_fs(storage.clone(), target, Arc::new(SystemClock), volume_key) {
         Ok(fs) => fs,
         Err(e) => {
@@ -623,7 +625,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
             std::process::exit(1);
         }
     };
-    fs_instance.set_log_dir(log_dir);
+    fs_instance.set_storage(storage.clone());
     fs_instance.set_read_only();
 
     let cache_dir = log_dir.join(".cache");
@@ -636,7 +638,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
         .unwrap(),
     );
     let log_cache = Arc::new(appendfs::log::LogFileCache::with_remote_support(
-        storage.clone(),
+        storage,
         Some(block_cache),
         remote_stores,
         Some(Arc::clone(&fs_instance.manifest)),
