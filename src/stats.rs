@@ -571,22 +571,23 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         out.push('\n');
         out.push_str("[FUSE Operations]\n");
         out.push_str(&format!(
-            "  {:<12} {:>8} {:>8} {:>10} {:>8} {:>12} {:>12}\n",
-            "OPERATION", "ACTIVE", "CALLS", "THROTTLED", "STALLED", "AVG LAT", "MAX LAT"
+            "  {:<12} {:>8} {:>8} {:>10} {:>14} {:>8} {:>12} {:>12}\n",
+            "OPERATION", "ACTIVE", "CALLS", "THROTTLED", "AVG THROTTLED", "STALLED", "AVG LAT", "MAX LAT"
         ));
         out.push_str(&format!(
-            "  {:-<12} {:-<8} {:-<8} {:-<10} {:-<8} {:-<12} {:-<12}\n",
-            "", "", "", "", "", "", ""
+            "  {:-<12} {:-<8} {:-<8} {:-<10} {:-<14} {:-<8} {:-<12} {:-<12}\n",
+            "", "", "", "", "", "", "", ""
         ));
         for op in &crate::operations::op::ALL_FUSE_OPS {
             let calls = fs.op_metrics.calls(*op);
             if calls > 0 {
                 out.push_str(&format!(
-                    "  {:<12} {:>8} {:>8} {:>10} {:>8} {:>12} {:>12}\n",
+                    "  {:<12} {:>8} {:>8} {:>10} {:>14} {:>8} {:>12} {:>12}\n",
                     op.as_str(),
                     fs.op_metrics.active(*op),
                     calls,
                     fs.op_metrics.throttled(*op),
+                    format_duration(fs.op_metrics.avg_throttled_duration(*op)),
                     fs.op_metrics.stalled(*op),
                     format_duration(fs.op_metrics.avg_latency(*op)),
                     format_duration(fs.op_metrics.max_latency(*op)),

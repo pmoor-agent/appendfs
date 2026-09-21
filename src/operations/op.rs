@@ -229,6 +229,7 @@ pub struct FuseOpMetrics {
     stalled: [AtomicU64; FUSE_OP_COUNT],
     total_nanos: [AtomicU64; FUSE_OP_COUNT],
     max_nanos: [AtomicU64; FUSE_OP_COUNT],
+    throttled_nanos: [AtomicU64; FUSE_OP_COUNT],
 }
 
 impl FuseOpMetrics {
@@ -267,6 +268,13 @@ impl FuseOpMetrics {
         self.max_nanos[op.index()].fetch_max(nanos, Ordering::Relaxed);
     }
 
+    /// Records the actual duration that `op` was throttled (waiting in pushback delay queue).
+    #[inline]
+    pub fn record_throttled_duration(&self, op: FuseOp, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.throttled_nanos[op.index()].fetch_add(nanos, Ordering::Relaxed);
+    }
+
     /// Cumulative count of invocations for `op`.
     #[inline]
     pub fn calls(&self, op: FuseOp) -> u64 {
@@ -289,6 +297,22 @@ impl FuseOpMetrics {
     #[inline]
     pub fn stalled(&self, op: FuseOp) -> u64 {
         self.stalled[op.index()].load(Ordering::Relaxed)
+    }
+
+    /// Cumulative duration that `op` was throttled.
+    pub fn throttled_duration(&self, op: FuseOp) -> Duration {
+        let nanos = self.throttled_nanos[op.index()].load(Ordering::Relaxed);
+        Duration::from_nanos(nanos)
+    }
+
+    /// Average throttled duration for `op` when the operation was actually throttled.
+    pub fn avg_throttled_duration(&self, op: FuseOp) -> Duration {
+        let throttled = self.throttled(op);
+        if throttled == 0 {
+            return Duration::ZERO;
+        }
+        let nanos = self.throttled_nanos[op.index()].load(Ordering::Relaxed);
+        Duration::from_nanos(nanos / throttled)
     }
 
     /// Average execution latency for `op`.
@@ -330,6 +354,12 @@ impl FuseOpMetrics {
     /// Total cumulative execution duration across all operations.
     pub fn total_duration(&self) -> Duration {
         let nanos: u64 = self.total_nanos.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        Duration::from_nanos(nanos)
+    }
+
+    /// Total cumulative throttled duration across all operations.
+    pub fn total_throttled_duration(&self) -> Duration {
+        let nanos: u64 = self.throttled_nanos.iter().map(|c| c.load(Ordering::Relaxed)).sum();
         Duration::from_nanos(nanos)
     }
 }

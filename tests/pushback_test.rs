@@ -11,7 +11,8 @@ fn mock_time() -> SystemTime {
 #[test]
 fn test_asymptotic_delay_mathematics() {
     let clock = Arc::new(MockClock(mock_time()));
-    let queue = DelayedResponseQueue::with_delays(clock, Duration::from_millis(10), Duration::from_secs(10));
+    let metrics = Arc::new(appendfs::operations::op::FuseOpMetrics::new());
+    let queue = DelayedResponseQueue::with_delays(clock, metrics, Duration::from_millis(10), Duration::from_secs(10));
     let max = queue.max_throttle_delay();
 
     // Negative or 0 ratio: zero delay
@@ -281,6 +282,48 @@ fn test_fuse_op_latency_metrics() {
     assert_eq!(metrics.total_duration(), Duration::from_millis(40));
     assert_eq!(metrics.avg_latency(FuseOp::Fsync), Duration::from_millis(20));
     assert_eq!(metrics.max_latency(FuseOp::Fsync), Duration::from_millis(30));
+}
+
+#[test]
+fn test_fuse_op_throttled_duration_metrics() {
+    use appendfs::{FuseOp, FuseOpMetrics, ThrottleDecision};
+
+    let metrics = FuseOpMetrics::new();
+    assert_eq!(metrics.throttled(FuseOp::Write), 0);
+    assert_eq!(metrics.throttled_duration(FuseOp::Write), Duration::ZERO);
+    assert_eq!(metrics.avg_throttled_duration(FuseOp::Write), Duration::ZERO);
+    assert_eq!(metrics.total_throttled_duration(), Duration::ZERO);
+
+    // Record calls: 4 calls to Write, but only 2 were throttled
+    metrics.record_call(FuseOp::Write);
+    metrics.record_throttle(FuseOp::Write, ThrottleDecision::NoDelay);
+    metrics.record_duration(FuseOp::Write, Duration::from_millis(5));
+
+    metrics.record_call(FuseOp::Write);
+    metrics.record_throttle(FuseOp::Write, ThrottleDecision::Delay(Duration::from_millis(50)));
+    metrics.record_duration(FuseOp::Write, Duration::from_millis(5));
+    metrics.record_throttled_duration(FuseOp::Write, Duration::from_millis(20));
+
+    metrics.record_call(FuseOp::Write);
+    metrics.record_throttle(FuseOp::Write, ThrottleDecision::Delay(Duration::from_millis(80)));
+    metrics.record_duration(FuseOp::Write, Duration::from_millis(5));
+    metrics.record_throttled_duration(FuseOp::Write, Duration::from_millis(40));
+
+    metrics.record_call(FuseOp::Write);
+    metrics.record_throttle(FuseOp::Write, ThrottleDecision::NoDelay);
+    metrics.record_duration(FuseOp::Write, Duration::from_millis(5));
+
+    assert_eq!(metrics.calls(FuseOp::Write), 4);
+    assert_eq!(metrics.throttled(FuseOp::Write), 2);
+    assert_eq!(metrics.throttled_duration(FuseOp::Write), Duration::from_millis(60));
+    // Average throttled duration when actually throttled: 60ms / 2 = 30ms (NOT 60ms / 4 = 15ms)
+    assert_eq!(metrics.avg_throttled_duration(FuseOp::Write), Duration::from_millis(30));
+    assert_eq!(metrics.total_throttled_duration(), Duration::from_millis(60));
+
+    // Another op (Lookup) that had no throttles
+    metrics.record_call(FuseOp::Lookup);
+    metrics.record_throttle(FuseOp::Lookup, ThrottleDecision::NoDelay);
+    assert_eq!(metrics.avg_throttled_duration(FuseOp::Lookup), Duration::ZERO);
 }
 
 #[test]

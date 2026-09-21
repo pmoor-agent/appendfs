@@ -159,7 +159,59 @@ fn test_runtime_status_fuse_operations_formatting() {
     assert!(status.contains("OPERATION"));
     assert!(status.contains("ACTIVE"));
     assert!(status.contains("CALLS"));
+    assert!(status.contains("AVG THROTTLED"));
     assert!(status.contains("AVG LAT"));
     assert!(status.contains("MAX LAT"));
     assert!(status.contains("lookup"));
+}
+
+#[test]
+fn test_runtime_status_fuse_operations_throttled_formatting() {
+    let clock = Arc::new(AdvancingClock::new(mock_time()));
+    let fs = InMemoryFS::with_clock(clock.clone());
+
+    // Record an unthrottled lookup
+    let req1 = Request::new_mock();
+    fs.dispatch_reply(req1, FuseOp::Lookup, Ok(FuseResponse::ok()), Duration::ZERO);
+
+    // Record two writes, one of which was throttled
+    let req2 = Request::new_mock();
+    let start2 = fs.clock.monotonic();
+    clock.advance(Duration::from_millis(5));
+    fs.dispatch_reply(req2, FuseOp::Write, Ok(FuseResponse::write(10)), start2);
+
+    let req3 = Request::new_mock();
+    let start3 = fs.clock.monotonic();
+    clock.advance(Duration::from_millis(5));
+    // Manually record throttle and delay via delayed_queue
+    fs.op_metrics.record_call(FuseOp::Write);
+    fs.op_metrics.record_throttle(
+        FuseOp::Write,
+        appendfs::operations::op::ThrottleDecision::Delay(Duration::from_millis(15)),
+    );
+    let dur3 = fs.clock.elapsed_since(start3);
+    fs.op_metrics.record_duration(FuseOp::Write, dur3);
+    fs.delayed_queue.delay_response(
+        FuseOp::Write,
+        appendfs::operations::op::ThrottleDecision::Delay(Duration::from_millis(15)),
+        req3,
+        Ok(FuseResponse::write(20)),
+    );
+
+    // Advance clock and wake expired
+    clock.advance(Duration::from_millis(15));
+    fs.delayed_queue.wake_expired();
+
+    assert_eq!(fs.op_metrics.calls(FuseOp::Write), 2);
+    assert_eq!(fs.op_metrics.throttled(FuseOp::Write), 1);
+    assert_eq!(
+        fs.op_metrics.avg_throttled_duration(FuseOp::Write),
+        Duration::from_millis(15)
+    );
+
+    let status = format_runtime_status(&fs);
+    assert!(status.contains("[FUSE Operations]"));
+    assert!(status.contains("AVG THROTTLED"));
+    // Verify 15.00 ms is in the formatted output for the throttled write
+    assert!(status.contains("15.00 ms"));
 }
