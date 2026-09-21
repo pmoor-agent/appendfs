@@ -1404,7 +1404,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
         volume_key.clone(),
     )
     .unwrap();
-    fs_latest.set_read_only(true);
+    fs_latest.set_read_only();
 
     // Attach remote tiered storage support
     let block_cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
@@ -1458,7 +1458,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
         volume_key.clone(),
     )
     .unwrap();
-    fs_past.set_read_only(true);
+    fs_past.set_read_only();
 
     let log_cache_past = Arc::new(LogFileCache::with_remote_support(
         storage.clone(),
@@ -1506,7 +1506,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
         volume_key.clone(),
     )
     .unwrap();
-    fs_gen1.set_read_only(true);
+    fs_gen1.set_read_only();
     let log_cache_gen1 = Arc::new(LogFileCache::with_remote_support(
         storage.clone(),
         Some(block_cache),

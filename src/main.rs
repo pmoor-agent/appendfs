@@ -623,7 +623,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
         }
     };
     fs_instance.set_log_dir(log_dir);
-    fs_instance.set_read_only(true);
+    fs_instance.set_read_only();
 
     let cache_dir = log_dir.join(".cache");
     let block_cache = Arc::new(

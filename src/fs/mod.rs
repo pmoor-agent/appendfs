@@ -1092,17 +1092,21 @@ impl InMemoryFS {
         Ok(())
     }
 
-    /// Marks the filesystem read-only (or, passed `false`, lifts a read-only marking that was
-    /// never escalated to a full shutdown). Backed by [`ShutdownState`] on `FsInner` rather than
-    /// a standalone flag, so this observes/updates the same state every handler checks inside
-    /// its own critical section - never downgrades out of `Stopped`.
-    pub fn set_read_only(&self, ro: bool) {
+    /// Marks the filesystem read-only, rejecting every subsequent mutation with `EROFS`.
+    ///
+    /// One-way: [`ShutdownState`] only ever advances, so this never resurrects a filesystem
+    /// that is already `Stopped`, and there is no way back to `Running`. Nothing needs to
+    /// un-mark a read-only mount - a mount is read-only for its whole life - and allowing it
+    /// would mean a filesystem could start accepting writes again midway through the shutdown
+    /// sequence, after `destroy()` had already marked it read-only to drain it.
+    ///
+    /// Backed by the same `FsInner` state every handler checks inside its own critical
+    /// section, rather than a standalone flag, so the transition cannot race a mutation.
+    pub fn set_read_only(&self) {
         self.with_inner(OpTag::Other, |inner| {
-            inner.shutdown_state = match (inner.shutdown_state, ro) {
-                (ShutdownState::Stopped, _) => ShutdownState::Stopped,
-                (_, true) => ShutdownState::ReadOnly,
-                (_, false) => ShutdownState::Running,
-            };
+            if inner.shutdown_state == ShutdownState::Running {
+                inner.shutdown_state = ShutdownState::ReadOnly;
+            }
         });
     }
 

@@ -491,42 +491,41 @@ impl InMemoryFS {
     /// and `flushing` to a final durable summary, stop accepting all requests including reads,
     /// then stop the flusher and drain whatever background/lock work remains.
     pub fn destroy(&self) {
-        // `Drop` calls `destroy()` unconditionally as a backstop for sessions where FUSE's
-        // `destroy` callback never fires (standalone binaries, tests); on a FUSE mount that
-        // means this runs twice. Bail out on the second call so it doesn't re-export an
-        // unchanged summary or re-notify replication for nothing.
-        //
-        // The state on entry also says *why* the filesystem is read-only, which the rest of
-        // this sequence needs: `Running` means this shutdown is what made it read-only,
-        // whereas `ReadOnly` means it was mounted that way.
-        let entry_state = self.with_inner(OpTag::Other, |inner| {
-            let entry_state = inner.shutdown_state;
-            if entry_state != ShutdownState::Stopped {
+        let Some(mounted_read_only) = self.with_inner(OpTag::Other, |inner| match inner.shutdown_state {
+            // Shutdown already ran to completion: `Drop` calling in after FUSE's `destroy`
+            // callback already did the work, or a second explicit call. Nothing left to do,
+            // and re-running would re-export an unchanged summary and re-notify replication.
+            ShutdownState::Stopped => None,
+            // Otherwise the entry state says *why* the filesystem is read-only, which the
+            // export below depends on: `ReadOnly` means it was mounted that way, `Running`
+            // means this shutdown is what just made it so.
+            entry_state => {
                 inner.shutdown_state = ShutdownState::ReadOnly;
+                Some(entry_state == ShutdownState::ReadOnly)
             }
-            entry_state
-        });
-        if entry_state == ShutdownState::Stopped {
+        }) else {
             return;
-        }
+        };
 
-        // Stopping the background thread first, rather than after, means `quiesce()` below
-        // always drains inline through `run_flush_cycle()` itself (`is_background()` is now
-        // false) instead of waiting on a thread that - having just been told to exit - might
-        // never service it. That is what makes this safe to do unconditionally instead of
-        // the old behavior of failing queued completions with `Interrupted`.
+        // `stop()` joins the flusher thread, so once it returns the background thread has
+        // exited and cannot pick up another cycle. Stopping it here, before the drain rather
+        // than after, is what lets `quiesce()` below run the remaining work inline through
+        // `run_flush_cycle()` itself (`is_background()` is now false) instead of waiting on a
+        // thread that has already been told to exit. That in turn is what makes the drain
+        // safe to do unconditionally, replacing the old behavior of failing queued
+        // completions with `Interrupted`.
         self.flusher.stop();
 
         // Drains `live`/`flushing` and exports the final summary before anything is torn
         // down, so unmount never strands a write the way discarding queued completions used
         // to.
         //
-        // Skipped entirely for a filesystem that was already read-only on entry - it was
-        // mounted that way (`mount_ro_arc`), and such a mount may be pointed at a historical
-        // recovery target (`--at-time` / `--batch-id`). Exporting from one would publish that
-        // historical state as the volume's newest summary, and a later recovery picking it up
-        // would roll the volume back. A read-only mount has nothing staged to drain anyway.
-        if entry_state == ShutdownState::Running {
+        // Skipped entirely for a filesystem that was mounted read-only (`mount_ro_arc`), since
+        // such a mount may be pointed at a historical recovery target (`--at-time` /
+        // `--batch-id`). Exporting from one would publish that historical state as the
+        // volume's newest summary, and a later recovery picking it up would roll the volume
+        // back. A read-only mount has nothing staged to drain anyway.
+        if !mounted_read_only {
             let _ = self.sync_and_export_summary();
         }
 
@@ -2008,7 +2007,7 @@ mod tests {
     #[test]
     fn test_in_memory_fs_destroy_drains_read_only() {
         let fs = Arc::new(InMemoryFS::new());
-        fs.set_read_only(true);
+        fs.set_read_only();
         let guard = fs.begin_async_op();
 
         let fs_clone = Arc::clone(&fs);
@@ -2057,7 +2056,7 @@ mod tests {
         fs.quiesce().unwrap();
 
         let summaries_before = summary_count(storage.as_ref());
-        fs.set_read_only(true);
+        fs.set_read_only();
         fs.destroy();
 
         assert_eq!(

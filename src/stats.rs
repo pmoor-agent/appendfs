@@ -708,7 +708,7 @@ mod tests {
         releasedir_core(&fs, dir.ino, dh).unwrap();
 
         // Check read-only mode reporting
-        fs.set_read_only(true);
+        fs.set_read_only();
         let ro_status = format_runtime_status(&fs);
         assert!(ro_status.contains("Access Mode:        Read-Only"));
     }

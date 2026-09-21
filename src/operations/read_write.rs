@@ -663,7 +663,7 @@ mod tests {
     fn test_fallocate_rejected_on_read_only_mount() {
         let fs = InMemoryFS::new();
         let ino = file_with(&fs, &[0xEF; 128]);
-        fs.set_read_only(true);
+        fs.set_read_only();
         assert_eq!(
             fallocate_core(&fs, ino, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, 0, 64),
             Err(FsError::EROFS)
