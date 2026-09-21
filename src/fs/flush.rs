@@ -9,7 +9,7 @@ use super::{FlushReason, FsInner, InMemoryFS, ShutdownState};
 use crate::error::FsError;
 use crate::extent_map::Extent;
 use crate::log::{GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode, RECORD_HEADER_SIZE};
-use crate::node::{EntryDelta, NodeDelta, NodeKind};
+use crate::node::{EntryDelta, NodeDelta};
 use crate::operations::locks::LockManager;
 use crate::storage::Storage;
 use crate::sync::OpTag;
@@ -540,44 +540,8 @@ impl InMemoryFS {
     /// Dynamically calculates live extent statistics across all active files and log generations.
     pub fn calculate_generation_live_stats(&self) -> Vec<GenerationLiveStats> {
         let manifest = self.manifest.read().unwrap().clone();
-        let live_map = {
-            let inner = self.inner.lock(OpTag::Stats).unwrap();
-            let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
-            for node_arc in inner.base.values() {
-                let node = node_arc.as_ref();
-                if let NodeKind::File { extent_map, .. } = &node.kind {
-                    for (_, entry) in extent_map.iter() {
-                        if let Extent::Disk { generation, length, .. } = &entry.extent {
-                            let stats = live_map.entry(*generation).or_insert((0, 0));
-                            stats.0 += *length as u64;
-                            stats.1 += 1;
-                        }
-                    }
-                }
-            }
-            live_map
-        };
-
-        let mut result = Vec::new();
-        for log in &manifest.logs {
-            let (live_bytes, live_extents) = live_map.get(&log.generation).copied().unwrap_or((0, 0));
-            let live_ratio = if log.total_data_bytes > 0 {
-                live_bytes as f64 / log.total_data_bytes as f64
-            } else {
-                0.0
-            };
-            result.push(GenerationLiveStats {
-                generation: log.generation,
-                filename: log.filename.clone(),
-                record_count: log.record_count,
-                total_bytes: log.total_bytes,
-                total_data_bytes: log.total_data_bytes,
-                live_bytes,
-                live_extents,
-                live_ratio,
-            });
-        }
-        result
+        let inner = self.inner.lock(OpTag::Stats).unwrap();
+        crate::stats::calculate_generation_live_stats_from_nodes(inner.base.values().map(|a| a.as_ref()), &manifest)
     }
 
     /// Performs a comprehensive, read-only integrity check of the filesystem state.

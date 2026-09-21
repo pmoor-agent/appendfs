@@ -1,6 +1,11 @@
-use crate::fs::InMemoryFS;
+use crate::extent_map::Extent;
+use crate::fs::{InMemoryFS, InodeCounts};
+use crate::log::LogManifest;
 use crate::log::manifest::GenerationLiveStats;
+use crate::node::{Node, NodeKind};
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
+use std::sync::Arc;
 
 /// Aggregate statistics and fragmentation status for an appendfs volume.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,12 +29,8 @@ impl VolumeStats {
         crate::log::log_filename(self.next_generation)
     }
 
-    /// Collects volume statistics from an in-memory filesystem state.
-    pub fn collect(fs: &InMemoryFS) -> Self {
-        let manifest = fs.manifest.read().unwrap().clone();
-        let counts = fs.inode_counts();
-
-        let generations = fs.calculate_generation_live_stats();
+    /// Constructs VolumeStats from individual pre-computed parts.
+    pub fn from_parts(next_generation: u64, counts: &InodeCounts, generations: Vec<GenerationLiveStats>) -> Self {
         let mut total_disk_bytes = 0;
         let mut total_data_bytes = 0;
         let mut total_live_bytes = 0;
@@ -49,7 +50,7 @@ impl VolumeStats {
         };
 
         Self {
-            next_generation: manifest.next_generation,
+            next_generation,
             total_inodes: counts.total_active(),
             directory_count: counts.directories,
             file_count: counts.files,
@@ -61,6 +62,21 @@ impl VolumeStats {
             overall_live_ratio,
             generations,
         }
+    }
+
+    /// Collects volume statistics from an in-memory filesystem state.
+    pub fn collect(fs: &InMemoryFS) -> Self {
+        let manifest = fs.manifest.read().unwrap().clone();
+        let counts = fs.inode_counts();
+        let generations = fs.calculate_generation_live_stats();
+        Self::from_parts(manifest.next_generation, &counts, generations)
+    }
+
+    /// Collects volume statistics directly from a snapshot's inodes and manifest.
+    pub fn collect_from_snapshot(inodes: &HashMap<u64, Arc<Node>>, manifest: &LogManifest) -> Self {
+        let counts = InodeCounts::from_nodes(inodes.values().map(|a| a.as_ref()));
+        let generations = calculate_generation_live_stats_from_nodes(inodes.values().map(|a| a.as_ref()), manifest);
+        Self::from_parts(manifest.next_generation, &counts, generations)
     }
 
     /// Formats stats into a clean, human-readable terminal table.
@@ -89,48 +105,94 @@ impl VolumeStats {
         }
         writeln!(out).unwrap();
 
-        if self.generations.is_empty() {
-            writeln!(
-                out,
-                "No log generation files present (clean unmounted / fresh summary)."
-            )
-            .unwrap();
-        } else {
-            writeln!(
-                out,
-                "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  STATUS",
-                "LOG FILE", "RECORDS", "LOG SIZE", "DATA SIZE", "LIVE DATA", "EXTENTS", "LIVE RATIO"
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "{:-<14} {:-<10} {:-<12} {:-<12} {:-<12} {:-<8} {:-<12}  {:-<24}",
-                "", "", "", "", "", "", "", ""
-            )
-            .unwrap();
-
-            for g in &self.generations {
-                let (status, ratio_str) =
-                    format_generation_status(g.total_data_bytes, g.live_bytes, g.live_ratio, g.record_count);
-
-                writeln!(
-                    out,
-                    "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
-                    g.filename,
-                    g.record_count,
-                    format_bytes(g.total_bytes),
-                    format_bytes(g.total_data_bytes),
-                    format_bytes(g.live_bytes),
-                    g.live_extents,
-                    ratio_str,
-                    status,
-                )
-                .unwrap();
-            }
-        }
-
+        out.push_str(&format_generations_table(&self.generations));
         out
     }
+}
+
+/// Dynamically calculates live extent statistics across all active files and log generations from a node iterator.
+pub fn calculate_generation_live_stats_from_nodes<'a, I>(nodes: I, manifest: &LogManifest) -> Vec<GenerationLiveStats>
+where
+    I: IntoIterator<Item = &'a Node>,
+{
+    let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
+    for node in nodes {
+        if let NodeKind::File { extent_map, .. } = &node.kind {
+            for (_, entry) in extent_map.iter() {
+                if let Extent::Disk { generation, length, .. } = &entry.extent {
+                    let stats = live_map.entry(*generation).or_insert((0, 0));
+                    stats.0 += *length as u64;
+                    stats.1 += 1;
+                }
+            }
+        }
+    }
+
+    let mut result = Vec::with_capacity(manifest.logs.len());
+    for log in &manifest.logs {
+        let (live_bytes, live_extents) = live_map.get(&log.generation).copied().unwrap_or((0, 0));
+        let live_ratio = if log.total_data_bytes > 0 {
+            live_bytes as f64 / log.total_data_bytes as f64
+        } else {
+            0.0
+        };
+        result.push(GenerationLiveStats {
+            generation: log.generation,
+            filename: log.filename.clone(),
+            record_count: log.record_count,
+            total_bytes: log.total_bytes,
+            total_data_bytes: log.total_data_bytes,
+            live_bytes,
+            live_extents,
+            live_ratio,
+        });
+    }
+    result
+}
+
+/// Formats a table of log generations with records, sizes, live data, extents, live ratio, and status.
+pub fn format_generations_table(generations: &[GenerationLiveStats]) -> String {
+    let mut out = String::new();
+    if generations.is_empty() {
+        writeln!(
+            out,
+            "No log generation files present (clean unmounted / fresh summary)."
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            out,
+            "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  STATUS",
+            "LOG FILE", "RECORDS", "LOG SIZE", "DATA SIZE", "LIVE DATA", "EXTENTS", "LIVE RATIO"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "{:-<14} {:-<10} {:-<12} {:-<12} {:-<12} {:-<8} {:-<12}  {:-<24}",
+            "", "", "", "", "", "", "", ""
+        )
+        .unwrap();
+
+        for g in generations {
+            let (status, ratio_str) =
+                format_generation_status(g.total_data_bytes, g.live_bytes, g.live_ratio, g.record_count);
+
+            writeln!(
+                out,
+                "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
+                g.filename,
+                g.record_count,
+                format_bytes(g.total_bytes),
+                format_bytes(g.total_data_bytes),
+                format_bytes(g.live_bytes),
+                g.live_extents,
+                ratio_str,
+                status,
+            )
+            .unwrap();
+        }
+    }
+    out
 }
 
 /// Determines the status label and live ratio display string for a log generation.
@@ -547,6 +609,68 @@ mod tests {
         let text = stats.display_text();
         assert!(text.contains("Total Inodes:        1"));
         assert!(text.contains("Overall Live Ratio:  N/A"));
+    }
+
+    #[test]
+    fn test_volume_stats_from_snapshot_matches_collect() {
+        use crate::extent_map::{Extent, ExtentMap};
+        use crate::log::LogFileInfo;
+        use crate::node::{InodeMeta, Node, NodeKind};
+        use std::time::SystemTime;
+
+        let fs = InMemoryFS::new();
+        let now = SystemTime::UNIX_EPOCH;
+
+        let mut extent_map = ExtentMap::new();
+        extent_map.insert(0, Extent::new_disk(1, 100, 4133, 20, 4096));
+
+        let file_node = Arc::new(Node {
+            meta: InodeMeta::new(0o644, 1, 1000, 1000, now),
+            kind: NodeKind::File { extent_map, size: 4096 },
+        });
+
+        let dir_node = Arc::new(Node {
+            meta: InodeMeta::new(0o755, 2, 1000, 1000, now),
+            kind: NodeKind::Directory {
+                parent: 1,
+                entries: vec![("data.bin".to_string(), 2)],
+            },
+        });
+
+        {
+            let mut inner = fs.inner.lock_for_tests().unwrap();
+            inner.base.insert(2, file_node);
+            inner.base.insert(3, dir_node);
+        }
+
+        {
+            let mut manifest = fs.manifest.write().unwrap();
+            manifest.logs.push(LogFileInfo {
+                generation: 1,
+                revision: 0,
+                filename: "000001.log".to_string(),
+                created_at: now,
+                record_count: 10,
+                total_bytes: 8192,
+                total_data_bytes: 4096,
+                md5: [0u8; 16],
+            });
+            manifest.next_generation = 2;
+        }
+
+        let stats_fs = VolumeStats::collect(&fs);
+        let snapshot = fs.snapshot_all();
+        let manifest = fs.manifest.read().unwrap().clone();
+        let stats_snapshot = VolumeStats::collect_from_snapshot(&snapshot, &manifest);
+
+        assert_eq!(stats_fs, stats_snapshot);
+        assert_eq!(stats_fs.display_text(), stats_snapshot.display_text());
+        assert_eq!(stats_snapshot.total_inodes, 3);
+        assert_eq!(stats_snapshot.file_count, 1);
+        assert_eq!(stats_snapshot.directory_count, 2);
+        assert_eq!(stats_snapshot.total_logical_bytes, 4096);
+        assert_eq!(stats_snapshot.total_live_bytes, 4096);
+        assert_eq!(stats_snapshot.overall_live_ratio, 1.0);
     }
 
     #[test]

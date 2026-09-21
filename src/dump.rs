@@ -931,57 +931,12 @@ pub fn dump_summary_reader_with_path(
         )
         .unwrap();
         writeln!(out).unwrap();
-        writeln!(
-            out,
-            "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  STATUS",
-            "LOG FILE", "RECORDS", "LOG SIZE", "DATA SIZE", "LIVE DATA", "EXTENTS", "LIVE RATIO"
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "{:-<14} {:-<10} {:-<12} {:-<12} {:-<12} {:-<8} {:-<12}  {:-<24}",
-            "", "", "", "", "", "", "", ""
-        )
-        .unwrap();
 
-        // Compute live bytes and extents from snapshot inodes
-        let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
-        for sync_node in inodes.values() {
-            let node = sync_node.as_ref();
-            if let NodeKind::File { extent_map, .. } = &node.kind {
-                for (_, entry) in extent_map.iter() {
-                    if let ExtentState::Disk { generation, length, .. } = &entry.extent {
-                        let stats = live_map.entry(*generation).or_insert((0, 0));
-                        stats.0 += *length as u64;
-                        stats.1 += 1;
-                    }
-                }
-            }
-        }
-
-        for g in &reader.manifest.logs {
-            let (live_bytes, live_extents) = live_map.get(&g.generation).copied().unwrap_or((0, 0));
-            let live_ratio = if g.total_data_bytes > 0 {
-                live_bytes as f64 / g.total_data_bytes as f64
-            } else {
-                0.0
-            };
-            let (status, ratio_str) =
-                crate::stats::format_generation_status(g.total_data_bytes, live_bytes, live_ratio, g.record_count);
-            writeln!(
-                out,
-                "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
-                g.filename,
-                g.record_count,
-                format_bytes(g.total_bytes),
-                format_bytes(g.total_data_bytes),
-                format_bytes(live_bytes),
-                live_extents,
-                ratio_str,
-                status
-            )
-            .unwrap();
-        }
+        let generations = crate::stats::calculate_generation_live_stats_from_nodes(
+            inodes.values().map(|a| a.as_ref()),
+            &reader.manifest,
+        );
+        out.push_str(&crate::stats::format_generations_table(&generations));
     }
     writeln!(out).unwrap();
 
