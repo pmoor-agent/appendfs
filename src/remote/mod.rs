@@ -20,8 +20,8 @@ pub mod worker;
 
 pub use crate::check::check_remote_integrity;
 pub use block_cache::{
-    BLOCK_SIZE, BlockCache, DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, MemoryBlockCache, OnDiskBlockCache,
-    TMP_FILE_MAX_AGE, TieredCache,
+    BLOCK_SIZE, BLOCK_TOUCH_THROTTLE, BlockCache, DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, MemoryBlockCache,
+    OnDiskBlockCache, TMP_FILE_MAX_AGE, TieredCache,
 };
 pub use bootstrap::bootstrap_from_remote;
 pub use coalesce::{BatchLeaderGuard, CoalesceError, FollowerBlock, RemoteReadCoalescer};

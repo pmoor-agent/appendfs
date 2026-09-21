@@ -50,7 +50,7 @@ pub use log::{
 pub use node::{InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta};
 pub use operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics};
 pub use remote::{
-    BatchLeaderGuard, BlockCache, ConcurrencyLimiter, ConcurrencyPermit, ConfiguredRemote,
+    BLOCK_TOUCH_THROTTLE, BatchLeaderGuard, BlockCache, ConcurrencyLimiter, ConcurrencyPermit, ConfiguredRemote,
     DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, FollowerBlock, MemoryBlockCache, OnDiskBlockCache,
     RemoteObject, RemoteReadCoalescer, RemoteReadTarget, RemoteRegistry, RemoteReplicationWorker, RemoteStore,
     RemoteTargetConfig, ReplicationPolicy, S3RemoteStore, TMP_FILE_MAX_AGE, TieredCache, TieredStorageReader,

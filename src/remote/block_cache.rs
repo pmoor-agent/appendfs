@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -25,6 +25,9 @@ static NEXT_TMP_NONCE: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum age of orphaned temporary block cache files (`*.tmp.*`) before being purged by `prune_if_needed`.
 pub const TMP_FILE_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// Throttle duration for refreshing block cache `mtime` on read access (10 minutes).
+pub const BLOCK_TOUCH_THROTTLE: Duration = Duration::from_secs(600);
 
 /// Default in-memory decrypted record cache size (128 MiB).
 pub const DEFAULT_DECRYPTED_CACHE_SIZE: usize = 128 * 1024 * 1024;
@@ -205,17 +208,27 @@ impl OnDiskBlockCache {
 
     pub fn read_block(&self, file_stem: &str, block_idx: u64) -> io::Result<Option<Vec<u8>>> {
         let path = self.block_path(file_stem, block_idx);
-        if !path.exists() {
-            return Ok(None);
-        }
-
         let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
 
-        let mut buf = Vec::new();
+        let meta = match file.metadata() {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        if let Ok(mtime) = meta.modified() {
+            let now = self.clock.now();
+            if now.duration_since(mtime).unwrap_or_default() > BLOCK_TOUCH_THROTTLE {
+                let times = FileTimes::new().set_modified(now);
+                let _ = file.set_times(times);
+            }
+        }
+
+        let mut buf = Vec::with_capacity(meta.len() as usize);
         file.read_to_end(&mut buf)?;
         Ok(Some(buf))
     }
@@ -690,6 +703,51 @@ mod tests {
 
         // The valid block should still be intact
         assert_eq!(cache.read_block("000001", 0).unwrap().unwrap(), data);
+    }
+
+    #[test]
+    fn test_on_disk_block_cache_lru_touch_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(crate::clock::AdvancingClock::new(SystemTime::now()));
+        // Capacity for exactly 2 blocks of 1000 bytes
+        let cache = OnDiskBlockCache::new(dir.path(), 2500, clock.clone()).unwrap();
+
+        let data0 = vec![0xAA; 1000];
+        let data1 = vec![0xBB; 1000];
+        let data2 = vec![0xCC; 1000];
+
+        // 1. Write block 0
+        cache.write_block("000001", 0, &data0).unwrap();
+
+        // 2. Advance time and write block 1
+        clock.advance(Duration::from_secs(60));
+        cache.write_block("000001", 1, &data1).unwrap();
+
+        // 3. Advance past BLOCK_TOUCH_THROTTLE
+        clock.advance(BLOCK_TOUCH_THROTTLE + Duration::from_secs(30));
+
+        // 4. Access block 0: this refreshes its mtime up to current clock time!
+        assert_eq!(cache.read_block("000001", 0).unwrap().unwrap(), data0);
+
+        // 5. Advance time slightly and write block 2 (causing capacity prune)
+        clock.advance(Duration::from_secs(5));
+        cache.write_block("000001", 2, &data2).unwrap();
+
+        // 6. Verify LRU behavior:
+        // Under FIFO, block 0 would have been pruned since it was created first.
+        // Under LRU with touch-on-read, block 0 was accessed recently, so block 1 (untouched) is pruned!
+        assert!(
+            cache.read_block("000001", 0).unwrap().is_some(),
+            "Block 0 was recently read and must be retained by LRU"
+        );
+        assert!(
+            cache.read_block("000001", 1).unwrap().is_none(),
+            "Block 1 was not accessed and must be pruned"
+        );
+        assert!(
+            cache.read_block("000001", 2).unwrap().is_some(),
+            "Block 2 was just written and must be retained"
+        );
     }
 
     #[test]
