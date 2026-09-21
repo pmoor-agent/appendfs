@@ -209,14 +209,16 @@ impl TestMount {
     pub fn remount_ro(&mut self, target: RecoveryTarget) {
         self.unmount();
         let storage: Arc<dyn appendfs::storage::Storage> = Arc::new(appendfs::storage::OsStorage::new(&self.log_path));
+        let ro_storage: Arc<dyn appendfs::storage::Storage> =
+            Arc::new(appendfs::storage::ReadOnlyStorage::new(storage));
         let mut fs = appendfs::log::recover_fs(
-            storage,
+            ro_storage.clone(),
             target,
             Arc::new(appendfs::SystemClock),
             appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        fs.set_log_dir(&self.log_path);
+        fs.set_storage(ro_storage);
         fs.set_read_only();
 
         let initial_dev = fs::metadata(&self.mount_path).unwrap().dev();

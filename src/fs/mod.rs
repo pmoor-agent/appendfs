@@ -1010,7 +1010,15 @@ impl InMemoryFS {
     }
 
     /// Attaches an active `LogWriter` to the filesystem instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the filesystem is in read-only mode or stopped.
     pub fn attach_log_writer(&mut self, writer: Arc<LogWriter>) {
+        assert!(
+            !self.is_read_only(),
+            "cannot attach a log writer to a read-only filesystem"
+        );
         self.log_writer = Some(writer);
     }
 
@@ -1383,5 +1391,24 @@ mod tests {
             attr_after_enabled_read.atime, expected_time,
             "atime should update on read when track_atime is true"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot attach a log writer to a read-only filesystem")]
+    fn test_attach_log_writer_panics_on_read_only_fs() {
+        let mut fs = InMemoryFS::new();
+        fs.set_read_only();
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let writer = Arc::new(
+            crate::log::LogWriter::create_lazy(
+                storage,
+                1,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.attach_log_writer(writer);
     }
 }
