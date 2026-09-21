@@ -875,8 +875,7 @@ impl InMemoryFS {
             .map(|w| Arc::clone(w.volume_key()))
             .unwrap_or_else(|| Arc::new(crate::crypto::VolumeKey::plaintext()));
 
-        let start_gen = log_writer.as_ref().map_or(1, |w| w.generation());
-        let manifest = Arc::new(RwLock::new(LogManifest::new(start_gen)));
+        let manifest = Arc::new(RwLock::new(LogManifest::new()));
 
         let virtual_files = Arc::new(virtual_files::VirtualFileRegistry::new());
         let async_tracker = Arc::new(AsyncTracker::new());
@@ -1013,6 +1012,30 @@ impl InMemoryFS {
     /// Attaches an active `LogWriter` to the filesystem instance.
     pub fn attach_log_writer(&mut self, writer: Arc<LogWriter>) {
         self.log_writer = Some(writer);
+    }
+
+    /// Returns the sequence number for the next log generation to be allocated.
+    ///
+    /// Computed dynamically as `max(existing) + 1`, considering all sealed logs in the
+    /// manifest, the generation of the latest summary snapshot, and the active log writer (if any).
+    pub fn next_generation(&self) -> u64 {
+        let manifest_max = self
+            .manifest
+            .read()
+            .unwrap()
+            .logs
+            .iter()
+            .map(|l| l.generation)
+            .max()
+            .unwrap_or(0);
+        let summary_gen = self.last_summary_generation.load(Ordering::SeqCst);
+        let active_gen = self.log_writer.as_ref().map_or(0, |w| w.generation());
+        manifest_max.max(summary_gen).max(active_gen) + 1
+    }
+
+    /// Returns the physical filename for the next log generation (e.g. "000002.log").
+    pub fn next_filename(&self) -> String {
+        crate::log::log_filename(self.next_generation())
     }
 
     /// Wakes up the background replication worker thread immediately.

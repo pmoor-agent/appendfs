@@ -172,7 +172,7 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
         .log_writer
         .as_ref()
         .map(|w| w.generation())
-        .unwrap_or_else(|| manifest.next_generation.saturating_sub(1).max(1));
+        .unwrap_or_else(|| manifest.logs.iter().map(|l| l.generation).max().unwrap_or(1));
     let sealed_gens: Vec<_> = manifest.logs.iter().filter(|l| l.generation < head_gen).collect();
     let last_sealed_gen = sealed_gens.iter().map(|l| l.generation).max().unwrap_or(0);
 

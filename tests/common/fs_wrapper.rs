@@ -592,7 +592,7 @@ impl TestFS {
         )
         .unwrap();
 
-        let next_gen = recovered.manifest.read().unwrap().next_generation;
+        let next_gen = recovered.next_generation();
         let start_batch_id = recovered.last_batch_id.load(Ordering::SeqCst) + 1;
         let writer = make_writer(
             storage.clone(),
@@ -673,7 +673,7 @@ impl TestFS {
             VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let next_gen = recovered.manifest.read().unwrap().next_generation;
+        let next_gen = recovered.next_generation();
         let start_batch_id = recovered.last_batch_id.load(Ordering::SeqCst) + 1;
         let writer = make_writer(
             storage.clone(),

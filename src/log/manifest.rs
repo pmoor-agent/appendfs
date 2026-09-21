@@ -75,28 +75,28 @@ fn parse_generation_revision_filename(filename: &str, extension: &str) -> Option
 /// The active log generation is managed exclusively by `LogWriter` and is never included in
 /// `logs`. Once a generation is sealed (via log roll, idle age, or summary snapshot), it is
 /// added to `logs` complete with its authenticated MD5 checksum and final counters.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LogManifest {
     /// Ordered list of sealed log files that back the extents in this filesystem state.
     pub logs: Vec<LogFileInfo>,
-    /// Next generation sequence number to allocate.
-    pub next_generation: u64,
 }
 
 impl LogManifest {
-    pub fn new(start_generation: u64) -> Self {
-        Self {
-            logs: Vec::new(),
-            next_generation: start_generation,
-        }
+    pub fn new() -> Self {
+        Self { logs: Vec::new() }
+    }
+
+    /// Sequence number for the next generation relative to sealed logs in this manifest (e.g. 1 if empty, max + 1).
+    pub fn next_generation(&self) -> u64 {
+        self.logs.iter().map(|l| l.generation).max().map_or(1, |max| max + 1)
     }
 
     /// Returns the physical filename for the next log generation (e.g. "000002.log").
     pub fn next_filename(&self) -> String {
-        log_filename(self.next_generation)
+        log_filename(self.next_generation())
     }
 
-    /// Records a sealed log file entry into the manifest and advances `next_generation`.
+    /// Records a sealed log file entry into the manifest.
     ///
     /// Panics if an entry for `(generation, revision)` has already been recorded in the manifest,
     /// or if a generation greater than `log.generation` already exists in the manifest.
@@ -115,9 +115,6 @@ impl LogManifest {
             "generation {} cannot be recorded: manifest already contains a greater generation",
             log.generation
         );
-        if log.generation >= self.next_generation {
-            self.next_generation = log.generation + 1;
-        }
         self.logs.push(log);
     }
 
@@ -149,9 +146,9 @@ mod tests {
 
     #[test]
     fn test_log_manifest_creation_and_sealed_records() {
-        let mut manifest = LogManifest::new(1);
+        let mut manifest = LogManifest::new();
         assert_eq!(manifest.logs.len(), 0);
-        assert_eq!(manifest.next_generation, 1);
+        assert_eq!(manifest.next_generation(), 1);
         assert_eq!(manifest.next_filename(), "000001.log");
 
         let log1 = LogFileInfo {
@@ -167,7 +164,7 @@ mod tests {
         manifest.record_sealed_log(log1);
         assert_eq!(manifest.logs.len(), 1);
         assert_eq!(manifest.logs[0].generation, 1);
-        assert_eq!(manifest.next_generation, 2);
+        assert_eq!(manifest.next_generation(), 2);
         assert_eq!(manifest.next_filename(), "000002.log");
 
         let log2 = LogFileInfo {
@@ -183,7 +180,7 @@ mod tests {
         manifest.record_sealed_log(log2);
         assert_eq!(manifest.logs.len(), 2);
         assert_eq!(manifest.logs[1].generation, 2);
-        assert_eq!(manifest.next_generation, 3);
+        assert_eq!(manifest.next_generation(), 3);
         assert_eq!(manifest.next_filename(), "000003.log");
 
         let bytes = crate::wire::serialize(&manifest).unwrap();
@@ -208,7 +205,7 @@ mod tests {
         assert_eq!(parse_summary_filename("/var/data/000100_r1.summary"), Some((100, 1)));
         assert_eq!(parse_summary_filename("000001.log"), None);
 
-        let mut manifest = LogManifest::new(1);
+        let mut manifest = LogManifest::new();
         manifest.record_sealed_log(LogFileInfo {
             generation: 1,
             revision: 1,
@@ -228,7 +225,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "generation 1 revision 0 already recorded in manifest")]
     fn test_record_sealed_log_duplicate_panics() {
-        let mut manifest = LogManifest::new(1);
+        let mut manifest = LogManifest::new();
         let log = LogFileInfo {
             generation: 1,
             revision: 0,
@@ -246,7 +243,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "manifest already contains a greater generation")]
     fn test_record_sealed_log_out_of_order_panics() {
-        let mut manifest = LogManifest::new(1);
+        let mut manifest = LogManifest::new();
         let log2 = LogFileInfo {
             generation: 2,
             revision: 0,

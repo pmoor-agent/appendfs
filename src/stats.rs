@@ -66,17 +66,17 @@ impl VolumeStats {
 
     /// Collects volume statistics from an in-memory filesystem state.
     pub fn collect(fs: &InMemoryFS) -> Self {
-        let manifest = fs.manifest.read().unwrap().clone();
         let counts = fs.inode_counts();
         let generations = fs.calculate_generation_live_stats();
-        Self::from_parts(manifest.next_generation, &counts, generations)
+        Self::from_parts(fs.next_generation(), &counts, generations)
     }
 
     /// Collects volume statistics directly from a snapshot's inodes and manifest.
     pub fn collect_from_snapshot(inodes: &HashMap<u64, Arc<Node>>, manifest: &LogManifest) -> Self {
         let counts = InodeCounts::from_nodes(inodes.values().map(|a| a.as_ref()));
         let generations = calculate_generation_live_stats_from_nodes(inodes.values().map(|a| a.as_ref()), manifest);
-        Self::from_parts(manifest.next_generation, &counts, generations)
+        let next_generation = manifest.logs.iter().map(|l| l.generation).max().map_or(1, |max| max + 1);
+        Self::from_parts(next_generation, &counts, generations)
     }
 
     /// Formats stats into a clean, human-readable terminal table.
@@ -265,7 +265,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         let head = fs.log_writer.as_ref().map(|w| w.generation());
         let total_gens = manifest.logs.len();
         let total_disk: u64 = manifest.logs.iter().map(|l| l.total_bytes).sum();
-        (head, manifest.next_generation, total_gens, total_disk)
+        (head, fs.next_generation(), total_gens, total_disk)
     };
 
     let mode_str = if fs.is_read_only() { "Read-Only" } else { "Read-Write" };
@@ -620,6 +620,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
 mod tests {
     use super::*;
     use crate::sync::OpTag;
+    use std::sync::Arc;
 
     #[test]
     fn test_volume_stats_formatting() {
@@ -678,7 +679,6 @@ mod tests {
                 total_data_bytes: 4096,
                 md5: [0u8; 16],
             });
-            manifest.next_generation = 2;
         }
 
         let stats_fs = VolumeStats::collect(&fs);
@@ -776,6 +776,28 @@ mod tests {
         let closed_status = format_runtime_status(&fs);
         assert!(closed_status.contains("Open Virt Handles:  0"));
         assert!(closed_status.contains("Open Inodes:        0"));
+    }
+
+    #[test]
+    fn test_format_runtime_status_with_active_writer() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::SystemClock);
+        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage.clone());
+        let writer = Arc::new(
+            crate::log::LogWriter::create(
+                storage,
+                5,
+                clock.as_ref(),
+                1024 * 1024,
+                1,
+                Arc::new(crate::crypto::VolumeKey::plaintext()),
+            )
+            .unwrap(),
+        );
+        fs.attach_log_writer(writer);
+        let status = format_runtime_status(&fs);
+        assert!(status.contains("Active Generation:  5 (000005.log)"));
+        assert!(status.contains("Next Generation:    6 (000006.log)"));
     }
 
     #[test]

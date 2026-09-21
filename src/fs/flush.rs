@@ -659,7 +659,7 @@ impl InMemoryFS {
             sealed_gen
         );
         debug_assert_eq!(
-            manifest.next_generation,
+            manifest.next_generation(),
             sealed_gen + 1,
             "manifest next_generation must equal sealed_gen + 1"
         );

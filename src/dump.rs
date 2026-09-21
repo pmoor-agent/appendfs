@@ -917,7 +917,7 @@ pub fn dump_summary_reader_with_path(
     writeln!(
         out,
         "Next Generation:     {} ({})",
-        reader.manifest.next_generation,
+        reader.manifest.next_generation(),
         reader.manifest.next_filename()
     )
     .unwrap();
@@ -1632,7 +1632,6 @@ mod tests {
                     md5: [2u8; 16],
                 },
             ],
-            next_generation: 3,
         };
 
         export_summary(
