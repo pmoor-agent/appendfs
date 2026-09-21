@@ -1,5 +1,4 @@
 #![cfg_attr(not(test), deny(clippy::too_many_lines))]
-pub mod async_runtime;
 pub mod check;
 pub mod cli;
 pub mod clock;
@@ -41,8 +40,8 @@ pub use dump::{dump_file, dump_log_file, dump_log_reader, dump_summary_file, dum
 pub use error::FsError;
 pub use extent_map::{Extent, ExtentEntry, ExtentMap};
 pub use fs::{
-    BatchCompletion, DelayedResponseQueue, FLUSH_HISTORY_CAPACITY, FlushReason, FlushRecord, FlushStats, InMemoryFS,
-    InnerStatsSnapshot, InodeCounts, OpTier, ThrottleDecision,
+    AsyncOpGuard, AsyncTracker, BatchCompletion, DelayedResponseQueue, FLUSH_HISTORY_CAPACITY, FlushReason,
+    FlushRecord, FlushStats, InMemoryFS, InnerStatsSnapshot, InodeCounts, OpTier, ThrottleDecision,
 };
 pub use log::{
     ExtentState, LogFileCache, LogReader, LogRecord, LogWriter, RecoveryTarget, SharedExtentState, SummaryFooter,

@@ -1,4 +1,3 @@
-use appendfs::async_runtime::block_on;
 use appendfs::clock::MockClock;
 use appendfs::error::FsError;
 use appendfs::fs::InMemoryFS;
@@ -336,15 +335,16 @@ fn test_deferred_result_mechanics() {
     }));
     assert!(cb_called2.load(Ordering::SeqCst));
 
-    // 8. wait_async via block_on
+    // 8. wait() blocks while token completes asynchronously on another thread
     let (token5, receiver5) = DeferredToken::new();
     let deferred5 = DeferredResult::deferred(receiver5);
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(10));
         token5.complete(Ok(FuseResponse::write(999)));
     });
-    let res = block_on(deferred5.wait_async());
+    let res = deferred5.wait();
     assert_eq!(res, Ok(FuseResponse::write(999)));
+    handle.join().unwrap();
 }
 
 #[test]

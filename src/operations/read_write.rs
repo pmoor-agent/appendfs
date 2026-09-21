@@ -526,15 +526,15 @@ pub fn create_response(
 }
 
 #[cfg(any(test, feature = "testing"))]
-pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), FsError> {
-    fsync_core_with_reason(fs, ino, fh, FlushReason::Fsync).await
+pub fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), FsError> {
+    fsync_core_with_reason(fs, ino, fh, FlushReason::Fsync)
 }
 
 /// Shared body for `fsync` and `fsyncdir`, which differ only in what they report as the
 /// reason for the flush.
 #[cfg(any(test, feature = "testing"))]
-pub async fn fsync_core_with_reason(fs: &InMemoryFS, ino: u64, fh: u64, reason: FlushReason) -> Result<(), FsError> {
-    fsync_response(fs, ino, fh, reason).wait_async().await.map(|_| ())
+pub fn fsync_core_with_reason(fs: &InMemoryFS, ino: u64, fh: u64, reason: FlushReason) -> Result<(), FsError> {
+    fsync_response(fs, ino, fh, reason).wait().map(|_| ())
 }
 
 pub struct FsyncDeferred(pub crate::fs::BatchCompletion);
@@ -776,32 +776,30 @@ mod tests {
     }
 
     #[test]
-    fn test_fsync_and_fsyncdir_core_async() {
-        crate::async_runtime::block_on(async {
-            let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-            let clock = Arc::new(SystemClock);
-            let writer = Arc::new(
-                LogWriter::create(
-                    storage.clone(),
-                    1,
-                    &*clock,
-                    crate::cli::DEFAULT_MAX_LOG_SIZE,
-                    1,
-                    crate::crypto::VolumeKey::plaintext_arc(),
-                )
-                .unwrap(),
-            );
-            let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
-            let file = create_core(&fs, 1, "fsync_core.bin", 0o644, 0, 1000, 1000).unwrap();
-            let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
-            write_core(&fs, file.ino, b"async fsync test", 0).unwrap();
+    fn test_fsync_and_fsyncdir_core() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        let file = create_core(&fs, 1, "fsync_core.bin", 0o644, 0, 1000, 1000).unwrap();
+        let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
+        write_core(&fs, file.ino, b"fsync test", 0).unwrap();
 
-            let res = fsync_core(&fs, file.ino, fh).await;
-            assert_eq!(res, Ok(()));
+        let res = fsync_core(&fs, file.ino, fh);
+        assert_eq!(res, Ok(()));
 
-            let dir_res = crate::operations::dir::fsyncdir_core(&fs).await;
-            assert_eq!(dir_res, Ok(()));
-        });
+        let dir_res = crate::operations::dir::fsyncdir_core(&fs);
+        assert_eq!(dir_res, Ok(()));
     }
 
     #[test]
