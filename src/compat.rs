@@ -43,6 +43,68 @@ pub const COMPAT_GID: u32 = 1000;
 /// Fixed passphrase for canonical encrypted compatibility fixtures.
 pub const COMPAT_ENCRYPTED_PASSPHRASE: &str = "passphrase";
 
+/// Canonical key file name used for key-file encrypted fixtures.
+pub const COMPAT_KEY_FILENAME: &str = "key.hex";
+
+/// Supported golden fixture configurations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatFixtureConfig {
+    /// Baseline plaintext volume with uncompressed log records.
+    UnencryptedUncompressed,
+    /// ChaCha20-Poly1305 encrypted volume with passphrase derivation and Zstd log compression.
+    PassphraseCompressed,
+    /// ChaCha20-Poly1305 encrypted volume with secret key + passphrase derivation and Zstd log compression.
+    SecretKeyPassphraseCompressed,
+}
+
+impl CompatFixtureConfig {
+    pub const ALL: [Self; 3] = [
+        Self::UnencryptedUncompressed,
+        Self::PassphraseCompressed,
+        Self::SecretKeyPassphraseCompressed,
+    ];
+
+    pub fn default_dir_name(self) -> &'static str {
+        match self {
+            Self::UnencryptedUncompressed => "v1",
+            Self::PassphraseCompressed => "v1_passphrase_compressed",
+            Self::SecretKeyPassphraseCompressed => "v1_secret_key_passphrase_compressed",
+        }
+    }
+
+    pub fn from_dir_path(path: &Path) -> Option<Self> {
+        let s = path.file_name()?.to_string_lossy();
+        if s.contains("secret_key") || s.contains("key_passphrase") || s.contains("keyfile") {
+            Some(Self::SecretKeyPassphraseCompressed)
+        } else if s.contains("passphrase") || s.contains("encrypted") {
+            Some(Self::PassphraseCompressed)
+        } else if s.starts_with('v') || s.contains("unencrypted") {
+            Some(Self::UnencryptedUncompressed)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_encrypted(self) -> bool {
+        matches!(self, Self::PassphraseCompressed | Self::SecretKeyPassphraseCompressed)
+    }
+
+    pub fn compression(self) -> crate::compress::Compression {
+        match self {
+            Self::UnencryptedUncompressed => crate::compress::Compression::None,
+            Self::PassphraseCompressed | Self::SecretKeyPassphraseCompressed => crate::compress::Compression::Zstd,
+        }
+    }
+
+    pub fn key_source(self) -> crate::crypto::KeySource {
+        match self {
+            Self::UnencryptedUncompressed => crate::crypto::KeySource::None,
+            Self::PassphraseCompressed => crate::crypto::KeySource::Passphrase,
+            Self::SecretKeyPassphraseCompressed => crate::crypto::KeySource::KeyFileAndPassphrase,
+        }
+    }
+}
+
 /// Fixed 16-byte KDF salt for canonical encrypted compatibility fixtures.
 pub const COMPAT_ENCRYPTED_SALT: [u8; 16] = [
     0x20, 0x26, 0x09, 0x07, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
@@ -73,7 +135,7 @@ pub const COMPAT_FIXTURE_DUMP_FILES: &[&str] = &[
 ];
 
 /// Resolves the volume key required to open `fixture_dir`, unlocking encrypted fixtures
-/// with the canonical test passphrase.
+/// with the canonical test credentials.
 pub fn resolve_fixture_volume_key(fixture_dir: &Path) -> Arc<VolumeKey> {
     let storage = OsStorage::new(fixture_dir);
     let summary_file = "000000.summary";
@@ -82,8 +144,40 @@ pub fn resolve_fixture_volume_key(fixture_dir: &Path) -> Arc<VolumeKey> {
     if volume_header.cipher == crate::crypto::CipherSuite::None {
         VolumeKey::plaintext_arc()
     } else {
-        let master = crate::crypto::MasterKey::from_passphrase(COMPAT_ENCRYPTED_PASSPHRASE, &volume_header.kdf_salt)
-            .expect("derive master key from fixture passphrase");
+        let master = match volume_header.key_source {
+            crate::crypto::KeySource::Passphrase => {
+                crate::crypto::MasterKey::from_passphrase(COMPAT_ENCRYPTED_PASSPHRASE, &volume_header.kdf_salt)
+                    .expect("derive master key from fixture passphrase")
+            }
+            crate::crypto::KeySource::KeyFileAndPassphrase => {
+                let key_file = fixture_dir.join(COMPAT_KEY_FILENAME);
+                crate::crypto::MasterKey::from_file_and_passphrase(
+                    &key_file,
+                    COMPAT_ENCRYPTED_PASSPHRASE,
+                    &volume_header.kdf_salt,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to load required key file '{}' for encrypted fixture '{}': {}",
+                        key_file.display(),
+                        fixture_dir.display(),
+                        e
+                    )
+                })
+            }
+            crate::crypto::KeySource::KeyFile => {
+                let key_file = fixture_dir.join(COMPAT_KEY_FILENAME);
+                crate::crypto::MasterKey::from_file(&key_file).unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to load required key file '{}' for encrypted fixture '{}': {}",
+                        key_file.display(),
+                        fixture_dir.display(),
+                        e
+                    )
+                })
+            }
+            crate::crypto::KeySource::None => unreachable!(),
+        };
         let volume_key = volume_header.unlock(&master).expect("unlock encrypted fixture volume");
         Arc::new(volume_key)
     }
@@ -493,101 +587,41 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     Ok(())
 }
 
-/// Generates the canonical compatibility volume into `out_dir`, writing `000000.summary`,
-/// `000001.log`, and `000001.summary`.
-pub fn create_canonical_compat_volume(out_dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(out_dir)?;
-
-    // Clean existing files in out_dir so init_volume starts with a fresh empty volume
-    if let Ok(entries) = fs::read_dir(out_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let _ = fs::remove_file(path);
-            }
+fn create_canonical_encrypted_compat_volume(out_dir: &Path, config: CompatFixtureConfig) -> io::Result<()> {
+    if config == CompatFixtureConfig::SecretKeyPassphraseCompressed {
+        let key_file = out_dir.join(COMPAT_KEY_FILENAME);
+        if !key_file.is_file() {
+            let canonical_key = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(config.default_dir_name())
+                .join(COMPAT_KEY_FILENAME);
+            fs::copy(&canonical_key, &key_file)?;
         }
     }
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(out_dir));
     let clock = Arc::new(CompatClock::new());
 
-    // 1. Initialize volume -> writes 000000.summary with deterministic clock.
-    // The root owner is pinned rather than taken from the invoking user, because these
-    // bytes are checked in and must reproduce on any machine. Matches the uid/gid the rest
-    // of the canonical tree is built with below.
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::deterministic_plaintext(crate::compress::Compression::None),
-        clock.clone(),
-        COMPAT_UID,
-        COMPAT_GID,
-    )?;
-
-    // 2. Open log writer for generation 1 with deterministic clock
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            crate::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(io::Error::other)?,
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
-    fs.volume_header = VolumeHeader::deterministic_plaintext(crate::compress::Compression::None);
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(out_dir);
-
-    // 3. Populate canonical tree across 3 flushes
-    populate_compat_tree(&fs, &clock).map_err(io::Error::from)?;
-
-    // 4. Export final summary snapshot -> writes 000001.summary
-    clock.set_offset(500);
-    fs.sync_and_export_summary()?;
-
-    // Drop fs to flush writer and release file descriptors
-    drop(fs);
-
-    let _ = fs::remove_file(out_dir.join(".lock"));
-
-    // 5. Generate golden dumps
-    generate_compat_dump_files(out_dir, None)?;
-
-    Ok(())
-}
-
-/// Generates the canonical encrypted compatibility volume into `out_dir`, writing `000000.summary`,
-/// `000001.log`, and `000001.summary` encrypted with ChaCha20-Poly1305 and derived from `passphrase`.
-pub fn create_canonical_compat_volume_encrypted(out_dir: &Path, passphrase: &str) -> io::Result<()> {
-    fs::create_dir_all(out_dir)?;
-
-    // Clean existing files in out_dir so init_volume starts with a fresh empty volume
-    if let Ok(entries) = fs::read_dir(out_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let _ = fs::remove_file(path);
-            }
+    let master_key = match config {
+        CompatFixtureConfig::PassphraseCompressed => {
+            crate::crypto::MasterKey::from_passphrase(COMPAT_ENCRYPTED_PASSPHRASE, &COMPAT_ENCRYPTED_SALT)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
         }
-    }
-
-    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(out_dir));
-    let clock = Arc::new(CompatClock::new());
-
-    let master_key = crate::crypto::MasterKey::from_passphrase(passphrase, &COMPAT_ENCRYPTED_SALT)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        CompatFixtureConfig::SecretKeyPassphraseCompressed => crate::crypto::MasterKey::from_file_and_passphrase(
+            out_dir.join(COMPAT_KEY_FILENAME),
+            COMPAT_ENCRYPTED_PASSPHRASE,
+            &COMPAT_ENCRYPTED_SALT,
+        )?,
+        CompatFixtureConfig::UnencryptedUncompressed => unreachable!(),
+    };
 
     let (volume_header, volume_key) = crate::crypto::VolumeHeader::new_encrypted_with_params(
         &master_key,
         COMPAT_ENCRYPTED_VOLUME_ID,
         COMPAT_ENCRYPTED_SALT,
         COMPAT_ENCRYPTED_KCV_IV,
-        crate::crypto::KeySource::Passphrase,
-        crate::compress::Compression::None,
+        config.key_source(),
+        config.compression(),
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
@@ -604,7 +638,7 @@ pub fn create_canonical_compat_volume_encrypted(out_dir: &Path, passphrase: &str
         Some(COMPAT_SUMMARY_0_IV),
     )?;
 
-    // 2. Open log writer for generation 1 with deterministic clock and volume encryption key
+    // 2. Open log writer for generation 1 with deterministic clock, volume encryption key, and compression
     let writer = Arc::new(
         LogWriter::create(
             storage.clone(),
@@ -614,7 +648,8 @@ pub fn create_canonical_compat_volume_encrypted(out_dir: &Path, passphrase: &str
             1,
             volume_key_arc.clone(),
         )
-        .map_err(io::Error::other)?,
+        .map_err(io::Error::other)?
+        .with_compression(config.compression()),
     );
 
     let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
@@ -631,15 +666,92 @@ pub fn create_canonical_compat_volume_encrypted(out_dir: &Path, passphrase: &str
     clock.set_offset(500);
     fs.sync_and_export_summary_with_iv(Some(COMPAT_SUMMARY_1_IV))?;
 
-    // Drop fs to flush writer and release file descriptors
     drop(fs);
-
     let _ = fs::remove_file(out_dir.join(".lock"));
 
     // 5. Generate golden dumps
     generate_compat_dump_files(out_dir, Some(&volume_key_arc))?;
 
     Ok(())
+}
+
+fn create_canonical_plaintext_compat_volume(out_dir: &Path, config: CompatFixtureConfig) -> io::Result<()> {
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(out_dir));
+    let clock = Arc::new(CompatClock::new());
+
+    let volume_header = VolumeHeader::deterministic_plaintext(config.compression());
+    let volume_key = VolumeKey::plaintext();
+    let volume_key_arc = VolumeKey::plaintext_arc();
+
+    // 1. Initialize volume -> writes 000000.summary with deterministic clock.
+    init_volume_with_clock_and_uids(
+        storage.clone(),
+        &volume_key,
+        volume_header.clone(),
+        clock.clone(),
+        COMPAT_UID,
+        COMPAT_GID,
+    )?;
+
+    // 2. Open log writer for generation 1 with deterministic clock and compression
+    let writer = Arc::new(
+        LogWriter::create(
+            storage.clone(),
+            1,
+            clock.as_ref(),
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            volume_key_arc,
+        )
+        .map_err(io::Error::other)?
+        .with_compression(config.compression()),
+    );
+
+    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
+    fs.volume_header = volume_header;
+    fs.log_writer = Some(writer);
+    fs.set_log_dir(out_dir);
+
+    // 3. Populate canonical tree across 3 flushes
+    populate_compat_tree(&fs, &clock).map_err(io::Error::from)?;
+
+    // 4. Export final summary snapshot -> writes 000001.summary
+    clock.set_offset(500);
+    fs.sync_and_export_summary()?;
+
+    drop(fs);
+    let _ = fs::remove_file(out_dir.join(".lock"));
+
+    // 5. Generate golden dumps
+    generate_compat_dump_files(out_dir, None)?;
+
+    Ok(())
+}
+
+/// Generates the canonical compatibility volume into `out_dir` matching `config`.
+pub fn create_canonical_compat_volume(out_dir: &Path, config: CompatFixtureConfig) -> io::Result<()> {
+    fs::create_dir_all(out_dir)?;
+
+    // Clean existing files in out_dir so init_volume starts with a fresh empty volume
+    if let Ok(entries) = fs::read_dir(out_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if config == CompatFixtureConfig::SecretKeyPassphraseCompressed
+                    && path.file_name() == Some(std::ffi::OsStr::new(COMPAT_KEY_FILENAME))
+                {
+                    continue;
+                }
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    if config.is_encrypted() {
+        create_canonical_encrypted_compat_volume(out_dir, config)
+    } else {
+        create_canonical_plaintext_compat_volume(out_dir, config)
+    }
 }
 
 /// Helper to navigate and locate an inode by relative POSIX path.
