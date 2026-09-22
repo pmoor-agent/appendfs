@@ -508,7 +508,7 @@ impl RemoteReplicationWorker {
             let gen_num = log_entry.generation;
             let filename = &log_entry.filename;
 
-            // Only sealed generations
+            // Only completed manifest generations (skip active writer generation)
             if gen_num >= active_gen {
                 continue;
             }
@@ -893,7 +893,8 @@ impl RemoteReplicationWorker {
                 continue;
             }
 
-            let age = now.duration_since(log_entry.created_at).unwrap_or_default();
+            let sealed_time = log_entry.sealed_at.unwrap_or(log_entry.created_at);
+            let age = now.duration_since(sealed_time).unwrap_or_default();
             if age < retention_dur {
                 continue;
             }
