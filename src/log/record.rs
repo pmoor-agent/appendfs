@@ -85,6 +85,8 @@ pub enum OpCode {
     InodeDelta = 3,
     /// Trailer written once per flush batch confirming completion and consistency.
     FlushCommit = 4,
+    /// Terminal record marking a cleanly rolled and closed log file.
+    Seal = 5,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -96,6 +98,7 @@ impl TryFrom<u8> for OpCode {
             2 => Ok(OpCode::DataZstd),
             3 => Ok(OpCode::InodeDelta),
             4 => Ok(OpCode::FlushCommit),
+            5 => Ok(OpCode::Seal),
             _ => Err("Unknown operation code"),
         }
     }
@@ -108,6 +111,7 @@ impl std::fmt::Display for OpCode {
             OpCode::DataZstd => "DataZstd",
             OpCode::InodeDelta => "InodeDelta",
             OpCode::FlushCommit => "FlushCommit",
+            OpCode::Seal => "Seal",
         };
         f.pad(name)
     }
@@ -162,6 +166,14 @@ impl RecordHeader {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlushCommitPayload {
     pub batch_id: u64,
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub timestamp: SystemTime,
+    pub record_count: u32,
+}
+
+/// Payload for the `OpCode::Seal` terminal record written at the end of a rolled log file.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealPayload {
     #[serde(with = "crate::clock::serde_system_time")]
     pub timestamp: SystemTime,
     pub record_count: u32,
@@ -606,6 +618,7 @@ pub enum DecodedPayload<'a> {
     Data(&'a [u8]),
     InodeDelta(LogEntryDelta),
     FlushCommit(FlushCommitPayload),
+    Seal(SealPayload),
 }
 
 impl DecodedPayload<'_> {
@@ -615,6 +628,7 @@ impl DecodedPayload<'_> {
             DecodedPayload::Data(_) => None,
             DecodedPayload::InodeDelta(delta) => delta.op_time(),
             DecodedPayload::FlushCommit(p) => Some(p.timestamp),
+            DecodedPayload::Seal(s) => Some(s.timestamp),
         }
     }
 }

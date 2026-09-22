@@ -153,7 +153,7 @@ pub fn dump_log_reader_with_path(
     let mut records: Vec<DumpRecordEntry> = Vec::new();
     let mut current_offset = FILE_HEADER_SIZE as u64;
 
-    let mut op_counts: [OpCodeStats; 5] = Default::default();
+    let mut op_counts: [OpCodeStats; 6] = Default::default();
     let mut write_buckets = vec![
         WriteBucket::new("< 64 B", 0, 63),
         WriteBucket::new("64 B .. 511 B", 64, 511),
@@ -291,6 +291,7 @@ pub fn dump_log_reader_with_path(
         };
 
         let is_commit = header.op_code == OpCode::FlushCommit;
+        let is_seal = header.op_code == OpCode::Seal;
         let rec_idx = records.len();
         records.push(DumpRecordEntry::Valid {
             offset: record_offset,
@@ -335,6 +336,11 @@ pub fn dump_log_reader_with_path(
                 if let DumpRecordEntry::Valid { is_committed, .. } = r {
                     *is_committed = true;
                 }
+            }
+            last_commit_idx = Some(rec_idx);
+        } else if is_seal {
+            if let DumpRecordEntry::Valid { is_committed, .. } = &mut records[rec_idx] {
+                *is_committed = true;
             }
             last_commit_idx = Some(rec_idx);
         }
@@ -413,7 +419,7 @@ pub fn dump_log_reader_with_path(
         .filter(|r| matches!(r, DumpRecordEntry::Valid { .. }))
         .count();
 
-    for code in 1..=4u8 {
+    for code in 1..=5u8 {
         if let Ok(opcode) = OpCode::try_from(code) {
             let stats = &op_counts[code as usize];
             let pct = if total_valid > 0 {
@@ -1123,6 +1129,74 @@ pub fn dump_summary_reader_with_path(
     Ok(out)
 }
 
+fn format_data_payload(
+    out: &mut String,
+    opcode: OpCode,
+    stored_len: u32,
+    uncompressed_len: Option<u64>,
+    payload: &[u8],
+    dump_data_hex: bool,
+) {
+    if opcode == OpCode::DataZstd {
+        if let Some(uncompressed) = uncompressed_len {
+            if uncompressed > stored_len as u64 {
+                let compressed = stored_len as u64;
+                let saved = uncompressed - compressed;
+                let pct = (saved as f64 / uncompressed as f64) * 100.0;
+                writeln!(
+                    out,
+                    "      data_len: {} (saved {} / {:.1}%)",
+                    format_bytes(uncompressed),
+                    format_bytes(saved),
+                    pct
+                )
+                .unwrap();
+            } else {
+                writeln!(out, "      data_len: {}", format_bytes(uncompressed)).unwrap();
+            }
+        } else {
+            writeln!(out, "      data_len: {}", format_bytes(stored_len as u64)).unwrap();
+        }
+    } else {
+        writeln!(out, "      data_len: {}", format_bytes(stored_len as u64)).unwrap();
+    }
+
+    if dump_data_hex && !payload.is_empty() {
+        out.push_str(&format_hexdump(payload, 256));
+    }
+}
+
+fn format_record_payload(out: &mut String, opcode: OpCode, payload: &[u8]) {
+    match opcode {
+        OpCode::InodeDelta => match crate::wire::deserialize::<crate::log::record::LogEntryDelta>(payload) {
+            Ok(delta) => writeln!(out, "      delta: {}", format_log_entry_delta(&delta)).unwrap(),
+            Err(_) => writeln!(out, "      [Failed to deserialize InodeDeltaPayload]").unwrap(),
+        },
+        OpCode::FlushCommit => match crate::wire::deserialize::<crate::log::record::FlushCommitPayload>(payload) {
+            Ok(b) => writeln!(
+                out,
+                "      batch_id: {}, batch_record_count: {}, commit_timestamp: {}",
+                b.batch_id,
+                b.record_count,
+                format_system_time(b.timestamp)
+            )
+            .unwrap(),
+            Err(_) => writeln!(out, "      [Failed to deserialize FlushCommitPayload]").unwrap(),
+        },
+        OpCode::Seal => match crate::wire::deserialize::<crate::log::record::SealPayload>(payload) {
+            Ok(s) => writeln!(
+                out,
+                "      sealed_record_count: {}, seal_timestamp: {}",
+                s.record_count,
+                format_system_time(s.timestamp)
+            )
+            .unwrap(),
+            Err(_) => writeln!(out, "      [Failed to deserialize SealPayload]").unwrap(),
+        },
+        _ => {}
+    }
+}
+
 fn format_payload_details(
     out: &mut String,
     opcode: OpCode,
@@ -1132,85 +1206,11 @@ fn format_payload_details(
     dump_data_hex: bool,
 ) {
     match opcode {
-        OpCode::Data => {
-            writeln!(out, "      data_len: {}", format_bytes(stored_len as u64)).unwrap();
-            if dump_data_hex && !payload.is_empty() {
-                out.push_str(&format_hexdump(payload, 256));
-            }
+        OpCode::Data | OpCode::DataZstd => {
+            format_data_payload(out, opcode, stored_len, uncompressed_len, payload, dump_data_hex);
         }
-        OpCode::DataZstd => {
-            if let Some(uncompressed) = uncompressed_len {
-                if uncompressed > stored_len as u64 {
-                    let compressed = stored_len as u64;
-                    let saved = uncompressed - compressed;
-                    let pct = (saved as f64 / uncompressed as f64) * 100.0;
-                    writeln!(
-                        out,
-                        "      data_len: {} (saved {} / {:.1}%)",
-                        format_bytes(uncompressed),
-                        format_bytes(saved),
-                        pct
-                    )
-                    .unwrap();
-                } else {
-                    writeln!(out, "      data_len: {}", format_bytes(uncompressed)).unwrap();
-                }
-            } else {
-                writeln!(out, "      data_len: {}", format_bytes(stored_len as u64)).unwrap();
-            }
-
-            if dump_data_hex && !payload.is_empty() {
-                out.push_str(&format_hexdump(payload, 256));
-            }
-        }
-        OpCode::InodeDelta => {
-            let dummy_header = crate::log::record::RecordHeader {
-                op_code: opcode,
-                inode: 0,
-                payload_len: payload.len() as u32,
-                auth_tag: [0; crate::log::record::AUTH_TAG_SIZE],
-            };
-            let dummy_record = crate::log::reader::LogRecord {
-                header: dummy_header,
-                payload: payload.to_vec(),
-                record_log_offset: 0,
-            };
-            match dummy_record.decode() {
-                Ok(crate::log::record::DecodedPayload::InodeDelta(delta)) => {
-                    writeln!(out, "      delta: {}", format_log_entry_delta(&delta)).unwrap();
-                }
-                _ => {
-                    writeln!(out, "      [Failed to deserialize {}Payload]", opcode).unwrap();
-                }
-            }
-        }
-        OpCode::FlushCommit => {
-            let dummy_header = crate::log::record::RecordHeader {
-                op_code: opcode,
-                inode: 0,
-                payload_len: payload.len() as u32,
-                auth_tag: [0; crate::log::record::AUTH_TAG_SIZE],
-            };
-            let dummy_record = crate::log::reader::LogRecord {
-                header: dummy_header,
-                payload: payload.to_vec(),
-                record_log_offset: 0,
-            };
-            match dummy_record.decode() {
-                Ok(crate::log::record::DecodedPayload::FlushCommit(b)) => {
-                    writeln!(
-                        out,
-                        "      batch_id: {}, batch_record_count: {}, commit_timestamp: {}",
-                        b.batch_id,
-                        b.record_count,
-                        format_system_time(b.timestamp)
-                    )
-                    .unwrap();
-                }
-                _ => {
-                    writeln!(out, "      [Failed to deserialize {}Payload]", opcode).unwrap();
-                }
-            }
+        OpCode::InodeDelta | OpCode::FlushCommit | OpCode::Seal => {
+            format_record_payload(out, opcode, payload);
         }
     }
 }
@@ -1613,6 +1613,7 @@ mod tests {
                     total_bytes: 5000,
                     total_data_bytes: 4096,
                     md5: [1u8; 16],
+                    sealed: true,
                 },
                 crate::log::LogFileInfo {
                     generation: 2,
@@ -1623,6 +1624,7 @@ mod tests {
                     total_bytes: 5000,
                     total_data_bytes: 4096,
                     md5: [2u8; 16],
+                    sealed: false,
                 },
             ],
         };
@@ -1654,6 +1656,17 @@ mod tests {
         assert!(dump_snap_v0.contains("/docs/fragmented.bin"));
         assert!(dump_snap_v0.contains("000001.log"));
         assert!(dump_snap_v0.contains("000002.log"));
+        assert!(dump_snap_v0.contains("(not sealed)"));
+        assert!(
+            dump_snap_v0
+                .lines()
+                .any(|l| l.contains("000001.log") && l.ends_with("Healthy"))
+        );
+        assert!(
+            dump_snap_v0
+                .lines()
+                .any(|l| l.contains("000002.log") && l.ends_with("Healthy (not sealed)"))
+        );
 
         // Level 1: Inode Tree Listing
         let dump_snap_v1 = dump_file(storage.as_ref(), "000001.summary", 1, None).unwrap();

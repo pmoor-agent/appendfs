@@ -23,7 +23,83 @@ struct ActiveLogFile {
 }
 
 impl ActiveLogFile {
-    fn seal(mut self) -> io::Result<super::manifest::LogFileInfo> {
+    fn append_record(
+        &mut self,
+        volume_key: &VolumeKey,
+        compression: crate::compress::Compression,
+        op_code: OpCode,
+        inode: u64,
+        payload: &[u8],
+    ) -> io::Result<(u64, u64, u32)> {
+        let generation = self.generation;
+        let revision = self.revision;
+        let record_log_offset = self.current_offset;
+        let (actual_op, cipher_payload, auth_tag) = crate::log::codec::encode(
+            volume_key,
+            compression,
+            crate::log::codec::RecordId {
+                generation,
+                revision,
+                record_offset: record_log_offset,
+                op_code: op_code as u8,
+                inode,
+            },
+            payload,
+        )?;
+
+        let header = RecordHeader {
+            op_code: actual_op,
+            inode,
+            payload_len: cipher_payload.len() as u32,
+            auth_tag,
+        };
+        let header_bytes = header.to_bytes();
+        let total_bytes = header_bytes.len() + cipher_payload.len();
+
+        let write_result = (|| -> io::Result<()> {
+            self.writer.append(&header_bytes)?;
+            if !cipher_payload.is_empty() {
+                self.writer.append(&cipher_payload)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = self.writer.truncate(record_log_offset);
+            self.current_offset = record_log_offset;
+            return Err(e);
+        }
+
+        self.md5_hasher.consume(header_bytes);
+        if !cipher_payload.is_empty() {
+            self.md5_hasher.consume(&cipher_payload);
+        }
+        self.current_offset += total_bytes as u64;
+
+        Ok((generation, record_log_offset, total_bytes as u32))
+    }
+
+    fn seal(
+        mut self,
+        volume_key: &VolumeKey,
+        timestamp: std::time::SystemTime,
+    ) -> io::Result<super::manifest::LogFileInfo> {
+        if self.current_offset > FILE_HEADER_SIZE as u64 {
+            let seal_payload = crate::log::record::SealPayload {
+                timestamp,
+                record_count: self.record_count,
+            };
+            let payload_bytes =
+                crate::wire::serialize(&seal_payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            self.append_record(
+                volume_key,
+                crate::compress::Compression::None,
+                OpCode::Seal,
+                0,
+                &payload_bytes,
+            )?;
+        }
         self.writer.sync()?;
         drop(self.writer);
         let sealed_md5 = self.md5_hasher.compute().0;
@@ -36,6 +112,7 @@ impl ActiveLogFile {
             total_bytes: self.current_offset,
             total_data_bytes: self.total_data_bytes,
             md5: sealed_md5,
+            sealed: true,
         })
     }
 }
@@ -56,12 +133,14 @@ enum ActiveLogState {
 fn seal_and_open_next(
     active: ActiveLogFile,
     storage: &Arc<dyn Storage>,
+    volume_key: &VolumeKey,
     clock: &dyn Clock,
     reason: &str,
 ) -> io::Result<(ActiveLogFile, super::manifest::LogFileInfo)> {
     let next_gen = active.generation + 1;
-    let sealed_info = active.seal()?;
-    let next_active = open_generation_file(storage, next_gen, clock.now())?;
+    let now = clock.now();
+    let sealed_info = active.seal(volume_key, now)?;
+    let next_active = open_generation_file(storage, next_gen, now)?;
     log::info!(
         "{} log file to generation {} ({})",
         reason,
@@ -299,7 +378,7 @@ impl LogWriter {
             }
             ActiveLogState::Open(active) => {
                 let next_gen = active.generation + 1;
-                match seal_and_open_next(active, &self.storage, clock, "Rolled") {
+                match seal_and_open_next(active, &self.storage, &self.volume_key, clock, "Rolled") {
                     Ok((next_active, sealed_info)) => {
                         *state = ActiveLogState::Open(next_active);
                         Ok(Some(sealed_info))
@@ -356,7 +435,7 @@ impl LogWriter {
         };
 
         let next_gen = active.generation + 1;
-        let sealed_info = active.seal()?;
+        let sealed_info = active.seal(&self.volume_key, clock.now())?;
         log::info!(
             "Age-rolled log file: sealed generation {}, next generation {} is lazy (unopened)",
             sealed_info.generation,
@@ -398,7 +477,7 @@ impl LogWriter {
         };
 
         let next_gen = active.generation + 1;
-        match seal_and_open_next(active, &self.storage, clock, "Force-rolled") {
+        match seal_and_open_next(active, &self.storage, &self.volume_key, clock, "Force-rolled") {
             Ok((next_active, sealed_info)) => {
                 *state = ActiveLogState::Open(next_active);
                 Ok(Some(sealed_info))
@@ -416,7 +495,7 @@ impl LogWriter {
     /// If the active log file is currently open and has committed data, syncs and seals it,
     /// transitioning writer state to `Unopened { generation: next_gen, created_at: None }`.
     /// Returns the sealed `LogFileInfo` if sealed.
-    pub fn seal_active(&self) -> io::Result<Option<super::manifest::LogFileInfo>> {
+    pub fn seal_active(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -443,7 +522,7 @@ impl LogWriter {
         };
 
         let next_gen = active.generation + 1;
-        let sealed_info = active.seal()?;
+        let sealed_info = active.seal(&self.volume_key, clock.now())?;
         log::info!(
             "Sealed active log generation {}, next generation {} is lazy (unopened)",
             sealed_info.generation,
@@ -494,52 +573,7 @@ impl LogWriter {
             }
         };
 
-        let generation = active.generation;
-        let revision = active.revision;
-        let record_log_offset = active.current_offset;
-        let (actual_op, cipher_payload, auth_tag) = crate::log::codec::encode(
-            &self.volume_key,
-            self.compression,
-            crate::log::codec::RecordId {
-                generation,
-                revision,
-                record_offset: record_log_offset,
-                op_code: op_code as u8,
-                inode,
-            },
-            payload,
-        )?;
-
-        let header = RecordHeader {
-            op_code: actual_op,
-            inode,
-            payload_len: cipher_payload.len() as u32,
-            auth_tag,
-        };
-        let header_bytes = header.to_bytes();
-        let total_bytes = header_bytes.len() + cipher_payload.len();
-
-        let write_result = (|| -> io::Result<()> {
-            active.writer.append(&header_bytes)?;
-            if !cipher_payload.is_empty() {
-                active.writer.append(&cipher_payload)?;
-            }
-            Ok(())
-        })();
-
-        if let Err(e) = write_result {
-            let _ = active.writer.truncate(record_log_offset);
-            active.current_offset = record_log_offset;
-            return Err(e);
-        }
-
-        active.md5_hasher.consume(header_bytes);
-        if !cipher_payload.is_empty() {
-            active.md5_hasher.consume(&cipher_payload);
-        }
-        active.current_offset += total_bytes as u64;
-
-        Ok((generation, record_log_offset, total_bytes as u32))
+        active.append_record(&self.volume_key, self.compression, op_code, inode, payload)
     }
 
     /// Rolls back the active log file to `offset` if it is currently in `generation`
@@ -863,6 +897,16 @@ mod tests {
             sealed_md5, expected_md5,
             "On-the-fly computed MD5 must match raw disk bytes bit-for-bit!"
         );
+
+        // Verify the terminal record in 000001.log is OpCode::Seal
+        let records: Vec<_> = LogReader::open(storage.as_ref(), "000001.log", VolumeKey::plaintext_arc())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[3].header.op_code, OpCode::Seal);
+        let seal: crate::log::record::SealPayload = crate::wire::deserialize(&records[3].payload).unwrap();
+        assert_eq!(seal.record_count, 3);
     }
 
     #[test]
@@ -932,10 +976,10 @@ mod tests {
         let writer = LogWriter::create(storage.clone(), 1, &clock, 1000, 1, VolumeKey::plaintext_arc()).unwrap();
 
         // When nothing written, seal_active returns None
-        assert!(writer.seal_active().unwrap().is_none());
+        assert!(writer.seal_active(&clock).unwrap().is_none());
 
         writer.append_record(OpCode::Data, 1, b"active data").unwrap();
-        let sealed = writer.seal_active().unwrap().unwrap();
+        let sealed = writer.seal_active(&clock).unwrap().unwrap();
         assert_eq!(sealed.generation, 1);
         assert_ne!(sealed.md5, [0u8; 16]);
         assert_eq!(writer.generation(), 2);

@@ -1,6 +1,6 @@
 use crate::log::record::{
     DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LogEntryDelta, OpCode, RECORD_HEADER_SIZE,
-    RecordHeader,
+    RecordHeader, SealPayload,
 };
 use crate::storage::{Storage, StorageReader};
 use std::io;
@@ -26,6 +26,7 @@ impl LogRecord {
             OpCode::FlushCommit => {
                 crate::wire::deserialize::<FlushCommitPayload>(&self.payload).map(DecodedPayload::FlushCommit)
             }
+            OpCode::Seal => crate::wire::deserialize::<SealPayload>(&self.payload).map(DecodedPayload::Seal),
         }
     }
 

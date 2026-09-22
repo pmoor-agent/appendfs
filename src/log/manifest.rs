@@ -22,6 +22,8 @@ pub struct LogFileInfo {
     pub total_data_bytes: u64,
     /// Authenticated MD5 digest of the completed, sealed generation log file.
     pub md5: [u8; 16],
+    /// Whether this log generation was cleanly sealed on rollover or shutdown.
+    pub sealed: bool,
 }
 
 /// Returns the physical filename for a given log generation (e.g. "000001.log").
@@ -112,6 +114,17 @@ impl LogManifest {
     pub fn get_by_generation(&self, generation: u64) -> Option<&LogFileInfo> {
         self.logs.iter().find(|l| l.generation == generation)
     }
+
+    /// Returns true if the volume was cleanly unmounted/sealed prior to summary export,
+    /// or false if the last recorded log generation was unsealed (indicating an unclean crash recovery).
+    pub fn last_shutdown_clean(&self) -> bool {
+        self.logs.last().is_none_or(|l| l.sealed)
+    }
+
+    /// Returns true if all recorded log generations were cleanly sealed.
+    pub fn all_logs_sealed(&self) -> bool {
+        self.logs.iter().all(|l| l.sealed)
+    }
 }
 
 /// Dynamically computed live extent statistics for a single log generation.
@@ -128,6 +141,8 @@ pub struct GenerationLiveStats {
     pub live_extents: u32,
     /// Ratio of live bytes to total data bytes written (0.0 to 1.0).
     pub live_ratio: f64,
+    /// Whether this log generation was cleanly sealed on rollover / shutdown.
+    pub sealed: bool,
 }
 
 #[cfg(test)]
@@ -148,6 +163,7 @@ mod tests {
             total_bytes: 1024,
             total_data_bytes: 512,
             md5: [1u8; 16],
+            sealed: true,
         };
         manifest.record_sealed_log(log1);
         assert_eq!(manifest.logs.len(), 1);
@@ -162,6 +178,7 @@ mod tests {
             total_bytes: 2048,
             total_data_bytes: 1024,
             md5: [2u8; 16],
+            sealed: true,
         };
         manifest.record_sealed_log(log2);
         assert_eq!(manifest.logs.len(), 2);
@@ -199,11 +216,78 @@ mod tests {
             total_bytes: 32,
             total_data_bytes: 0,
             md5: [42u8; 16],
+            sealed: true,
         });
         assert_eq!(manifest.logs.len(), 1);
         assert_eq!(manifest.logs[0].generation, 1);
         assert_eq!(manifest.logs[0].revision, 1);
         assert_eq!(manifest.logs[0].filename, "000001_r1.log");
+    }
+
+    #[test]
+    fn test_last_shutdown_clean_and_all_logs_sealed() {
+        let mut manifest = LogManifest::new();
+        assert!(manifest.last_shutdown_clean());
+        assert!(manifest.all_logs_sealed());
+
+        let log1 = LogFileInfo {
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 5,
+            total_bytes: 1024,
+            total_data_bytes: 512,
+            md5: [1u8; 16],
+            sealed: true,
+        };
+        manifest.record_sealed_log(log1);
+        assert!(manifest.last_shutdown_clean());
+        assert!(manifest.all_logs_sealed());
+
+        // Generation 2 wasn't cleanly sealed (crash)
+        let log2 = LogFileInfo {
+            generation: 2,
+            revision: 0,
+            filename: "000002.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 2,
+            total_bytes: 512,
+            total_data_bytes: 256,
+            md5: [2u8; 16],
+            sealed: false,
+        };
+        manifest.record_sealed_log(log2);
+        assert!(!manifest.last_shutdown_clean());
+        assert!(!manifest.all_logs_sealed());
+
+        // Generation 3 was sealed
+        let mut manifest2 = LogManifest::new();
+        manifest2.record_sealed_log(LogFileInfo {
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 1,
+            total_bytes: 100,
+            total_data_bytes: 50,
+            md5: [1u8; 16],
+            sealed: false,
+        });
+        manifest2.record_sealed_log(LogFileInfo {
+            generation: 2,
+            revision: 0,
+            filename: "000002.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 1,
+            total_bytes: 100,
+            total_data_bytes: 50,
+            md5: [2u8; 16],
+            sealed: true,
+        });
+        // Last shutdown was clean (log2 was sealed), but not all logs were sealed (log1 wasn't)
+        assert!(manifest2.last_shutdown_clean());
+        assert!(!manifest2.all_logs_sealed());
     }
 
     #[test]
@@ -219,6 +303,7 @@ mod tests {
             total_bytes: 1024,
             total_data_bytes: 512,
             md5: [1u8; 16],
+            sealed: true,
         };
         manifest.record_sealed_log(log.clone());
         manifest.record_sealed_log(log);
@@ -237,6 +322,7 @@ mod tests {
             total_bytes: 1024,
             total_data_bytes: 512,
             md5: [2u8; 16],
+            sealed: true,
         };
         let log1 = LogFileInfo {
             generation: 1,
@@ -247,6 +333,7 @@ mod tests {
             total_bytes: 1024,
             total_data_bytes: 512,
             md5: [1u8; 16],
+            sealed: true,
         };
         manifest.record_sealed_log(log2);
         manifest.record_sealed_log(log1);

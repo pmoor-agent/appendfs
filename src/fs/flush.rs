@@ -578,7 +578,7 @@ impl InMemoryFS {
 
         // Seal the active generation before taking the summary snapshot
         if let Some(ref writer) = self.log_writer
-            && let Some(sealed_info) = writer.seal_active()?
+            && let Some(sealed_info) = writer.seal_active(self.clock.as_ref())?
         {
             self.manifest.write().unwrap().record_sealed_log(sealed_info);
         }

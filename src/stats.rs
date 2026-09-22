@@ -150,6 +150,7 @@ where
             live_bytes,
             live_extents,
             live_ratio,
+            sealed: log.sealed,
         });
     }
     result
@@ -182,6 +183,12 @@ pub fn format_generations_table(generations: &[GenerationLiveStats]) -> String {
             let (status, ratio_str) =
                 format_generation_status(g.total_data_bytes, g.live_bytes, g.live_ratio, g.record_count);
 
+            let display_status = if !g.sealed {
+                format!("{status} (not sealed)")
+            } else {
+                status.to_string()
+            };
+
             writeln!(
                 out,
                 "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
@@ -192,7 +199,7 @@ pub fn format_generations_table(generations: &[GenerationLiveStats]) -> String {
                 format_bytes(g.live_bytes),
                 g.live_extents,
                 ratio_str,
-                status,
+                display_status,
             )
             .unwrap();
         }
@@ -685,6 +692,7 @@ mod tests {
                 total_bytes: 8192,
                 total_data_bytes: 4096,
                 md5: [0u8; 16],
+                sealed: true,
             });
         }
 
@@ -701,6 +709,55 @@ mod tests {
         assert_eq!(stats_snapshot.total_logical_bytes, 4096);
         assert_eq!(stats_snapshot.total_live_bytes, 4096);
         assert_eq!(stats_snapshot.overall_live_ratio, 1.0);
+    }
+
+    #[test]
+    fn test_format_generations_table_sealed_and_unsealed() {
+        let generations = vec![
+            GenerationLiveStats {
+                generation: 1,
+                filename: "000001.log".to_string(),
+                record_count: 10,
+                total_bytes: 8192,
+                total_data_bytes: 4096,
+                live_bytes: 4096,
+                live_extents: 1,
+                live_ratio: 1.0,
+                sealed: true,
+            },
+            GenerationLiveStats {
+                generation: 2,
+                filename: "000002.log".to_string(),
+                record_count: 5,
+                total_bytes: 4096,
+                total_data_bytes: 2048,
+                live_bytes: 2048,
+                live_extents: 1,
+                live_ratio: 1.0,
+                sealed: false,
+            },
+        ];
+
+        let table = format_generations_table(&generations);
+        assert!(table.contains("000001.log"));
+        assert!(table.contains("000002.log"));
+        // Gen 1 is sealed, so shows Healthy without "(not sealed)"
+        assert!(
+            table.contains("Healthy\n")
+                || table
+                    .lines()
+                    .any(|l| l.contains("000001.log") && l.ends_with("Healthy"))
+        );
+        // Gen 2 is unsealed, so shows Healthy (not sealed)
+        assert!(
+            table
+                .lines()
+                .any(|l| l.contains("000002.log") && l.ends_with("Healthy (not sealed)"))
+        );
+
+        // Empty table
+        let empty_table = format_generations_table(&[]);
+        assert!(empty_table.contains("No log generation files present"));
     }
 
     #[test]
