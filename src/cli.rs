@@ -392,7 +392,7 @@ pub struct MountArgs {
     #[arg(long = "flush-threshold-ops", default_value_t = DEFAULT_MAX_BUFFER_OPS)]
     pub flush_threshold_ops: usize,
 
-    /// Log file size in bytes at which to roll to the next generation; a soft limit, as the flush that crosses it is written in full first (default: 2 GiB)
+    /// Log file size in bytes at which to roll to the next generation; a soft limit, as the flush that crosses it is written in full first, overshooting by up to the flush threshold (or about twice that under a slow flush) (default: 2 GiB)
     #[arg(short = 's', long = "max-log-size", default_value_t = DEFAULT_MAX_LOG_SIZE)]
     pub max_log_size: u64,
 

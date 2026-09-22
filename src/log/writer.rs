@@ -354,8 +354,10 @@ impl LogWriter {
     /// Returns the sealed `LogFileInfo` if a rollover occurred.
     ///
     /// `max_log_size` is a soft limit: this runs after a batch group has been written, not
-    /// before, so a generation can end up larger than `max_log_size` by up to one coalesced
-    /// group before it is rolled. A lazy (unopened) generation has nothing to seal and is left
+    /// before, so the group that crosses `max_log_size` lands in full. A single batch can be
+    /// as large as the flush threshold (`--flush-threshold`, 128 MiB by default), and up to
+    /// about twice that when a slow flush lets staged writes pile up, so a generation can
+    /// overshoot by that much before it is rolled. A lazy (unopened) generation has nothing to seal and is left
     /// alone; [`LogWriter::open_if_unopened`] opens it.
     pub fn roll_if_needed(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
