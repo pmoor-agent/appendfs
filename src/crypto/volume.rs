@@ -302,14 +302,14 @@ impl VolumeKey {
     /// `op_code` and `inode` are authenticated but not encrypted - see [`record_aad`].
     pub fn encrypt_record(
         &self,
-        generation: u64,
-        revision: u32,
+        generation: u32,
+        revision: u16,
         record_offset: u64,
         op_code: u8,
         inode: u64,
         payload: &[u8],
     ) -> Result<(Vec<u8>, [u8; 16]), CryptoError> {
-        let nonce = derive_record_nonce(generation, revision, record_offset);
+        let nonce = derive_record_nonce(generation, revision, record_offset)?;
         let aad = record_aad(op_code, record_offset, inode);
         encrypt_payload(self.cipher, &self.key, &nonce, &aad, payload)
     }
@@ -321,15 +321,15 @@ impl VolumeKey {
     #[allow(clippy::too_many_arguments)]
     pub fn decrypt_record(
         &self,
-        generation: u64,
-        revision: u32,
+        generation: u32,
+        revision: u16,
         record_offset: u64,
         op_code: u8,
         inode: u64,
         ciphertext: &[u8],
         expected_tag: &[u8; 16],
     ) -> Result<Vec<u8>, CryptoError> {
-        let nonce = derive_record_nonce(generation, revision, record_offset);
+        let nonce = derive_record_nonce(generation, revision, record_offset)?;
         let aad = record_aad(op_code, record_offset, inode);
         decrypt_payload(self.cipher, &self.key, &nonce, &aad, ciphertext, expected_tag)
     }

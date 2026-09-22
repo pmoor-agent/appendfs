@@ -429,7 +429,7 @@ pub enum ReadSliceSource {
     Cache { data: Arc<Vec<u8>>, src_offset: usize },
     /// Cold disk or remote S3 extent.
     Disk {
-        generation: u64,
+        generation: u32,
         record_log_offset: u64,
         record_size: u32,
         payload_offset: u32,

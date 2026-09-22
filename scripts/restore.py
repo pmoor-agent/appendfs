@@ -38,8 +38,10 @@ import zstandard as zstd
 
 FILE_MAGIC = b"APPF"
 SUMMARY_MAGIC = b"APPS"
-FILE_HEADER_SIZE = 32
+FILE_HEADER_SIZE = 26
 RECORD_HEADER_SIZE = 29
+SUMMARY_HEADER_SIZE = 66
+VOLUME_HEADER_SIZE = 72
 
 OP_DATA = 1
 OP_DATA_ZSTD = 2
@@ -192,11 +194,22 @@ def parse_entry_delta(payload: bytes) -> tuple:
         raise ValueError(f"Unknown LogEntryDelta tag: {tag}")
 
 
+MAX_NONCE_RECORD_OFFSET = 1 << 48
+
+
 def derive_record_nonce(generation: int, revision: int, record_offset: int) -> bytes:
     """Derives a deterministic 12-byte nonce matching AppendFS's derive_record_nonce.
-    Format: [generation (4 bytes BE) || revision (4 bytes BE) || record_offset (4 bytes BE)]
+
+    Format: [generation (4 bytes BE) || revision (2 bytes BE) || record_offset (6 bytes BE)]
+
+    `generation` and `revision` need no check: they are 32- and 16-bit fields on disk, so
+    neither can exceed its slot here. Only the offset raises rather than wrapping. Masking it
+    - as this did while it was a 32-bit field - would silently derive a nonce belonging to a
+    different record, so a restore would decrypt to garbage and blame the volume.
     """
-    return struct.pack(">III", generation & 0xFFFFFFFF, revision & 0xFFFFFFFF, record_offset & 0xFFFFFFFF)
+    if not 0 <= record_offset < MAX_NONCE_RECORD_OFFSET:
+        raise ValueError(f"record offset {record_offset} is not encodable in a record nonce")
+    return struct.pack(">IH", generation, revision) + record_offset.to_bytes(6, "big")
 
 
 def derive_record_aad(op_code: int, record_offset: int, inode: int) -> bytes:
@@ -297,18 +310,18 @@ def read_volume_header_from_summary(summary_path: Path) -> Tuple[bytes, bytes, b
     if not summary_path.is_file():
         raise FileNotFoundError(f"Summary file not found: '{summary_path}'")
     with open(summary_path, "rb") as f:
-        hdr = f.read(72)
-        if len(hdr) < 72:
+        hdr = f.read(SUMMARY_HEADER_SIZE)
+        if len(hdr) < SUMMARY_HEADER_SIZE:
             raise ValueError(f"Corrupt or truncated summary header in '{summary_path}'")
         magic, ver, gen, rev, tx, next_ino, sec, nsec, iv, vh_len, uncompressed_len = struct.unpack(
-            ">4sIQIQQqI12sIQ", hdr
+            ">4sIIHQQqI12sIQ", hdr
         )
         if magic != b"APPS":
             raise ValueError(f"Invalid magic {magic} in '{summary_path}'")
-        if vh_len < 72:
+        if vh_len < VOLUME_HEADER_SIZE:
             raise ValueError(f"Summary '{summary_path}' does not contain an encrypted VolumeHeader")
-        vh_bytes = f.read(72)
-        if len(vh_bytes) < 72:
+        vh_bytes = f.read(VOLUME_HEADER_SIZE)
+        if len(vh_bytes) < VOLUME_HEADER_SIZE:
             raise ValueError(f"Truncated VolumeHeader in '{summary_path}'")
         cipher, key_source, compression, volume_id, kdf_salt, kcv_iv, kcv_tag = struct.unpack(
             ">III16s16s12s16s", vh_bytes
@@ -425,7 +438,7 @@ class Restorer:
             hdr = f.read(FILE_HEADER_SIZE)
             if len(hdr) < FILE_HEADER_SIZE:
                 return
-            magic, ver, gen, rev, secs, nsecs = struct.unpack(">4sIQIqI", hdr)
+            magic, ver, gen, rev, secs, nsecs = struct.unpack(">4sIIHqI", hdr)
             if magic != FILE_MAGIC:
                 raise ValueError(f"Invalid file magic {magic} in {log_path.name}")
 

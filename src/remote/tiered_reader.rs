@@ -15,7 +15,7 @@ use std::sync::Arc;
 ///    Remotes are queried by priority (lower numbers first). Equal-priority remotes are load-balanced
 ///    pseudo-randomly but deterministically via a hash of `(filename, block_idx)`.
 pub struct TieredStorageReader {
-    pub generation: u64,
+    pub generation: u32,
     pub filename: String,
     pub expected_len: u64,
     pub local_storage: Option<Arc<dyn Storage>>,
@@ -26,7 +26,7 @@ pub struct TieredStorageReader {
 
 impl TieredStorageReader {
     pub fn new(
-        generation: u64,
+        generation: u32,
         filename: impl Into<String>,
         expected_len: u64,
         remotes: impl IntoIterator<Item = impl Into<RemoteReadTarget>>,
@@ -36,7 +36,7 @@ impl TieredStorageReader {
     }
 
     pub fn with_local_storage(
-        generation: u64,
+        generation: u32,
         filename: impl Into<String>,
         expected_len: u64,
         local_storage: Option<Arc<dyn Storage>>,

@@ -509,7 +509,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
     }
 
     // Pass 3: File Extent & ExtentMap Validation
-    let mut active_generations: HashSet<u64> = manifest.logs.iter().map(|l| l.generation).collect();
+    let mut active_generations: HashSet<u32> = manifest.logs.iter().map(|l| l.generation).collect();
     if let Some(ref w) = fs.log_writer {
         active_generations.insert(w.generation());
     }
@@ -721,7 +721,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
     }
 
     // Pass 4: Manifest & Physical File Consistency
-    let mut prev_gen = 0u64;
+    let mut prev_gen = 0u32;
     for info in &manifest.logs {
         if info.generation == 0 {
             report.issues.push(IntegrityIssue::error(

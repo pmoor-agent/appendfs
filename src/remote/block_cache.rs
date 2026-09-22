@@ -42,8 +42,8 @@ pub struct DecryptedRecordCache {
 
 #[derive(Debug)]
 struct DecryptedLruInner {
-    map: HashMap<(u64, u32, u64), Arc<Vec<u8>>>,
-    queue: VecDeque<(u64, u32, u64)>,
+    map: HashMap<(u32, u16, u64), Arc<Vec<u8>>>,
+    queue: VecDeque<(u32, u16, u64)>,
     current_bytes: usize,
 }
 
@@ -95,7 +95,7 @@ impl DecryptedRecordCache {
         self.entries.lock().unwrap().map.is_empty()
     }
 
-    pub fn get(&self, generation: u64, revision: u32, record_log_offset: u64) -> Option<Arc<Vec<u8>>> {
+    pub fn get(&self, generation: u32, revision: u16, record_log_offset: u64) -> Option<Arc<Vec<u8>>> {
         let mut guard = self.entries.lock().unwrap();
         let key = (generation, revision, record_log_offset);
         if let Some(val) = guard.map.get(&key) {
@@ -111,7 +111,7 @@ impl DecryptedRecordCache {
         }
     }
 
-    pub fn insert(&self, generation: u64, revision: u32, record_log_offset: u64, payload: Arc<Vec<u8>>) {
+    pub fn insert(&self, generation: u32, revision: u16, record_log_offset: u64, payload: Arc<Vec<u8>>) {
         let mut guard = self.entries.lock().unwrap();
         let key = (generation, revision, record_log_offset);
         let new_len = payload.len();

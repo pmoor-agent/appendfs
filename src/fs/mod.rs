@@ -40,7 +40,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -821,7 +821,7 @@ pub struct InMemoryFS {
     /// Number of generations rolled since the last summary was exported.
     pub generations_since_last_summary: AtomicU64,
     /// Generation number of the last exported summary file.
-    pub last_summary_generation: AtomicU64,
+    pub last_summary_generation: AtomicU32,
     /// Condition variable and flag to immediately notify the background replication worker of new logs/summaries.
     pub replication_notifier: Arc<(Mutex<bool>, Condvar)>,
     /// Tracks in-flight asynchronous operations (e.g. cold reads, async fsyncs) to ensure safe unmount without use-after-free.
@@ -928,7 +928,7 @@ impl InMemoryFS {
             summary_interval_generations: AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_GENERATIONS),
             bytes_since_last_summary: AtomicU64::new(0),
             generations_since_last_summary: AtomicU64::new(0),
-            last_summary_generation: AtomicU64::new(0),
+            last_summary_generation: AtomicU32::new(0),
             replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
             async_tracker,
             op_metrics,
@@ -1028,7 +1028,7 @@ impl InMemoryFS {
     /// of the latest summary snapshot, and the active log writer (if any). If the active
     /// log writer is open, the next generation is `active + 1`. If the writer is lazy
     /// (unopened), the next generation reflects the unopened generation waiting to be created.
-    pub fn next_generation(&self) -> u64 {
+    pub fn next_generation(&self) -> u32 {
         let manifest_max = self
             .manifest
             .read()
@@ -1039,9 +1039,12 @@ impl InMemoryFS {
             .max()
             .unwrap_or(0);
         let summary_gen = self.last_summary_generation.load(Ordering::SeqCst);
-        let base_next = manifest_max.max(summary_gen) + 1;
+        // Saturating rather than wrapping: at the end of the generation space the writer's
+        // own roll reports it (see `next_generation`), which is a far better place to fail
+        // than a silent wrap back to generation 0 here.
+        let base_next = manifest_max.max(summary_gen).saturating_add(1);
         match self.log_writer.as_ref() {
-            Some(w) if w.is_open() => base_next.max(w.generation() + 1),
+            Some(w) if w.is_open() => base_next.max(w.generation().saturating_add(1)),
             Some(w) => base_next.max(w.generation()),
             None => base_next,
         }

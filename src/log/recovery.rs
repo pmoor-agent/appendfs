@@ -23,7 +23,7 @@ pub enum RecoveryTarget {
     /// Replay up to and including the given wall-clock timestamp.
     Timestamp(std::time::SystemTime),
     /// Replay up to and including log generation `generation`.
-    Generation(u64),
+    Generation(u32),
 }
 
 /// Rebuilds complete in-memory filesystem state from summary files and `.log` files in `storage`
@@ -39,7 +39,7 @@ pub fn recover_fs(
     let files = storage.list_files()?;
 
     // 1. Scan for eligible single-file .summary snapshots matching the target
-    let mut latest_summary: Option<(u64, u32, SummaryReader)> = None;
+    let mut latest_summary: Option<(u32, u16, SummaryReader)> = None;
     let mut unreadable: Vec<String> = Vec::new();
     for file in &files {
         if let Some((gen_num, rev_num)) = parse_summary_filename(file) {
@@ -83,7 +83,7 @@ pub fn recover_fs(
         ));
     }
 
-    let mut log_files_map: BTreeMap<u64, (u32, String)> = BTreeMap::new();
+    let mut log_files_map: BTreeMap<u32, (u16, String)> = BTreeMap::new();
     for file in &files {
         if let Some((gen_num, rev_num)) = parse_log_filename(file) {
             match log_files_map.get(&gen_num) {
@@ -95,7 +95,7 @@ pub fn recover_fs(
         }
     }
 
-    let log_files: Vec<(u64, String)> = log_files_map
+    let log_files: Vec<(u32, String)> = log_files_map
         .into_iter()
         .map(|(gen_num, (_, file))| (gen_num, file))
         .collect();
@@ -117,7 +117,7 @@ pub fn recover_fs(
         }
     }
 
-    let mut min_log_gen = 0u64;
+    let mut min_log_gen = 0u32;
     let mut last_batch_id = 0u64;
     let mut expected_batch_id: Option<u64> = None;
 
@@ -383,7 +383,8 @@ pub fn recover_fs(
         }
     }
 
-    let gens_since_summary = max_replayed_generation.saturating_sub(min_log_gen);
+    // A count of generations rather than a generation number, so it widens to the u64 counter.
+    let gens_since_summary = u64::from(max_replayed_generation.saturating_sub(min_log_gen));
     fs_instance
         .generations_since_last_summary
         .store(gens_since_summary, Ordering::SeqCst);

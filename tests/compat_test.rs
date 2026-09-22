@@ -235,6 +235,158 @@ fn test_v1_secret_key_passphrase_compressed_deterministic_reproducibility() {
     }
 }
 
+/// Shortest byte string worth searching for.
+///
+/// A match on fewer bytes than this says nothing: three bytes recur by chance roughly once
+/// per 16 MiB of ciphertext, so a hit would be noise rather than a leak. Fixture bytes are
+/// checked in and deterministic, so this threshold cannot make the test flaky either way.
+const MIN_NEEDLE_BYTES: usize = 4;
+
+/// Every byte string the fixture volume holds that a reader without the key must not see.
+///
+/// Collected by walking the recovered filesystem rather than by listing literals, so
+/// anything added to `create_canonical_compat_volume` later is covered without this test
+/// being touched. Each entry is `(what it is, the bytes)`.
+fn collect_secret_plaintext(fs: &InMemoryFS) -> Vec<(String, Vec<u8>)> {
+    let mut secrets: Vec<(String, Vec<u8>)> = Vec::new();
+    // Paths carry no trailing slash, so the root is the empty string and is displayed as "/".
+    let mut pending = vec![(String::new(), 1u64)];
+
+    while let Some((path, ino)) = pending.pop() {
+        let display = if path.is_empty() { "/" } else { path.as_str() };
+
+        for name in fs.list_xattrs(ino).unwrap_or_default() {
+            if let Some(value) = fs.get_xattr(ino, &name) {
+                secrets.push((format!("xattr value of {} on {}", name, display), value));
+            }
+            secrets.push((format!("xattr name on {}", display), name.into_bytes()));
+        }
+
+        let Some(attr) = fs.get_attr(ino) else { continue };
+        match attr.file_type {
+            appendfs::FileType::Directory => {
+                for (name, child) in fs.list_directory(ino).unwrap_or_default() {
+                    let child_path = format!("{}/{}", path, name);
+                    secrets.push((format!("name of {}", child_path), name.into_bytes()));
+                    // Hard links revisit an inode, which only duplicates needles; directories
+                    // cannot be hard-linked, so the walk terminates.
+                    pending.push((child_path, child));
+                }
+            }
+            appendfs::FileType::Symlink => {
+                if let Some(target) = fs.read_link(ino) {
+                    secrets.push((format!("symlink target of {}", display), target.into_bytes()));
+                }
+            }
+            appendfs::FileType::RegularFile if attr.size > 0 => {
+                let data = fs
+                    .read_file_data(ino, 0, attr.size as usize)
+                    .unwrap_or_else(|e| panic!("read {} for the plaintext scan: {:?}", display, e));
+                secrets.push((format!("contents of {}", display), data));
+            }
+            _ => {}
+        }
+    }
+
+    secrets.retain(|(_, bytes)| bytes.len() >= MIN_NEEDLE_BYTES);
+    assert!(
+        secrets.len() > 10,
+        "the plaintext scan collected only {} needles, so it is not testing much",
+        secrets.len()
+    );
+    secrets
+}
+
+/// Verifies that no name, file content, symlink target, or xattr of an encrypted fixture
+/// appears in its checked-in volume files, or in anything the read path writes to disk
+/// while serving them.
+///
+/// The byte-for-byte reproducibility tests prove the *format* has not moved; this proves
+/// what the format is for. It runs against the committed bytes rather than a freshly
+/// generated volume, so a regression that starts leaking plaintext is caught the moment
+/// fixtures are regenerated, not merely when the encoding changes.
+///
+/// Two directories are scanned:
+///
+/// - the fixture itself, for what the *write* path produced; and
+/// - the on-disk block cache, for what the *read* path spills. That cache is the one place
+///   a read can put volume bytes back on disk. Reading a sealed generation pre-warms it
+///   from local storage - no remote and no pruning required, which is the whole point of
+///   pre-warming: blocks that were read once stay readable after the log is purged. It must
+///   hold the encrypted 1 MiB blocks it read, never the decrypted records derived from them.
+///
+/// The `-dump.txt` goldens beside the fixture are excluded: they are decrypted renderings
+/// produced *with* the fixture key, and contain plaintext by design.
+pub fn verify_no_plaintext_in_encrypted_fixture(fixture_dir: &Path) {
+    let Some(config) = CompatFixtureConfig::from_dir_path(fixture_dir) else {
+        return;
+    };
+    if !config.is_encrypted() {
+        return;
+    }
+
+    // Recovered from a copy, scanned on the originals: nothing here may touch the fixtures.
+    let temp = tempfile::tempdir().unwrap();
+    for name in appendfs::compat::COMPAT_FIXTURE_FILES {
+        fs::copy(fixture_dir.join(name), temp.path().join(name)).expect("copy fixture file");
+    }
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(temp.path()));
+    let clock: Arc<dyn appendfs::Clock> = Arc::new(appendfs::SystemClock);
+    let mut fs_recovered = recover_fs(
+        storage.clone(),
+        RecoveryTarget::Latest,
+        clock.clone(),
+        resolve_fixture_volume_key(fixture_dir),
+    )
+    .expect("recover encrypted fixture");
+
+    // No remotes, nothing pruned: reading a sealed generation pre-warms the block cache
+    // straight from local storage.
+    let cache_dir = temp.path().join(".cache");
+    let block_cache = Arc::new(
+        appendfs::remote::OnDiskBlockCache::new(&cache_dir, 64 * 1024 * 1024, clock.clone())
+            .expect("create on-disk block cache"),
+    );
+    fs_recovered.log_cache = Some(Arc::new(appendfs::log::LogFileCache::with_remote_support(
+        storage.clone(),
+        Some(block_cache.clone()),
+        Vec::<appendfs::remote::RemoteReadTarget>::new(),
+        Some(Arc::clone(&fs_recovered.manifest)),
+    )));
+
+    // Reads every file, which both gathers the needles and fills the block cache.
+    let secrets = collect_secret_plaintext(&fs_recovered);
+
+    let volume_files: Vec<PathBuf> = appendfs::compat::COMPAT_FIXTURE_FILES
+        .iter()
+        .map(|name| fixture_dir.join(name))
+        .collect();
+    let cached_blocks: Vec<PathBuf> = fs::read_dir(&cache_dir)
+        .expect("read block cache dir")
+        .map(|e| e.expect("cache dir entry").path())
+        .filter(|p| p.is_file())
+        .collect();
+    assert!(
+        !cached_blocks.is_empty(),
+        "no blocks were cached, so the read path was never exercised: {}",
+        cache_dir.display()
+    );
+
+    for path in volume_files.iter().chain(cached_blocks.iter()) {
+        let bytes = fs::read(path).expect("read file to scan");
+        for (what, needle) in &secrets {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle.as_slice()),
+                "plaintext leak: the {} appears in {} ({} bytes: {:?})",
+                what,
+                path.display(),
+                needle.len(),
+                String::from_utf8_lossy(&needle[..needle.len().min(64)])
+            );
+        }
+    }
+}
+
 /// Verifies that dump output for all canonical volume files in `fixture_dir` matches
 /// the checked-in golden `-dump.txt` files.
 pub fn verify_fixture_dumps(fixture_dir: &Path) {
@@ -288,6 +440,7 @@ fn test_all_fixture_versions() {
         println!("Running compatibility checks on fixture: {}", version_name);
         verify_recovery_with_latest_summary_missing(version_dir);
         verify_recovery_from_latest_summary_snapshot(version_dir);
+        verify_no_plaintext_in_encrypted_fixture(version_dir);
         verify_fixture_dumps(version_dir);
         verify_python_restore_script(version_dir);
     }

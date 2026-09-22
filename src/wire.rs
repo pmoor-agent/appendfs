@@ -43,14 +43,16 @@ mod tests {
     struct Sample {
         magic: [u8; 4],
         version: u32,
-        generation: u64,
+        // Named for what it exercises - a 64-bit field - rather than after any real field,
+        // so a search for a `u64` generation turns up nothing outside this encoding test.
+        wide: u64,
     }
 
     fn sample() -> Sample {
         Sample {
             magic: *b"APPS",
             version: 1,
-            generation: 258,
+            wide: 258,
         }
     }
 
@@ -71,7 +73,7 @@ mod tests {
         let large = serialize(&Sample {
             magic: *b"APPS",
             version: u32::MAX,
-            generation: u64::MAX,
+            wide: u64::MAX,
         })
         .unwrap();
 

@@ -640,7 +640,7 @@ impl InMemoryFS {
     pub fn export_summary_for_base(
         &self,
         storage: &dyn Storage,
-        sealed_gen: u64,
+        sealed_gen: u32,
         last_batch_id: u64,
     ) -> std::io::Result<String> {
         let snapshot = self.inner.lock(OpTag::Flush).unwrap().base.clone();
