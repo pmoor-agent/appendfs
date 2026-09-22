@@ -310,11 +310,10 @@ fn collect_secret_plaintext(fs: &InMemoryFS) -> Vec<(String, Vec<u8>)> {
 ///
 /// - the fixture itself, for what the *write* path produced; and
 /// - the on-disk block cache, for what the *read* path spills. That cache is the one place
-///   a read can put volume bytes back on disk, and it is filled by reading a file whose
-///   extents are only available from a remote - so this reads every file in the fixture
-///   through a remote with the local log pruned, which is exactly the tiered-storage
-///   configuration an archival mount ends up in. It must cache the encrypted 1 MiB blocks
-///   it fetched, never the decrypted records it derived from them.
+///   a read can put volume bytes back on disk. Reading a sealed generation pre-warms it
+///   from local storage - no remote and no pruning required, which is the whole point of
+///   pre-warming: blocks that were read once stay readable after the log is purged. It must
+///   hold the encrypted 1 MiB blocks it read, never the decrypted records derived from them.
 ///
 /// The `-dump.txt` goldens beside the fixture are excluded: they are decrypted renderings
 /// produced *with* the fixture key, and contain plaintext by design.
@@ -333,29 +332,16 @@ pub fn verify_no_plaintext_in_encrypted_fixture(fixture_dir: &Path) {
     }
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(temp.path()));
     let clock: Arc<dyn appendfs::Clock> = Arc::new(appendfs::SystemClock);
-    let volume_key = resolve_fixture_volume_key(fixture_dir);
     let mut fs_recovered = recover_fs(
         storage.clone(),
         RecoveryTarget::Latest,
         clock.clone(),
-        volume_key.clone(),
+        resolve_fixture_volume_key(fixture_dir),
     )
     .expect("recover encrypted fixture");
 
-    // Serve the log from a remote with no local copy, so every extent read has to be
-    // fetched and therefore block-cached. Recovery has already read the summaries, so only
-    // the log needs to move.
-    let remote = Arc::new(appendfs::MockRemoteStore::new());
-    let gen1_md5 = fs_recovered
-        .manifest
-        .read()
-        .unwrap()
-        .get_by_generation(1)
-        .map(|l| l.md5);
-    appendfs::remote::worker::upload_storage_file(storage.as_ref(), remote.as_ref(), "000001.log", gen1_md5.as_ref())
-        .expect("upload fixture log to remote");
-    storage.remove_file("000001.log").expect("prune local log");
-
+    // No remotes, nothing pruned: reading a sealed generation pre-warms the block cache
+    // straight from local storage.
     let cache_dir = temp.path().join(".cache");
     let block_cache = Arc::new(
         appendfs::remote::OnDiskBlockCache::new(&cache_dir, 64 * 1024 * 1024, clock.clone())
@@ -364,7 +350,7 @@ pub fn verify_no_plaintext_in_encrypted_fixture(fixture_dir: &Path) {
     fs_recovered.log_cache = Some(Arc::new(appendfs::log::LogFileCache::with_remote_support(
         storage.clone(),
         Some(block_cache.clone()),
-        vec![("remote".to_string(), remote.clone() as Arc<dyn appendfs::RemoteStore>)],
+        Vec::<appendfs::remote::RemoteReadTarget>::new(),
         Some(Arc::clone(&fs_recovered.manifest)),
     )));
 
