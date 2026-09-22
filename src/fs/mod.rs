@@ -351,16 +351,17 @@ pub struct FlushRecord {
     pub ops: usize,
     /// When the flusher picked the batch up.
     pub started_at: SystemTime,
-    /// Time spent writing the batch's records to the log and syncing the file.
-    ///
-    /// Separated from `fold` because the two say different things when the flusher falls
-    /// behind: this one is the storage device, `fold` is contention on the inner lock and
-    /// the cost of applying deltas to `base`.
-    pub persist: Duration,
+    /// Time spent synthesizing and appending the batch's records to the log writer.
+    pub serialize: Duration,
+    /// Time from the end of serializing this batch to the beginning of physical disk sync.
+    /// In the non-coalescing case, this is `Duration::ZERO`.
+    pub wait: Duration,
+    /// Time spent physically syncing the log file to disk (`writer.flush()`).
+    /// Identical for every batch within a coalesced group.
+    pub flush: Duration,
     /// Time spent popping the batch and applying its deltas to `base`.
     pub fold: Duration,
-    /// Total, end to end. Exceeds `persist + fold` by whatever the freeze and queue check
-    /// at the head of the cycle cost.
+    /// Total, end to end.
     pub duration: Duration,
 }
 
@@ -379,9 +380,13 @@ pub struct FlushStats {
     pub total_disk_bytes: u64,
     /// Mutating operations flushed since mount.
     pub total_ops: u64,
-    /// Cumulative time spent writing and syncing batches since mount.
-    pub total_persist: Duration,
-    /// Cumulative time spent folding batches into `base` since mount.
+    /// Cumulative duration spent serializing records into the log writer since mount.
+    pub total_serialize: Duration,
+    /// Cumulative duration spent waiting for coalesced batches to sync since mount.
+    pub total_wait: Duration,
+    /// Cumulative duration spent physically syncing the log file to disk since mount.
+    pub total_flush: Duration,
+    /// Cumulative duration of the delta folding phase since mount.
     pub total_fold: Duration,
     /// Batches completed per reason, indexed by [`FlushReason::index`].
     pub by_reason: [u64; 5],
@@ -791,6 +796,14 @@ pub struct InMemoryFS {
     pub max_flush_queue_bytes: usize,
     /// Maximum total mutating operations across all frozen flush batches allowed to queue up before auto-freezing is bounded.
     pub max_flush_queue_ops: usize,
+    /// Maximum number of small flush batches to coalesce into a single on-disk flush cycle.
+    pub max_coalesce_batches: usize,
+    /// Maximum cumulative staged data bytes across coalesced flush batches before forcing a disk flush.
+    pub max_coalesce_bytes: usize,
+    /// Maximum cumulative mutation operations across coalesced flush batches before forcing a disk flush.
+    pub max_coalesce_ops: usize,
+    /// Maximum data bytes for an individual flush batch to be eligible for coalescing.
+    pub small_batch_max_bytes: usize,
     pub flush_interval: AtomicU64,
     pub(crate) flusher: flusher::Flusher,
     /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to false.
@@ -916,6 +929,10 @@ impl InMemoryFS {
             max_flush_queue_depth: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_DEPTH,
             max_flush_queue_bytes: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_BYTES,
             max_flush_queue_ops: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_OPS,
+            max_coalesce_batches: crate::cli::DEFAULT_MAX_COALESCE_BATCHES,
+            max_coalesce_bytes: crate::cli::DEFAULT_MAX_COALESCE_BYTES,
+            max_coalesce_ops: crate::cli::DEFAULT_MAX_COALESCE_OPS,
+            small_batch_max_bytes: crate::cli::DEFAULT_SMALL_BATCH_MAX_BYTES,
             flush_interval: AtomicU64::new(0),
             flusher: flusher::Flusher::new(),
             track_atime: false,

@@ -529,8 +529,9 @@ mod tests {
             .append_record(crate::log::record::OpCode::Data, 1, b"batch1 data")
             .unwrap();
         writer1
-            .emit_flush_commit_and_flush(1, b"batch1 data".len() as u64, &*clock)
+            .emit_flush_commit(1, b"batch1 data".len() as u64, &*clock)
             .unwrap();
+        writer1.flush().unwrap();
         assert_eq!(writer1.last_batch_id(), 1);
         writer1.seal_active(&*clock).unwrap();
         drop(writer1);
@@ -551,8 +552,9 @@ mod tests {
             .append_record(crate::log::record::OpCode::Data, 1, b"batch3 data")
             .unwrap();
         writer2
-            .emit_flush_commit_and_flush(1, b"batch3 data".len() as u64, &*clock)
+            .emit_flush_commit(1, b"batch3 data".len() as u64, &*clock)
             .unwrap();
+        writer2.flush().unwrap();
         assert_eq!(writer2.last_batch_id(), 3);
         drop(writer2);
 
@@ -722,7 +724,7 @@ mod tests {
                 storage.clone(),
                 1,
                 &*clock,
-                100, // Small max_log_size to trigger roll
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
                 1,
                 VolumeKey::plaintext_arc(),
             )
