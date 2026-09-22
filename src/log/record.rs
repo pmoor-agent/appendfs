@@ -5,8 +5,8 @@ use std::time::SystemTime;
 
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
 pub const CURRENT_VERSION: u32 = 1;
-/// magic(4) + version(4) + generation(4) + revision(4) + created_at seconds(8) + nanoseconds(4).
-pub const FILE_HEADER_SIZE: usize = 28;
+/// magic(4) + version(4) + generation(4) + revision(2) + created_at seconds(8) + nanoseconds(4).
+pub const FILE_HEADER_SIZE: usize = 26;
 pub const RECORD_HEADER_SIZE: usize = 29;
 pub const AUTH_TAG_SIZE: usize = 16;
 
@@ -17,7 +17,7 @@ pub struct FileHeader {
     pub magic: [u8; 4],
     pub version: u32,
     pub generation: u32,
-    pub revision: u32,
+    pub revision: u16,
     #[serde(with = "crate::clock::serde_system_time")]
     pub created_at: SystemTime,
 }
@@ -38,14 +38,14 @@ impl FileHeader {
         buf[0..4].copy_from_slice(&self.magic);
         buf[4..8].copy_from_slice(&self.version.to_be_bytes());
         buf[8..12].copy_from_slice(&self.generation.to_be_bytes());
-        buf[12..16].copy_from_slice(&self.revision.to_be_bytes());
+        buf[12..14].copy_from_slice(&self.revision.to_be_bytes());
         // Seconds are stored as a full signed 64-bit count. Narrowing them to u32 - as this
         // header briefly did - silently wraps every timestamp past 2106 back to 1970 and
         // every pre-1970 one forward to ~2106, which corrupts the ordering that
         // `mount-ro --at-time` selects generations by.
         let (secs, nsecs) = crate::clock::system_time_to_unix(self.created_at);
-        buf[16..24].copy_from_slice(&secs.to_be_bytes());
-        buf[24..28].copy_from_slice(&nsecs.to_be_bytes());
+        buf[14..22].copy_from_slice(&secs.to_be_bytes());
+        buf[22..26].copy_from_slice(&nsecs.to_be_bytes());
         buf
     }
 
@@ -59,9 +59,9 @@ impl FileHeader {
             return Err("unsupported file version");
         }
         let generation = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
-        let revision = u32::from_be_bytes(bytes[12..16].try_into().unwrap());
-        let secs = i64::from_be_bytes(bytes[16..24].try_into().unwrap());
-        let nsecs = u32::from_be_bytes(bytes[24..28].try_into().unwrap());
+        let revision = u16::from_be_bytes(bytes[12..14].try_into().unwrap());
+        let secs = i64::from_be_bytes(bytes[14..22].try_into().unwrap());
+        let nsecs = u32::from_be_bytes(bytes[22..26].try_into().unwrap());
         let created_at = crate::clock::unix_to_system_time(secs, nsecs);
         Ok(Self {
             magic,

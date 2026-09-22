@@ -39,7 +39,7 @@ pub fn recover_fs(
     let files = storage.list_files()?;
 
     // 1. Scan for eligible single-file .summary snapshots matching the target
-    let mut latest_summary: Option<(u32, u32, SummaryReader)> = None;
+    let mut latest_summary: Option<(u32, u16, SummaryReader)> = None;
     let mut unreadable: Vec<String> = Vec::new();
     for file in &files {
         if let Some((gen_num, rev_num)) = parse_summary_filename(file) {
@@ -83,7 +83,7 @@ pub fn recover_fs(
         ));
     }
 
-    let mut log_files_map: BTreeMap<u32, (u32, String)> = BTreeMap::new();
+    let mut log_files_map: BTreeMap<u32, (u16, String)> = BTreeMap::new();
     for file in &files {
         if let Some((gen_num, rev_num)) = parse_log_filename(file) {
             match log_files_map.get(&gen_num) {

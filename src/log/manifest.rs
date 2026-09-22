@@ -8,7 +8,7 @@ pub struct LogFileInfo {
     pub generation: u32,
     /// Compaction revision sequence number (0 for original uncompacted roll, 1+ for compacted revisions).
     #[serde(default)]
-    pub revision: u32,
+    pub revision: u16,
     /// Physical filename on disk (e.g. "000001.log" or "000001_r1.log").
     pub filename: String,
     /// Creation timestamp for this log generation.
@@ -32,7 +32,7 @@ pub fn log_filename(generation: u32) -> String {
 }
 
 /// Returns the physical filename for a given log generation and revision (e.g. "000001_r2.log").
-pub fn log_filename_with_revision(generation: u32, revision: u32) -> String {
+pub fn log_filename_with_revision(generation: u32, revision: u16) -> String {
     if revision == 0 {
         format!("{:06}.log", generation)
     } else {
@@ -44,7 +44,7 @@ pub fn log_filename_with_revision(generation: u32, revision: u32) -> String {
 ///
 /// Supports both base names (e.g. "000001.log" -> (1, 0)) and revision names
 /// (e.g. "000001_r2.log" -> (1, 2)). Returns `None` if the format is unrecognized.
-pub fn parse_log_filename(filename: &str) -> Option<(u32, u32)> {
+pub fn parse_log_filename(filename: &str) -> Option<(u32, u16)> {
     parse_generation_revision_filename(filename, ".log")
 }
 
@@ -52,11 +52,11 @@ pub fn parse_log_filename(filename: &str) -> Option<(u32, u32)> {
 ///
 /// Supports both base names (e.g. "000001.summary" -> (1, 0)) and revision names
 /// (e.g. "000001_r2.summary" -> (1, 2)). Returns `None` if the format is unrecognized.
-pub fn parse_summary_filename(filename: &str) -> Option<(u32, u32)> {
+pub fn parse_summary_filename(filename: &str) -> Option<(u32, u16)> {
     parse_generation_revision_filename(filename, ".summary")
 }
 
-fn parse_generation_revision_filename(filename: &str, extension: &str) -> Option<(u32, u32)> {
+fn parse_generation_revision_filename(filename: &str, extension: &str) -> Option<(u32, u16)> {
     let name = filename.rsplit('/').next().unwrap_or(filename);
     if !name.ends_with(extension) {
         return None;
@@ -64,7 +64,7 @@ fn parse_generation_revision_filename(filename: &str, extension: &str) -> Option
     let stem = &name[..name.len() - extension.len()];
     if let Some((gen_str, rev_str)) = stem.split_once("_r") {
         let generation = gen_str.parse::<u32>().ok()?;
-        let rev = rev_str.parse::<u32>().ok()?;
+        let rev = rev_str.parse::<u16>().ok()?;
         Some((generation, rev))
     } else {
         let generation = stem.parse::<u32>().ok()?;

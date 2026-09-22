@@ -1,8 +1,6 @@
 use crate::crypto::cipher::CryptoError;
 use rand::RngCore;
 
-/// Largest compaction revision encodable in a record nonce.
-pub const MAX_NONCE_REVISION: u32 = u16::MAX as u32;
 /// Exclusive upper bound on a record offset encodable in a record nonce (256 TiB).
 pub const MAX_NONCE_RECORD_OFFSET: u64 = 1 << 48;
 
@@ -26,19 +24,14 @@ pub const MAX_NONCE_RECORD_OFFSET: u64 = 1 << 48;
 /// file larger than 4 GiB silently reused a nonce - which under ChaCha20-Poly1305 leaks the
 /// XOR of two plaintexts and the Poly1305 one-time key with it.
 ///
-/// `generation` needs no bound because it is a `u32` everywhere a generation exists, on disk
-/// and in memory alike, so it cannot overflow its field. The other two are checked: exceeding
-/// them is unreachable in practice - 256 TiB in one generation, 65,536 revisions of it - and
-/// if one ever were reached, refusing the write costs a failed flush while encoding it anyway
-/// would quietly destroy the confidentiality of two records.
+/// Two of the three coordinates need no bound check at all: `generation` is a `u32` and
+/// `revision` a `u16` everywhere they exist, on disk and in memory alike, so neither can
+/// overflow its field. Only `record_offset` is checked, because a file offset is naturally a
+/// `u64` and 48 bits is a real limit rather than a type. Reaching it needs 256 TiB in one
+/// generation, and if it ever were reached, refusing the write costs a failed flush while
+/// encoding it anyway would quietly destroy the confidentiality of two records.
 #[inline]
-pub fn derive_record_nonce(generation: u32, revision: u32, record_offset: u64) -> Result<[u8; 12], CryptoError> {
-    if revision > MAX_NONCE_REVISION {
-        return Err(CryptoError::NonceOverflow(format!(
-            "revision {} exceeds the maximum of {} encodable in a record nonce",
-            revision, MAX_NONCE_REVISION
-        )));
-    }
+pub fn derive_record_nonce(generation: u32, revision: u16, record_offset: u64) -> Result<[u8; 12], CryptoError> {
     if record_offset >= MAX_NONCE_RECORD_OFFSET {
         return Err(CryptoError::NonceOverflow(format!(
             "record offset {} reaches the {}-byte limit encodable in a record nonce",
@@ -48,7 +41,7 @@ pub fn derive_record_nonce(generation: u32, revision: u32, record_offset: u64) -
 
     let mut nonce = [0u8; 12];
     nonce[0..4].copy_from_slice(&generation.to_be_bytes());
-    nonce[4..6].copy_from_slice(&(revision as u16).to_be_bytes());
+    nonce[4..6].copy_from_slice(&revision.to_be_bytes());
     nonce[6..8].copy_from_slice(&((record_offset >> 32) as u16).to_be_bytes());
     nonce[8..12].copy_from_slice(&(record_offset as u32).to_be_bytes());
     Ok(nonce)
@@ -72,7 +65,7 @@ pub fn generate_random_16() -> [u8; 16] {
 mod tests {
     use super::*;
 
-    fn nonce(generation: u32, revision: u32, record_offset: u64) -> [u8; 12] {
+    fn nonce(generation: u32, revision: u16, record_offset: u64) -> [u8; 12] {
         derive_record_nonce(generation, revision, record_offset).unwrap()
     }
 
@@ -115,7 +108,7 @@ mod tests {
     /// against, which would only restate the code.
     #[test]
     fn test_nonce_layout_is_pinned() {
-        let cases: [(u32, u32, u64, [u8; 12]); 4] = [
+        let cases: [(u32, u16, u64, [u8; 12]); 4] = [
             (0, 0, 0, [0; 12]),
             (1, 0, 32, [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 32]),
             (
@@ -124,7 +117,7 @@ mod tests {
                 0x0000_1234_5678_9abc,
                 [0, 0, 0, 7, 0, 2, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc],
             ),
-            (u32::MAX, 0xFFFF, (1 << 48) - 1, [0xFF; 12]),
+            (u32::MAX, u16::MAX, (1 << 48) - 1, [0xFF; 12]),
         ];
 
         for (generation, revision, offset, expected) in cases {
@@ -150,15 +143,16 @@ mod tests {
         assert_ne!(nonce(7, 1, 0), nonce(7, 0, 1 << 32));
     }
 
-    /// `generation` is absent here on purpose: it is a `u32` end to end, so there is no
-    /// out-of-range value to pass. The type is the check.
+    /// Only `record_offset` appears here: `generation` is a `u32` and `revision` a `u16` end
+    /// to end, so neither has an out-of-range value to pass. For those two the type is the
+    /// check; this is what is left over.
     #[test]
-    fn test_out_of_range_coordinates_fail_closed() {
+    fn test_out_of_range_offset_fails_closed() {
         // Each of these would have silently wrapped onto a nonce already in use.
         for (generation, revision, offset) in [
-            (1, MAX_NONCE_REVISION + 1, 32),
             (1, 0, MAX_NONCE_RECORD_OFFSET),
             (1, 0, u64::MAX),
+            (u32::MAX, u16::MAX, MAX_NONCE_RECORD_OFFSET),
         ] {
             let err = derive_record_nonce(generation, revision, offset)
                 .expect_err(&format!("({}, {}, {}) must be refused", generation, revision, offset));
@@ -173,7 +167,7 @@ mod tests {
         }
 
         // The boundary values themselves remain usable.
-        assert!(derive_record_nonce(u32::MAX, MAX_NONCE_REVISION, MAX_NONCE_RECORD_OFFSET - 1).is_ok());
+        assert!(derive_record_nonce(u32::MAX, u16::MAX, MAX_NONCE_RECORD_OFFSET - 1).is_ok());
     }
 
     #[test]

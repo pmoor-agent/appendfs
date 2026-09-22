@@ -303,7 +303,7 @@ impl VolumeKey {
     pub fn encrypt_record(
         &self,
         generation: u32,
-        revision: u32,
+        revision: u16,
         record_offset: u64,
         op_code: u8,
         inode: u64,
@@ -322,7 +322,7 @@ impl VolumeKey {
     pub fn decrypt_record(
         &self,
         generation: u32,
-        revision: u32,
+        revision: u16,
         record_offset: u64,
         op_code: u8,
         inode: u64,

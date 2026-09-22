@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 struct ActiveLogFile {
     writer: Box<dyn StorageWriter>,
     generation: u32,
-    revision: u32,
+    revision: u16,
     current_offset: u64,
     filename: String,
     created_at: std::time::SystemTime,

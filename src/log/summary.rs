@@ -13,7 +13,7 @@ use std::sync::Arc;
 pub const SUMMARY_FOOTER_SIZE: usize = 52;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
 pub const CURRENT_SUMMARY_VERSION: u32 = 1;
-pub const SUMMARY_HEADER_SIZE: usize = 68;
+pub const SUMMARY_HEADER_SIZE: usize = 66;
 
 /// Fixed-size header written at offset 0 of `{:06}.summary` (or `{:06}_r{}.summary`),
 /// exactly `SUMMARY_HEADER_SIZE` bytes - readers seek past it by that constant, so the two must agree.
@@ -22,7 +22,7 @@ pub struct SummaryHeader {
     pub magic: [u8; 4],
     pub version: u32,
     pub generation: u32,
-    pub revision: u32,
+    pub revision: u16,
     pub last_batch_id: u64,
     pub next_inode: u64,
     #[serde(with = "crate::clock::serde_system_time")]
@@ -160,7 +160,7 @@ pub fn summary_filename(generation: u32) -> String {
 }
 
 /// Returns the physical filename for a given summary generation and revision (e.g. "000001_r2.summary").
-pub fn summary_filename_with_revision(generation: u32, revision: u32) -> String {
+pub fn summary_filename_with_revision(generation: u32, revision: u16) -> String {
     if revision == 0 {
         format!("{:06}.summary", generation)
     } else {

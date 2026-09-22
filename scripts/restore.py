@@ -38,9 +38,9 @@ import zstandard as zstd
 
 FILE_MAGIC = b"APPF"
 SUMMARY_MAGIC = b"APPS"
-FILE_HEADER_SIZE = 28
+FILE_HEADER_SIZE = 26
 RECORD_HEADER_SIZE = 29
-SUMMARY_HEADER_SIZE = 68
+SUMMARY_HEADER_SIZE = 66
 VOLUME_HEADER_SIZE = 72
 
 OP_DATA = 1
@@ -194,7 +194,6 @@ def parse_entry_delta(payload: bytes) -> tuple:
         raise ValueError(f"Unknown LogEntryDelta tag: {tag}")
 
 
-MAX_NONCE_REVISION = 0xFFFF
 MAX_NONCE_RECORD_OFFSET = 1 << 48
 
 
@@ -203,13 +202,11 @@ def derive_record_nonce(generation: int, revision: int, record_offset: int) -> b
 
     Format: [generation (4 bytes BE) || revision (2 bytes BE) || record_offset (6 bytes BE)]
 
-    `generation` needs no check: it is a 32-bit field on disk, so it cannot exceed its slot
-    here. The other two raise rather than wrapping. Masking them - as this did while
-    the offset was a 32-bit field - would silently derive a nonce that belongs to a
+    `generation` and `revision` need no check: they are 32- and 16-bit fields on disk, so
+    neither can exceed its slot here. Only the offset raises rather than wrapping. Masking it
+    - as this did while it was a 32-bit field - would silently derive a nonce belonging to a
     different record, so a restore would decrypt to garbage and blame the volume.
     """
-    if not 0 <= revision <= MAX_NONCE_REVISION:
-        raise ValueError(f"revision {revision} is not encodable in a record nonce")
     if not 0 <= record_offset < MAX_NONCE_RECORD_OFFSET:
         raise ValueError(f"record offset {record_offset} is not encodable in a record nonce")
     return struct.pack(">IH", generation, revision) + record_offset.to_bytes(6, "big")
@@ -317,7 +314,7 @@ def read_volume_header_from_summary(summary_path: Path) -> Tuple[bytes, bytes, b
         if len(hdr) < SUMMARY_HEADER_SIZE:
             raise ValueError(f"Corrupt or truncated summary header in '{summary_path}'")
         magic, ver, gen, rev, tx, next_ino, sec, nsec, iv, vh_len, uncompressed_len = struct.unpack(
-            ">4sIIIQQqI12sIQ", hdr
+            ">4sIIHQQqI12sIQ", hdr
         )
         if magic != b"APPS":
             raise ValueError(f"Invalid magic {magic} in '{summary_path}'")
@@ -441,7 +438,7 @@ class Restorer:
             hdr = f.read(FILE_HEADER_SIZE)
             if len(hdr) < FILE_HEADER_SIZE:
                 return
-            magic, ver, gen, rev, secs, nsecs = struct.unpack(">4sIIIqI", hdr)
+            magic, ver, gen, rev, secs, nsecs = struct.unpack(">4sIIHqI", hdr)
             if magic != FILE_MAGIC:
                 raise ValueError(f"Invalid file magic {magic} in {log_path.name}")
 

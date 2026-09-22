@@ -37,7 +37,7 @@ pub fn bootstrap_from_remote(
     }
 
     // 2. Find newest .summary file
-    let mut latest_summary: Option<((u32, u32), String)> = None;
+    let mut latest_summary: Option<((u32, u16), String)> = None;
     for obj in &objects {
         if let Some((generation, rev)) = crate::log::parse_summary_filename(&obj.key)
             && latest_summary.as_ref().is_none_or(|(gr, _)| (generation, rev) > *gr)

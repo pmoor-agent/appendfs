@@ -19,7 +19,7 @@ use std::io;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordId {
     pub generation: u32,
-    pub revision: u32,
+    pub revision: u16,
     pub record_offset: u64,
     pub op_code: u8,
     pub inode: u64,
