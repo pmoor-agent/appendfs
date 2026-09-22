@@ -249,37 +249,40 @@ const MIN_NEEDLE_BYTES: usize = 4;
 /// being touched. Each entry is `(what it is, the bytes)`.
 fn collect_secret_plaintext(fs: &InMemoryFS) -> Vec<(String, Vec<u8>)> {
     let mut secrets: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut pending = vec![(String::from("/"), 1u64)];
+    // Paths carry no trailing slash, so the root is the empty string and is displayed as "/".
+    let mut pending = vec![(String::new(), 1u64)];
 
     while let Some((path, ino)) = pending.pop() {
+        let display = if path.is_empty() { "/" } else { path.as_str() };
+
         for name in fs.list_xattrs(ino).unwrap_or_default() {
             if let Some(value) = fs.get_xattr(ino, &name) {
-                secrets.push((format!("xattr value of {} on {}", name, path), value));
+                secrets.push((format!("xattr value of {} on {}", name, display), value));
             }
-            secrets.push((format!("xattr name on {}", path), name.into_bytes()));
+            secrets.push((format!("xattr name on {}", display), name.into_bytes()));
         }
 
         let Some(attr) = fs.get_attr(ino) else { continue };
         match attr.file_type {
             appendfs::FileType::Directory => {
                 for (name, child) in fs.list_directory(ino).unwrap_or_default() {
-                    let child_path = format!("{}{}", path, name);
+                    let child_path = format!("{}/{}", path, name);
                     secrets.push((format!("name of {}", child_path), name.into_bytes()));
                     // Hard links revisit an inode, which only duplicates needles; directories
                     // cannot be hard-linked, so the walk terminates.
-                    pending.push((format!("{}/", child_path), child));
+                    pending.push((child_path, child));
                 }
             }
             appendfs::FileType::Symlink => {
                 if let Some(target) = fs.read_link(ino) {
-                    secrets.push((format!("symlink target of {}", path), target.into_bytes()));
+                    secrets.push((format!("symlink target of {}", display), target.into_bytes()));
                 }
             }
             appendfs::FileType::RegularFile if attr.size > 0 => {
                 let data = fs
                     .read_file_data(ino, 0, attr.size as usize)
-                    .unwrap_or_else(|e| panic!("read {} for the plaintext scan: {:?}", path, e));
-                secrets.push((format!("contents of {}", path), data));
+                    .unwrap_or_else(|e| panic!("read {} for the plaintext scan: {:?}", display, e));
+                secrets.push((format!("contents of {}", display), data));
             }
             _ => {}
         }
@@ -295,15 +298,26 @@ fn collect_secret_plaintext(fs: &InMemoryFS) -> Vec<(String, Vec<u8>)> {
 }
 
 /// Verifies that no name, file content, symlink target, or xattr of an encrypted fixture
-/// appears in its checked-in volume files.
+/// appears in its checked-in volume files, or in anything the read path writes to disk
+/// while serving them.
 ///
 /// The byte-for-byte reproducibility tests prove the *format* has not moved; this proves
 /// what the format is for. It runs against the committed bytes rather than a freshly
 /// generated volume, so a regression that starts leaking plaintext is caught the moment
 /// fixtures are regenerated, not merely when the encoding changes.
 ///
-/// Only the volume files are scanned. The `-dump.txt` goldens beside them are decrypted
-/// renderings produced *with* the fixture key - they contain plaintext by design.
+/// Two directories are scanned:
+///
+/// - the fixture itself, for what the *write* path produced; and
+/// - the on-disk block cache, for what the *read* path spills. That cache is the one place
+///   a read can put volume bytes back on disk, and it is filled by reading a file whose
+///   extents are only available from a remote - so this reads every file in the fixture
+///   through a remote with the local log pruned, which is exactly the tiered-storage
+///   configuration an archival mount ends up in. It must cache the encrypted 1 MiB blocks
+///   it fetched, never the decrypted records it derived from them.
+///
+/// The `-dump.txt` goldens beside the fixture are excluded: they are decrypted renderings
+/// produced *with* the fixture key, and contain plaintext by design.
 pub fn verify_no_plaintext_in_encrypted_fixture(fixture_dir: &Path) {
     let Some(config) = CompatFixtureConfig::from_dir_path(fixture_dir) else {
         return;
@@ -317,19 +331,63 @@ pub fn verify_no_plaintext_in_encrypted_fixture(fixture_dir: &Path) {
     for name in appendfs::compat::COMPAT_FIXTURE_FILES {
         fs::copy(fixture_dir.join(name), temp.path().join(name)).expect("copy fixture file");
     }
-    let fs_recovered = recover_fs(
-        Arc::new(OsStorage::new(temp.path())),
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(temp.path()));
+    let clock: Arc<dyn appendfs::Clock> = Arc::new(appendfs::SystemClock);
+    let volume_key = resolve_fixture_volume_key(fixture_dir);
+    let mut fs_recovered = recover_fs(
+        storage.clone(),
         RecoveryTarget::Latest,
-        Arc::new(appendfs::SystemClock),
-        resolve_fixture_volume_key(fixture_dir),
+        clock.clone(),
+        volume_key.clone(),
     )
     .expect("recover encrypted fixture");
 
+    // Serve the log from a remote with no local copy, so every extent read has to be
+    // fetched and therefore block-cached. Recovery has already read the summaries, so only
+    // the log needs to move.
+    let remote = Arc::new(appendfs::MockRemoteStore::new());
+    let gen1_md5 = fs_recovered
+        .manifest
+        .read()
+        .unwrap()
+        .get_by_generation(1)
+        .map(|l| l.md5);
+    appendfs::remote::worker::upload_storage_file(storage.as_ref(), remote.as_ref(), "000001.log", gen1_md5.as_ref())
+        .expect("upload fixture log to remote");
+    storage.remove_file("000001.log").expect("prune local log");
+
+    let cache_dir = temp.path().join(".cache");
+    let block_cache = Arc::new(
+        appendfs::remote::OnDiskBlockCache::new(&cache_dir, 64 * 1024 * 1024, clock.clone())
+            .expect("create on-disk block cache"),
+    );
+    fs_recovered.log_cache = Some(Arc::new(appendfs::log::LogFileCache::with_remote_support(
+        storage.clone(),
+        Some(block_cache.clone()),
+        vec![("remote".to_string(), remote.clone() as Arc<dyn appendfs::RemoteStore>)],
+        Some(Arc::clone(&fs_recovered.manifest)),
+    )));
+
+    // Reads every file, which both gathers the needles and fills the block cache.
     let secrets = collect_secret_plaintext(&fs_recovered);
 
-    for name in appendfs::compat::COMPAT_FIXTURE_FILES {
-        let path = fixture_dir.join(name);
-        let bytes = fs::read(&path).expect("read fixture volume file");
+    let volume_files: Vec<PathBuf> = appendfs::compat::COMPAT_FIXTURE_FILES
+        .iter()
+        .map(|name| fixture_dir.join(name))
+        .collect();
+    let cached_blocks: Vec<PathBuf> = fs::read_dir(&cache_dir)
+        .expect("read block cache dir")
+        .map(|e| e.expect("cache dir entry").path())
+        .filter(|p| p.is_file())
+        .collect();
+    assert!(
+        !cached_blocks.is_empty(),
+        "no blocks were cached, so the read path was never exercised: {}",
+        cache_dir.display()
+    );
+
+    for path in volume_files.iter().chain(cached_blocks.iter()) {
+        let bytes = fs::read(path).expect("read file to scan");
         for (what, needle) in &secrets {
             assert!(
                 !bytes.windows(needle.len()).any(|w| w == needle.as_slice()),
