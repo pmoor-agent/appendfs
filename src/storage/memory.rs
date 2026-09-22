@@ -79,7 +79,12 @@ impl StorageWriter for MemoryStorageWriter {
 
     fn truncate(&mut self, len: u64) -> io::Result<()> {
         let mut guard = self.buffer.write().unwrap();
-        guard.truncate(len as usize);
+        let target = len as usize;
+        if target > guard.len() {
+            guard.resize(target, 0);
+        } else {
+            guard.truncate(target);
+        }
         Ok(())
     }
 

@@ -1,14 +1,16 @@
 use std::io;
 use std::sync::Arc;
 
+pub mod buffered;
 pub mod fault;
 pub mod memory;
 pub mod os;
 pub mod readonly;
 
+pub use buffered::{BufferedStorageWriter, DEFAULT_STORAGE_BUFFER_CAPACITY};
 pub use fault::FaultStorage;
 pub use memory::MemoryStorage;
-pub use os::OsStorage;
+pub use os::{OsStorage, OsStorageReader, OsStorageWriter};
 pub use readonly::ReadOnlyStorage;
 
 /// Read-only access to a stored file. Completely stateless and thread-safe.
@@ -49,6 +51,24 @@ pub trait StorageWriter: Send + Sync {
     /// Returns `true` if the file length is 0.
     fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len()? == 0)
+    }
+}
+
+impl<W: StorageWriter + ?Sized> StorageWriter for Box<W> {
+    fn append(&mut self, data: &[u8]) -> io::Result<()> {
+        (**self).append(data)
+    }
+
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        (**self).truncate(len)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        (**self).sync()
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        (**self).len()
     }
 }
 

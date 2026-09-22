@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCode, RecordHeader};
-use crate::storage::{Storage, StorageWriter, WriteMode};
+use crate::storage::{BufferedStorageWriter, Storage, StorageWriter, WriteMode};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,7 +77,8 @@ fn open_generation_file(
     created_at: std::time::SystemTime,
 ) -> io::Result<ActiveLogFile> {
     let filename = super::log_filename(generation);
-    let mut writer = storage.open_writer(&filename, WriteMode::CreateNew)?;
+    let raw_writer = storage.open_writer(&filename, WriteMode::CreateNew)?;
+    let mut writer = BufferedStorageWriter::new(raw_writer)?;
     let mut md5_hasher = md5::Context::new();
 
     let file_header = FileHeader::new(generation, created_at);
@@ -87,7 +88,7 @@ fn open_generation_file(
     md5_hasher.consume(header_bytes);
 
     Ok(ActiveLogFile {
-        writer,
+        writer: Box::new(writer),
         generation,
         revision: file_header.revision,
         current_offset: FILE_HEADER_SIZE as u64,

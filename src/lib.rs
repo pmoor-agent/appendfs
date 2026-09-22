@@ -67,7 +67,8 @@ pub use stats::{
     format_runtime_status,
 };
 pub use storage::{
-    FaultStorage, MemoryStorage, OsStorage, ReadOnlyStorage, Storage, StorageReader, StorageWriter, WriteMode,
+    BufferedStorageWriter, DEFAULT_STORAGE_BUFFER_CAPACITY, FaultStorage, MemoryStorage, OsStorage, OsStorageReader,
+    OsStorageWriter, ReadOnlyStorage, Storage, StorageReader, StorageWriter, WriteMode,
 };
 pub use sync::{ActionGuard, ActionMutex, OpStatSnapshot, OpTag, PostUnlockQueue};
 #[cfg(any(test, feature = "testing"))]

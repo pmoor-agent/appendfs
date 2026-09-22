@@ -2,7 +2,7 @@ use crate::crypto::VolumeKey;
 use crate::extent_map::ExtentMap;
 use crate::fs::InMemoryFS;
 use crate::node::{Node, NodeKind};
-use crate::storage::{Storage, StorageReader, WriteMode};
+use crate::storage::{BufferedStorageWriter, Storage, StorageReader, StorageWriter, WriteMode};
 use crate::sync::OpTag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -220,7 +220,8 @@ pub fn export_summary_with_iv(
     let filename = summary_filename(generation);
     let tmp_filename = format!("{}.tmp", filename);
 
-    let mut writer = storage.open_writer(&tmp_filename, WriteMode::Overwrite)?;
+    let raw_writer = storage.open_writer(&tmp_filename, WriteMode::Overwrite)?;
+    let mut writer = BufferedStorageWriter::new(raw_writer)?;
     let mut hasher = blake3::Hasher::new();
 
     let is_encrypted = volume_key.cipher().is_encrypted();

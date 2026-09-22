@@ -45,6 +45,12 @@ pub struct OsStorageWriter {
     file: File,
 }
 
+impl OsStorageWriter {
+    pub fn new(file: File) -> Self {
+        Self { file }
+    }
+}
+
 impl StorageWriter for OsStorageWriter {
     fn append(&mut self, data: &[u8]) -> io::Result<()> {
         self.file.write_all(data)
@@ -57,7 +63,6 @@ impl StorageWriter for OsStorageWriter {
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        self.file.flush()?;
         self.file.sync_data()
     }
 
@@ -118,9 +123,8 @@ impl Storage for OsStorage {
             WriteMode::CreateNew => options.create_new(true),
             WriteMode::Overwrite => options.create(true).truncate(true),
         };
-        Ok(Box::new(OsStorageWriter {
-            file: options.open(&path)?,
-        }))
+        let file = options.open(&path)?;
+        Ok(Box::new(OsStorageWriter::new(file)))
     }
 
     fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn crate::storage::StorageLock>> {
