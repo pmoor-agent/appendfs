@@ -87,64 +87,27 @@ pub fn default_epoch() -> SystemTime {
     UNIX_EPOCH
 }
 
-/// Which calendar a `SystemTime` is broken down against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Zone {
-    Local,
-    Utc,
-}
-
-/// Breaks a unix timestamp into calendar fields.
-///
-/// The standard library stops at `Duration` since the epoch - it has no civil calendar at
-/// all - so this is either libc or a date library. libc keeps the dependency list as it is,
-/// and confining the `unsafe` here means the three formatters below share one copy of it.
-/// Returns `None` for a timestamp libc cannot represent.
-fn civil_parts(secs: i64, zone: Zone) -> Option<libc::tm> {
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let time_t = secs as libc::time_t;
-    let res = match zone {
-        Zone::Local => unsafe { libc::localtime_r(&time_t, &mut tm) },
-        Zone::Utc => unsafe { libc::gmtime_r(&time_t, &mut tm) },
-    };
-    if res.is_null() { None } else { Some(tm) }
-}
-
 /// Formats a `SystemTime` as `<unix_secs>.<nanos>s (YYYY-MM-DD HH:MM:SS)` in local civil time.
 pub fn format_local_civil_time(time: SystemTime) -> String {
     let (secs, nsecs) = system_time_to_unix(time);
-    match civil_parts(secs, Zone::Local) {
-        Some(tm) => format!(
-            "{}.{:09}s ({:04}-{:02}-{:02} {:02}:{:02}:{:02})",
-            secs,
-            nsecs,
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        ),
-        None => format!("{}.{:09}s (unknown time)", secs, nsecs),
+    match jiff::Timestamp::try_from(time) {
+        Ok(ts) => {
+            let zoned = ts.to_zoned(jiff::tz::TimeZone::system());
+            format!("{}.{:09}s ({})", secs, nsecs, zoned.strftime("%Y-%m-%d %H:%M:%S"))
+        }
+        Err(_) => format!("{}.{:09}s (unknown time)", secs, nsecs),
     }
 }
 
 /// Formats a `SystemTime` as `<unix_secs>.<nanos>s (YYYY-MM-DD HH:MM:SS UTC)`.
 pub fn format_utc_civil_time(time: SystemTime) -> String {
     let (secs, nsecs) = system_time_to_unix(time);
-    match civil_parts(secs, Zone::Utc) {
-        Some(tm) => format!(
-            "{}.{:09}s ({:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC)",
-            secs,
-            nsecs,
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        ),
-        None => format!("{}.{:09}s (unknown time)", secs, nsecs),
+    match jiff::Timestamp::try_from(time) {
+        Ok(ts) => {
+            let zoned = ts.to_zoned(jiff::tz::TimeZone::UTC);
+            format!("{}.{:09}s ({} UTC)", secs, nsecs, zoned.strftime("%Y-%m-%d %H:%M:%S"))
+        }
+        Err(_) => format!("{}.{:09}s (unknown time)", secs, nsecs),
     }
 }
 
@@ -154,17 +117,12 @@ pub fn format_utc_civil_time(time: SystemTime) -> String {
 /// timezone - or daylight saving transition - the process happened to start in.
 pub fn format_utc_compact(time: SystemTime) -> String {
     let (secs, _) = system_time_to_unix(time);
-    match civil_parts(secs, Zone::Utc) {
-        Some(tm) => format!(
-            "{:04}{:02}{:02}-{:02}{:02}{:02}",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        ),
-        None => format!("unknown-{}", secs),
+    match jiff::Timestamp::try_from(time) {
+        Ok(ts) => {
+            let zoned = ts.to_zoned(jiff::tz::TimeZone::UTC);
+            zoned.strftime("%Y%m%d-%H%M%S").to_string()
+        }
+        Err(_) => format!("unknown-{}", secs),
     }
 }
 
@@ -179,25 +137,63 @@ pub fn parse_timestamp(input: &str) -> Result<SystemTime, String> {
         return Ok(unix_to_system_time(secs, nsecs));
     }
 
-    let formats = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"];
+    if let Ok(ts) = trimmed.parse::<jiff::Timestamp>() {
+        return Ok(SystemTime::from(ts));
+    }
 
-    for fmt_str in &formats {
-        let c_fmt = std::ffi::CString::new(*fmt_str).unwrap();
-        let c_input = std::ffi::CString::new(trimmed.trim_end_matches('Z')).unwrap();
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        let res = unsafe { libc::strptime(c_input.as_ptr(), c_fmt.as_ptr(), &mut tm) };
-        if !res.is_null() {
-            let time_t = unsafe { libc::timegm(&mut tm) };
-            if time_t != -1 {
-                return Ok(UNIX_EPOCH + Duration::from_secs(time_t as u64));
-            }
-        }
+    let without_z = trimmed.trim_end_matches('Z');
+    if let Ok(dt) = without_z.parse::<jiff::civil::DateTime>()
+        && let Ok(zoned) = dt.to_zoned(jiff::tz::TimeZone::UTC)
+    {
+        return Ok(SystemTime::from(zoned.timestamp()));
+    }
+
+    if let Ok(date) = without_z.parse::<jiff::civil::Date>()
+        && let Ok(zoned) = date
+            .to_datetime(jiff::civil::Time::midnight())
+            .to_zoned(jiff::tz::TimeZone::UTC)
+    {
+        return Ok(SystemTime::from(zoned.timestamp()));
     }
 
     Err(format!(
         "Invalid timestamp '{}'. Expected unix seconds or ISO date (e.g. '2026-08-17T10:00:00Z')",
         input
     ))
+}
+
+/// Parses a human-readable duration string (e.g. "30d", "24h", "60m", "120s", "1h 30m", "500ms") into a `std::time::Duration`.
+///
+/// Requires an explicit unit designator; raw numbers without units (such as "42") are rejected.
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    let span: jiff::Span = trimmed.parse().map_err(|e| format!("invalid duration '{s}': {e}"))?;
+    if span.is_negative() {
+        return Err(format!("duration cannot be negative: '{s}'"));
+    }
+    let signed_dur = span
+        .to_duration(jiff::SpanRelativeTo::days_are_24_hours())
+        .map_err(|e| format!("duration out of range '{s}': {e}"))?;
+    signed_dur
+        .try_into()
+        .map_err(|e| format!("duration out of range '{s}': {e}"))
+}
+
+/// Formats a `std::time::Duration` into a friendly human-readable duration string (e.g. "30d", "1d", "1h", "2m", "42s", "0s").
+pub fn format_duration(d: Duration) -> String {
+    let Ok(span) = jiff::Span::try_from(d) else {
+        return format!("{}s", d.as_secs());
+    };
+    let round_config = jiff::SpanRound::new()
+        .largest(jiff::Unit::Day)
+        .relative(jiff::SpanRelativeTo::days_are_24_hours());
+    match span.round(round_config) {
+        Ok(rounded) => jiff::fmt::friendly::SpanPrinter::new().span_to_string(&rounded),
+        Err(_) => format!("{}s", d.as_secs()),
+    }
 }
 
 pub mod serde_system_time {
@@ -450,5 +446,82 @@ mod tests {
         let time = unix_to_system_time(1700000330, 0);
         let formatted = format_utc_civil_time(time);
         assert_eq!(formatted, "1700000330.000000000s (2023-11-14 22:18:50 UTC)");
+    }
+
+    #[test]
+    fn test_parse_timestamp_unix_seconds_and_decimals() {
+        let t1 = parse_timestamp("1755424800").unwrap();
+        assert_eq!(t1, unix_to_system_time(1755424800, 0));
+
+        let t2 = parse_timestamp("1755424800.5").unwrap();
+        assert_eq!(t2, unix_to_system_time(1755424800, 500_000_000));
+    }
+
+    #[test]
+    fn test_parse_timestamp_rfc3339_and_civil() {
+        let expected = unix_to_system_time(1786960800, 0); // 2026-08-17 10:00:00 UTC
+
+        // RFC 3339 UTC with Z
+        assert_eq!(parse_timestamp("2026-08-17T10:00:00Z").unwrap(), expected);
+        // RFC 3339 with explicit timezone offset (+02:00 -> 10:00 UTC is 12:00 local)
+        assert_eq!(parse_timestamp("2026-08-17T12:00:00+02:00").unwrap(), expected);
+        // ISO 8601 with fractional seconds
+        assert_eq!(
+            parse_timestamp("2026-08-17T10:00:00.250Z").unwrap(),
+            unix_to_system_time(1786960800, 250_000_000)
+        );
+        // Civil date-time with space
+        assert_eq!(parse_timestamp("2026-08-17 10:00:00").unwrap(), expected);
+        // Civil date-time with T (no offset)
+        assert_eq!(parse_timestamp("2026-08-17T10:00:00").unwrap(), expected);
+        // Civil date only (midnight UTC)
+        let expected_date = unix_to_system_time(1786924800, 0); // 2026-08-17 00:00:00 UTC
+        assert_eq!(parse_timestamp("2026-08-17").unwrap(), expected_date);
+    }
+
+    #[test]
+    fn test_parse_timestamp_invalid() {
+        assert!(parse_timestamp("").is_err());
+        assert!(parse_timestamp("not a timestamp").is_err());
+        assert!(parse_timestamp("2026-13-40").is_err());
+        assert!(parse_timestamp("2026-08-17 25:00:00").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration() {
+        assert_eq!(parse_duration("30d").unwrap(), Duration::from_secs(30 * 86400));
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86400));
+        assert_eq!(parse_duration("60m").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("120s").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("0s").unwrap(), Duration::from_secs(0));
+        assert_eq!(parse_duration("1h 30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+
+        // Raw numbers without units must be rejected
+        assert!(parse_duration("42").is_err());
+        assert!(parse_duration("0").is_err());
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("   ").is_err());
+        assert!(parse_duration("invalid").is_err());
+        assert!(parse_duration("-5s").is_err());
+    }
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(42)), "42s");
+        assert_eq!(format_duration(Duration::from_secs(120)), "2m");
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_duration(Duration::from_secs(3665)), "1h 1m 5s");
+        assert_eq!(format_duration(Duration::from_secs(86400)), "1d");
+        assert_eq!(format_duration(Duration::from_secs(30 * 86400)), "30d");
+
+        // Roundtrip checks
+        for secs in [0, 42, 120, 3600, 3665, 86400, 30 * 86400] {
+            let dur = Duration::from_secs(secs);
+            let formatted = format_duration(dur);
+            assert_eq!(parse_duration(&formatted).unwrap(), dur);
+        }
     }
 }

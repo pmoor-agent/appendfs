@@ -491,7 +491,7 @@ fn cmd_mount(args: MountArgs) {
     // The flusher checks `max_log_age` at the end of every cycle, so this one limit covers
     // both the CLI flag and the remote policy's `max_log_age_secs`; the tighter wins.
     let registry = load_remote_registry(storage.as_ref());
-    let max_log_age = appendfs::cli::parse_duration(&args.max_log_age)
+    let max_log_age = appendfs::clock::parse_duration(&args.max_log_age)
         .ok()
         .map(|cli| cli.min(std::time::Duration::from_secs(registry.policy.max_log_age_secs)));
     let writer = match LogWriter::create_lazy(storage.clone(), next_gen, args.max_log_size, start_batch_id, volume_key)

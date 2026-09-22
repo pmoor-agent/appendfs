@@ -508,32 +508,6 @@ pub struct FsckArgs {
     pub remote: Option<String>,
 }
 
-/// Helper parsing duration strings such as "30d", "2h", "30m", "120s".
-pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty duration".to_string());
-    }
-    if let Some(rest) = s.strip_suffix('d') {
-        let days: u64 = rest.parse().map_err(|e| format!("{}", e))?;
-        return Ok(std::time::Duration::from_secs(days * 86400));
-    }
-    if let Some(rest) = s.strip_suffix('h') {
-        let hours: u64 = rest.parse().map_err(|e| format!("{}", e))?;
-        return Ok(std::time::Duration::from_secs(hours * 3600));
-    }
-    if let Some(rest) = s.strip_suffix('m') {
-        let mins: u64 = rest.parse().map_err(|e| format!("{}", e))?;
-        return Ok(std::time::Duration::from_secs(mins * 60));
-    }
-    if let Some(rest) = s.strip_suffix('s') {
-        let secs: u64 = rest.parse().map_err(|e| format!("{}", e))?;
-        return Ok(std::time::Duration::from_secs(secs));
-    }
-    let secs: u64 = s.parse().map_err(|e| format!("{}", e))?;
-    Ok(std::time::Duration::from_secs(secs))
-}
-
 /// Helper scanning `storage` for existing `.log` files to find the highest generation number.
 pub fn find_latest_generation_in_storage(storage: &dyn crate::storage::Storage) -> u64 {
     let mut max_gen = 0u64;
@@ -577,20 +551,6 @@ mod tests {
         assert_eq!(args.max_flush_queue_ops, 32_768);
         assert_eq!(args.max_log_age, "24h");
         assert!(!args.track_atime);
-    }
-
-    #[test]
-    fn test_parse_duration() {
-        assert_eq!(
-            parse_duration("30d").unwrap(),
-            std::time::Duration::from_secs(30 * 86400)
-        );
-        assert_eq!(parse_duration("1d").unwrap(), std::time::Duration::from_secs(86400));
-        assert_eq!(parse_duration("24h").unwrap(), std::time::Duration::from_secs(86400));
-        assert_eq!(parse_duration("60m").unwrap(), std::time::Duration::from_secs(3600));
-        assert_eq!(parse_duration("120s").unwrap(), std::time::Duration::from_secs(120));
-        assert_eq!(parse_duration("0s").unwrap(), std::time::Duration::from_secs(0));
-        assert_eq!(parse_duration("42").unwrap(), std::time::Duration::from_secs(42));
     }
 
     #[test]

@@ -34,7 +34,8 @@ pub use cli::{
     find_latest_generation_in_storage,
 };
 pub use clock::{
-    AdvancingClock, Clock, MockClock, SystemClock, format_local_civil_time, format_utc_civil_time, parse_timestamp,
+    AdvancingClock, Clock, MockClock, SystemClock, format_duration, format_local_civil_time, format_utc_civil_time,
+    format_utc_compact, parse_duration, parse_timestamp,
 };
 pub use dump::{dump_file, dump_log_file, dump_log_reader, dump_summary_file, dump_summary_reader};
 pub use error::FsError;

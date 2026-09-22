@@ -233,7 +233,8 @@ pub struct ReplicationPolicy {
 impl ReplicationPolicy {
     /// Returns the parsed local retention duration.
     pub fn local_retention_duration(&self) -> std::time::Duration {
-        crate::cli::parse_duration(&self.local_retention).unwrap_or_else(|_| std::time::Duration::from_secs(30 * 86400))
+        crate::clock::parse_duration(&self.local_retention)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(30 * 86400))
     }
 }
 
