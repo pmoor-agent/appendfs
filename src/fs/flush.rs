@@ -338,7 +338,7 @@ impl InMemoryFS {
             loop {
                 let started_at = self.clock.now();
                 let started_monotonic = self.clock.monotonic();
-                let batch = {
+                let (batch, mut entries) = {
                     let mut inner = self.inner.lock(OpTag::Flush).unwrap();
                     // The freeze belongs to whoever decided one was needed - an fsync, a
                     // `quiesce`, the inactivity tick, or a mutation crossing the staged
@@ -349,20 +349,13 @@ impl InMemoryFS {
                     match inner.flushing.front() {
                         Some(b) => {
                             assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
-                            Arc::clone(b)
+                            let mut entries = b.entries.clone();
+                            inner.normalize_directory_deltas(&mut entries);
+                            (Arc::clone(b), entries)
                         }
                         None => break,
                     }
                 };
-
-                // Copying the deltas is proportional to the batch, so it happens out here
-                // rather than under the lock every FUSE operation contends for. The queued
-                // batch keeps its staged extents throughout, which is what readers resolve
-                // against until the fold below replaces them.
-                //
-                // Deliberately outside the `persist` window: that measures the storage
-                // device, and this copy shows up in the remainder instead.
-                let mut entries = batch.entries.clone();
 
                 let persist_start = self.clock.monotonic();
                 let disk_bytes = self.synthesize_and_write_flushing_layer(&mut entries, writer)?;
@@ -2602,5 +2595,94 @@ mod tests {
 
         // The data written before the fsync is readable from `base` after the fold.
         assert_eq!(&fs.read_file_data(file.ino, 14, 9).unwrap(), b"live data");
+    }
+
+    #[test]
+    fn test_flush_log_emits_normalized_directory_deltas() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+        // Initial setup in batch 1: create file.txt
+        let _ = crate::operations::read_write::create_core(&fs, 1, "file.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        // In batch 2:
+        // 1. touch tmp.txt; rm tmp.txt
+        let _ = crate::operations::read_write::create_core(&fs, 1, "tmp.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::links::unlink_core(&fs, 1, "tmp.txt").unwrap();
+        // 2. rename file.txt -> ren.txt -> file.txt
+        crate::operations::links::rename_core(&fs, 1, "file.txt", 1, "ren.txt").unwrap();
+        crate::operations::links::rename_core(&fs, 1, "ren.txt", 1, "file.txt").unwrap();
+
+        // Flush to disk
+        fs.quiesce().unwrap();
+
+        // Read records from the log file
+        let log_file = crate::log::log_filename(1);
+        let records =
+            crate::log::LogReader::open(storage.as_ref(), &log_file, crate::crypto::VolumeKey::plaintext_arc())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+        // Find the InodeDelta record for directory 1 in batch 2
+        let mut current_batch = 1;
+        let mut dir_deltas_batch2 = Vec::new();
+        for rec in &records {
+            if rec.header.op_code == crate::log::record::OpCode::FlushCommit {
+                let commit: crate::log::record::FlushCommitPayload = crate::wire::deserialize(&rec.payload).unwrap();
+                current_batch = commit.batch_id + 1;
+            } else if current_batch == 2
+                && rec.header.inode == 1
+                && rec.header.op_code == crate::log::record::OpCode::InodeDelta
+            {
+                let delta: crate::log::record::LogEntryDelta = crate::wire::deserialize(&rec.payload).unwrap();
+                if let crate::log::record::LogEntryDelta::Node(crate::log::record::LogNodeDelta::Directory(d)) = delta {
+                    dir_deltas_batch2.push(d);
+                }
+            }
+        }
+
+        assert_eq!(
+            dir_deltas_batch2.len(),
+            1,
+            "batch 2 must emit exactly one directory delta for root"
+        );
+        let dir_delta = &dir_deltas_batch2[0];
+        assert!(
+            dir_delta.added.is_empty(),
+            "emitted log delta must have empty added: {:?}",
+            dir_delta.added
+        );
+        assert!(
+            dir_delta.removed.is_empty(),
+            "emitted log delta must have empty removed: {:?}",
+            dir_delta.removed
+        );
+
+        // Crash recovery check: recover the filesystem and verify integrity
+        let recovered_fs = crate::log::recovery::recover_fs(
+            storage,
+            crate::log::recovery::RecoveryTarget::Latest,
+            clock,
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        assert!(recovered_fs.lookup_child(1, "file.txt").is_some());
+        assert!(recovered_fs.lookup_child(1, "tmp.txt").is_none());
+        assert!(recovered_fs.lookup_child(1, "ren.txt").is_none());
     }
 }
