@@ -41,7 +41,7 @@ pub enum SnapshotNode {
 /// Builds the active `LogWriter` for the given storage.
 fn make_writer(
     storage: Arc<dyn Storage>,
-    generation: u64,
+    generation: u32,
     clock: &dyn Clock,
     max_log_size: u64,
     start_tx: u64,

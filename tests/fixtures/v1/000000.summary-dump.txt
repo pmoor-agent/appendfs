@@ -4,9 +4,9 @@ Generation:          0
 Format Version:      1
 Last Batch ID:       0
 Next Inode:          2
-File Size:           253 B
+File Size:           249 B
 Encryption:          Plaintext (None)
-Checksum (BLAKE3):   964bc2443e085366d13c065a54e0d12ffbbf06d9d3271c927427f4a264f70b64 (VERIFIED)
+Checksum (BLAKE3):   5b818385d00c7ede9c7abac18239e1f7df376a2579e8284ba52e8654817df546 (VERIFIED)
 
 --- Inode Breakdown ---
 Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)

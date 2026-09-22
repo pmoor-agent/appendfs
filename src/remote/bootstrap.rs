@@ -37,7 +37,7 @@ pub fn bootstrap_from_remote(
     }
 
     // 2. Find newest .summary file
-    let mut latest_summary: Option<((u64, u32), String)> = None;
+    let mut latest_summary: Option<((u32, u32), String)> = None;
     for obj in &objects {
         if let Some((generation, rev)) = crate::log::parse_summary_filename(&obj.key)
             && latest_summary.as_ref().is_none_or(|(gr, _)| (generation, rev) > *gr)
@@ -89,7 +89,7 @@ fn restore_next_generation_log(
     remote: &dyn RemoteStore,
     storage: &dyn Storage,
     objects: &[RemoteObject],
-    next_gen: u64,
+    next_gen: u32,
 ) -> io::Result<()> {
     let sealed_log_name = crate::log::log_filename(next_gen);
     if let Some(sealed_obj) = objects.iter().find(|o| o.key == sealed_log_name) {

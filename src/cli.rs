@@ -450,7 +450,7 @@ pub struct MountRoArgs {
 
     /// Target log generation for historical recovery
     #[arg(long = "generation")]
-    pub generation: Option<u64>,
+    pub generation: Option<u32>,
 }
 
 impl std::ops::Deref for MountRoArgs {
@@ -509,8 +509,8 @@ pub struct FsckArgs {
 }
 
 /// Helper scanning `storage` for existing `.log` files to find the highest generation number.
-pub fn find_latest_generation_in_storage(storage: &dyn crate::storage::Storage) -> u64 {
-    let mut max_gen = 0u64;
+pub fn find_latest_generation_in_storage(storage: &dyn crate::storage::Storage) -> u32 {
+    let mut max_gen = 0u32;
     if let Ok(files) = storage.list_files() {
         for file in files {
             if let Some((gen_num, _rev)) = crate::log::parse_log_filename(&file)
@@ -524,7 +524,7 @@ pub fn find_latest_generation_in_storage(storage: &dyn crate::storage::Storage) 
 }
 
 /// Helper scanning `log_dir` for existing `.log` files to find the highest generation number.
-pub fn find_latest_generation(log_dir: impl AsRef<Path>) -> u64 {
+pub fn find_latest_generation(log_dir: impl AsRef<Path>) -> u32 {
     let storage = crate::storage::OsStorage::new(log_dir);
     find_latest_generation_in_storage(&storage)
 }

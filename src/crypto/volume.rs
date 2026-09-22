@@ -302,7 +302,7 @@ impl VolumeKey {
     /// `op_code` and `inode` are authenticated but not encrypted - see [`record_aad`].
     pub fn encrypt_record(
         &self,
-        generation: u64,
+        generation: u32,
         revision: u32,
         record_offset: u64,
         op_code: u8,
@@ -321,7 +321,7 @@ impl VolumeKey {
     #[allow(clippy::too_many_arguments)]
     pub fn decrypt_record(
         &self,
-        generation: u64,
+        generation: u32,
         revision: u32,
         record_offset: u64,
         op_code: u8,

@@ -13,7 +13,7 @@ use std::sync::Arc;
 pub const SUMMARY_FOOTER_SIZE: usize = 52;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
 pub const CURRENT_SUMMARY_VERSION: u32 = 1;
-pub const SUMMARY_HEADER_SIZE: usize = 72;
+pub const SUMMARY_HEADER_SIZE: usize = 68;
 
 /// Fixed-size header written at offset 0 of `{:06}.summary` (or `{:06}_r{}.summary`),
 /// exactly `SUMMARY_HEADER_SIZE` bytes - readers seek past it by that constant, so the two must agree.
@@ -21,7 +21,7 @@ pub const SUMMARY_HEADER_SIZE: usize = 72;
 pub struct SummaryHeader {
     pub magic: [u8; 4],
     pub version: u32,
-    pub generation: u64,
+    pub generation: u32,
     pub revision: u32,
     pub last_batch_id: u64,
     pub next_inode: u64,
@@ -37,7 +37,7 @@ pub struct SummaryHeader {
 
 impl SummaryHeader {
     pub fn new(
-        generation: u64,
+        generation: u32,
         last_batch_id: u64,
         next_inode: u64,
         created_at: std::time::SystemTime,
@@ -155,12 +155,12 @@ fn coalesce_extents(extent_map: &ExtentMap) -> ExtentMap {
 }
 
 /// Returns the physical filename for a given summary snapshot (e.g. "000001.summary").
-pub fn summary_filename(generation: u64) -> String {
+pub fn summary_filename(generation: u32) -> String {
     summary_filename_with_revision(generation, 0)
 }
 
 /// Returns the physical filename for a given summary generation and revision (e.g. "000001_r2.summary").
-pub fn summary_filename_with_revision(generation: u64, revision: u32) -> String {
+pub fn summary_filename_with_revision(generation: u32, revision: u32) -> String {
     if revision == 0 {
         format!("{:06}.summary", generation)
     } else {
@@ -178,7 +178,7 @@ pub struct SummarySnapshot<'a> {
     pub manifest: &'a crate::log::LogManifest,
     /// Volume identity and key-check material, written unencrypted ahead of the body.
     pub volume_header: &'a crate::crypto::VolumeHeader,
-    pub generation: u64,
+    pub generation: u32,
     pub last_batch_id: u64,
     pub next_inode: u64,
     pub created_at: std::time::SystemTime,
@@ -1124,9 +1124,10 @@ mod tests {
 
         init_volume(storage.clone(), &key, header).unwrap();
 
-        // Tamper with uncompressed_len (bytes 64..72 in SummaryHeader)
+        // Tamper with uncompressed_len, the last field of SummaryHeader. Derived from
+        // SUMMARY_HEADER_SIZE rather than hardcoded, so it follows the header's layout.
         let mut bytes = storage.get_file_bytes("000000.summary").unwrap();
-        bytes[64..72].copy_from_slice(&999999u64.to_be_bytes());
+        bytes[SUMMARY_HEADER_SIZE - 8..SUMMARY_HEADER_SIZE].copy_from_slice(&999999u64.to_be_bytes());
 
         // Recompute whole-file BLAKE3 checksum so footer verification passes
         let footer_offset = bytes.len() - SUMMARY_FOOTER_SIZE;
@@ -1152,9 +1153,10 @@ mod tests {
         )
         .unwrap();
 
-        // Tamper with uncompressed_len (bytes 64..72 in SummaryHeader)
+        // Tamper with uncompressed_len, the last field of SummaryHeader. Derived from
+        // SUMMARY_HEADER_SIZE rather than hardcoded, so it follows the header's layout.
         let mut bytes = storage.get_file_bytes("000000.summary").unwrap();
-        bytes[64..72].copy_from_slice(&999999u64.to_be_bytes());
+        bytes[SUMMARY_HEADER_SIZE - 8..SUMMARY_HEADER_SIZE].copy_from_slice(&999999u64.to_be_bytes());
 
         // Recompute whole-file BLAKE3 checksum so footer verification passes
         let footer_offset = bytes.len() - SUMMARY_FOOTER_SIZE;

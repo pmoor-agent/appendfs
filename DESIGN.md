@@ -64,7 +64,8 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 ## 3. Log-Structured Storage & Staging Model
 
 ### 3.1 Monotonic Sequence / Generation Naming
-- Each log file is named using a strictly increasing 64-bit **generation sequence number** as the primary sort key (e.g. `000001_1721838000.log`, `000002_1721841600.log`).
+- Each log file is named using a strictly increasing 32-bit **generation sequence number** as the primary sort key (e.g. `000001.log`, `000002.log`; a compacted revision of a generation adds an `_r<n>` suffix, e.g. `000002_r1.log`).
+- A generation is a `u32` everywhere it appears - on disk, in the manifest, in extents, and in the record nonce - so the nonce's 32-bit generation field cannot be overflowed by construction rather than by a runtime check.
 - The generation sequence number guarantees deterministic ordering during recovery, replay, and cloud syncing regardless of system clock skew.
 
 ### 3.2 LSM Delta-Overlay In-Memory Architecture & Flush Semantics

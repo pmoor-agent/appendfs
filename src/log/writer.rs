@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 struct ActiveLogFile {
     writer: Box<dyn StorageWriter>,
-    generation: u64,
+    generation: u32,
     revision: u32,
     current_offset: u64,
     filename: String,
@@ -30,7 +30,7 @@ impl ActiveLogFile {
         op_code: OpCode,
         inode: u64,
         payload: &[u8],
-    ) -> io::Result<(u64, u64, u32)> {
+    ) -> io::Result<(u32, u64, u32)> {
         let generation = self.generation;
         let revision = self.revision;
         let record_log_offset = self.current_offset;
@@ -120,7 +120,7 @@ impl ActiveLogFile {
 #[allow(clippy::large_enum_variant)]
 enum ActiveLogState {
     Unopened {
-        generation: u64,
+        generation: u32,
         created_at: Option<std::time::SystemTime>,
     },
     Open(ActiveLogFile),
@@ -137,7 +137,7 @@ fn seal_and_open_next(
     clock: &dyn Clock,
     reason: &str,
 ) -> io::Result<(ActiveLogFile, super::manifest::LogFileInfo)> {
-    let next_gen = active.generation + 1;
+    let next_gen = next_generation(active.generation)?;
     let now = clock.now();
     let sealed_info = active.seal(volume_key, now)?;
     let next_active = open_generation_file(storage, next_gen, now)?;
@@ -150,9 +150,27 @@ fn seal_and_open_next(
     Ok((next_active, sealed_info))
 }
 
+/// The generation following `generation`, or an error at the end of the sequence.
+///
+/// A generation is a `u32` everywhere it appears, which is what lets the record nonce carry
+/// one without a range check. The flip side is that `+ 1` can overflow: in release mode it
+/// would wrap silently to generation 0 and reuse every nonce the volume has ever derived, so
+/// the roll fails instead. Reaching this needs 4.29 billion generations.
+fn next_generation(generation: u32) -> io::Result<u32> {
+    generation.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "generation {} is the last one this format can address; the volume cannot roll further",
+                generation
+            ),
+        )
+    })
+}
+
 fn open_generation_file(
     storage: &Arc<dyn Storage>,
-    generation: u64,
+    generation: u32,
     created_at: std::time::SystemTime,
 ) -> io::Result<ActiveLogFile> {
     let filename = super::log_filename(generation);
@@ -214,7 +232,7 @@ impl LogWriter {
     /// Creates a new generation log file backed by a custom `Storage` instance.
     pub fn create(
         storage: Arc<dyn Storage>,
-        generation: u64,
+        generation: u32,
         clock: &dyn Clock,
         max_log_size: u64,
         start_batch_id: u64,
@@ -239,7 +257,7 @@ impl LogWriter {
     /// is not created until the first append or roll.
     pub fn create_lazy(
         storage: Arc<dyn Storage>,
-        generation: u64,
+        generation: u32,
         max_log_size: u64,
         start_batch_id: u64,
         volume_key: Arc<VolumeKey>,
@@ -265,7 +283,7 @@ impl LogWriter {
     /// is used when the active log file is eventually opened.
     pub fn create_lazy_with_clock(
         storage: Arc<dyn Storage>,
-        generation: u64,
+        generation: u32,
         clock: &dyn Clock,
         max_log_size: u64,
         start_batch_id: u64,
@@ -378,7 +396,7 @@ impl LogWriter {
                 }
             }
             ActiveLogState::Open(active) => {
-                let next_gen = active.generation + 1;
+                let next_gen = next_generation(active.generation)?;
                 match seal_and_open_next(active, &self.storage, &self.volume_key, clock, "Rolled") {
                     Ok((next_active, sealed_info)) => {
                         *state = ActiveLogState::Open(next_active);
@@ -435,7 +453,7 @@ impl LogWriter {
             unreachable!();
         };
 
-        let next_gen = active.generation + 1;
+        let next_gen = next_generation(active.generation)?;
         let sealed_info = active.seal(&self.volume_key, clock.now())?;
         log::info!(
             "Age-rolled log file: sealed generation {}, next generation {} is lazy (unopened)",
@@ -477,7 +495,7 @@ impl LogWriter {
             unreachable!();
         };
 
-        let next_gen = active.generation + 1;
+        let next_gen = next_generation(active.generation)?;
         match seal_and_open_next(active, &self.storage, &self.volume_key, clock, "Force-rolled") {
             Ok((next_active, sealed_info)) => {
                 *state = ActiveLogState::Open(next_active);
@@ -522,7 +540,7 @@ impl LogWriter {
             unreachable!();
         };
 
-        let next_gen = active.generation + 1;
+        let next_gen = next_generation(active.generation)?;
         let sealed_info = active.seal(&self.volume_key, clock.now())?;
         log::info!(
             "Sealed active log generation {}, next generation {} is lazy (unopened)",
@@ -554,7 +572,7 @@ impl LogWriter {
     /// Appends a record (`RecordHeader` + payload bytes) to the active log file.
     ///
     /// Returns `(generation, record_log_offset, record_size)`.
-    pub fn append_record(&self, op_code: OpCode, inode: u64, payload: &[u8]) -> io::Result<(u64, u64, u32)> {
+    pub fn append_record(&self, op_code: OpCode, inode: u64, payload: &[u8]) -> io::Result<(u32, u64, u32)> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -579,7 +597,7 @@ impl LogWriter {
 
     /// Rolls back the active log file to `offset` if it is currently in `generation`
     /// and its offset is past `offset`. Truncates the underlying file on disk and seeks back.
-    pub fn rollback_to(&self, generation: u64, offset: u64) -> io::Result<()> {
+    pub fn rollback_to(&self, generation: u32, offset: u64) -> io::Result<()> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -657,7 +675,7 @@ impl LogWriter {
     }
 
     /// Returns the active generation sequence number.
-    pub fn generation(&self) -> u64 {
+    pub fn generation(&self) -> u32 {
         let state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -759,6 +777,18 @@ mod tests {
     use crate::log::reader::LogReader;
     use crate::storage::MemoryStorage;
     use std::time::SystemTime;
+
+    #[test]
+    fn test_generation_space_ends_rather_than_wrapping() {
+        // Wrapping here would restart the generation sequence at 0 and reuse every nonce the
+        // volume has derived, so the end of the space has to be an error, not a wrap.
+        assert_eq!(next_generation(0).unwrap(), 1);
+        assert_eq!(next_generation(u32::MAX - 1).unwrap(), u32::MAX);
+
+        let err = next_generation(u32::MAX).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("cannot roll further"), "{}", err);
+    }
 
     #[test]
     fn test_log_writer_create_and_append() {

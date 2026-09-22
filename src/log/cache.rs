@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 #[allow(clippy::type_complexity)]
 pub struct LogFileCache {
     storage: Arc<dyn Storage>,
-    cache: Mutex<HashMap<u64, Arc<dyn StorageReader>>>,
+    cache: Mutex<HashMap<u32, Arc<dyn StorageReader>>>,
     pub decrypted_cache: Arc<DecryptedRecordCache>,
     pub block_cache: Option<Arc<dyn BlockCache>>,
     pub remotes: Arc<RwLock<Vec<RemoteReadTarget>>>,
@@ -60,7 +60,7 @@ impl LogFileCache {
     }
 
     /// Invalidates and drops any cached reader for the given generation so unlinked disk space is reclaimed.
-    pub fn invalidate(&self, generation: u64) {
+    pub fn invalidate(&self, generation: u32) {
         let mut guard = self.cache.lock().unwrap();
         guard.remove(&generation);
     }
@@ -72,7 +72,7 @@ impl LogFileCache {
 
     /// Retrieves an open log reader handle, verifying the `FileHeader` on first open.
     /// If the log file was pruned locally, falls back to `TieredStorageReader` over S3 range requests.
-    pub fn get_or_open(&self, generation: u64) -> io::Result<Arc<dyn StorageReader>> {
+    pub fn get_or_open(&self, generation: u32) -> io::Result<Arc<dyn StorageReader>> {
         let mut guard = self.cache.lock().unwrap();
         if let Some(reader) = guard.get(&generation) {
             return Ok(Arc::clone(reader));
@@ -171,12 +171,12 @@ impl LogFileCache {
     }
 
     /// Returns the cached decrypted record payload for `(generation, record_log_offset)` if present in memory.
-    pub fn get_cached_record(&self, generation: u64, record_log_offset: u64) -> Option<Arc<Vec<u8>>> {
+    pub fn get_cached_record(&self, generation: u32, record_log_offset: u64) -> Option<Arc<Vec<u8>>> {
         self.decrypted_cache.get(generation, 0, record_log_offset)
     }
 
     /// Stores a decrypted record payload for `(generation, record_log_offset)` in the cache.
-    pub fn insert_cached_record(&self, generation: u64, record_log_offset: u64, payload: Arc<Vec<u8>>) {
+    pub fn insert_cached_record(&self, generation: u32, record_log_offset: u64, payload: Arc<Vec<u8>>) {
         self.decrypted_cache.insert(generation, 0, record_log_offset, payload);
     }
 
@@ -187,7 +187,7 @@ impl LogFileCache {
     #[allow(clippy::too_many_arguments)]
     pub fn read_extent_payload(
         &self,
-        generation: u64,
+        generation: u32,
         record_log_offset: u64,
         record_size: u32,
         payload_offset: u32,

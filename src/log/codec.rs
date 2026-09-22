@@ -18,7 +18,7 @@ use std::io;
 /// relabelled as a different record type or reattributed to another inode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordId {
-    pub generation: u64,
+    pub generation: u32,
     pub revision: u32,
     pub record_offset: u64,
     pub op_code: u8,

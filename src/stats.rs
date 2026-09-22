@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// Aggregate statistics and fragmentation status for an appendfs volume.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VolumeStats {
-    pub next_generation: u64,
+    pub next_generation: u32,
     pub total_inodes: usize,
     pub directory_count: usize,
     pub file_count: usize,
@@ -30,7 +30,7 @@ impl VolumeStats {
     }
 
     /// Constructs VolumeStats from individual pre-computed parts.
-    pub fn from_parts(next_generation: u64, counts: &InodeCounts, generations: Vec<GenerationLiveStats>) -> Self {
+    pub fn from_parts(next_generation: u32, counts: &InodeCounts, generations: Vec<GenerationLiveStats>) -> Self {
         let mut total_disk_bytes = 0;
         let mut total_data_bytes = 0;
         let mut total_live_bytes = 0;
@@ -120,7 +120,7 @@ pub fn calculate_generation_live_stats_from_nodes<'a, I>(nodes: I, manifest: &Lo
 where
     I: IntoIterator<Item = &'a Node>,
 {
-    let mut live_map: HashMap<u64, (u64, u32)> = HashMap::new();
+    let mut live_map: HashMap<u32, (u64, u32)> = HashMap::new();
     for node in nodes {
         if let NodeKind::File { extent_map, .. } = &node.kind {
             for (_, entry) in extent_map.iter() {

@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 pub type StagedBuffer = Arc<RwLock<Vec<u8>>>;
 
 /// Generation number reserved to mean "this extent is a hole" on disk.
-pub const ZERO_EXTENT_GENERATION: u64 = 0;
+pub const ZERO_EXTENT_GENERATION: u32 = 0;
 
 /// Decodes a hole's length from an on-disk extent descriptor.
 #[inline]
@@ -28,7 +28,7 @@ pub enum Extent {
     },
     /// Data is flushed to disk in a `.log` file.
     Disk {
-        generation: u64,
+        generation: u32,
         record_log_offset: u64,
         record_size: u32,
         payload_offset: u32,
@@ -82,7 +82,7 @@ impl Eq for Extent {}
 
 #[derive(Serialize, Deserialize)]
 struct SerializedExtent {
-    generation: u64,
+    generation: u32,
     record_log_offset: u64,
     record_size: u32,
     payload_offset: u32,
@@ -166,7 +166,7 @@ impl Extent {
 
     #[inline]
     pub fn new_disk(
-        generation: u64,
+        generation: u32,
         record_log_offset: u64,
         record_size: u32,
         payload_offset: u32,
@@ -1279,7 +1279,7 @@ mod tests {
         }
     }
 
-    fn read_extent_bytes(ext: &Extent, disk_store: &std::collections::HashMap<(u64, u64), Vec<u8>>) -> Vec<u8> {
+    fn read_extent_bytes(ext: &Extent, disk_store: &std::collections::HashMap<(u32, u64), Vec<u8>>) -> Vec<u8> {
         match ext {
             Extent::Staged {
                 data,
@@ -1321,7 +1321,7 @@ mod tests {
         let mut max_written = 0usize;
 
         let mut em = ExtentMap::new();
-        let mut disk_store: HashMap<(u64, u64), Vec<u8>> = HashMap::new();
+        let mut disk_store: HashMap<(u32, u64), Vec<u8>> = HashMap::new();
         let mut next_disk_log_offset = 1000u64;
 
         // Optionally hold a reusable staged buffer to test contiguous coalescing

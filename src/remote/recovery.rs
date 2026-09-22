@@ -53,7 +53,7 @@ fn fetch_object_from_remotes(
 fn fetch_and_verify_summary(
     remote_stores: &[RemoteReadTarget],
     storage: &dyn Storage,
-    gen_num: u64,
+    gen_num: u32,
     rev_num: u32,
     volume_key: Arc<VolumeKey>,
     target: RecoveryTarget,
@@ -142,7 +142,7 @@ pub fn prepare_remote_recovery_for_target(
     }
     local_summaries.sort_by_key(|(gr, _)| *gr);
 
-    let mut best_local_eligible: Option<(u64, u32, crate::log::SummaryHeader)> = None;
+    let mut best_local_eligible: Option<(u32, u32, crate::log::SummaryHeader)> = None;
     for ((gen_num, rev_num), file) in &local_summaries {
         if let Ok(reader) = SummaryReader::open(storage, file, volume_key.clone()) {
             let eligible = match target {

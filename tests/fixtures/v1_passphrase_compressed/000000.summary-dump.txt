@@ -4,10 +4,10 @@ Generation:          0
 Format Version:      1
 Last Batch ID:       0
 Next Inode:          2
-File Size:           269 B
+File Size:           265 B
 Encryption:          ChaCha20-Poly1305
 Unlocked by:         Passphrase
-Checksum (BLAKE3):   fa0ccf65ba746fa25d1b6b625e8e1dd91ae87444bf76f9a7c8ba4c3f7d457f9e (VERIFIED)
+Checksum (BLAKE3):   560833d71520de5b1052c213423d8c906b3d9f62ad5da7ac65d27f09e455df0f (VERIFIED)
 
 --- Inode Breakdown ---
 Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)

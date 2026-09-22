@@ -106,8 +106,8 @@ pub fn cross_copy_file(
 #[derive(Debug, Clone, Default)]
 pub struct RemoteSyncTelemetry {
     pub name: String,
-    pub synced_generation: u64,
-    pub active_part: Option<(u64, u32)>,
+    pub synced_generation: u32,
+    pub active_part: Option<(u32, u32)>,
     pub last_sync_time: Option<SystemTime>,
     pub last_error: Option<String>,
 }
@@ -123,7 +123,7 @@ impl ReplicationTelemetry {
         Self::default()
     }
 
-    pub fn record_synced_gen(&mut self, remote_name: &str, generation_num: u64, now: SystemTime) {
+    pub fn record_synced_gen(&mut self, remote_name: &str, generation_num: u32, now: SystemTime) {
         let entry = self
             .remotes
             .entry(remote_name.to_string())
@@ -138,7 +138,7 @@ impl ReplicationTelemetry {
         }
     }
 
-    pub fn record_active_part(&mut self, remote_name: &str, generation_num: u64, part_idx: u32, now: SystemTime) {
+    pub fn record_active_part(&mut self, remote_name: &str, generation_num: u32, part_idx: u32, now: SystemTime) {
         let entry = self
             .remotes
             .entry(remote_name.to_string())
@@ -305,10 +305,10 @@ impl RemoteReplicationWorker {
 
         let thread_handle = thread::spawn(move || {
             let mut last_part_sync = fs_clone.clock.now();
-            let mut uploaded_part_offsets: std::collections::HashMap<u64, (u64, u32)> =
+            let mut uploaded_part_offsets: std::collections::HashMap<u32, (u64, u32)> =
                 std::collections::HashMap::new();
             let mut last_audit = SystemTime::UNIX_EPOCH; // Run initial audit on startup
-            let mut confirmed_generations: std::collections::HashMap<String, std::collections::HashSet<u64>> =
+            let mut confirmed_generations: std::collections::HashMap<String, std::collections::HashSet<u32>> =
                 std::collections::HashMap::new();
             let mut confirmed_summaries: std::collections::HashMap<String, std::collections::HashSet<String>> =
                 std::collections::HashMap::new();
@@ -414,7 +414,7 @@ impl RemoteReplicationWorker {
         registry: &Arc<RwLock<RemoteRegistry>>,
         log_dir: &Path,
         last_part_sync: &mut SystemTime,
-        uploaded_parts: &mut std::collections::HashMap<u64, (u64, u32)>,
+        uploaded_parts: &mut std::collections::HashMap<u32, (u64, u32)>,
     ) -> io::Result<()> {
         let mut last_audit = SystemTime::UNIX_EPOCH;
         let mut confirmed_generations = std::collections::HashMap::new();
@@ -440,9 +440,9 @@ impl RemoteReplicationWorker {
         registry: &Arc<RwLock<RemoteRegistry>>,
         _log_dir: &Path,
         last_part_sync: &mut SystemTime,
-        uploaded_parts: &mut std::collections::HashMap<u64, (u64, u32)>,
+        uploaded_parts: &mut std::collections::HashMap<u32, (u64, u32)>,
         last_audit: &mut SystemTime,
-        confirmed_generations: &mut std::collections::HashMap<String, std::collections::HashSet<u64>>,
+        confirmed_generations: &mut std::collections::HashMap<String, std::collections::HashSet<u32>>,
         confirmed_summaries: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
         force_audit: bool,
     ) -> io::Result<()> {
@@ -859,7 +859,7 @@ impl RemoteReplicationWorker {
         fs: &InMemoryFS,
         storage: &Arc<dyn Storage>,
         manifest: &crate::log::LogManifest,
-        active_gen: u64,
+        active_gen: u32,
         policy: &crate::remote::config::ReplicationPolicy,
         stores: &[ConfiguredRemote],
         store_listings: &[Option<HashMap<String, RemoteObject>>],

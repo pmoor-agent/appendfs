@@ -5,8 +5,8 @@ use std::time::SystemTime;
 
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
 pub const CURRENT_VERSION: u32 = 1;
-/// magic(4) + version(4) + generation(8) + revision(4) + created_at seconds(8) + nanoseconds(4).
-pub const FILE_HEADER_SIZE: usize = 32;
+/// magic(4) + version(4) + generation(4) + revision(4) + created_at seconds(8) + nanoseconds(4).
+pub const FILE_HEADER_SIZE: usize = 28;
 pub const RECORD_HEADER_SIZE: usize = 29;
 pub const AUTH_TAG_SIZE: usize = 16;
 
@@ -16,14 +16,14 @@ pub const AUTH_TAG_SIZE: usize = 16;
 pub struct FileHeader {
     pub magic: [u8; 4],
     pub version: u32,
-    pub generation: u64,
+    pub generation: u32,
     pub revision: u32,
     #[serde(with = "crate::clock::serde_system_time")]
     pub created_at: SystemTime,
 }
 
 impl FileHeader {
-    pub fn new(generation: u64, created_at: SystemTime) -> Self {
+    pub fn new(generation: u32, created_at: SystemTime) -> Self {
         Self {
             magic: FILE_MAGIC,
             version: CURRENT_VERSION,
@@ -37,15 +37,15 @@ impl FileHeader {
         let mut buf = [0u8; FILE_HEADER_SIZE];
         buf[0..4].copy_from_slice(&self.magic);
         buf[4..8].copy_from_slice(&self.version.to_be_bytes());
-        buf[8..16].copy_from_slice(&self.generation.to_be_bytes());
-        buf[16..20].copy_from_slice(&self.revision.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.generation.to_be_bytes());
+        buf[12..16].copy_from_slice(&self.revision.to_be_bytes());
         // Seconds are stored as a full signed 64-bit count. Narrowing them to u32 - as this
         // header briefly did - silently wraps every timestamp past 2106 back to 1970 and
         // every pre-1970 one forward to ~2106, which corrupts the ordering that
         // `mount-ro --at-time` selects generations by.
         let (secs, nsecs) = crate::clock::system_time_to_unix(self.created_at);
-        buf[20..28].copy_from_slice(&secs.to_be_bytes());
-        buf[28..32].copy_from_slice(&nsecs.to_be_bytes());
+        buf[16..24].copy_from_slice(&secs.to_be_bytes());
+        buf[24..28].copy_from_slice(&nsecs.to_be_bytes());
         buf
     }
 
@@ -58,10 +58,10 @@ impl FileHeader {
         if version != CURRENT_VERSION {
             return Err("unsupported file version");
         }
-        let generation = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-        let revision = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-        let secs = i64::from_be_bytes(bytes[20..28].try_into().unwrap());
-        let nsecs = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
+        let generation = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        let revision = u32::from_be_bytes(bytes[12..16].try_into().unwrap());
+        let secs = i64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        let nsecs = u32::from_be_bytes(bytes[24..28].try_into().unwrap());
         let created_at = crate::clock::unix_to_system_time(secs, nsecs);
         Ok(Self {
             magic,
@@ -334,7 +334,7 @@ impl From<&FileDelta> for LogFileDelta {
 }
 
 impl LogFileDelta {
-    pub fn into_file_delta(self, generation: u64) -> FileDelta {
+    pub fn into_file_delta(self, generation: u32) -> FileDelta {
         let mut extents = ExtentMap::with_capacity(self.extents.len());
         for ext in self.extents {
             let state = if ext.record_log_offset == 0 {
@@ -435,7 +435,7 @@ impl From<&NodeDelta> for LogNodeDelta {
 }
 
 impl LogNodeDelta {
-    pub fn into_node_delta(self, generation: u64) -> NodeDelta {
+    pub fn into_node_delta(self, generation: u32) -> NodeDelta {
         match self {
             LogNodeDelta::Directory(d) => NodeDelta::Directory(DirectoryDelta::from(d)),
             LogNodeDelta::File(f) => NodeDelta::File(f.into_file_delta(generation)),
@@ -563,7 +563,7 @@ impl<'de> Deserialize<'de> for LogEntryDelta {
 }
 
 impl LogEntryDelta {
-    pub fn into_entry_delta(self, generation: u64) -> EntryDelta {
+    pub fn into_entry_delta(self, generation: u32) -> EntryDelta {
         match self {
             LogEntryDelta::Node(n) => EntryDelta::Node(n.into_node_delta(generation)),
             LogEntryDelta::Tombstone => EntryDelta::Tombstone,
