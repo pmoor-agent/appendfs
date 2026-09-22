@@ -192,11 +192,27 @@ def parse_entry_delta(payload: bytes) -> tuple:
         raise ValueError(f"Unknown LogEntryDelta tag: {tag}")
 
 
+MAX_NONCE_GENERATION = 0xFFFFFFFF
+MAX_NONCE_REVISION = 0xFFFF
+MAX_NONCE_RECORD_OFFSET = 1 << 48
+
+
 def derive_record_nonce(generation: int, revision: int, record_offset: int) -> bytes:
     """Derives a deterministic 12-byte nonce matching AppendFS's derive_record_nonce.
-    Format: [generation (4 bytes BE) || revision (4 bytes BE) || record_offset (4 bytes BE)]
+
+    Format: [generation (4 bytes BE) || revision (2 bytes BE) || record_offset (6 bytes BE)]
+
+    Out-of-range coordinates raise rather than wrapping. Masking them - as this did while
+    the offset was a 32-bit field - would silently derive a nonce that belongs to a
+    different record, so a restore would decrypt to garbage and blame the volume.
     """
-    return struct.pack(">III", generation & 0xFFFFFFFF, revision & 0xFFFFFFFF, record_offset & 0xFFFFFFFF)
+    if not 0 <= generation <= MAX_NONCE_GENERATION:
+        raise ValueError(f"generation {generation} is not encodable in a record nonce")
+    if not 0 <= revision <= MAX_NONCE_REVISION:
+        raise ValueError(f"revision {revision} is not encodable in a record nonce")
+    if not 0 <= record_offset < MAX_NONCE_RECORD_OFFSET:
+        raise ValueError(f"record offset {record_offset} is not encodable in a record nonce")
+    return struct.pack(">IH", generation, revision) + record_offset.to_bytes(6, "big")
 
 
 def derive_record_aad(op_code: int, record_offset: int, inode: int) -> bytes:
