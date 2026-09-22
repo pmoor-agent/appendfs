@@ -5,7 +5,7 @@ use appendfs::operations::read_write::{
     FUSE_SET_ATTR_MODE, create_core, open_core, release_core, setattr_core, write_handle_core,
 };
 use appendfs::storage::OsStorage;
-use appendfs::{InMemoryFS, LogWriter, Storage, VolumeHeader, VolumeKey};
+use appendfs::{Clock, InMemoryFS, LogWriter, Storage, VolumeHeader, VolumeKey};
 
 use std::fs;
 use std::path::PathBuf;
@@ -990,4 +990,220 @@ fn test_python_restore_sparse_hole_and_expansion() {
     assert_eq!(&content[4096..65536], &[0x00u8; 61440]);
     // 65536..69632: 0xBB
     assert_eq!(&content[65536..69632], &[0xBBu8; 4096]);
+}
+
+#[test]
+fn test_python_restore_rejects_record_after_seal() {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
+    if !script_path.is_file() {
+        return;
+    }
+
+    let vol_temp = tempfile::tempdir().unwrap();
+    let vol_dir = vol_temp.path();
+
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
+    let clock = Arc::new(CompatClock::new());
+    init_volume_with_clock_and_uids(
+        storage.clone(),
+        &VolumeKey::plaintext(),
+        VolumeHeader::plaintext(),
+        clock.clone(),
+        1000,
+        1000,
+    )
+    .unwrap();
+
+    let writer = Arc::new(
+        LogWriter::create(
+            storage.clone(),
+            1,
+            clock.as_ref(),
+            10_000,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
+    );
+
+    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+    fs.volume_header = VolumeHeader::plaintext();
+    fs.log_writer = Some(writer.clone());
+    fs.set_log_dir(vol_dir);
+
+    mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+    fs.quiesce().unwrap();
+
+    // Seal gen 1 cleanly
+    writer.seal_active(clock.as_ref()).unwrap();
+    fs.log_writer = None;
+    drop(fs);
+    drop(writer);
+
+    // Append an extraneous record after seal directly to 000001.log
+    let log_file = vol_dir.join("000001.log");
+    let mut log_bytes = fs::read(&log_file).unwrap();
+    let extra_payload = b"extraneous";
+    let (_, cipher, tag) = appendfs::log::codec::encode(
+        &VolumeKey::plaintext(),
+        appendfs::compress::Compression::None,
+        appendfs::log::codec::RecordId {
+            generation: 1,
+            revision: 0,
+            record_offset: log_bytes.len() as u64,
+            op_code: appendfs::log::OpCode::Data as u8,
+            inode: 2,
+        },
+        extra_payload,
+    )
+    .unwrap();
+    let extra_header = appendfs::log::record::RecordHeader {
+        op_code: appendfs::log::OpCode::Data,
+        inode: 2,
+        payload_len: cipher.len() as u32,
+        auth_tag: tag,
+    };
+    log_bytes.extend_from_slice(&extra_header.to_bytes());
+    log_bytes.extend_from_slice(&cipher);
+    fs::write(&log_file, log_bytes).unwrap();
+
+    // Restore must fail
+    let dest_temp = tempfile::tempdir().unwrap();
+    let dest_path = dest_temp.path();
+
+    let output = std::process::Command::new("python3")
+        .arg(&script_path)
+        .arg(vol_dir)
+        .arg(dest_path)
+        .output()
+        .expect("execute python3");
+
+    assert!(!output.status.success(), "restore should fail on record after seal");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("extraneous record op=1 found after Seal record"),
+        "expected extraneous record error, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_python_restore_rejects_seal_record_count_mismatch() {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
+    if !script_path.is_file() {
+        return;
+    }
+
+    let vol_temp = tempfile::tempdir().unwrap();
+    let vol_dir = vol_temp.path();
+
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
+    let clock = Arc::new(CompatClock::new());
+    init_volume_with_clock_and_uids(
+        storage.clone(),
+        &VolumeKey::plaintext(),
+        VolumeHeader::plaintext(),
+        clock.clone(),
+        1000,
+        1000,
+    )
+    .unwrap();
+
+    let writer = Arc::new(
+        LogWriter::create(
+            storage.clone(),
+            1,
+            clock.as_ref(),
+            10_000,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
+    );
+
+    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+    fs.volume_header = VolumeHeader::plaintext();
+    fs.log_writer = Some(writer.clone());
+    fs.set_log_dir(vol_dir);
+
+    mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+    fs.quiesce().unwrap();
+
+    // Seal gen 1 cleanly
+    writer.seal_active(clock.as_ref()).unwrap();
+    fs.log_writer = None;
+    drop(fs);
+    drop(writer);
+
+    // Read valid records without the seal
+    let log_file = vol_dir.join("000001.log");
+    let mut reader =
+        appendfs::log::LogReader::open(storage.as_ref(), "000001.log", VolumeKey::plaintext_arc()).unwrap();
+    let mut valid_records = Vec::new();
+    for r in &mut reader {
+        let rec = r.unwrap();
+        if rec.header.op_code != appendfs::log::OpCode::Seal {
+            valid_records.push(rec);
+        }
+    }
+    drop(reader);
+
+    // Reconstruct 000001.log with valid records + bad seal count
+    let file_header = appendfs::log::record::FileHeader::new(1, clock.now());
+    let mut new_bytes = file_header.to_bytes().to_vec();
+    for rec in valid_records {
+        let h = rec.header.to_bytes();
+        new_bytes.extend_from_slice(&h);
+        new_bytes.extend_from_slice(&rec.payload);
+    }
+
+    let bad_seal = appendfs::log::record::SealPayload {
+        timestamp: clock.now(),
+        record_count: 999, // Mismatch!
+    };
+    let bad_payload = appendfs::wire::serialize(&bad_seal).unwrap();
+    let (_, cipher, tag) = appendfs::log::codec::encode(
+        &VolumeKey::plaintext(),
+        appendfs::compress::Compression::None,
+        appendfs::log::codec::RecordId {
+            generation: 1,
+            revision: 0,
+            record_offset: new_bytes.len() as u64,
+            op_code: appendfs::log::OpCode::Seal as u8,
+            inode: 0,
+        },
+        &bad_payload,
+    )
+    .unwrap();
+    let tagged_header = appendfs::log::record::RecordHeader {
+        op_code: appendfs::log::OpCode::Seal,
+        inode: 0,
+        payload_len: cipher.len() as u32,
+        auth_tag: tag,
+    };
+    new_bytes.extend_from_slice(&tagged_header.to_bytes());
+    new_bytes.extend_from_slice(&cipher);
+    fs::write(&log_file, new_bytes).unwrap();
+
+    // Restore must fail
+    let dest_temp = tempfile::tempdir().unwrap();
+    let dest_path = dest_temp.path();
+
+    let output = std::process::Command::new("python3")
+        .arg(&script_path)
+        .arg(vol_dir)
+        .arg(dest_path)
+        .output()
+        .expect("execute python3");
+
+    assert!(
+        !output.status.success(),
+        "restore should fail on seal record count mismatch"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Seal record count mismatch"),
+        "expected seal count mismatch error, got: {}",
+        stderr
+    );
 }

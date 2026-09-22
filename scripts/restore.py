@@ -45,6 +45,7 @@ OP_DATA = 1
 OP_DATA_ZSTD = 2
 OP_INODE_DELTA = 3
 OP_FLUSH_COMMIT = 4
+OP_SEAL = 5
 
 TAG_TOMBSTONE = 0
 TAG_DIRECTORY = 1
@@ -434,6 +435,8 @@ class Restorer:
             batch_chunks: Dict[Tuple[int, int], bytes] = {}
             batch_deltas: Dict[int, tuple] = {}
             records_in_batch = 0
+            committed_records_count = 0
+            is_sealed = False
 
             while True:
                 rh_bytes = f.read(RECORD_HEADER_SIZE)
@@ -445,6 +448,12 @@ class Restorer:
                 if len(raw_payload) < plen:
                     # Truncated record at end of log due to crash mid-flush; discard
                     break
+
+                if is_sealed:
+                    raise ValueError(
+                        f"Integrity violation in {log_path.name} @ offset 0x{rec_log_offset:x}: "
+                        f"extraneous record op={op} found after Seal record"
+                    )
 
                 # 1. Check for integrity errors: operations targeting deleted/tombstoned inodes
                 if ino in self.tombstoned_inodes:
@@ -507,9 +516,27 @@ class Restorer:
                     # Atomic commit point for the batch!
                     self._commit_batch(batch_chunks, batch_deltas)
                     self.last_committed_batch_id = batch_id
+                    committed_records_count += 1 + records_in_batch
                     batch_chunks.clear()
                     batch_deltas.clear()
                     records_in_batch = 0
+                elif op == OP_SEAL:
+                    if len(payload) < 16:
+                        raise ValueError(
+                            f"Malformed Seal payload (len={len(payload)}) in {log_path.name} @ offset 0x{rec_log_offset:x}"
+                        )
+                    if records_in_batch != 0:
+                        raise ValueError(
+                            f"Integrity violation in {log_path.name} @ offset 0x{rec_log_offset:x}: "
+                            f"seal record preceded by {records_in_batch} uncommitted records"
+                        )
+                    seal_secs, seal_nsecs, seal_count = struct.unpack(">qII", payload[:16])
+                    if seal_count != committed_records_count:
+                        raise ValueError(
+                            f"Seal record count mismatch in {log_path.name} @ offset 0x{rec_log_offset:x}: "
+                            f"claimed {seal_count} records but committed {committed_records_count}"
+                        )
+                    is_sealed = True
                 else:
                     raise ValueError(
                         f"Unknown opcode {op} in {log_path.name} @ offset 0x{rec_log_offset:x}"

@@ -4,23 +4,24 @@ Generation:          1
 Revision:            0
 Format Version:      1
 Created At:          1700000000.000000000s (2023-11-14 22:13:20 UTC)
-File Size:           37.38 KiB
-Total Valid Records: 38
+File Size:           37.42 KiB
+Total Valid Records: 39
 Total Data Payload:  33.14 KiB
 
 --- Flush Batch Statistics ---
 Committed Flushes:   3
-Avg Records / Flush: 12.7
+Avg Records / Flush: 13.0
 Avg Data / Flush:    11.04 KiB
 Trailing Batch:      None (cleanly committed at EOF)
 
 --- Record Breakdown by OpCode ---
 OP CODE             COUNT    TOTAL BYTES % OF RECORDS
 -------------- ---------- -------------- ------------
-Data                    6      33.14 KiB        15.8%
+Data                    6      33.14 KiB        15.4%
 DataZstd                0            0 B         0.0%
-InodeDelta             29       3.07 KiB        76.3%
-FlushCommit             3           72 B         7.9%
+InodeDelta             29       3.07 KiB        74.4%
+FlushCommit             3           72 B         7.7%
+Seal                    1           16 B         2.6%
 
 --- Write Payload Size Histogram ---
 SIZE RANGE            COUNT    TOTAL BYTES   DISTRIBUTION
@@ -109,3 +110,5 @@ SIZE RANGE            COUNT    TOTAL BYTES   DISTRIBUTION
       delta: Socket { mode: 0o755, uid: 1000, gid: 1000, nlink: 1, atime: 1700000330.000000000s (2023-11-14 22:18:50 UTC), mtime: 1700000340.000000000s (2023-11-14 22:19:00 UTC), ctime: 1700000330.000000000s (2023-11-14 22:18:50 UTC), created_at: 1700000330.000000000s (2023-11-14 22:18:50 UTC) }
 #38    [0x00009550 / 38224   ] FlushCommit    inode 0     len 24 B     tag 44caf603 [COMMITTED]
       batch_id: 3, batch_record_count: 18, commit_timestamp: 1700000330.000000000s (2023-11-14 22:18:50 UTC)
+#39    [0x00009585 / 38277   ] Seal           inode 0     len 16 B     tag 1e14220e [COMMITTED]
+      sealed_record_count: 38, seal_timestamp: 1700000500.000000000s (2023-11-14 22:21:40 UTC)

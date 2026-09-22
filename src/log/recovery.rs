@@ -3,7 +3,7 @@ use crate::crypto::VolumeKey;
 use crate::fs::InMemoryFS;
 use crate::log::manifest::{parse_log_filename, parse_summary_filename};
 use crate::log::reader::{LogReader, LogRecord};
-use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode};
+use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode, SealPayload};
 use crate::log::summary::SummaryReader;
 use crate::node::EntryDelta;
 use crate::sync::OpTag;
@@ -153,6 +153,8 @@ pub fn recover_fs(
     let mut total_recovered_data_bytes = 0u64;
     let mut max_replayed_generation = min_log_gen;
 
+    let max_existing_generation = log_files.last().map(|(g, _)| *g).unwrap_or(0);
+
     // 3. Replay log files with generation > min_log_gen
     for (gen_num, filename) in log_files {
         if gen_num <= min_log_gen && min_log_gen > 0 {
@@ -170,6 +172,7 @@ pub fn recover_fs(
         let mut pending: Vec<LogRecord> = Vec::new();
         let mut committed_records_count = 0u32;
         let mut log_data_bytes = 0u64;
+        let mut is_sealed = false;
 
         let mut reader = LogReader::open(storage.as_ref(), &filename, volume_key.clone())?;
         let log_created_at = reader.file_header().created_at;
@@ -187,7 +190,50 @@ pub fn recover_fs(
 
             let header = record.header;
 
-            if header.op_code == OpCode::FlushCommit {
+            if is_sealed {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "extraneous record with OpCode {} found after Seal record in generation {}",
+                        header.op_code, gen_num
+                    ),
+                ));
+            }
+
+            if header.op_code == OpCode::Seal {
+                if !pending.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "found {} uncommitted record(s) before Seal record in generation {}",
+                            pending.len(),
+                            gen_num
+                        ),
+                    ));
+                }
+
+                let seal = crate::wire::deserialize::<SealPayload>(&record.payload).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("malformed Seal payload in generation {}: {}", gen_num, e),
+                    )
+                })?;
+
+                if seal.record_count != committed_records_count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Seal record_count mismatch in generation {}: claimed {} but committed {}",
+                            gen_num, seal.record_count, committed_records_count
+                        ),
+                    ));
+                }
+
+                is_sealed = true;
+                if let Some(op_time) = record.op_time() {
+                    last_op_time = Some(op_time);
+                }
+            } else if header.op_code == OpCode::FlushCommit {
                 let commit = crate::wire::deserialize::<FlushCommitPayload>(&record.payload).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -267,7 +313,7 @@ pub fn recover_fs(
                             let entry_delta = log_delta.into_entry_delta(gen_num);
                             current_batch.insert(target_ino, entry_delta);
                         }
-                        DecodedPayload::FlushCommit(_) => {}
+                        DecodedPayload::FlushCommit(_) | DecodedPayload::Seal(_) => {}
                     }
                 }
 
@@ -300,6 +346,21 @@ pub fn recover_fs(
             );
         }
 
+        let is_active_log = gen_num == max_existing_generation;
+        if is_active_log && !is_sealed {
+            log::info!(
+                "Active head log file '{}' (generation {}) is unsealed (diagnostic evidence of unclean crash)",
+                filename,
+                gen_num
+            );
+        } else if !is_sealed && !target_cutoff_reached {
+            log::warn!(
+                "Intermediate log file '{}' (generation {}) lacks a terminal Seal record (flagged as truncated or abnormally terminated)",
+                filename,
+                gen_num
+            );
+        }
+
         let log_file_len = storage.file_len(&filename).unwrap_or(0);
         let log_md5 = reader.finish_md5()?;
         let log_file_info = crate::log::LogFileInfo {
@@ -311,6 +372,7 @@ pub fn recover_fs(
             total_bytes: log_file_len,
             total_data_bytes: log_data_bytes,
             md5: log_md5,
+            sealed: is_sealed,
         };
         fs_instance.manifest.write().unwrap().record_sealed_log(log_file_info);
 
@@ -469,6 +531,7 @@ mod tests {
             .emit_flush_commit_and_flush(1, b"batch1 data".len() as u64, &*clock)
             .unwrap();
         assert_eq!(writer1.last_batch_id(), 1);
+        writer1.seal_active(&*clock).unwrap();
         drop(writer1);
 
         // Writer 2 starts at batch 3 (simulating a dropped/missing batch 2)
@@ -640,5 +703,280 @@ mod tests {
         let manifest = recovered_torn.manifest.read().unwrap();
         let entry = manifest.get_by_generation(1).expect("generation 1 in manifest");
         assert_eq!(entry.md5, expected_md5_torn);
+    }
+
+    #[test]
+    fn test_recovery_verifies_rolled_log_is_sealed() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                100, // Small max_log_size to trigger roll
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+
+        let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+        fs.log_writer = Some(writer.clone());
+        fs.set_storage(storage.clone());
+
+        // Batch 1 into gen 1
+        crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        // Roll to generation 2 (this seals gen 1 with OpCode::Seal)
+        let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+        assert_eq!(sealed.generation, 1);
+        fs.manifest.write().unwrap().record_sealed_log(sealed);
+
+        // Batch 2 into gen 2
+        crate::operations::dir::mkdir_core(&fs, 1, "dir2", 0o755, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        // Verify recovery succeeds across rolled gen 1 (sealed) and active gen 2
+        let recovered = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            clock.clone(),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        assert!(recovered.lookup_child(1, "dir1").is_some());
+        assert!(recovered.lookup_child(1, "dir2").is_some());
+
+        let manifest = recovered.manifest.read().unwrap();
+        assert_eq!(manifest.logs.len(), 2);
+        assert!(manifest.logs[0].sealed, "gen 1 was cleanly rolled and sealed");
+        assert!(!manifest.logs[1].sealed, "active gen 2 ended without explicit seal");
+        assert!(!manifest.last_shutdown_clean());
+    }
+
+    #[test]
+    fn test_recovery_handles_unsealed_intermediate_log_from_crash() {
+        let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
+        let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, 10_000, 1, VolumeKey::plaintext_arc()).unwrap());
+
+        let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+        fs.log_writer = Some(writer.clone());
+        fs.set_storage(storage.clone());
+
+        crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+        fs.log_writer = None;
+        drop(fs);
+        drop(writer);
+
+        // Now simulate gen 2 being created after crash recovery without sealing gen 1
+        let writer2 = LogWriter::create(storage.clone(), 2, &*clock, 10_000, 2, VolumeKey::plaintext_arc()).unwrap();
+        let mut fs2 = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+        fs2.log_writer = Some(Arc::new(writer2));
+        fs2.set_storage(storage.clone());
+        crate::operations::dir::mkdir_core(&fs2, 1, "dir2", 0o755, 1000, 1000).unwrap();
+        fs2.quiesce().unwrap();
+        fs2.log_writer = None;
+        drop(fs2);
+
+        // Recovery must succeed and recover both dir1 and dir2
+        let recovered = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            clock.clone(),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        assert!(recovered.lookup_child(1, "dir1").is_some());
+        assert!(recovered.lookup_child(1, "dir2").is_some());
+
+        let manifest = recovered.manifest.read().unwrap();
+        assert_eq!(manifest.logs.len(), 2);
+        assert!(!manifest.logs[0].sealed, "gen 1 crashed without seal");
+        assert!(!manifest.logs[1].sealed, "gen 2 crashed without seal");
+        assert!(!manifest.last_shutdown_clean());
+        assert!(!manifest.all_logs_sealed());
+    }
+
+    #[test]
+    fn test_recovery_rejects_record_after_seal() {
+        let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
+        let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, 10_000, 1, VolumeKey::plaintext_arc()).unwrap());
+
+        let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+        fs.log_writer = Some(writer.clone());
+        fs.set_storage(storage.clone());
+
+        crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+        writer.seal_active(&*clock).unwrap();
+        drop(fs);
+        drop(writer);
+
+        // Append an extraneous record after seal directly to 000001.log
+        let mut log_bytes = mem_storage.get_file_bytes("000001.log").unwrap();
+        let extra_payload = b"extraneous";
+        let (_, cipher, tag) = crate::log::codec::encode(
+            &VolumeKey::plaintext(),
+            crate::compress::Compression::None,
+            crate::log::codec::RecordId {
+                generation: 1,
+                revision: 0,
+                record_offset: log_bytes.len() as u64,
+                op_code: OpCode::Data as u8,
+                inode: 2,
+            },
+            extra_payload,
+        )
+        .unwrap();
+        let extra_header = crate::log::record::RecordHeader {
+            op_code: OpCode::Data,
+            inode: 2,
+            payload_len: cipher.len() as u32,
+            auth_tag: tag,
+        };
+        log_bytes.extend_from_slice(&extra_header.to_bytes());
+        log_bytes.extend_from_slice(&cipher);
+        mem_storage.insert_file("000001.log", log_bytes);
+
+        let result = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            clock.clone(),
+            VolumeKey::plaintext_arc(),
+        );
+        let err_msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("Expected recovery to fail on record after seal"),
+        };
+        assert!(
+            err_msg.contains("extraneous record with OpCode Data found after Seal record in generation 1"),
+            "Expected extraneous record error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_recovery_rejects_seal_record_count_mismatch() {
+        let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
+        let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        let writer =
+            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, 10_000, 1, VolumeKey::plaintext_arc()).unwrap());
+
+        let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+        fs.log_writer = Some(writer.clone());
+        fs.set_storage(storage.clone());
+
+        crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        // Seal gen 1 with record_count = 3 (1 dir delta + 1 attr delta + 1 FlushCommit)
+        let _ = writer.seal_active(&*clock).unwrap();
+        fs.log_writer = None;
+        drop(fs);
+        drop(writer);
+
+        // Forge a wrong Seal record by appending a bad Seal payload
+        let bad_seal = SealPayload {
+            timestamp: clock.now(),
+            record_count: 999, // mismatch!
+        };
+        let bad_payload = crate::wire::serialize(&bad_seal).unwrap();
+
+        // Replace 000001.log with one containing bad seal count
+        let mut reader = LogReader::open(storage.as_ref(), "000001.log", VolumeKey::plaintext_arc()).unwrap();
+        let mut valid_records = Vec::new();
+        for r in &mut reader {
+            let rec = r.unwrap();
+            if rec.header.op_code != OpCode::Seal {
+                valid_records.push(rec);
+            }
+        }
+        drop(reader);
+
+        // Reconstruct 000001.log with valid records + bad seal
+        let file_header = crate::log::record::FileHeader::new(1, clock.now());
+        let mut new_bytes = file_header.to_bytes().to_vec();
+        for rec in valid_records {
+            let h = rec.header.to_bytes();
+            new_bytes.extend_from_slice(&h);
+            new_bytes.extend_from_slice(&rec.payload);
+        }
+        // Use encode to compute valid tag for bad seal
+        let (_, cipher, tag) = crate::log::codec::encode(
+            &VolumeKey::plaintext(),
+            crate::compress::Compression::None,
+            crate::log::codec::RecordId {
+                generation: 1,
+                revision: 0,
+                record_offset: new_bytes.len() as u64,
+                op_code: OpCode::Seal as u8,
+                inode: 0,
+            },
+            &bad_payload,
+        )
+        .unwrap();
+        let tagged_header = crate::log::record::RecordHeader {
+            op_code: OpCode::Seal,
+            inode: 0,
+            payload_len: cipher.len() as u32,
+            auth_tag: tag,
+        };
+        new_bytes.extend_from_slice(&tagged_header.to_bytes());
+        new_bytes.extend_from_slice(&cipher);
+        mem_storage.insert_file("000001.log", new_bytes);
+
+        let result = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            clock.clone(),
+            VolumeKey::plaintext_arc(),
+        );
+        let err_msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("Expected recovery to fail on seal record count mismatch"),
+        };
+        assert!(
+            err_msg.contains("Seal record_count mismatch in generation 1: claimed 999 but committed 3"),
+            "Expected record count mismatch error, got: {}",
+            err_msg
+        );
     }
 }
