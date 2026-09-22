@@ -208,6 +208,45 @@ impl FsInner {
         self.with_inode_layers_below_live(ino, |layers| layers.attr())
     }
 
+    /// Normalizes directory deltas across a batch about to be flushed against the folded `base`.
+    ///
+    /// The flusher drains `flushing` strictly in FIFO order, folding each batch into `base` before
+    /// writing the next. Therefore, the batch at the head of `flushing` has no intermediate flushing
+    /// layers underneath it—only `base`.
+    ///
+    /// When self-canceling directory operations occur within the same flush batch (such as `mv a b; mv b a`,
+    /// or `touch foo; rm foo`), the in-memory `DirectoryDelta` accumulates redundant additions and phantom
+    /// tombstones (e.g. `added: ["a" -> 123], removed: ["b"]`).
+    ///
+    /// Normalization inspects the folded `base`:
+    /// - Retains `added` entries only if `base` does not already map `name` to the exact same `child_ino`.
+    /// - Retains `removed` entries only if `name` actually existed in `base`.
+    ///
+    /// This eliminates redundant additions and phantom tombstones from log batches with zero disk I/O,
+    /// writing only genuinely modified directory entries or pure timestamp attribute deltas.
+    pub fn normalize_directory_deltas(&self, entries: &mut HashMap<u64, EntryDelta>) {
+        for (&ino, entry) in entries.iter_mut() {
+            if let EntryDelta::Node(NodeDelta::Directory(dir_delta)) = entry {
+                if let Some(node_arc) = self.base.get(&ino) {
+                    if let NodeKind::Directory {
+                        entries: ref base_entries,
+                        ..
+                    } = node_arc.kind
+                    {
+                        dir_delta.added.retain(|name, &mut child_ino| {
+                            !base_entries.iter().any(|(n, ino)| n == name && *ino == child_ino)
+                        });
+                        dir_delta
+                            .removed
+                            .retain(|name| base_entries.iter().any(|(n, _)| n == name));
+                    }
+                } else {
+                    dir_delta.removed.clear();
+                }
+            }
+        }
+    }
+
     pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
         self.with_inode_layers(ino, |layers| layers.attr())
     }
@@ -640,5 +679,210 @@ mod tests {
             !fs.snapshot_all().contains_key(&attr.ino),
             "resurrected inode leaked into the snapshot as an orphan"
         );
+    }
+
+    #[test]
+    fn test_normalize_directory_deltas_touch_and_rm_same_batch() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+
+        // Create and immediately unlink in the same batch
+        let _attr = crate::operations::read_write::create_core(&fs, 1, "temp.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::links::unlink_core(&fs, 1, "temp.txt").unwrap();
+
+        // Before freeze, live has a phantom tombstone in removed
+        fs.with_inner_for_tests(|inner| {
+            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = inner.live.get(&1) {
+                assert!(d.removed.contains("temp.txt"), "live must stage the removal");
+                assert!(!d.added.contains_key("temp.txt"), "live must not retain added entry");
+            } else {
+                panic!("expected directory delta in live");
+            }
+        });
+
+        // Freeze live into flushing
+        assert!(fs.freeze_now());
+
+        // Pre-flush normalization against base prunes the phantom tombstone
+        fs.with_inner_for_tests(|inner| {
+            let batch = inner.flushing.back().expect("batch must be in flushing");
+            let mut entries = batch.entries.clone();
+            inner.normalize_directory_deltas(&mut entries);
+            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = entries.get(&1) {
+                assert!(
+                    d.removed.is_empty(),
+                    "phantom tombstone must be pruned by normalization: {:?}",
+                    d.removed
+                );
+                assert!(d.added.is_empty(), "added must remain empty");
+                assert!(d.attr_delta.mtime.is_some(), "mtime update must be preserved");
+                assert!(d.attr_delta.ctime.is_some(), "ctime update must be preserved");
+            } else {
+                panic!("expected directory delta in normalized entries");
+            }
+        });
+    }
+
+    #[test]
+    fn test_normalize_directory_deltas_self_canceling_rename() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+
+        // Create file.txt and fold into base
+        let attr = crate::operations::read_write::create_core(&fs, 1, "file.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        // Self-canceling rename: file.txt -> tmp.txt -> file.txt
+        crate::operations::links::rename_core(&fs, 1, "file.txt", 1, "tmp.txt").unwrap();
+        crate::operations::links::rename_core(&fs, 1, "tmp.txt", 1, "file.txt").unwrap();
+
+        // Before freeze, live contains redundant added: "file.txt" and phantom removed: "tmp.txt"
+        fs.with_inner_for_tests(|inner| {
+            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = inner.live.get(&1) {
+                assert!(d.added.contains_key("file.txt"), "live has redundant addition");
+                assert!(d.removed.contains("tmp.txt"), "live has phantom removal");
+            } else {
+                panic!("expected directory delta in live");
+            }
+        });
+
+        // Freeze live into flushing
+        assert!(fs.freeze_now());
+
+        // Pre-flush normalization against base prunes both redundant addition and phantom tombstone
+        fs.with_inner_for_tests(|inner| {
+            let batch = inner.flushing.back().expect("batch must be in flushing");
+            let mut entries = batch.entries.clone();
+            inner.normalize_directory_deltas(&mut entries);
+            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = entries.get(&1) {
+                assert!(d.added.is_empty(), "redundant addition must be pruned: {:?}", d.added);
+                assert!(
+                    d.removed.is_empty(),
+                    "phantom tombstone must be pruned: {:?}",
+                    d.removed
+                );
+                assert!(d.attr_delta.mtime.is_some(), "mtime update must be preserved");
+            } else {
+                panic!("expected directory delta in normalized entries");
+            }
+        });
+
+        // File remains fully accessible
+        assert_eq!(fs.lookup_child(1, "file.txt"), Some(attr.ino));
+        assert_eq!(fs.lookup_child(1, "tmp.txt"), None);
+    }
+
+    #[test]
+    fn test_normalize_directory_deltas_chained_rename() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+
+        // Create a.txt and fold into base
+        let attr = crate::operations::read_write::create_core(&fs, 1, "a.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        // Chained rename: a.txt -> b.txt -> c.txt in the same batch
+        crate::operations::links::rename_core(&fs, 1, "a.txt", 1, "b.txt").unwrap();
+        crate::operations::links::rename_core(&fs, 1, "b.txt", 1, "c.txt").unwrap();
+
+        // Freeze live into flushing
+        assert!(fs.freeze_now());
+
+        fs.with_inner_for_tests(|inner| {
+            let batch = inner.flushing.back().expect("batch must be in flushing");
+            let mut entries = batch.entries.clone();
+            inner.normalize_directory_deltas(&mut entries);
+            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = entries.get(&1) {
+                assert_eq!(d.added.get("c.txt"), Some(&attr.ino), "c.txt must be retained in added");
+                assert!(
+                    !d.added.contains_key("b.txt"),
+                    "intermediate b.txt must not be in added"
+                );
+                assert!(d.removed.contains("a.txt"), "original a.txt must be in removed");
+                assert!(
+                    !d.removed.contains("b.txt"),
+                    "intermediate phantom tombstone b.txt must be pruned"
+                );
+            } else {
+                panic!("expected directory delta in normalized entries");
+            }
+        });
+    }
+
+    #[test]
+    fn test_normalize_directory_deltas_across_flushing_batches() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+
+        // Batch 1: create file1.txt and flush (which folds into base)
+        let _attr = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        // Batch 2: unlink file1.txt in live
+        crate::operations::links::unlink_core(&fs, 1, "file1.txt").unwrap();
+        assert!(fs.freeze_now());
+
+        // Batch 2 must retain "file1.txt" in removed because it exists in folded base
+        fs.with_inner_for_tests(|inner| {
+            let batch2 = inner.flushing.back().expect("batch2 must be in flushing");
+            let mut entries2 = batch2.entries.clone();
+            inner.normalize_directory_deltas(&mut entries2);
+            if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = entries2.get(&1) {
+                assert!(
+                    d.removed.contains("file1.txt"),
+                    "file1.txt must be retained in removed since it existed in base"
+                );
+            } else {
+                panic!("expected directory delta in batch2");
+            }
+        });
     }
 }
