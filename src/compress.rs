@@ -59,9 +59,38 @@ impl std::fmt::Display for Compression {
     }
 }
 
+use std::cell::RefCell;
+
+thread_local! {
+    static COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> = const { RefCell::new(None) };
+    static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { RefCell::new(None) };
+}
+
+fn decompress_zstd_buffered(compressed: &[u8], capacity: usize) -> io::Result<Vec<u8>> {
+    DECOMPRESSOR.with_borrow_mut(|slot| {
+        let decompressor = match slot {
+            Some(d) => d,
+            None => {
+                *slot = Some(zstd::bulk::Decompressor::new()?);
+                slot.as_mut().unwrap()
+            }
+        };
+        decompressor.decompress(compressed, capacity)
+    })
+}
+
 /// Compresses `payload` unconditionally using zstd.
 pub fn compress_zstd_unconditional(payload: &[u8]) -> io::Result<Vec<u8>> {
-    zstd::bulk::compress(payload, ZSTD_LEVEL)
+    COMPRESSOR.with_borrow_mut(|slot| {
+        let compressor = match slot {
+            Some(c) => c,
+            None => {
+                *slot = Some(zstd::bulk::Compressor::new(ZSTD_LEVEL)?);
+                slot.as_mut().unwrap()
+            }
+        };
+        compressor.compress(payload)
+    })
 }
 
 /// Compresses `payload` using zstd if compression is beneficial.
@@ -120,7 +149,7 @@ pub fn decompress_zstd_exact(compressed: &[u8], expected_len: usize) -> io::Resu
         ));
     }
 
-    let decompressed = zstd::bulk::decompress(compressed, expected_len)
+    let decompressed = decompress_zstd_buffered(compressed, expected_len)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decompression failed: {}", e)))?;
 
     if decompressed.len() != expected_len {
@@ -151,7 +180,7 @@ pub fn decompress_zstd_with_limit(compressed: &[u8], max_len: usize) -> io::Resu
         ));
     }
 
-    zstd::bulk::decompress(compressed, original_len)
+    decompress_zstd_buffered(compressed, original_len)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decompression failed: {}", e)))
 }
 
