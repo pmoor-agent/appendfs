@@ -27,6 +27,7 @@ toml = "0.8"
 url = "2.5"
 base64 = "0.22"
 tempfile = "3.8"
+jiff = "0.2"
 
 [features]
 default = []
