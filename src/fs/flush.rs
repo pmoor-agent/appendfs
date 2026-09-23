@@ -50,6 +50,7 @@ impl InMemoryFS {
             self.max_flush_queue_bytes,
             self.max_flush_queue_ops,
             self.clock.monotonic(),
+            self.clock.now(),
         );
         if froze {
             self.sync_pushback_saturation(inner);
@@ -213,6 +214,7 @@ impl InMemoryFS {
     fn synthesize_and_write_flushing_layer(
         &self,
         frozen: &mut HashMap<u64, EntryDelta>,
+        commit_timestamp: SystemTime,
         writer: &LogWriter,
     ) -> std::io::Result<(u64, u64)> {
         debug_assert!(self.flusher.in_cycle(), "only the flusher may write batches to the log");
@@ -306,7 +308,7 @@ impl InMemoryFS {
             }
 
             // 3. Emit FlushCommit trailer (physical sync deferred to batch coalescing boundary)
-            writer.emit_flush_commit(written_count, flushed_data_bytes, &*self.clock)?;
+            writer.emit_flush_commit(written_count, flushed_data_bytes, commit_timestamp)?;
 
             let active_offset = writer.current_offset();
             let disk_bytes = active_offset.saturating_sub(batch_checkpoint.offset);
@@ -403,7 +405,7 @@ impl InMemoryFS {
         for (batch, mut entries) in candidates {
             let started_at = self.clock.now();
             let started_monotonic = self.clock.monotonic();
-            match self.synthesize_and_write_flushing_layer(&mut entries, writer) {
+            match self.synthesize_and_write_flushing_layer(&mut entries, batch.commit_timestamp, writer) {
                 Ok((flushed_data_bytes, disk_bytes)) => {
                     let serialize_end = self.clock.monotonic();
                     let serialize_duration = serialize_end.saturating_sub(started_monotonic);
@@ -1940,6 +1942,76 @@ mod tests {
         let report =
             crate::check::check_volume(storage.clone(), true, crate::crypto::VolumeKey::plaintext_arc()).unwrap();
         assert!(report.is_clean(), "Integrity check must be clean: {:?}", report.issues);
+    }
+
+    /// A batch rewritten after a failed sync must reproduce the failed attempt byte for byte.
+    ///
+    /// The rollback puts the batch back at the same offsets, and so under the same record
+    /// nonces. Identical plaintext re-encrypts to identical ciphertext and leaks nothing, but
+    /// any record whose plaintext changed would reuse a ChaCha20-Poly1305 nonce - exposing the
+    /// XOR of the two plaintexts and the Poly1305 one-time key. The clock advances between
+    /// the attempts to catch anything, like the `FlushCommit` timestamp, read at write time.
+    #[test]
+    fn test_batch_retried_after_failed_sync_rewrites_identical_bytes() {
+        let mem = Arc::new(crate::storage::MemoryStorage::new());
+        let fault_storage = crate::storage::FaultStorage::new(mem);
+        let storage = Arc::new(fault_storage.clone());
+        let clock = crate::clock::AdvancingClock::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+
+        let master = crate::crypto::MasterKey::new([0x42u8; 32]);
+        let (_, key) = crate::crypto::VolumeHeader::new_encrypted(
+            &master,
+            [0u8; 16],
+            crate::crypto::KeySource::KeyFile,
+            crate::compress::Compression::None,
+        )
+        .unwrap();
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                Arc::new(key),
+            )
+            .unwrap()
+            .with_compression(crate::compress::Compression::Zstd),
+        );
+        let fs = InMemoryFS::with_clock_and_log(Arc::new(clock.clone()), Some(writer));
+
+        for i in 0..3u8 {
+            let name = format!("file_{}.bin", i);
+            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, f.ino, &vec![i; 4096], 0).unwrap();
+        }
+        let dir = crate::operations::dir::mkdir_core(&fs, 1, "dir", 0o755, 1000, 1000).unwrap();
+        crate::operations::read_write::create_core(&fs, dir.ino, "inner.txt", 0o644, 0, 1000, 1000).unwrap();
+
+        fault_storage.fail_syncs(true);
+        assert!(fs.quiesce().is_err(), "the flush must fail on the injected sync error");
+        fault_storage.fail_syncs(false);
+
+        let tails = fault_storage.truncated_tails();
+        assert_eq!(tails.len(), 1, "the failed group must be rolled back exactly once");
+        let failed = &tails[0];
+        assert_eq!(failed.filename, "000001.log");
+
+        clock.advance(Duration::from_secs(3600));
+        fs.quiesce().unwrap();
+
+        let log = storage.open_reader("000001.log").unwrap();
+        let mut retried = vec![0u8; failed.bytes.len()];
+        log.read_exact_at(failed.offset, &mut retried).unwrap();
+        assert!(
+            retried == failed.bytes,
+            "the retry must rewrite the rolled-back batch byte for byte, or it reuses record nonces"
+        );
+        assert_eq!(
+            log.len().unwrap(),
+            failed.offset + failed.bytes.len() as u64,
+            "nothing beyond the retried batch was staged, so nothing else may be written"
+        );
     }
 
     #[test]

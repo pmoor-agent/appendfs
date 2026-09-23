@@ -2,7 +2,7 @@ use crate::storage::{Storage, StorageReader, StorageWriter, WriteMode};
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Storage wrapper capable of injecting fine-grained faults for test verification.
 #[derive(Clone)]
@@ -13,6 +13,15 @@ pub struct FaultStorage {
     fail_sync: Arc<AtomicBool>,
     fail_on_open: Arc<RwLock<HashMap<String, io::ErrorKind>>>,
     bitflips: Arc<RwLock<Vec<(String, u64, u8)>>>,
+    truncated: Arc<Mutex<Vec<TruncatedTail>>>,
+}
+
+/// Bytes a `truncate` cut off the end of a file, as they were just before the cut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncatedTail {
+    pub filename: String,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
 }
 
 impl FaultStorage {
@@ -24,7 +33,16 @@ impl FaultStorage {
             fail_sync: Arc::new(AtomicBool::new(false)),
             fail_on_open: Arc::new(RwLock::new(HashMap::new())),
             bitflips: Arc::new(RwLock::new(Vec::new())),
+            truncated: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Every tail cut off by a writer's `truncate`, in order.
+    ///
+    /// A rollback erases what a failed attempt wrote, but on a real disk those bytes can
+    /// outlive the truncate; this keeps them so a test can compare them with the retry.
+    pub fn truncated_tails(&self) -> Vec<TruncatedTail> {
+        self.truncated.lock().unwrap().clone()
     }
 
     /// Sets whether `sync` should fail with simulated I/O error.
@@ -105,6 +123,9 @@ impl StorageReader for FaultStorageReader {
 
 pub struct FaultStorageWriter {
     inner: Box<dyn StorageWriter>,
+    storage: Arc<dyn Storage>,
+    filename: String,
+    truncated: Arc<Mutex<Vec<TruncatedTail>>>,
     max_append_bytes: Arc<AtomicU64>,
     write_partial_on_fail: Arc<AtomicBool>,
     fail_sync: Arc<AtomicBool>,
@@ -127,6 +148,18 @@ impl StorageWriter for FaultStorageWriter {
     }
 
     fn truncate(&mut self, len: u64) -> io::Result<()> {
+        let current_len = self.inner.len()?;
+        if len < current_len {
+            let mut bytes = vec![0u8; (current_len - len) as usize];
+            self.storage
+                .open_reader(&self.filename)?
+                .read_exact_at(len, &mut bytes)?;
+            self.truncated.lock().unwrap().push(TruncatedTail {
+                filename: self.filename.clone(),
+                offset: len,
+                bytes,
+            });
+        }
         self.inner.truncate(len)
     }
 
@@ -178,6 +211,9 @@ impl Storage for FaultStorage {
         let writer = self.inner.open_writer(name, mode)?;
         Ok(Box::new(FaultStorageWriter {
             inner: writer,
+            storage: Arc::clone(&self.inner),
+            filename: name.to_string(),
+            truncated: Arc::clone(&self.truncated),
             max_append_bytes: Arc::clone(&self.max_append_bytes),
             write_partial_on_fail: Arc::clone(&self.write_partial_on_fail),
             fail_sync: Arc::clone(&self.fail_sync),

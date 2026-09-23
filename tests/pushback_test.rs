@@ -76,6 +76,7 @@ fn test_tier_throttling_decision_logic() {
             completion,
             reason: appendfs::fs::FlushReason::Threshold,
             frozen_at: std::time::Duration::ZERO,
+            commit_timestamp: std::time::UNIX_EPOCH,
         }));
     }
     fs.refresh_pushback_saturation();
@@ -254,6 +255,7 @@ fn test_delayed_response_queue_stall_calculation() {
             completion,
             reason: appendfs::fs::FlushReason::Threshold,
             frozen_at: std::time::Duration::ZERO,
+            commit_timestamp: std::time::UNIX_EPOCH,
         }));
         inner.flushing_bytes = 100;
         inner.flushing_ops = 1;
@@ -352,6 +354,7 @@ fn test_fs_destroy_drains_stalled_waiters_and_completes_cleanly() {
             completion,
             reason: appendfs::fs::FlushReason::Threshold,
             frozen_at: std::time::Duration::ZERO,
+            commit_timestamp: std::time::UNIX_EPOCH,
         }));
         inner.flushing_bytes = 100;
         inner.flushing_ops = 1;
@@ -435,6 +438,7 @@ fn test_calculate_throttle_is_completely_lock_free() {
             completion,
             reason: appendfs::fs::FlushReason::Threshold,
             frozen_at: std::time::Duration::ZERO,
+            commit_timestamp: std::time::UNIX_EPOCH,
         }));
         inner.flushing_bytes = 100;
         inner.flushing_ops = 1;

@@ -430,6 +430,14 @@ pub struct FlushBatch {
     pub reason: FlushReason,
     /// When the batch entered the `flushing` queue, on [`Clock::monotonic`].
     pub frozen_at: Duration,
+    /// Wall-clock time the batch was frozen, written into its `FlushCommit` trailer.
+    ///
+    /// Fixed here rather than read when the trailer is written, because a failed flush rolls
+    /// the log back and rewrites the batch at the same offsets, under the same record nonces.
+    /// Every other byte of the batch comes out identical on the retry, so the rewrite leaks
+    /// nothing; a fresh timestamp would make the trailer the one record that re-encrypts a
+    /// different plaintext under a nonce already used.
+    pub commit_timestamp: SystemTime,
 }
 
 /// Consolidated mutable filesystem state protected by `InMemoryFS::inner`.
@@ -550,13 +558,15 @@ impl FsInner {
     /// If queue depth, byte count, or op count reaches or exceeds capacity, this is a no-op
     /// that preserves `live` and staged byte/op counters, returning `false`.
     /// Returns `true` if a batch was frozen, or `false` if `live` was empty or `flushing` was full.
-    /// `now` is the [`Clock::monotonic`] reading stamped on the batch as its `frozen_at`.
+    /// `now` is the [`Clock::monotonic`] reading stamped on the batch as its `frozen_at`, and
+    /// `wall_now` the [`Clock::now`] reading stamped as its `commit_timestamp`.
     pub fn freeze_live(
         &mut self,
         max_flush_queue_depth: usize,
         max_flush_queue_bytes: usize,
         max_flush_queue_ops: usize,
         now: Duration,
+        wall_now: SystemTime,
     ) -> bool {
         if self.flushing_at_capacity(max_flush_queue_depth, max_flush_queue_bytes, max_flush_queue_ops) {
             return false;
@@ -588,6 +598,7 @@ impl FsInner {
                 completion,
                 reason,
                 frozen_at: now,
+                commit_timestamp: wall_now,
             }));
             true
         } else {
