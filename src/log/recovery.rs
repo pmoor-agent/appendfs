@@ -172,9 +172,10 @@ pub fn recover_fs(
         let mut pending: Vec<LogRecord> = Vec::new();
         let mut committed_records_count = 0u32;
         let mut log_data_bytes = 0u64;
-        let mut is_sealed = false;
+        let mut sealed_at: Option<SystemTime> = None;
 
         let mut reader = LogReader::open(storage.as_ref(), &filename, volume_key.clone())?;
+        let log_version = reader.file_header().version;
         let log_created_at = reader.file_header().created_at;
         for record_res in &mut reader {
             let record = match record_res {
@@ -190,7 +191,7 @@ pub fn recover_fs(
 
             let header = record.header;
 
-            if is_sealed {
+            if sealed_at.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -229,7 +230,7 @@ pub fn recover_fs(
                     ));
                 }
 
-                is_sealed = true;
+                sealed_at = Some(seal.timestamp);
                 if let Some(op_time) = record.op_time() {
                     last_op_time = Some(op_time);
                 }
@@ -347,13 +348,13 @@ pub fn recover_fs(
         }
 
         let is_active_log = gen_num == max_existing_generation;
-        if is_active_log && !is_sealed {
+        if is_active_log && sealed_at.is_none() {
             log::info!(
                 "Active head log file '{}' (generation {}) is unsealed (diagnostic evidence of unclean crash)",
                 filename,
                 gen_num
             );
-        } else if !is_sealed && !target_cutoff_reached {
+        } else if sealed_at.is_none() && !target_cutoff_reached {
             log::warn!(
                 "Intermediate log file '{}' (generation {}) lacks a terminal Seal record (flagged as truncated or abnormally terminated)",
                 filename,
@@ -364,6 +365,7 @@ pub fn recover_fs(
         let log_file_len = storage.file_len(&filename).unwrap_or(0);
         let log_md5 = reader.finish_md5()?;
         let log_file_info = crate::log::LogFileInfo {
+            version: log_version,
             generation: gen_num,
             revision: parse_log_filename(&filename).map(|(_, r)| r).unwrap_or(0),
             filename: filename.clone(),
@@ -372,7 +374,7 @@ pub fn recover_fs(
             total_bytes: log_file_len,
             total_data_bytes: log_data_bytes,
             md5: log_md5,
-            sealed: is_sealed,
+            sealed_at,
         };
         fs_instance.manifest.write().unwrap().record_sealed_log(log_file_info);
 
@@ -761,8 +763,15 @@ mod tests {
 
         let manifest = recovered.manifest.read().unwrap();
         assert_eq!(manifest.logs.len(), 2);
-        assert!(manifest.logs[0].sealed, "gen 1 was cleanly rolled and sealed");
-        assert!(!manifest.logs[1].sealed, "active gen 2 ended without explicit seal");
+        assert_eq!(manifest.logs[0].version, 1);
+        assert_eq!(manifest.logs[1].version, 1);
+        assert!(manifest.logs[0].is_sealed(), "gen 1 was cleanly rolled and sealed");
+        assert!(manifest.logs[0].sealed_at.is_some());
+        assert!(
+            !manifest.logs[1].is_sealed(),
+            "active gen 2 ended without explicit seal"
+        );
+        assert_eq!(manifest.logs[1].sealed_at, None);
         assert!(!manifest.last_shutdown_clean());
     }
 
@@ -814,8 +823,12 @@ mod tests {
 
         let manifest = recovered.manifest.read().unwrap();
         assert_eq!(manifest.logs.len(), 2);
-        assert!(!manifest.logs[0].sealed, "gen 1 crashed without seal");
-        assert!(!manifest.logs[1].sealed, "gen 2 crashed without seal");
+        assert_eq!(manifest.logs[0].version, 1);
+        assert_eq!(manifest.logs[1].version, 1);
+        assert!(!manifest.logs[0].is_sealed(), "gen 1 crashed without seal");
+        assert_eq!(manifest.logs[0].sealed_at, None);
+        assert!(!manifest.logs[1].is_sealed(), "gen 2 crashed without seal");
+        assert_eq!(manifest.logs[1].sealed_at, None);
         assert!(!manifest.last_shutdown_clean());
         assert!(!manifest.all_logs_sealed());
     }

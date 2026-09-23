@@ -150,7 +150,7 @@ where
             live_bytes,
             live_extents,
             live_ratio,
-            sealed: log.sealed,
+            sealed: log.is_sealed(),
         });
     }
     result
@@ -701,6 +701,7 @@ mod tests {
         {
             let mut manifest = fs.manifest.write().unwrap();
             manifest.logs.push(LogFileInfo {
+                version: 1,
                 generation: 1,
                 revision: 0,
                 filename: "000001.log".to_string(),
@@ -709,7 +710,7 @@ mod tests {
                 total_bytes: 8192,
                 total_data_bytes: 4096,
                 md5: [0u8; 16],
-                sealed: true,
+                sealed_at: Some(now),
             });
         }
 

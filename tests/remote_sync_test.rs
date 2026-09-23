@@ -1976,3 +1976,82 @@ fn test_per_remote_upload_partial_logs_behavior() {
     let base = fresh_fs.inner.lock_for_tests().unwrap().base.clone();
     assert!(base.len() >= 2); // root + active_doc.txt
 }
+
+#[test]
+fn test_unsealed_manifest_logs_are_synced_and_pruned() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let mock_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let clock = Arc::new(appendfs::clock::MockClock(mock_time));
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
+
+    // 1. Write an unsealed log file (generation 1) without an OpCode::Seal record
+    let writer = LogWriter::create(storage.clone(), 1, &*clock, 10_000_000, 1, volume_key.clone()).unwrap();
+    writer
+        .append_record(appendfs::log::OpCode::InodeDelta, 1, b"unsealed record payload")
+        .unwrap();
+    writer.emit_flush_commit(1, 23, &*clock).unwrap();
+    writer.flush().unwrap();
+    // Drop writer directly without rolling/sealing -> simulates crash / unsealed log
+    drop(writer);
+
+    // 2. Recover filesystem -> gen 1 recovered into manifest without a seal record
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    {
+        let manifest = fs.manifest.read().unwrap();
+        assert_eq!(manifest.logs.len(), 1);
+        assert_eq!(manifest.logs[0].generation, 1);
+        assert!(!manifest.logs[0].is_sealed(), "gen 1 is unsealed");
+        assert_eq!(manifest.logs[0].sealed_at, None);
+    }
+
+    // 3. Mount log writer for gen 2 and export summary covering gen 1
+    let gen2_writer =
+        Arc::new(LogWriter::create(storage.clone(), 2, &*clock, 10_000_000, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(gen2_writer);
+    let exported = fs.export_summary(storage.as_ref()).unwrap();
+    assert_eq!(exported, "000001.summary");
+
+    let fs_arc = Arc::new(fs);
+
+    // 4. Configure remote target
+    let mock_remote = Arc::new(MockRemoteStore::new());
+    let mut registry = RemoteRegistry::new();
+    registry.add_remote("remote1", RemoteTargetConfig::new("test-bucket"));
+    registry.set_store_override("remote1", mock_remote.clone());
+    registry.policy.min_synced_remotes = 1;
+    registry.policy.local_retention = "0s".to_string();
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+
+    // 5. Run replication worker cycle
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+
+    // Verify unsealed 000001.log WAS replicated to the remote
+    assert!(
+        mock_remote.head_object("000001.log").unwrap().is_some(),
+        "unsealed generation 1 log in manifest must be replicated to remote"
+    );
+
+    // Verify unsealed 000001.log WAS pruned locally after confirmation on remote
+    assert!(
+        !storage.exists("000001.log"),
+        "unsealed generation 1 log in manifest must be pruned locally when retention criteria met"
+    );
+}

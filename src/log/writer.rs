@@ -101,6 +101,7 @@ impl ActiveLogFile {
         drop(self.writer);
         let sealed_md5 = self.md5_hasher.compute().0;
         Ok(super::manifest::LogFileInfo {
+            version: crate::log::record::CURRENT_VERSION,
             generation: self.generation,
             revision: 0,
             filename: self.filename,
@@ -109,7 +110,7 @@ impl ActiveLogFile {
             total_bytes: self.current_offset,
             total_data_bytes: self.total_data_bytes,
             md5: sealed_md5,
-            sealed: true,
+            sealed_at: Some(timestamp),
         })
     }
 }
@@ -852,7 +853,8 @@ mod tests {
     #[test]
     fn test_on_the_fly_md5_computation_matches_disk_bytes() {
         let storage = Arc::new(MemoryStorage::new());
-        let clock = SystemClock;
+        let mock_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let clock = crate::clock::MockClock(mock_time);
         let writer = LogWriter::create(storage.clone(), 1, &clock, 100, 1, VolumeKey::plaintext_arc()).unwrap();
 
         writer.append_record(OpCode::Data, 1, b"first record payload").unwrap();
@@ -865,6 +867,9 @@ mod tests {
         // Roll to generation 2 -> returns sealed LogFileInfo
         let roll_res = writer.roll_if_needed(&clock).unwrap();
         let sealed_info = roll_res.unwrap();
+        assert_eq!(sealed_info.version, crate::log::record::CURRENT_VERSION);
+        assert!(sealed_info.is_sealed());
+        assert_eq!(sealed_info.sealed_at, Some(mock_time));
         assert_eq!(sealed_info.generation, 1);
         assert_eq!(sealed_info.record_count, 3);
         assert_eq!(sealed_info.total_data_bytes, 20);

@@ -1606,6 +1606,7 @@ mod tests {
         let manifest = LogManifest {
             logs: vec![
                 crate::log::LogFileInfo {
+                    version: 1,
                     generation: 1,
                     revision: 0,
                     filename: "000001.log".to_string(),
@@ -1614,9 +1615,10 @@ mod tests {
                     total_bytes: 5000,
                     total_data_bytes: 4096,
                     md5: [1u8; 16],
-                    sealed: true,
+                    sealed_at: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(10)),
                 },
                 crate::log::LogFileInfo {
+                    version: 1,
                     generation: 2,
                     revision: 0,
                     filename: "000002.log".to_string(),
@@ -1625,7 +1627,7 @@ mod tests {
                     total_bytes: 5000,
                     total_data_bytes: 4096,
                     md5: [2u8; 16],
-                    sealed: false,
+                    sealed_at: None,
                 },
             ],
         };
