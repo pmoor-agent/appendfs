@@ -161,43 +161,31 @@ impl FsInner {
 
     // --- Overlay Query & Resolution Methods ---
 
-    pub fn with_inode_layers<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
-        let base_entry = self.base.get(&ino);
-        let mut deltas = Vec::with_capacity(self.flushing.len() + 1);
-        for batch in self.flushing.iter() {
-            if let Some(entry) = batch.entries.get(&ino) {
-                deltas.push(entry);
-            }
-        }
-        if let Some(entry) = self.live.get(&ino) {
-            deltas.push(entry);
-        }
-
-        let stack = InodeLayerStack {
+    /// `ino` resolved against `base` and the oldest `flushing_layers` batches in `flushing`,
+    /// leaving out the rest of the queue and `live`.
+    fn inode_layers_up_to(&self, ino: u64, flushing_layers: usize) -> InodeLayerStack<'_> {
+        let mut deltas = Vec::with_capacity(flushing_layers + 1);
+        deltas.extend(
+            self.flushing
+                .iter()
+                .take(flushing_layers)
+                .filter_map(|batch| batch.entries.get(&ino)),
+        );
+        InodeLayerStack {
             ino,
-            base: base_entry,
+            base: self.base.get(&ino),
             deltas,
-        };
+        }
+    }
 
+    pub fn with_inode_layers<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
+        let mut stack = self.inode_layers_up_to(ino, self.flushing.len());
+        stack.deltas.extend(self.live.get(&ino));
         f(stack)
     }
 
     pub fn with_inode_layers_below_live<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
-        let base_entry = self.base.get(&ino);
-        let mut deltas = Vec::with_capacity(self.flushing.len());
-        for batch in self.flushing.iter() {
-            if let Some(entry) = batch.entries.get(&ino) {
-                deltas.push(entry);
-            }
-        }
-
-        let stack = InodeLayerStack {
-            ino,
-            base: base_entry,
-            deltas,
-        };
-
-        f(stack)
+        f(self.inode_layers_up_to(ino, self.flushing.len()))
     }
 
     pub fn exists_below_live(&self, ino: u64) -> bool {
@@ -224,18 +212,7 @@ impl FsInner {
     pub fn normalize_directory_deltas(&self, entries: &mut HashMap<u64, EntryDelta>, flushing_index: usize) {
         for (&ino, entry) in entries.iter_mut() {
             if let EntryDelta::Node(NodeDelta::Directory(dir_delta)) = entry {
-                let mut lower_deltas = Vec::with_capacity(flushing_index);
-                for batch in self.flushing.iter().take(flushing_index) {
-                    if let Some(e) = batch.entries.get(&ino) {
-                        lower_deltas.push(e);
-                    }
-                }
-                let stack = InodeLayerStack {
-                    ino,
-                    base: self.base.get(&ino),
-                    deltas: lower_deltas,
-                };
-
+                let stack = self.inode_layers_up_to(ino, flushing_index);
                 if !stack.exists() || stack.file_type() != Some(FileType::Directory) {
                     dir_delta.removed.clear();
                 } else {
