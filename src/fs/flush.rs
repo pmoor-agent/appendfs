@@ -186,16 +186,10 @@ impl InMemoryFS {
             let storage = writer.storage();
             let last_batch_id = writer.last_batch_id();
             match self.export_summary_for_base(storage.as_ref(), sealed_gen, last_batch_id) {
-                Ok(filename) => {
+                Ok(_) => {
                     self.bytes_since_last_summary.store(0, Ordering::SeqCst);
                     self.generations_since_last_summary.store(0, Ordering::SeqCst);
                     self.last_summary_generation.store(sealed_gen, Ordering::SeqCst);
-                    log::info!(
-                        "Exported periodic summary snapshot {} for sealed generation {} (last_batch_id: {})",
-                        filename,
-                        sealed_gen,
-                        last_batch_id
-                    );
                 }
                 Err(e) => {
                     log::warn!(
