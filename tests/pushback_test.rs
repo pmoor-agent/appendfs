@@ -63,19 +63,20 @@ fn test_tier_throttling_decision_logic() {
     {
         let mut inner = fs.inner.lock(OpTag::Test).unwrap();
         let completion = inner.live_completion.clone();
-        inner.flushing.push_back(Arc::new(appendfs::fs::FlushBatch::new(
-            1,
-            std::iter::once((
+        inner.flushing.push_back(Arc::new(appendfs::fs::FlushBatch {
+            id: 1,
+            entries: std::iter::once((
                 1,
                 appendfs::node::EntryDelta::Node(appendfs::node::NodeDelta::Directory(Default::default())),
             ))
             .collect(),
-            appendfs::fs::WriteArena::new(),
-            100,
-            1,
+            arena: appendfs::fs::WriteArena::new(),
+            bytes: 100,
+            ops: 1,
             completion,
-            appendfs::fs::FlushReason::Threshold,
-        )));
+            reason: appendfs::fs::FlushReason::Threshold,
+            frozen_at: std::time::Duration::ZERO,
+        }));
     }
     fs.refresh_pushback_saturation();
 
@@ -240,19 +241,20 @@ fn test_delayed_response_queue_stall_calculation() {
     {
         let mut inner = fs.inner.lock(OpTag::Test).unwrap();
         let completion = inner.live_completion.clone();
-        inner.flushing.push_back(Arc::new(appendfs::fs::FlushBatch::new(
-            1,
-            std::iter::once((
+        inner.flushing.push_back(Arc::new(appendfs::fs::FlushBatch {
+            id: 1,
+            entries: std::iter::once((
                 1,
                 appendfs::node::EntryDelta::Node(appendfs::node::NodeDelta::Directory(Default::default())),
             ))
             .collect(),
-            appendfs::fs::WriteArena::new(),
-            100,
-            1,
+            arena: appendfs::fs::WriteArena::new(),
+            bytes: 100,
+            ops: 1,
             completion,
-            appendfs::fs::FlushReason::Threshold,
-        )));
+            reason: appendfs::fs::FlushReason::Threshold,
+            frozen_at: std::time::Duration::ZERO,
+        }));
         inner.flushing_bytes = 100;
         inner.flushing_ops = 1;
         // Stage 1000 bytes -> hard stall
@@ -337,19 +339,20 @@ fn test_fs_destroy_drains_stalled_waiters_and_completes_cleanly() {
     {
         let mut inner = fs.inner.lock(OpTag::Test).unwrap();
         let completion = inner.live_completion.clone();
-        inner.flushing.push_back(Arc::new(appendfs::fs::FlushBatch::new(
-            1,
-            std::iter::once((
+        inner.flushing.push_back(Arc::new(appendfs::fs::FlushBatch {
+            id: 1,
+            entries: std::iter::once((
                 1,
                 appendfs::node::EntryDelta::Node(appendfs::node::NodeDelta::Directory(Default::default())),
             ))
             .collect(),
-            appendfs::fs::WriteArena::new(),
-            100,
-            1,
+            arena: appendfs::fs::WriteArena::new(),
+            bytes: 100,
+            ops: 1,
             completion,
-            appendfs::fs::FlushReason::Threshold,
-        )));
+            reason: appendfs::fs::FlushReason::Threshold,
+            frozen_at: std::time::Duration::ZERO,
+        }));
         inner.flushing_bytes = 100;
         inner.flushing_ops = 1;
         inner.staged_bytes = 1000;
@@ -419,19 +422,20 @@ fn test_calculate_throttle_is_completely_lock_free() {
     {
         let mut inner = fs.inner.lock(OpTag::Test).unwrap();
         let completion = inner.live_completion.clone();
-        inner.flushing.push_back(Arc::new(appendfs::fs::FlushBatch::new(
-            1,
-            std::iter::once((
+        inner.flushing.push_back(Arc::new(appendfs::fs::FlushBatch {
+            id: 1,
+            entries: std::iter::once((
                 1,
                 appendfs::node::EntryDelta::Node(appendfs::node::NodeDelta::Directory(Default::default())),
             ))
             .collect(),
-            appendfs::fs::WriteArena::new(),
-            100,
-            1,
+            arena: appendfs::fs::WriteArena::new(),
+            bytes: 100,
+            ops: 1,
             completion,
-            appendfs::fs::FlushReason::Threshold,
-        )));
+            reason: appendfs::fs::FlushReason::Threshold,
+            frozen_at: std::time::Duration::ZERO,
+        }));
         inner.flushing_bytes = 100;
         inner.flushing_ops = 1;
         inner.staged_bytes = 500; // ratio = 0.5

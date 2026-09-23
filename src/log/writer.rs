@@ -17,9 +17,6 @@ struct ActiveLogFile {
     record_count: u32,
     total_data_bytes: u64,
     md5_hasher: md5::Context,
-    batch_checkpoint_hasher: Option<md5::Context>,
-    batch_checkpoint_record_count: u32,
-    batch_checkpoint_data_bytes: u64,
 }
 
 impl ActiveLogFile {
@@ -150,6 +147,40 @@ fn seal_and_open_next(
     Ok((next_active, sealed_info))
 }
 
+/// Seals the open generation in `state` if it has committed data, leaving its successor
+/// lazy (unopened) so no file exists for it until something is written.
+///
+/// On failure the writer is left lazy on the successor, as [`seal_and_open_next`] does.
+fn seal_into_lazy(
+    state: &mut ActiveLogState,
+    volume_key: &VolumeKey,
+    clock: &dyn Clock,
+) -> io::Result<Option<super::manifest::LogFileInfo>> {
+    let ActiveLogState::Open(active) = &*state else {
+        return Ok(None);
+    };
+    if active.current_offset <= FILE_HEADER_SIZE as u64 {
+        return Ok(None);
+    }
+    let next_gen = next_generation(active.generation)?;
+    let ActiveLogState::Open(active) = std::mem::replace(
+        state,
+        ActiveLogState::Unopened {
+            generation: next_gen,
+            created_at: None,
+        },
+    ) else {
+        unreachable!();
+    };
+    let sealed_info = active.seal(volume_key, clock.now())?;
+    log::info!(
+        "Sealed log generation {}, next generation {} is lazy (unopened)",
+        sealed_info.generation,
+        next_gen
+    );
+    Ok(Some(sealed_info))
+}
+
 /// The generation following `generation`, or an error at the end of the sequence.
 ///
 /// A generation is a `u32` everywhere it appears, which is what lets the record nonce carry
@@ -194,19 +225,38 @@ fn open_generation_file(
         record_count: 0,
         total_data_bytes: 0,
         md5_hasher,
-        batch_checkpoint_hasher: None,
-        batch_checkpoint_record_count: 0,
-        batch_checkpoint_data_bytes: 0,
     })
 }
 
 use crate::crypto::VolumeKey;
 
+/// Point-in-time snapshot of [`LogWriter`] state for atomic rollback on write failures.
+#[derive(Clone)]
+pub struct LogCheckpoint {
+    pub generation: u32,
+    pub offset: u64,
+    pub batch_id: u64,
+    hasher: Option<md5::Context>,
+    record_count: u32,
+    total_data_bytes: u64,
+}
+
+impl std::fmt::Debug for LogCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogCheckpoint")
+            .field("generation", &self.generation)
+            .field("offset", &self.offset)
+            .field("batch_id", &self.batch_id)
+            .field("record_count", &self.record_count)
+            .field("total_data_bytes", &self.total_data_bytes)
+            .finish()
+    }
+}
+
 /// Active log writer managing append-only writes to generation log files with automatic rolling.
 pub struct LogWriter {
     active_state: Mutex<ActiveLogState>,
     batch_id: AtomicU64,
-    batch_checkpoint_batch_id: AtomicU64,
     storage: Arc<dyn Storage>,
     max_log_size: u64,
     max_log_age: Option<std::time::Duration>,
@@ -243,7 +293,6 @@ impl LogWriter {
         Ok(Self {
             active_state: Mutex::new(ActiveLogState::Open(active_file)),
             batch_id: AtomicU64::new(start_batch_id),
-            batch_checkpoint_batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
@@ -269,7 +318,6 @@ impl LogWriter {
                 created_at: None,
             }),
             batch_id: AtomicU64::new(start_batch_id),
-            batch_checkpoint_batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
@@ -296,7 +344,6 @@ impl LogWriter {
                 created_at: Some(clock.now()),
             }),
             batch_id: AtomicU64::new(start_batch_id),
-            batch_checkpoint_batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
@@ -337,134 +384,53 @@ impl LogWriter {
         matches!(*state, ActiveLogState::Open(_))
     }
 
-    /// Rolls to a new generation log file (or opens the initial lazy log file) if needed.
-    /// Returns the sealed `LogFileInfo` if a rollover occurred.
-    pub fn roll_if_needed(
-        &self,
-        estimated_additional_bytes: u64,
-        clock: &dyn Clock,
-    ) -> io::Result<Option<super::manifest::LogFileInfo>> {
+    /// Seals the active generation if it has reached `max_log_size` or `max_log_age`, leaving
+    /// its successor lazy (unopened) until [`LogWriter::open_if_unopened`] has something to
+    /// write to it. Returns the sealed `LogFileInfo` if a rollover occurred.
+    ///
+    /// The flusher runs this after every synced group and at the end of every cycle, including
+    /// idle ones, so an untouched filesystem still seals its generation on schedule. Leaving the
+    /// successor unopened means neither an idle filesystem nor a shutdown drain leaves empty
+    /// log files behind.
+    ///
+    /// `max_log_size` is a soft limit: this runs after a batch group has been written, not
+    /// before, so the group that crosses `max_log_size` lands in full. A single batch can be
+    /// as large as the flush threshold (`--flush-threshold`, 128 MiB by default), and up to
+    /// about twice that when a slow flush lets staged writes pile up, so a generation can
+    /// overshoot by that much before it is rolled.
+    pub fn roll_if_needed(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-
-        match &*state {
-            ActiveLogState::Unopened { .. } => {}
-            ActiveLogState::Open(active) => {
-                let size_exceeded = active.current_offset > FILE_HEADER_SIZE as u64
-                    && active.current_offset + estimated_additional_bytes > self.max_log_size;
-
-                let age_exceeded = if let Some(max_age) = self.max_log_age {
-                    active.current_offset > FILE_HEADER_SIZE as u64
-                        && clock.now().duration_since(active.created_at).unwrap_or_default() >= max_age
-                } else {
-                    false
-                };
-
-                if !size_exceeded && !age_exceeded {
-                    return Ok(None);
-                }
-            }
-        }
-
-        let old_state = std::mem::replace(
-            &mut *state,
-            ActiveLogState::Unopened {
-                generation: 0,
-                created_at: None,
-            },
-        );
-
-        match old_state {
-            ActiveLogState::Unopened { generation, created_at } => {
-                let gen_num = generation;
-                let c_time = created_at.unwrap_or_else(|| clock.now());
-                match open_generation_file(&self.storage, gen_num, c_time) {
-                    Ok(active_file) => {
-                        *state = ActiveLogState::Open(active_file);
-                        log::info!("Lazily opened log file for generation {}", gen_num);
-                        Ok(None)
-                    }
-                    Err(e) => {
-                        *state = ActiveLogState::Unopened {
-                            generation: gen_num,
-                            created_at,
-                        };
-                        Err(e)
-                    }
-                }
-            }
-            ActiveLogState::Open(active) => {
-                let next_gen = next_generation(active.generation)?;
-                match seal_and_open_next(active, &self.storage, &self.volume_key, clock, "Rolled") {
-                    Ok((next_active, sealed_info)) => {
-                        *state = ActiveLogState::Open(next_active);
-                        Ok(Some(sealed_info))
-                    }
-                    Err(e) => {
-                        *state = ActiveLogState::Unopened {
-                            generation: next_gen,
-                            created_at: None,
-                        };
-                        Err(e)
-                    }
-                }
-            }
-        }
-    }
-
-    /// Rolls the active generation if it has been open longer than `max_log_age`, ignoring
-    /// its size, putting the writer into lazy mode so the new generation file is not opened
-    /// until the next write.
-    ///
-    /// The flusher runs this at the end of every cycle, including the idle ones, so an
-    /// untouched filesystem still seals its generation on schedule. Leaving the successor
-    /// unopened (lazy) ensures an idle filesystem does not generate empty log files over time.
-    pub fn roll_if_aged(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
-        let Some(max_age) = self.max_log_age else {
+        let ActiveLogState::Open(active) = &*state else {
             return Ok(None);
         };
+        let size_exceeded = active.current_offset >= self.max_log_size;
+        let age_exceeded = self
+            .max_log_age
+            .is_some_and(|max_age| clock.now().duration_since(active.created_at).unwrap_or_default() >= max_age);
+        if !size_exceeded && !age_exceeded {
+            return Ok(None);
+        }
+        seal_into_lazy(&mut state, &self.volume_key, clock)
+    }
+
+    /// Ensures that the active log file is open. If it is currently lazy/unopened,
+    /// opens it using the provided clock.
+    pub fn open_if_unopened(&self, clock: &dyn Clock) -> io::Result<()> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
 
-        match &*state {
-            // Nothing written yet, so there is nothing to seal.
-            ActiveLogState::Unopened { .. } => return Ok(None),
-            ActiveLogState::Open(active) => {
-                if active.current_offset <= FILE_HEADER_SIZE as u64
-                    || clock.now().duration_since(active.created_at).unwrap_or_default() < max_age
-                {
-                    return Ok(None);
-                }
-            }
+        if let ActiveLogState::Unopened { generation, created_at } = *state {
+            let c_time = created_at.unwrap_or_else(|| clock.now());
+            let active_file = open_generation_file(&self.storage, generation, c_time)?;
+            *state = ActiveLogState::Open(active_file);
+            log::info!("Lazily opened log file for generation {}", generation);
         }
-
-        let old_state = std::mem::replace(
-            &mut *state,
-            ActiveLogState::Unopened {
-                generation: 0,
-                created_at: None,
-            },
-        );
-        let ActiveLogState::Open(active) = old_state else {
-            unreachable!();
-        };
-
-        let next_gen = next_generation(active.generation)?;
-        let sealed_info = active.seal(&self.volume_key, clock.now())?;
-        log::info!(
-            "Age-rolled log file: sealed generation {}, next generation {} is lazy (unopened)",
-            sealed_info.generation,
-            next_gen
-        );
-        *state = ActiveLogState::Unopened {
-            generation: next_gen,
-            created_at: None,
-        };
-        Ok(Some(sealed_info))
+        Ok(())
     }
 
     /// Forcefully rolls the active generation file to `generation + 1` if it has committed data,
@@ -519,53 +485,34 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-
-        match &*state {
-            ActiveLogState::Unopened { .. } => return Ok(None),
-            ActiveLogState::Open(active) => {
-                if active.current_offset <= FILE_HEADER_SIZE as u64 {
-                    return Ok(None);
-                }
-            }
-        }
-
-        let old_state = std::mem::replace(
-            &mut *state,
-            ActiveLogState::Unopened {
-                generation: 0,
-                created_at: None,
-            },
-        );
-        let ActiveLogState::Open(active) = old_state else {
-            unreachable!();
-        };
-
-        let next_gen = next_generation(active.generation)?;
-        let sealed_info = active.seal(&self.volume_key, clock.now())?;
-        log::info!(
-            "Sealed active log generation {}, next generation {} is lazy (unopened)",
-            sealed_info.generation,
-            next_gen
-        );
-        *state = ActiveLogState::Unopened {
-            generation: next_gen,
-            created_at: None,
-        };
-        Ok(Some(sealed_info))
+        seal_into_lazy(&mut state, &self.volume_key, clock)
     }
 
-    /// Checkpoints the running MD5 hasher, counters, and batch_id at the beginning of a flush batch for rollback safety.
-    pub fn checkpoint_batch_start(&self) {
-        self.batch_checkpoint_batch_id
-            .store(self.batch_id.load(Ordering::SeqCst), Ordering::SeqCst);
-        let mut state = match self.active_state.lock() {
+    /// Captures a point-in-time snapshot of the log writer state (generation, offset,
+    /// batch_id, record counters, and MD5 hasher) that can be restored via [`LogWriter::rollback_to`].
+    pub fn checkpoint(&self) -> LogCheckpoint {
+        let batch_id = self.batch_id.load(Ordering::SeqCst);
+        let state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        if let ActiveLogState::Open(active) = &mut *state {
-            active.batch_checkpoint_hasher = Some(active.md5_hasher.clone());
-            active.batch_checkpoint_record_count = active.record_count;
-            active.batch_checkpoint_data_bytes = active.total_data_bytes;
+        match &*state {
+            ActiveLogState::Unopened { generation, .. } => LogCheckpoint {
+                generation: *generation,
+                offset: 0,
+                batch_id,
+                hasher: None,
+                record_count: 0,
+                total_data_bytes: 0,
+            },
+            ActiveLogState::Open(active) => LogCheckpoint {
+                generation: active.generation,
+                offset: active.current_offset,
+                batch_id,
+                hasher: Some(active.md5_hasher.clone()),
+                record_count: active.record_count,
+                total_data_bytes: active.total_data_bytes,
+            },
         }
     }
 
@@ -595,39 +542,38 @@ impl LogWriter {
         active.append_record(&self.volume_key, self.compression, op_code, inode, payload)
     }
 
-    /// Rolls back the active log file to `offset` if it is currently in `generation`
-    /// and its offset is past `offset`. Truncates the underlying file on disk and seeks back.
-    pub fn rollback_to(&self, generation: u32, offset: u64) -> io::Result<()> {
+    /// Rolls back the active log file to the given `checkpoint`.
+    ///
+    /// Truncates the underlying file on disk back to `checkpoint.offset`, restoring
+    /// the running MD5 hasher, counters, and next `batch_id`.
+    pub fn rollback_to(&self, checkpoint: &LogCheckpoint) -> io::Result<()> {
+        self.batch_id.store(checkpoint.batch_id, Ordering::SeqCst);
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
         if let ActiveLogState::Open(active) = &mut *state
-            && active.generation == generation
-            && active.current_offset > offset
+            && active.generation == checkpoint.generation
+            && active.current_offset > checkpoint.offset
         {
-            let _ = active.writer.truncate(offset);
-            active.current_offset = offset;
-            if let Some(ref checkpoint) = active.batch_checkpoint_hasher {
-                active.md5_hasher = checkpoint.clone();
+            let res = active.writer.truncate(checkpoint.offset);
+            active.current_offset = checkpoint.offset;
+            if let Some(ref h) = checkpoint.hasher {
+                active.md5_hasher = h.clone();
             }
-            active.record_count = active.batch_checkpoint_record_count;
-            active.total_data_bytes = active.batch_checkpoint_data_bytes;
+            active.record_count = checkpoint.record_count;
+            active.total_data_bytes = checkpoint.total_data_bytes;
+            res?;
         }
-        self.batch_id
-            .store(self.batch_checkpoint_batch_id.load(Ordering::SeqCst), Ordering::SeqCst);
         Ok(())
     }
 
-    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records, flushes
-    /// to persistent media, and updates active log record and data byte counters.
+    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records,
+    /// and updates active log record and data byte counters.
     /// Assigns and returns the next monotonic `batch_id`.
-    pub fn emit_flush_commit_and_flush(
-        &self,
-        record_count: u32,
-        data_bytes: u64,
-        clock: &dyn Clock,
-    ) -> io::Result<u64> {
+    ///
+    /// Note: To physically sync records through to durable media, call [`LogWriter::flush`].
+    pub fn emit_flush_commit(&self, record_count: u32, data_bytes: u64, clock: &dyn Clock) -> io::Result<u64> {
         let batch_id = self.batch_id.fetch_add(1, Ordering::SeqCst);
         let now = clock.now();
         let commit_payload = FlushCommitPayload {
@@ -643,8 +589,6 @@ impl LogWriter {
             self.batch_id.store(batch_id, Ordering::SeqCst);
             return Err(e);
         }
-
-        self.flush()?;
 
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
@@ -838,12 +782,12 @@ mod tests {
     fn test_roll_if_needed_rolls_between_batches() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 60, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 40, 1, VolumeKey::plaintext_arc()).unwrap();
 
         writer.append_record(OpCode::Data, 1, b"0123456789").unwrap();
         assert_eq!(writer.generation(), 1);
 
-        writer.roll_if_needed(1000, &clock).unwrap();
+        writer.roll_if_needed(&clock).unwrap();
         assert_eq!(writer.generation(), 2);
 
         let (gen_num, _, _) = writer.append_record(OpCode::Data, 2, b"0123456789").unwrap();
@@ -851,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_flush_commit_and_flush_round_trip() {
+    fn test_emit_flush_commit_round_trip() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
         let writer = LogWriter::create(
@@ -866,7 +810,8 @@ mod tests {
 
         writer.append_record(OpCode::InodeDelta, 1, b"payload").unwrap();
         writer.append_record(OpCode::Data, 1, b"more").unwrap();
-        let committed_batch_id = writer.emit_flush_commit_and_flush(2, 4, &clock).unwrap();
+        let committed_batch_id = writer.emit_flush_commit(2, 4, &clock).unwrap();
+        writer.flush().unwrap();
         assert_eq!(committed_batch_id, 1);
 
         let records: Vec<_> = LogReader::open(storage.as_ref(), &writer.filename(), VolumeKey::plaintext_arc())
@@ -891,12 +836,16 @@ mod tests {
         assert_eq!(writer.generation(), 1);
         assert!(!storage.exists("000001.log"));
 
-        let opened_gen = writer.roll_if_needed(100, &clock).unwrap();
-        assert_eq!(opened_gen, None);
+        // Nothing to seal, and rolling is not what opens a lazy generation.
+        assert_eq!(writer.roll_if_needed(&clock).unwrap(), None);
+        assert!(!writer.is_open());
+        assert!(!storage.exists("000001.log"));
+
+        writer.open_if_unopened(&clock).unwrap();
         assert!(writer.is_open());
         assert!(storage.exists("000001.log"));
 
-        let no_roll = writer.roll_if_needed(100, &clock).unwrap();
+        let no_roll = writer.roll_if_needed(&clock).unwrap();
         assert_eq!(no_roll, None);
     }
 
@@ -910,10 +859,11 @@ mod tests {
         writer
             .append_record(OpCode::InodeDelta, 1, b"second record payload")
             .unwrap();
-        writer.emit_flush_commit_and_flush(2, 20, &clock).unwrap();
+        writer.emit_flush_commit(2, 20, &clock).unwrap();
+        writer.flush().unwrap();
 
         // Roll to generation 2 -> returns sealed LogFileInfo
-        let roll_res = writer.roll_if_needed(1000, &clock).unwrap();
+        let roll_res = writer.roll_if_needed(&clock).unwrap();
         let sealed_info = roll_res.unwrap();
         assert_eq!(sealed_info.generation, 1);
         assert_eq!(sealed_info.record_count, 3);
@@ -941,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn test_roll_if_aged_puts_writer_in_lazy_mode_and_does_not_open_file() {
+    fn test_roll_if_needed_on_age_puts_writer_in_lazy_mode_and_does_not_open_file() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = AdvancingClock::new(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
         let writer = LogWriter::create(
@@ -959,9 +909,9 @@ mod tests {
         assert_eq!(writer.generation(), 1);
         assert!(storage.exists("000001.log"));
 
-        // No user records yet: current_offset <= FILE_HEADER_SIZE, so roll_if_aged does not roll
+        // No user records yet: current_offset <= FILE_HEADER_SIZE, so roll_if_needed does not roll
         clock.advance(std::time::Duration::from_secs(3601));
-        let rolled = writer.roll_if_aged(&clock).unwrap();
+        let rolled = writer.roll_if_needed(&clock).unwrap();
         assert!(rolled.is_none());
         assert_eq!(writer.generation(), 1);
 
@@ -969,7 +919,7 @@ mod tests {
         writer.append_record(OpCode::Data, 10, b"some data").unwrap();
 
         // Aged out now: rolls, seals generation 1, and leaves generation 2 in lazy mode
-        let rolled = writer.roll_if_aged(&clock).unwrap();
+        let rolled = writer.roll_if_needed(&clock).unwrap();
         assert!(rolled.is_some());
         let sealed_info = rolled.unwrap();
         assert_eq!(sealed_info.generation, 1);
@@ -987,7 +937,7 @@ mod tests {
 
         // Additional age-checks while lazy must do nothing and not create files
         clock.advance(std::time::Duration::from_secs(3600 * 24 * 7));
-        assert!(writer.roll_if_aged(&clock).unwrap().is_none());
+        assert!(writer.roll_if_needed(&clock).unwrap().is_none());
         assert!(!writer.is_open());
         assert!(!storage.exists("000002.log"));
         assert!(!storage.exists("000003.log"));
@@ -1022,26 +972,69 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
         let writer = LogWriter::create(storage.clone(), 1, &clock, 1000, 1, VolumeKey::plaintext_arc()).unwrap();
-        let initial_offset = writer.current_offset();
 
         // Checkpoint before batch starts at batch_id = 1
-        writer.checkpoint_batch_start();
+        let checkpoint1 = writer.checkpoint();
 
         // Write some records and emit flush commit
         writer.append_record(OpCode::Data, 1, b"batch data").unwrap();
-        let committed_id = writer.emit_flush_commit_and_flush(1, 10, &clock).unwrap();
+        let committed_id = writer.emit_flush_commit(1, 10, &clock).unwrap();
+        writer.flush().unwrap();
         assert_eq!(committed_id, 1);
         assert_eq!(writer.last_batch_id(), 1);
 
-        // Simulate flush failure: rollback to initial_offset
-        writer.rollback_to(1, initial_offset).unwrap();
+        // Simulate flush failure: rollback to checkpoint1
+        writer.rollback_to(&checkpoint1).unwrap();
         assert_eq!(writer.last_batch_id(), 0);
 
         // Retrying the batch should re-use batch_id 1
-        writer.checkpoint_batch_start();
+        let checkpoint2 = writer.checkpoint();
+        assert_eq!(checkpoint2.offset, checkpoint1.offset);
+        assert_eq!(checkpoint2.batch_id, 1);
         writer.append_record(OpCode::Data, 1, b"batch data retry").unwrap();
-        let retried_id = writer.emit_flush_commit_and_flush(1, 16, &clock).unwrap();
+        let retried_id = writer.emit_flush_commit(1, 16, &clock).unwrap();
+        writer.flush().unwrap();
         assert_eq!(retried_id, 1);
         assert_eq!(writer.last_batch_id(), 1);
+    }
+
+    #[test]
+    fn test_multiple_independent_checkpoints() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = SystemClock;
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 10000, 1, VolumeKey::plaintext_arc()).unwrap();
+
+        // Checkpoint A (before batch 1)
+        let cp_a = writer.checkpoint();
+
+        writer.append_record(OpCode::Data, 1, b"batch 1 data").unwrap();
+        let b1 = writer.emit_flush_commit(1, 12, &clock).unwrap();
+        assert_eq!(b1, 1);
+
+        // Checkpoint B (after batch 1, before batch 2)
+        let cp_b = writer.checkpoint();
+        assert_eq!(cp_b.batch_id, 2);
+        assert!(cp_b.offset > cp_a.offset);
+
+        writer.append_record(OpCode::Data, 2, b"batch 2 data").unwrap();
+        let b2 = writer.emit_flush_commit(1, 12, &clock).unwrap();
+        assert_eq!(b2, 2);
+
+        // Checkpoint C (after batch 2, before batch 3)
+        let cp_c = writer.checkpoint();
+        assert_eq!(cp_c.batch_id, 3);
+        assert!(cp_c.offset > cp_b.offset);
+
+        writer.append_record(OpCode::Data, 3, b"batch 3 partial").unwrap();
+
+        // Roll back to CP B: should restore to end of batch 1
+        writer.rollback_to(&cp_b).unwrap();
+        assert_eq!(writer.current_offset(), cp_b.offset);
+        assert_eq!(writer.last_batch_id(), 1);
+
+        // Further roll back to CP A: should restore to before batch 1
+        writer.rollback_to(&cp_a).unwrap();
+        assert_eq!(writer.current_offset(), cp_a.offset);
+        assert_eq!(writer.last_batch_id(), 0);
     }
 }
