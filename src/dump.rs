@@ -158,9 +158,15 @@ pub fn dump_log_reader_with_path(
         WriteBucket::new("< 64 B", 0, 63),
         WriteBucket::new("64 B .. 511 B", 64, 511),
         WriteBucket::new("512 B .. 4 KiB", 512, 4095),
-        WriteBucket::new("4 KiB .. 64 KiB", 4096, 65535),
-        WriteBucket::new("64 KiB .. 1 MiB", 65536, 1048575),
-        WriteBucket::new("> 1 MiB", 1048576, u64::MAX),
+        WriteBucket::new("4 KiB .. 16 KiB", 4096, 16383),
+        WriteBucket::new("16 KiB .. 64 KiB", 16384, 65535),
+        WriteBucket::new("64 KiB .. 256 KiB", 65536, 262143),
+        WriteBucket::new("256 KiB .. 512 KiB", 262144, 524287),
+        WriteBucket::new("512 KiB .. 1 MiB", 524288, 1048575),
+        WriteBucket::new("1 MiB .. 2 MiB", 1048576, 2097151),
+        WriteBucket::new("2 MiB .. 3 MiB", 2097152, 3145727),
+        WriteBucket::new("3 MiB .. 4 MiB", 3145728, 4194304),
+        WriteBucket::new("> 4 MiB", 4194305, u64::MAX),
     ];
 
     let mut total_flush_batches = 0usize;
@@ -2004,5 +2010,50 @@ mod tests {
             "{:<14} {:>10} {:>12} {:>14} {:>12}",
             "Seal", 0, "0.0%", "0 B", "0.0%"
         )));
+    }
+
+    #[test]
+    fn test_write_payload_size_histogram_bucket_ranges() {
+        let buckets = vec![
+            WriteBucket::new("< 64 B", 0, 63),
+            WriteBucket::new("64 B .. 511 B", 64, 511),
+            WriteBucket::new("512 B .. 4 KiB", 512, 4095),
+            WriteBucket::new("4 KiB .. 16 KiB", 4096, 16383),
+            WriteBucket::new("16 KiB .. 64 KiB", 16384, 65535),
+            WriteBucket::new("64 KiB .. 256 KiB", 65536, 262143),
+            WriteBucket::new("256 KiB .. 512 KiB", 262144, 524287),
+            WriteBucket::new("512 KiB .. 1 MiB", 524288, 1048575),
+            WriteBucket::new("1 MiB .. 2 MiB", 1048576, 2097151),
+            WriteBucket::new("2 MiB .. 3 MiB", 2097152, 3145727),
+            WriteBucket::new("3 MiB .. 4 MiB", 3145728, 4194304),
+            WriteBucket::new("> 4 MiB", 4194305, u64::MAX),
+        ];
+
+        let find_bucket = |size: u64| -> &'static str { buckets.iter().find(|b| b.matches(size)).unwrap().label };
+
+        assert_eq!(find_bucket(0), "< 64 B");
+        assert_eq!(find_bucket(63), "< 64 B");
+        assert_eq!(find_bucket(64), "64 B .. 511 B");
+        assert_eq!(find_bucket(511), "64 B .. 511 B");
+        assert_eq!(find_bucket(512), "512 B .. 4 KiB");
+        assert_eq!(find_bucket(4095), "512 B .. 4 KiB");
+        assert_eq!(find_bucket(4096), "4 KiB .. 16 KiB");
+        assert_eq!(find_bucket(16383), "4 KiB .. 16 KiB");
+        assert_eq!(find_bucket(16384), "16 KiB .. 64 KiB");
+        assert_eq!(find_bucket(65535), "16 KiB .. 64 KiB");
+        assert_eq!(find_bucket(65536), "64 KiB .. 256 KiB");
+        assert_eq!(find_bucket(262143), "64 KiB .. 256 KiB");
+        assert_eq!(find_bucket(262144), "256 KiB .. 512 KiB");
+        assert_eq!(find_bucket(524287), "256 KiB .. 512 KiB");
+        assert_eq!(find_bucket(524288), "512 KiB .. 1 MiB");
+        assert_eq!(find_bucket(1048575), "512 KiB .. 1 MiB");
+        assert_eq!(find_bucket(1048576), "1 MiB .. 2 MiB");
+        assert_eq!(find_bucket(2097151), "1 MiB .. 2 MiB");
+        assert_eq!(find_bucket(2097152), "2 MiB .. 3 MiB");
+        assert_eq!(find_bucket(3145727), "2 MiB .. 3 MiB");
+        assert_eq!(find_bucket(3145728), "3 MiB .. 4 MiB");
+        assert_eq!(find_bucket(4194304), "3 MiB .. 4 MiB");
+        assert_eq!(find_bucket(4194305), "> 4 MiB");
+        assert_eq!(find_bucket(10 * 1024 * 1024), "> 4 MiB");
     }
 }
