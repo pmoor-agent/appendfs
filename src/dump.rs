@@ -155,12 +155,18 @@ pub fn dump_log_reader_with_path(
 
     let mut op_counts: [OpCodeStats; 6] = Default::default();
     let mut write_buckets = vec![
-        WriteBucket::new("< 64 B", 0, 63),
-        WriteBucket::new("64 B .. 511 B", 64, 511),
-        WriteBucket::new("512 B .. 4 KiB", 512, 4095),
-        WriteBucket::new("4 KiB .. 64 KiB", 4096, 65535),
-        WriteBucket::new("64 KiB .. 1 MiB", 65536, 1048575),
-        WriteBucket::new("> 1 MiB", 1048576, u64::MAX),
+        WriteBucket::new("[0, 64 B]", 0, 64),
+        WriteBucket::new("(64 B, 512 B]", 65, 512),
+        WriteBucket::new("(512 B, 4 KiB]", 513, 4096),
+        WriteBucket::new("(4 KiB, 16 KiB]", 4097, 16384),
+        WriteBucket::new("(16 KiB, 64 KiB]", 16385, 65536),
+        WriteBucket::new("(64 KiB, 256 KiB]", 65537, 262144),
+        WriteBucket::new("(256 KiB, 512 KiB]", 262145, 524288),
+        WriteBucket::new("(512 KiB, 1 MiB]", 524289, 1048576),
+        WriteBucket::new("(1 MiB, 2 MiB]", 1048577, 2097152),
+        WriteBucket::new("(2 MiB, 3 MiB]", 2097153, 3145728),
+        WriteBucket::new("(3 MiB, 4 MiB]", 3145729, 4194304),
+        WriteBucket::new("> 4 MiB", 4194305, u64::MAX),
     ];
 
     let mut total_flush_batches = 0usize;
@@ -408,33 +414,41 @@ pub fn dump_log_reader_with_path(
     writeln!(out, "--- Record Breakdown by OpCode ---").unwrap();
     writeln!(
         out,
-        "{:<14} {:>10} {:>14} {:>12}",
-        "OP CODE", "COUNT", "TOTAL BYTES", "% OF RECORDS"
+        "{:<14} {:>10} {:>12} {:>14} {:>12}",
+        "OP CODE", "COUNT", "% OF RECORDS", "TOTAL BYTES", "% OF BYTES"
     )
     .unwrap();
-    writeln!(out, "{:-<14} {:-<10} {:-<14} {:-<12}", "", "", "", "").unwrap();
+    writeln!(out, "{:-<14} {:-<10} {:-<12} {:-<14} {:-<12}", "", "", "", "", "").unwrap();
 
     let total_valid = records
         .iter()
         .filter(|r| matches!(r, DumpRecordEntry::Valid { .. }))
         .count();
+    let total_payload_bytes: u64 = op_counts.iter().map(|s| s.payload_bytes).sum();
 
     for code in 1..=5u8 {
         if let Ok(opcode) = OpCode::try_from(code) {
             let stats = &op_counts[code as usize];
-            let pct = if total_valid > 0 {
+            let rec_pct = if total_valid > 0 {
                 stats.count as f64 / total_valid as f64 * 100.0
             } else {
                 0.0
             };
-            let pct_str = format!("{:.1}%", pct);
+            let byte_pct = if total_payload_bytes > 0 {
+                stats.payload_bytes as f64 / total_payload_bytes as f64 * 100.0
+            } else {
+                0.0
+            };
+            let rec_pct_str = format!("{:.1}%", rec_pct);
+            let byte_pct_str = format!("{:.1}%", byte_pct);
             writeln!(
                 out,
-                "{:<14} {:>10} {:>14} {:>12}",
+                "{:<14} {:>10} {:>12} {:>14} {:>12}",
                 opcode,
                 stats.count,
+                rec_pct_str,
                 format_bytes(stats.payload_bytes),
-                pct_str
+                byte_pct_str
             )
             .unwrap();
         }
@@ -510,11 +524,11 @@ pub fn dump_log_reader_with_path(
         writeln!(out, "--- Write Payload Size Histogram ---").unwrap();
         writeln!(
             out,
-            "{:<18} {:>8} {:>14}   DISTRIBUTION",
+            "{:<20} {:>8} {:>14}   DISTRIBUTION",
             "SIZE RANGE", "COUNT", "TOTAL BYTES"
         )
         .unwrap();
-        writeln!(out, "{:-<18} {:-<8} {:-<14}   {:-<20}", "", "", "", "").unwrap();
+        writeln!(out, "{:-<20} {:-<8} {:-<14}   {:-<20}", "", "", "", "").unwrap();
 
         for b in &write_buckets {
             let pct = (b.count as f64 / total_writes as f64) * 100.0;
@@ -522,7 +536,7 @@ pub fn dump_log_reader_with_path(
             let bar: String = "█".repeat(bar_len);
             writeln!(
                 out,
-                "{:<18} {:>8} {:>14}   {:<20} ({:.1}%)",
+                "{:<20} {:>8} {:>14}   {:<20} ({:.1}%)",
                 b.label,
                 b.count,
                 format_bytes(b.total_bytes),
@@ -1482,7 +1496,7 @@ mod tests {
         assert!(summary_dump.contains("Committed Flushes:   1"));
         assert!(summary_dump.contains("Trailing Batch:      None"));
         assert!(summary_dump.contains("Data"));
-        assert!(summary_dump.contains("64 B .. 511 B"));
+        assert!(summary_dump.contains("(64 B, 512 B]"));
 
         // Level 1: Records
         let v1_dump = dump_log_file(storage.as_ref(), "000001.log", 1, None).unwrap();
@@ -1922,5 +1936,124 @@ mod tests {
         // Level 2 dump with key: should decrypt, decompress, and hex dump
         let v2_unlocked = dump_log_file(storage.as_ref(), "000001.log", 2, Some(&vol_key)).unwrap();
         assert!(v2_unlocked.contains("Repeating encryp"));
+    }
+
+    #[test]
+    fn test_dump_log_file_breakdown_table_percentages() {
+        use crate::log::record::{LogAttrDelta, LogDirectoryDelta, LogEntryDelta, LogNodeDelta};
+
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(OsStorage::new(dir.path()));
+        let clock = SystemClock;
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            &clock,
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        let dir_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta {
+            parent: Some(1),
+            added: vec![("a.txt".to_string(), 2)],
+            removed: vec![],
+            attr_delta: LogAttrDelta::default(),
+        }));
+        let delta_bytes = crate::wire::serialize(&dir_delta).unwrap();
+        let delta_len = delta_bytes.len() as u64;
+        writer.append_record(OpCode::InodeDelta, 1, &delta_bytes).unwrap();
+
+        let data_bytes = vec![0xAB; 200];
+        writer.append_record(OpCode::Data, 2, &data_bytes).unwrap();
+
+        writer.emit_flush_commit(2, 200, &clock).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let dump = dump_log_file(storage.as_ref(), "000001.log", 0, None).unwrap();
+
+        assert!(dump.contains("OP CODE             COUNT % OF RECORDS    TOTAL BYTES   % OF BYTES"));
+        assert!(dump.contains("-------------- ---------- ------------ -------------- ------------"));
+
+        let total_bytes = delta_len + 200 + 24;
+        let data_byte_pct = (200.0 / total_bytes as f64) * 100.0;
+        let delta_byte_pct = (delta_len as f64 / total_bytes as f64) * 100.0;
+        let commit_byte_pct = (24.0 / total_bytes as f64) * 100.0;
+
+        assert!(dump.contains(&format!(
+            "{:<14} {:>10} {:>12} {:>14} {:>12}",
+            "Data",
+            1,
+            "33.3%",
+            "200 B",
+            format!("{:.1}%", data_byte_pct)
+        )));
+        assert!(dump.contains(&format!(
+            "{:<14} {:>10} {:>12} {:>14} {:>12}",
+            "InodeDelta",
+            1,
+            "33.3%",
+            format_bytes(delta_len),
+            format!("{:.1}%", delta_byte_pct)
+        )));
+        assert!(dump.contains(&format!(
+            "{:<14} {:>10} {:>12} {:>14} {:>12}",
+            "FlushCommit",
+            1,
+            "33.3%",
+            "24 B",
+            format!("{:.1}%", commit_byte_pct)
+        )));
+        assert!(dump.contains(&format!(
+            "{:<14} {:>10} {:>12} {:>14} {:>12}",
+            "Seal", 0, "0.0%", "0 B", "0.0%"
+        )));
+    }
+
+    #[test]
+    fn test_write_payload_size_histogram_bucket_ranges() {
+        let buckets = vec![
+            WriteBucket::new("[0, 64 B]", 0, 64),
+            WriteBucket::new("(64 B, 512 B]", 65, 512),
+            WriteBucket::new("(512 B, 4 KiB]", 513, 4096),
+            WriteBucket::new("(4 KiB, 16 KiB]", 4097, 16384),
+            WriteBucket::new("(16 KiB, 64 KiB]", 16385, 65536),
+            WriteBucket::new("(64 KiB, 256 KiB]", 65537, 262144),
+            WriteBucket::new("(256 KiB, 512 KiB]", 262145, 524288),
+            WriteBucket::new("(512 KiB, 1 MiB]", 524289, 1048576),
+            WriteBucket::new("(1 MiB, 2 MiB]", 1048577, 2097152),
+            WriteBucket::new("(2 MiB, 3 MiB]", 2097153, 3145728),
+            WriteBucket::new("(3 MiB, 4 MiB]", 3145729, 4194304),
+            WriteBucket::new("> 4 MiB", 4194305, u64::MAX),
+        ];
+
+        let find_bucket = |size: u64| -> &'static str { buckets.iter().find(|b| b.matches(size)).unwrap().label };
+
+        assert_eq!(find_bucket(0), "[0, 64 B]");
+        assert_eq!(find_bucket(64), "[0, 64 B]");
+        assert_eq!(find_bucket(65), "(64 B, 512 B]");
+        assert_eq!(find_bucket(512), "(64 B, 512 B]");
+        assert_eq!(find_bucket(513), "(512 B, 4 KiB]");
+        assert_eq!(find_bucket(4096), "(512 B, 4 KiB]");
+        assert_eq!(find_bucket(4097), "(4 KiB, 16 KiB]");
+        assert_eq!(find_bucket(16384), "(4 KiB, 16 KiB]");
+        assert_eq!(find_bucket(16385), "(16 KiB, 64 KiB]");
+        assert_eq!(find_bucket(65536), "(16 KiB, 64 KiB]");
+        assert_eq!(find_bucket(65537), "(64 KiB, 256 KiB]");
+        assert_eq!(find_bucket(262144), "(64 KiB, 256 KiB]");
+        assert_eq!(find_bucket(262145), "(256 KiB, 512 KiB]");
+        assert_eq!(find_bucket(524288), "(256 KiB, 512 KiB]");
+        assert_eq!(find_bucket(524289), "(512 KiB, 1 MiB]");
+        assert_eq!(find_bucket(1048576), "(512 KiB, 1 MiB]");
+        assert_eq!(find_bucket(1048577), "(1 MiB, 2 MiB]");
+        assert_eq!(find_bucket(2097152), "(1 MiB, 2 MiB]");
+        assert_eq!(find_bucket(2097153), "(2 MiB, 3 MiB]");
+        assert_eq!(find_bucket(3145728), "(2 MiB, 3 MiB]");
+        assert_eq!(find_bucket(3145729), "(3 MiB, 4 MiB]");
+        assert_eq!(find_bucket(4194304), "(3 MiB, 4 MiB]");
+        assert_eq!(find_bucket(4194305), "> 4 MiB");
+        assert_eq!(find_bucket(10 * 1024 * 1024), "> 4 MiB");
     }
 }

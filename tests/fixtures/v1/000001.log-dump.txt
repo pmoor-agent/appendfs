@@ -15,23 +15,29 @@ Avg Data / Flush:    11.04 KiB
 Trailing Batch:      None (cleanly committed at EOF)
 
 --- Record Breakdown by OpCode ---
-OP CODE             COUNT    TOTAL BYTES % OF RECORDS
--------------- ---------- -------------- ------------
-Data                    6      33.14 KiB        15.4%
-DataZstd                0            0 B         0.0%
-InodeDelta             29       3.07 KiB        74.4%
-FlushCommit             3           72 B         7.7%
-Seal                    1           16 B         2.6%
+OP CODE             COUNT % OF RECORDS    TOTAL BYTES   % OF BYTES
+-------------- ---------- ------------ -------------- ------------
+Data                    6        15.4%      33.14 KiB        91.3%
+DataZstd                0         0.0%            0 B         0.0%
+InodeDelta             29        74.4%       3.07 KiB         8.4%
+FlushCommit             3         7.7%           72 B         0.2%
+Seal                    1         2.6%           16 B         0.0%
 
 --- Write Payload Size Histogram ---
-SIZE RANGE            COUNT    TOTAL BYTES   DISTRIBUTION
------------------- -------- --------------   --------------------
-< 64 B                    2           40 B   ███████              (33.3%)
-64 B .. 511 B             1          100 B   ███                  (16.7%)
-512 B .. 4 KiB            1       1.00 KiB   ███                  (16.7%)
-4 KiB .. 64 KiB           2      32.00 KiB   ███████              (33.3%)
-64 KiB .. 1 MiB           0            0 B                        (0.0%)
-> 1 MiB                   0            0 B                        (0.0%)
+SIZE RANGE              COUNT    TOTAL BYTES   DISTRIBUTION
+-------------------- -------- --------------   --------------------
+[0, 64 B]                   2           40 B   ███████              (33.3%)
+(64 B, 512 B]               1          100 B   ███                  (16.7%)
+(512 B, 4 KiB]              1       1.00 KiB   ███                  (16.7%)
+(4 KiB, 16 KiB]             2      32.00 KiB   ███████              (33.3%)
+(16 KiB, 64 KiB]            0            0 B                        (0.0%)
+(64 KiB, 256 KiB]           0            0 B                        (0.0%)
+(256 KiB, 512 KiB]          0            0 B                        (0.0%)
+(512 KiB, 1 MiB]            0            0 B                        (0.0%)
+(1 MiB, 2 MiB]              0            0 B                        (0.0%)
+(2 MiB, 3 MiB]              0            0 B                        (0.0%)
+(3 MiB, 4 MiB]              0            0 B                        (0.0%)
+> 4 MiB                     0            0 B                        (0.0%)
 
 === Sequential Record Stream ===
 #1     [0x0000001a / 26      ] Data           inode 4     len 16 B     tag d962b934 [COMMITTED]
