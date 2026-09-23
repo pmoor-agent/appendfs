@@ -276,16 +276,18 @@ pub fn export_summary_with_iv(
     writer.append(&footer.to_bytes())?;
 
     writer.sync()?;
+    let size = writer.len()?;
     drop(writer);
 
     storage.rename(&tmp_filename, &filename)?;
 
     log::info!(
-        "Exported single-file summary snapshot {} (generation: {}, inodes: {}, last_batch_id: {})",
+        "Exported summary snapshot {} (generation: {}, inodes: {}, last_batch_id: {}, size: {})",
         filename,
         generation,
         inodes_snapshot.len(),
-        last_batch_id
+        last_batch_id,
+        crate::stats::format_bytes(size)
     );
 
     Ok(filename)
