@@ -1032,22 +1032,9 @@ impl InMemoryFS {
         self.log_writer = Some(writer);
     }
 
-    /// Returns the sequence number for the next log generation to be allocated.
-    ///
-    /// Computed dynamically considering all sealed logs in the manifest, the generation
-    /// of the latest summary snapshot, and the active log writer (if any). If the active
-    /// log writer is open, the next generation is `active + 1`. If the writer is lazy
-    /// (unopened), the next generation reflects the unopened generation waiting to be created.
-    pub fn next_generation(&self) -> u32 {
-        let manifest_max = self
-            .manifest
-            .read()
-            .unwrap()
-            .logs
-            .iter()
-            .map(|l| l.generation)
-            .max()
-            .unwrap_or(0);
+    /// Returns the sequence number for the next log generation to be allocated from an already-locked manifest.
+    pub fn next_generation_locked(&self, manifest: &crate::log::LogManifest) -> u32 {
+        let manifest_max = manifest.logs.iter().map(|l| l.generation).max().unwrap_or(0);
         let summary_gen = self.last_summary_generation.load(Ordering::SeqCst);
         // Saturating rather than wrapping: at the end of the generation space the writer's
         // own roll reports it (see `next_generation`), which is a far better place to fail
@@ -1058,6 +1045,16 @@ impl InMemoryFS {
             Some(w) => base_next.max(w.generation()),
             None => base_next,
         }
+    }
+
+    /// Returns the sequence number for the next log generation to be allocated.
+    ///
+    /// Computed dynamically considering all sealed logs in the manifest, the generation
+    /// of the latest summary snapshot, and the active log writer (if any). If the active
+    /// log writer is open, the next generation is `active + 1`. If the writer is lazy
+    /// (unopened), the next generation reflects the unopened generation waiting to be created.
+    pub fn next_generation(&self) -> u32 {
+        self.next_generation_locked(&self.manifest.read().unwrap())
     }
 
     /// Returns the physical filename for the next log generation (e.g. "000002.log").

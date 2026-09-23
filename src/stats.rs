@@ -277,7 +277,8 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         let head = fs.log_writer.as_ref().filter(|w| w.is_open()).map(|w| w.generation());
         let total_gens = manifest.logs.len();
         let total_disk: u64 = manifest.logs.iter().map(|l| l.total_bytes).sum();
-        (head, fs.next_generation(), total_gens, total_disk)
+        let next_gen = fs.next_generation_locked(&manifest);
+        (head, next_gen, total_gens, total_disk)
     };
 
     let mode_str = if fs.is_read_only() { "Read-Only" } else { "Read-Write" };
@@ -1122,5 +1123,35 @@ mod tests {
 
         assert_eq!(after_stats_count - before_stats_count, 1);
         assert!(status.contains("Active Inodes:      1001 (1 directories, 1000 files, 0 symlinks, 0 special)"));
+    }
+
+    #[test]
+    fn test_format_runtime_status_concurrent_with_manifest_writer() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let fs = Arc::new(InMemoryFS::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let fs_writer = Arc::clone(&fs);
+        let stop_writer = Arc::clone(&stop);
+
+        let writer_handle = thread::spawn(move || {
+            while !stop_writer.load(Ordering::Relaxed) {
+                {
+                    let manifest = fs_writer.manifest.write().unwrap();
+                    let _ = manifest.logs.len();
+                }
+                thread::yield_now();
+            }
+        });
+
+        for _ in 0..500 {
+            let status = format_runtime_status(&fs);
+            assert!(status.contains("=== appendfs Runtime Status ==="));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer_handle.join().unwrap();
     }
 }
