@@ -6,7 +6,6 @@
 //! records directly onto `base`, guaranteeing identical state transitions across crash recovery.
 
 use super::{FlushReason, FsInner, InMemoryFS, ShutdownState};
-use crate::clock::Clock;
 use crate::error::FsError;
 use crate::extent_map::Extent;
 use crate::log::{GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode};
@@ -160,24 +159,14 @@ impl InMemoryFS {
         self.inner.lock(OpTag::Fold).unwrap().fold_entries(entries);
     }
 
-    /// Runs one of the writer's roll checks and applies the effects of a roll: records the
-    /// sealed generation in the manifest, exports a periodic summary if one is due, and tells
-    /// replication there is new work.
+    /// Rolls the active generation if it has reached `max_log_size` or `max_log_age`, and
+    /// applies the effects of a roll: records the sealed generation in the manifest, exports a
+    /// periodic summary if one is due, and tells replication there is new work.
     ///
-    /// Used for both kinds of roll the flusher performs - the size check that runs after each
-    /// synced group, and the age check at the end of every cycle - so a generation is sealed
-    /// the same way whichever tripped it. Skipped once the filesystem is read-only: shutdown
-    /// drains through `run_flush_cycle` and then seals the final generation itself when it
-    /// exports the closing summary.
-    fn roll_log(
-        &self,
-        writer: &LogWriter,
-        check: impl FnOnce(&LogWriter, &dyn Clock) -> std::io::Result<Option<LogFileInfo>>,
-    ) -> std::io::Result<()> {
-        if self.is_read_only() {
-            return Ok(());
-        }
-        let Some(sealed_info) = check(writer, &*self.clock)? else {
+    /// Also runs during the shutdown drain, so a large backlog is still split across
+    /// generations; the successor is left lazy, so the drain never leaves an empty one behind.
+    fn roll_log(&self, writer: &LogWriter) -> std::io::Result<()> {
+        let Some(sealed_info) = writer.roll_if_needed(&*self.clock)? else {
             return Ok(());
         };
         let sealed_gen = sealed_info.generation;
@@ -395,15 +384,12 @@ impl InMemoryFS {
                 // Rolled after the group is synced and its waiters released, so they never pay
                 // for sealing a generation or exporting a summary. This makes `max_log_size` a
                 // soft limit: the group that crosses it lands in full, and the roll follows.
-                self.roll_log(writer, LogWriter::roll_if_needed)?;
+                self.roll_log(writer)?;
             }
 
-            // Age-based rolling. The size check only runs after a group has been written, so
-            // on an idle filesystem `max_log_age` would never come due; checking it at the end
-            // of every cycle means the inactivity tick seals the generation with nothing left
-            // to write. On rollover, `roll_if_aged` leaves the successor generation lazy
-            // (unopened) so that an idle filesystem does not accumulate empty log files.
-            self.roll_log(writer, LogWriter::roll_if_aged)?;
+            // Checked again at the end of every cycle, including idle ones: with nothing
+            // written, the check above never runs, and `max_log_age` would never come due.
+            self.roll_log(writer)?;
             Ok(())
         })
     }
@@ -1727,6 +1713,51 @@ mod tests {
         // Read again after folding
         let data_after_fold = fs.read_file_data(ino, 0, 50).unwrap();
         assert_eq!(data_after_fold, data);
+    }
+
+    #[test]
+    fn test_shutdown_drain_rolls_without_leaving_an_empty_generation() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::log::init_volume(
+            storage.clone(),
+            &crate::crypto::VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                50 * 1024,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let mut fs = InMemoryFS::with_clock_and_storage(clock, storage.clone());
+        fs.log_writer = Some(writer);
+
+        // Three queued batches, each too large to coalesce with another, and two of them
+        // together past `max_log_size`: the drain has to roll between them.
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            let file = crate::operations::read_write::create_core(&fs, 1, name, 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, file.ino, &[7u8; 40 * 1024], 0).unwrap();
+            assert!(fs.freeze_now());
+        }
+
+        fs.destroy();
+
+        assert!(storage.exists("000001.log"));
+        assert!(
+            storage.exists("000002.log"),
+            "the drain must roll once the backlog crosses max_log_size"
+        );
+        assert!(
+            !storage.exists("000003.log"),
+            "sealing the last generation must not leave an empty successor behind"
+        );
     }
 
     #[test]

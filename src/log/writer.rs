@@ -147,6 +147,40 @@ fn seal_and_open_next(
     Ok((next_active, sealed_info))
 }
 
+/// Seals the open generation in `state` if it has committed data, leaving its successor
+/// lazy (unopened) so no file exists for it until something is written.
+///
+/// On failure the writer is left lazy on the successor, as [`seal_and_open_next`] does.
+fn seal_into_lazy(
+    state: &mut ActiveLogState,
+    volume_key: &VolumeKey,
+    clock: &dyn Clock,
+) -> io::Result<Option<super::manifest::LogFileInfo>> {
+    let ActiveLogState::Open(active) = &*state else {
+        return Ok(None);
+    };
+    if active.current_offset <= FILE_HEADER_SIZE as u64 {
+        return Ok(None);
+    }
+    let next_gen = next_generation(active.generation)?;
+    let ActiveLogState::Open(active) = std::mem::replace(
+        state,
+        ActiveLogState::Unopened {
+            generation: next_gen,
+            created_at: None,
+        },
+    ) else {
+        unreachable!();
+    };
+    let sealed_info = active.seal(volume_key, clock.now())?;
+    log::info!(
+        "Sealed log generation {}, next generation {} is lazy (unopened)",
+        sealed_info.generation,
+        next_gen
+    );
+    Ok(Some(sealed_info))
+}
+
 /// The generation following `generation`, or an error at the end of the sequence.
 ///
 /// A generation is a `u32` everywhere it appears, which is what lets the record nonce carry
@@ -350,65 +384,36 @@ impl LogWriter {
         matches!(*state, ActiveLogState::Open(_))
     }
 
-    /// Rolls to a new generation if the active one has reached `max_log_size` or `max_log_age`.
-    /// Returns the sealed `LogFileInfo` if a rollover occurred.
+    /// Seals the active generation if it has reached `max_log_size` or `max_log_age`, leaving
+    /// its successor lazy (unopened) until [`LogWriter::open_if_unopened`] has something to
+    /// write to it. Returns the sealed `LogFileInfo` if a rollover occurred.
+    ///
+    /// The flusher runs this after every synced group and at the end of every cycle, including
+    /// idle ones, so an untouched filesystem still seals its generation on schedule. Leaving the
+    /// successor unopened means neither an idle filesystem nor a shutdown drain leaves empty
+    /// log files behind.
     ///
     /// `max_log_size` is a soft limit: this runs after a batch group has been written, not
     /// before, so the group that crosses `max_log_size` lands in full. A single batch can be
     /// as large as the flush threshold (`--flush-threshold`, 128 MiB by default), and up to
     /// about twice that when a slow flush lets staged writes pile up, so a generation can
-    /// overshoot by that much before it is rolled. A lazy (unopened) generation has nothing to seal and is left
-    /// alone; [`LogWriter::open_if_unopened`] opens it.
+    /// overshoot by that much before it is rolled.
     pub fn roll_if_needed(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-
-        match &*state {
-            ActiveLogState::Unopened { .. } => return Ok(None),
-            ActiveLogState::Open(active) => {
-                let size_exceeded =
-                    active.current_offset > FILE_HEADER_SIZE as u64 && active.current_offset >= self.max_log_size;
-
-                let age_exceeded = if let Some(max_age) = self.max_log_age {
-                    active.current_offset > FILE_HEADER_SIZE as u64
-                        && clock.now().duration_since(active.created_at).unwrap_or_default() >= max_age
-                } else {
-                    false
-                };
-
-                if !size_exceeded && !age_exceeded {
-                    return Ok(None);
-                }
-            }
-        }
-
-        let old_state = std::mem::replace(
-            &mut *state,
-            ActiveLogState::Unopened {
-                generation: 0,
-                created_at: None,
-            },
-        );
-        let ActiveLogState::Open(active) = old_state else {
-            unreachable!();
+        let ActiveLogState::Open(active) = &*state else {
+            return Ok(None);
         };
-
-        let next_gen = next_generation(active.generation)?;
-        match seal_and_open_next(active, &self.storage, &self.volume_key, clock, "Rolled") {
-            Ok((next_active, sealed_info)) => {
-                *state = ActiveLogState::Open(next_active);
-                Ok(Some(sealed_info))
-            }
-            Err(e) => {
-                *state = ActiveLogState::Unopened {
-                    generation: next_gen,
-                    created_at: None,
-                };
-                Err(e)
-            }
+        let size_exceeded = active.current_offset >= self.max_log_size;
+        let age_exceeded = self
+            .max_log_age
+            .is_some_and(|max_age| clock.now().duration_since(active.created_at).unwrap_or_default() >= max_age);
+        if !size_exceeded && !age_exceeded {
+            return Ok(None);
         }
+        seal_into_lazy(&mut state, &self.volume_key, clock)
     }
 
     /// Ensures that the active log file is open. If it is currently lazy/unopened,
@@ -426,59 +431,6 @@ impl LogWriter {
             log::info!("Lazily opened log file for generation {}", generation);
         }
         Ok(())
-    }
-
-    /// Rolls the active generation if it has been open longer than `max_log_age`, ignoring
-    /// its size, putting the writer into lazy mode so the new generation file is not opened
-    /// until the next write.
-    ///
-    /// The flusher runs this at the end of every cycle, including the idle ones, so an
-    /// untouched filesystem still seals its generation on schedule. Leaving the successor
-    /// unopened (lazy) ensures an idle filesystem does not generate empty log files over time.
-    pub fn roll_if_aged(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
-        let Some(max_age) = self.max_log_age else {
-            return Ok(None);
-        };
-        let mut state = match self.active_state.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-
-        match &*state {
-            // Nothing written yet, so there is nothing to seal.
-            ActiveLogState::Unopened { .. } => return Ok(None),
-            ActiveLogState::Open(active) => {
-                if active.current_offset <= FILE_HEADER_SIZE as u64
-                    || clock.now().duration_since(active.created_at).unwrap_or_default() < max_age
-                {
-                    return Ok(None);
-                }
-            }
-        }
-
-        let old_state = std::mem::replace(
-            &mut *state,
-            ActiveLogState::Unopened {
-                generation: 0,
-                created_at: None,
-            },
-        );
-        let ActiveLogState::Open(active) = old_state else {
-            unreachable!();
-        };
-
-        let next_gen = next_generation(active.generation)?;
-        let sealed_info = active.seal(&self.volume_key, clock.now())?;
-        log::info!(
-            "Age-rolled log file: sealed generation {}, next generation {} is lazy (unopened)",
-            sealed_info.generation,
-            next_gen
-        );
-        *state = ActiveLogState::Unopened {
-            generation: next_gen,
-            created_at: None,
-        };
-        Ok(Some(sealed_info))
     }
 
     /// Forcefully rolls the active generation file to `generation + 1` if it has committed data,
@@ -533,39 +485,7 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-
-        match &*state {
-            ActiveLogState::Unopened { .. } => return Ok(None),
-            ActiveLogState::Open(active) => {
-                if active.current_offset <= FILE_HEADER_SIZE as u64 {
-                    return Ok(None);
-                }
-            }
-        }
-
-        let old_state = std::mem::replace(
-            &mut *state,
-            ActiveLogState::Unopened {
-                generation: 0,
-                created_at: None,
-            },
-        );
-        let ActiveLogState::Open(active) = old_state else {
-            unreachable!();
-        };
-
-        let next_gen = next_generation(active.generation)?;
-        let sealed_info = active.seal(&self.volume_key, clock.now())?;
-        log::info!(
-            "Sealed active log generation {}, next generation {} is lazy (unopened)",
-            sealed_info.generation,
-            next_gen
-        );
-        *state = ActiveLogState::Unopened {
-            generation: next_gen,
-            created_at: None,
-        };
-        Ok(Some(sealed_info))
+        seal_into_lazy(&mut state, &self.volume_key, clock)
     }
 
     /// Captures a point-in-time snapshot of the log writer state (generation, offset,
@@ -971,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn test_roll_if_aged_puts_writer_in_lazy_mode_and_does_not_open_file() {
+    fn test_roll_if_needed_on_age_puts_writer_in_lazy_mode_and_does_not_open_file() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = AdvancingClock::new(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
         let writer = LogWriter::create(
@@ -989,9 +909,9 @@ mod tests {
         assert_eq!(writer.generation(), 1);
         assert!(storage.exists("000001.log"));
 
-        // No user records yet: current_offset <= FILE_HEADER_SIZE, so roll_if_aged does not roll
+        // No user records yet: current_offset <= FILE_HEADER_SIZE, so roll_if_needed does not roll
         clock.advance(std::time::Duration::from_secs(3601));
-        let rolled = writer.roll_if_aged(&clock).unwrap();
+        let rolled = writer.roll_if_needed(&clock).unwrap();
         assert!(rolled.is_none());
         assert_eq!(writer.generation(), 1);
 
@@ -999,7 +919,7 @@ mod tests {
         writer.append_record(OpCode::Data, 10, b"some data").unwrap();
 
         // Aged out now: rolls, seals generation 1, and leaves generation 2 in lazy mode
-        let rolled = writer.roll_if_aged(&clock).unwrap();
+        let rolled = writer.roll_if_needed(&clock).unwrap();
         assert!(rolled.is_some());
         let sealed_info = rolled.unwrap();
         assert_eq!(sealed_info.generation, 1);
@@ -1017,7 +937,7 @@ mod tests {
 
         // Additional age-checks while lazy must do nothing and not create files
         clock.advance(std::time::Duration::from_secs(3600 * 24 * 7));
-        assert!(writer.roll_if_aged(&clock).unwrap().is_none());
+        assert!(writer.roll_if_needed(&clock).unwrap().is_none());
         assert!(!writer.is_open());
         assert!(!storage.exists("000002.log"));
         assert!(!storage.exists("000003.log"));
