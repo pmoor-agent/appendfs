@@ -329,7 +329,9 @@ mod tests {
     #[test]
     fn test_quiesce_waits_for_the_background_flusher_to_drain() {
         let fs = test_fs();
+        let writer = fs.log_writer.clone().unwrap();
         fs.flusher.start(&fs, None);
+        let batches_before = writer.last_batch_id();
 
         stage_a_write(&fs, "queued.bin");
         assert!(fs.freeze_now());
@@ -337,8 +339,15 @@ mod tests {
 
         // Returns only once both the queued batch and the still-live write are on disk.
         fs.quiesce().unwrap();
-        assert_eq!(fs.flush_queue_depth(), 0);
+        assert_eq!(writer.last_batch_id(), batches_before + 2);
         assert_eq!(fs.staged_bytes(), 0);
+
+        // Waiters are released at the sync, before the flusher folds the batches into `base`,
+        // so the queue itself may take a moment longer to empty.
+        assert!(crate::wait_until(
+            || fs.flush_queue_depth() == 0,
+            Duration::from_secs(3)
+        ));
         fs.destroy();
     }
 
