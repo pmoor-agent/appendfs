@@ -19,6 +19,10 @@ pub struct LogFileCache {
     pub block_cache: Option<Arc<dyn BlockCache>>,
     pub remotes: Arc<RwLock<Vec<RemoteReadTarget>>>,
     pub manifest: Option<Arc<RwLock<crate::log::LogManifest>>>,
+    /// Whether logs in the manifest that are still present locally are read through `block_cache` too.
+    /// Off by default: the local file already holds those blocks, so caching them only pays
+    /// off once the log is pruned, and costs a second copy on disk until then.
+    cache_local_reads: bool,
 }
 
 impl LogFileCache {
@@ -35,6 +39,7 @@ impl LogFileCache {
             block_cache: None,
             remotes: Arc::new(RwLock::new(Vec::new())),
             manifest: None,
+            cache_local_reads: false,
         }
     }
 
@@ -51,7 +56,15 @@ impl LogFileCache {
             block_cache,
             remotes: Arc::new(RwLock::new(remotes.into_iter().map(Into::into).collect())),
             manifest,
+            cache_local_reads: false,
         }
+    }
+
+    /// Makes reads of logs in the manifest that are still present locally copy their blocks into `block_cache`,
+    /// so they remain readable without a remote fetch after the local log is pruned.
+    pub fn with_cache_local_reads(mut self, cache_local_reads: bool) -> Self {
+        self.cache_local_reads = cache_local_reads;
+        self
     }
 
     /// Sets the byte capacity for the in-memory decrypted record cache.
@@ -78,21 +91,21 @@ impl LogFileCache {
             return Ok(Arc::clone(reader));
         }
 
-        let (filename, is_sealed, mut expected_len) = if let Some(ref m) = self.manifest {
+        let (filename, in_manifest, mut expected_len) = if let Some(ref m) = self.manifest {
             let man = m.read().unwrap();
             let log_entry = man.get_by_generation(generation);
-            let is_sealed = log_entry.is_some();
+            let in_manifest = log_entry.is_some();
             let expected_len = log_entry.map(|l| l.total_bytes).unwrap_or(0);
             let filename = log_entry
                 .map(|l| l.filename.clone())
                 .unwrap_or_else(|| super::log_filename(generation));
-            (filename, is_sealed, expected_len)
+            (filename, in_manifest, expected_len)
         } else {
             (super::log_filename(generation), false, 0)
         };
 
         // If expected_len is not yet in manifest but local file exists:
-        if is_sealed
+        if in_manifest
             && expected_len == 0
             && let Ok(r) = self.storage.open_reader(&filename)
             && let Ok(l) = r.len()
@@ -100,11 +113,13 @@ impl LogFileCache {
             expected_len = l;
         }
 
-        // If generation is sealed and block_cache is enabled, use the unified TieredStorageReader!
+        // If generation is in the manifest and local reads are cached, use the unified TieredStorageReader.
         // This checks OnDiskBlockCache first, falling back to local storage (Tier 0) to pre-warm the cache,
-        // and falling back to remotes if the local file was purged.
-        if let Some(ref bc) = self.block_cache
-            && is_sealed
+        // and falling back to remotes if the local file was purged. Otherwise a local file is read
+        // directly, and the TieredStorageReader below only takes over once it has been purged.
+        if self.cache_local_reads
+            && let Some(ref bc) = self.block_cache
+            && in_manifest
             && expected_len > 0
         {
             let remotes = self.remotes.read().unwrap().clone();

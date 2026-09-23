@@ -310,10 +310,11 @@ fn collect_secret_plaintext(fs: &InMemoryFS) -> Vec<(String, Vec<u8>)> {
 ///
 /// - the fixture itself, for what the *write* path produced; and
 /// - the on-disk block cache, for what the *read* path spills. That cache is the one place
-///   a read can put volume bytes back on disk. Reading a sealed generation pre-warms it
-///   from local storage - no remote and no pruning required, which is the whole point of
-///   pre-warming: blocks that were read once stay readable after the log is purged. It must
-///   hold the encrypted 1 MiB blocks it read, never the decrypted records derived from them.
+///   a read can put volume bytes back on disk. With `--disk-cache-local-reads`, reading a
+///   sealed generation pre-warms it from local storage - no remote and no pruning required,
+///   which is the whole point of pre-warming: blocks that were read once stay readable after
+///   the log is purged. It must hold the encrypted 1 MiB blocks it read, never the decrypted
+///   records derived from them.
 ///
 /// The `-dump.txt` goldens beside the fixture are excluded: they are decrypted renderings
 /// produced *with* the fixture key, and contain plaintext by design.
@@ -340,19 +341,22 @@ pub fn verify_no_plaintext_in_encrypted_fixture(fixture_dir: &Path) {
     )
     .expect("recover encrypted fixture");
 
-    // No remotes, nothing pruned: reading a sealed generation pre-warms the block cache
-    // straight from local storage.
+    // No remotes, nothing pruned: with local reads cached, reading a sealed generation
+    // pre-warms the block cache straight from local storage.
     let cache_dir = temp.path().join(".cache");
     let block_cache = Arc::new(
         appendfs::remote::OnDiskBlockCache::new(&cache_dir, 64 * 1024 * 1024, clock.clone())
             .expect("create on-disk block cache"),
     );
-    fs_recovered.log_cache = Some(Arc::new(appendfs::log::LogFileCache::with_remote_support(
-        storage.clone(),
-        Some(block_cache.clone()),
-        Vec::<appendfs::remote::RemoteReadTarget>::new(),
-        Some(Arc::clone(&fs_recovered.manifest)),
-    )));
+    fs_recovered.log_cache = Some(Arc::new(
+        appendfs::log::LogFileCache::with_remote_support(
+            storage.clone(),
+            Some(block_cache.clone()),
+            Vec::<appendfs::remote::RemoteReadTarget>::new(),
+            Some(Arc::clone(&fs_recovered.manifest)),
+        )
+        .with_cache_local_reads(true),
+    ));
 
     // Reads every file, which both gathers the needles and fills the block cache.
     let secrets = collect_secret_plaintext(&fs_recovered);
