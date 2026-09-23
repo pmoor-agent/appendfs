@@ -15,13 +15,13 @@ Avg Data / Flush:    11.04 KiB
 Trailing Batch:      None (cleanly committed at EOF)
 
 --- Record Breakdown by OpCode ---
-OP CODE             COUNT    TOTAL BYTES % OF RECORDS
--------------- ---------- -------------- ------------
-Data                    6      33.14 KiB        15.4%
-DataZstd                0            0 B         0.0%
-InodeDelta             29       3.07 KiB        74.4%
-FlushCommit             3           72 B         7.7%
-Seal                    1           16 B         2.6%
+OP CODE             COUNT % OF RECORDS    TOTAL BYTES   % OF BYTES
+-------------- ---------- ------------ -------------- ------------
+Data                    6        15.4%      33.14 KiB        91.3%
+DataZstd                0         0.0%            0 B         0.0%
+InodeDelta             29        74.4%       3.07 KiB         8.4%
+FlushCommit             3         7.7%           72 B         0.2%
+Seal                    1         2.6%           16 B         0.0%
 
 --- Write Payload Size Histogram ---
 SIZE RANGE            COUNT    TOTAL BYTES   DISTRIBUTION
