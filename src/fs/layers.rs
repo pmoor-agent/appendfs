@@ -811,15 +811,16 @@ mod tests {
             .lock_for_tests()
             .unwrap()
             .flushing
-            .push_back(std::sync::Arc::new(FlushBatch::new(
-                1,
-                flushing_batch,
-                WriteArena::new(),
-                0,
-                0,
-                crate::fs::BatchCompletion::new(),
-                crate::fs::FlushReason::Threshold,
-            )));
+            .push_back(std::sync::Arc::new(FlushBatch {
+                id: 1,
+                entries: flushing_batch,
+                arena: WriteArena::new(),
+                bytes: 0,
+                ops: 0,
+                completion: crate::fs::BatchCompletion::new(),
+                reason: crate::fs::FlushReason::Threshold,
+                frozen_at: std::time::Duration::ZERO,
+            }));
 
         // 3. Live layer: Staged extent at 30..50
         let mut live_delta = FileDelta::default();

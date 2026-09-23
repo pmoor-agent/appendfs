@@ -351,6 +351,8 @@ pub struct FlushRecord {
     pub ops: usize,
     /// When the flusher picked the batch up.
     pub started_at: SystemTime,
+    /// Time from entering the `flushing` queue until the flusher started serializing it.
+    pub queued: Duration,
     /// Time spent synthesizing and appending the batch's records to the log writer.
     pub serialize: Duration,
     /// Time from the end of serializing this batch to the beginning of physical disk sync.
@@ -361,7 +363,8 @@ pub struct FlushRecord {
     pub flush: Duration,
     /// Time spent popping the batch and applying its deltas to `base`.
     pub fold: Duration,
-    /// Total, end to end.
+    /// Total, from entering the `flushing` queue until folded into `base`. Waiters are
+    /// released after `flush`, so what they see is this minus `fold`.
     pub duration: Duration,
 }
 
@@ -380,6 +383,8 @@ pub struct FlushStats {
     pub total_disk_bytes: u64,
     /// Mutating operations flushed since mount.
     pub total_ops: u64,
+    /// Cumulative duration batches spent in the `flushing` queue before being picked up since mount.
+    pub total_queued: Duration,
     /// Cumulative duration spent serializing records into the log writer since mount.
     pub total_serialize: Duration,
     /// Cumulative duration spent waiting for coalesced batches to sync since mount.
@@ -418,34 +423,13 @@ pub struct FlushBatch {
     pub arena: WriteArena,
     pub bytes: usize,
     pub ops: usize,
+    /// Comes from the `live` layer these entries were frozen out of, so anyone who registered
+    /// interest while they were still live is carried into this batch.
     pub completion: BatchCompletion,
     /// Why this batch was frozen.
     pub reason: FlushReason,
-}
-
-impl FlushBatch {
-    /// `completion` comes from the `live` layer these entries were frozen out of, so anyone
-    /// who registered interest while they were still live is carried into this batch.
-    pub fn new(
-        id: u64,
-        entries: HashMap<u64, EntryDelta>,
-        arena: WriteArena,
-        bytes: usize,
-        ops: usize,
-        completion: BatchCompletion,
-        reason: FlushReason,
-    ) -> Self {
-        assert!(!entries.is_empty(), "FlushBatch must contain at least one entry");
-        Self {
-            id,
-            entries,
-            arena,
-            bytes,
-            ops,
-            completion,
-            reason,
-        }
-    }
+    /// When the batch entered the `flushing` queue, on [`Clock::monotonic`].
+    pub frozen_at: Duration,
 }
 
 /// Consolidated mutable filesystem state protected by `InMemoryFS::inner`.
@@ -566,11 +550,13 @@ impl FsInner {
     /// If queue depth, byte count, or op count reaches or exceeds capacity, this is a no-op
     /// that preserves `live` and staged byte/op counters, returning `false`.
     /// Returns `true` if a batch was frozen, or `false` if `live` was empty or `flushing` was full.
+    /// `now` is the [`Clock::monotonic`] reading stamped on the batch as its `frozen_at`.
     pub fn freeze_live(
         &mut self,
         max_flush_queue_depth: usize,
         max_flush_queue_bytes: usize,
         max_flush_queue_ops: usize,
+        now: Duration,
     ) -> bool {
         if self.flushing_at_capacity(max_flush_queue_depth, max_flush_queue_bytes, max_flush_queue_ops) {
             return false;
@@ -593,9 +579,16 @@ impl FsInner {
             // An outstanding request names this batch even when a threshold is what finally
             // tripped the freeze - the requester's data is in here either way.
             let reason = self.freeze_requested.take().unwrap_or(FlushReason::Threshold);
-            self.flushing.push_back(Arc::new(FlushBatch::new(
-                id, entries, arena, bytes, ops, completion, reason,
-            )));
+            self.flushing.push_back(Arc::new(FlushBatch {
+                id,
+                entries,
+                arena,
+                bytes,
+                ops,
+                completion,
+                reason,
+                frozen_at: now,
+            }));
             true
         } else {
             false

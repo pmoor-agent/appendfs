@@ -28,6 +28,7 @@ struct Telemetry {
     total_bytes: u64,
     total_disk_bytes: u64,
     total_ops: u64,
+    total_queued: Duration,
     total_serialize: Duration,
     total_wait: Duration,
     total_flush: Duration,
@@ -158,6 +159,7 @@ impl Flusher {
         telemetry.total_bytes += record.bytes as u64;
         telemetry.total_disk_bytes += record.disk_bytes;
         telemetry.total_ops += record.ops as u64;
+        telemetry.total_queued += record.queued;
         telemetry.total_serialize += record.serialize;
         telemetry.total_wait += record.wait;
         telemetry.total_flush += record.flush;
@@ -179,6 +181,7 @@ impl Flusher {
             total_bytes: telemetry.total_bytes,
             total_disk_bytes: telemetry.total_disk_bytes,
             total_ops: telemetry.total_ops,
+            total_queued: telemetry.total_queued,
             total_serialize: telemetry.total_serialize,
             total_wait: telemetry.total_wait,
             total_flush: telemetry.total_flush,
@@ -504,6 +507,7 @@ mod tests {
         // reproducible zero, where an `Instant` would report whatever the wall clock did.
         for (label, measured) in [
             ("total", record.duration),
+            ("queued", record.queued),
             ("serialize", record.serialize),
             ("wait", record.wait),
             ("flush", record.flush),
@@ -516,6 +520,38 @@ mod tests {
                 label
             );
         }
+    }
+
+    #[test]
+    fn test_flush_record_counts_time_spent_queued() {
+        let clock = Arc::new(crate::clock::AdvancingClock::new(
+            std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        ));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+        stage_a_write(&fs, "queued.bin");
+        assert!(fs.freeze_now());
+        clock.advance(Duration::from_millis(250));
+        fs.quiesce().unwrap();
+
+        let stats = fs.flush_stats();
+        let record = stats.recent.first().expect("one batch");
+        assert_eq!(record.queued, Duration::from_millis(250));
+        // Nothing advances the clock while the flusher works, so the queue is the whole total.
+        assert_eq!(record.duration, Duration::from_millis(250));
+        assert_eq!(stats.total_queued, Duration::from_millis(250));
     }
 
     #[test]
@@ -541,9 +577,10 @@ mod tests {
             );
             assert!(record.flush > Duration::ZERO, "flushing the batch must be measured");
             assert!(
-                record.duration >= record.serialize + record.wait + record.flush + record.fold,
-                "the total must cover all phases: {:?} < {:?} + {:?} + {:?} + {:?}",
+                record.duration >= record.queued + record.serialize + record.wait + record.flush + record.fold,
+                "the total must cover all phases: {:?} < {:?} + {:?} + {:?} + {:?} + {:?}",
                 record.duration,
+                record.queued,
                 record.serialize,
                 record.wait,
                 record.flush,
@@ -555,6 +592,11 @@ mod tests {
             stats.total_disk_bytes,
             stats.recent.iter().map(|r| r.disk_bytes).sum::<u64>(),
             "cumulative disk bytes must agree with the history"
+        );
+        assert_eq!(
+            stats.total_queued,
+            stats.recent.iter().map(|r| r.queued).sum::<Duration>(),
+            "cumulative queued time must agree with the history"
         );
         assert_eq!(
             stats.total_serialize,

@@ -477,19 +477,20 @@ mod tests {
         {
             let mut inner = fs.inner.lock(crate::sync::OpTag::Other).unwrap();
             let completion = inner.live_completion.clone();
-            inner.flushing.push_back(std::sync::Arc::new(crate::fs::FlushBatch::new(
-                1,
-                std::iter::once((
+            inner.flushing.push_back(std::sync::Arc::new(crate::fs::FlushBatch {
+                id: 1,
+                entries: std::iter::once((
                     1,
                     crate::node::EntryDelta::Node(crate::node::NodeDelta::Directory(Default::default())),
                 ))
                 .collect(),
-                crate::fs::WriteArena::new(),
-                100,
-                1,
+                arena: crate::fs::WriteArena::new(),
+                bytes: 100,
+                ops: 1,
                 completion,
-                crate::fs::FlushReason::Threshold,
-            )));
+                reason: crate::fs::FlushReason::Threshold,
+                frozen_at: std::time::Duration::ZERO,
+            }));
             inner.flushing_bytes = 100;
             inner.flushing_ops = 1;
             // Stage 1000 bytes -> hard stall

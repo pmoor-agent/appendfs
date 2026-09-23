@@ -50,6 +50,7 @@ impl InMemoryFS {
             self.max_flush_queue_depth,
             self.max_flush_queue_bytes,
             self.max_flush_queue_ops,
+            self.clock.monotonic(),
         );
         if froze {
             self.sync_pushback_saturation(inner);
@@ -522,20 +523,22 @@ impl InMemoryFS {
                 disk_bytes,
                 ops: popped.ops,
                 started_at,
+                queued: started_monotonic.saturating_sub(popped.frozen_at),
                 serialize,
                 wait,
                 flush: flush_duration,
                 fold,
-                duration: finished.saturating_sub(started_monotonic),
+                duration: finished.saturating_sub(popped.frozen_at),
             };
             log::debug!(
-                "Flushed batch {} ({}): {} staged bytes ({} on disk), {} ops in {:?} ({:?} serialize, {:?} wait, {:?} flush, {:?} fold)",
+                "Flushed batch {} ({}): {} staged bytes ({} on disk), {} ops in {:?} ({:?} queued, {:?} serialize, {:?} wait, {:?} flush, {:?} fold)",
                 record.id,
                 record.reason,
                 record.bytes,
                 record.disk_bytes,
                 record.ops,
                 record.duration,
+                record.queued,
                 record.serialize,
                 record.wait,
                 record.flush,
