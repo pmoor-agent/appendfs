@@ -155,17 +155,17 @@ pub fn dump_log_reader_with_path(
 
     let mut op_counts: [OpCodeStats; 6] = Default::default();
     let mut write_buckets = vec![
-        WriteBucket::new("< 64 B", 0, 63),
-        WriteBucket::new("64 B .. 511 B", 64, 511),
-        WriteBucket::new("512 B .. 4 KiB", 512, 4095),
-        WriteBucket::new("4 KiB .. 16 KiB", 4096, 16383),
-        WriteBucket::new("16 KiB .. 64 KiB", 16384, 65535),
-        WriteBucket::new("64 KiB .. 256 KiB", 65536, 262143),
-        WriteBucket::new("256 KiB .. 512 KiB", 262144, 524287),
-        WriteBucket::new("512 KiB .. 1 MiB", 524288, 1048575),
-        WriteBucket::new("1 MiB .. 2 MiB", 1048576, 2097151),
-        WriteBucket::new("2 MiB .. 3 MiB", 2097152, 3145727),
-        WriteBucket::new("3 MiB .. 4 MiB", 3145728, 4194304),
+        WriteBucket::new("[0, 64 B]", 0, 64),
+        WriteBucket::new("(64 B, 512 B]", 65, 512),
+        WriteBucket::new("(512 B, 4 KiB]", 513, 4096),
+        WriteBucket::new("(4 KiB, 16 KiB]", 4097, 16384),
+        WriteBucket::new("(16 KiB, 64 KiB]", 16385, 65536),
+        WriteBucket::new("(64 KiB, 256 KiB]", 65537, 262144),
+        WriteBucket::new("(256 KiB, 512 KiB]", 262145, 524288),
+        WriteBucket::new("(512 KiB, 1 MiB]", 524289, 1048576),
+        WriteBucket::new("(1 MiB, 2 MiB]", 1048577, 2097152),
+        WriteBucket::new("(2 MiB, 3 MiB]", 2097153, 3145728),
+        WriteBucket::new("(3 MiB, 4 MiB]", 3145729, 4194304),
         WriteBucket::new("> 4 MiB", 4194305, u64::MAX),
     ];
 
@@ -524,11 +524,11 @@ pub fn dump_log_reader_with_path(
         writeln!(out, "--- Write Payload Size Histogram ---").unwrap();
         writeln!(
             out,
-            "{:<18} {:>8} {:>14}   DISTRIBUTION",
+            "{:<20} {:>8} {:>14}   DISTRIBUTION",
             "SIZE RANGE", "COUNT", "TOTAL BYTES"
         )
         .unwrap();
-        writeln!(out, "{:-<18} {:-<8} {:-<14}   {:-<20}", "", "", "", "").unwrap();
+        writeln!(out, "{:-<20} {:-<8} {:-<14}   {:-<20}", "", "", "", "").unwrap();
 
         for b in &write_buckets {
             let pct = (b.count as f64 / total_writes as f64) * 100.0;
@@ -536,7 +536,7 @@ pub fn dump_log_reader_with_path(
             let bar: String = "█".repeat(bar_len);
             writeln!(
                 out,
-                "{:<18} {:>8} {:>14}   {:<20} ({:.1}%)",
+                "{:<20} {:>8} {:>14}   {:<20} ({:.1}%)",
                 b.label,
                 b.count,
                 format_bytes(b.total_bytes),
@@ -1496,7 +1496,7 @@ mod tests {
         assert!(summary_dump.contains("Committed Flushes:   1"));
         assert!(summary_dump.contains("Trailing Batch:      None"));
         assert!(summary_dump.contains("Data"));
-        assert!(summary_dump.contains("64 B .. 511 B"));
+        assert!(summary_dump.contains("(64 B, 512 B]"));
 
         // Level 1: Records
         let v1_dump = dump_log_file(storage.as_ref(), "000001.log", 1, None).unwrap();
@@ -2015,44 +2015,44 @@ mod tests {
     #[test]
     fn test_write_payload_size_histogram_bucket_ranges() {
         let buckets = vec![
-            WriteBucket::new("< 64 B", 0, 63),
-            WriteBucket::new("64 B .. 511 B", 64, 511),
-            WriteBucket::new("512 B .. 4 KiB", 512, 4095),
-            WriteBucket::new("4 KiB .. 16 KiB", 4096, 16383),
-            WriteBucket::new("16 KiB .. 64 KiB", 16384, 65535),
-            WriteBucket::new("64 KiB .. 256 KiB", 65536, 262143),
-            WriteBucket::new("256 KiB .. 512 KiB", 262144, 524287),
-            WriteBucket::new("512 KiB .. 1 MiB", 524288, 1048575),
-            WriteBucket::new("1 MiB .. 2 MiB", 1048576, 2097151),
-            WriteBucket::new("2 MiB .. 3 MiB", 2097152, 3145727),
-            WriteBucket::new("3 MiB .. 4 MiB", 3145728, 4194304),
+            WriteBucket::new("[0, 64 B]", 0, 64),
+            WriteBucket::new("(64 B, 512 B]", 65, 512),
+            WriteBucket::new("(512 B, 4 KiB]", 513, 4096),
+            WriteBucket::new("(4 KiB, 16 KiB]", 4097, 16384),
+            WriteBucket::new("(16 KiB, 64 KiB]", 16385, 65536),
+            WriteBucket::new("(64 KiB, 256 KiB]", 65537, 262144),
+            WriteBucket::new("(256 KiB, 512 KiB]", 262145, 524288),
+            WriteBucket::new("(512 KiB, 1 MiB]", 524289, 1048576),
+            WriteBucket::new("(1 MiB, 2 MiB]", 1048577, 2097152),
+            WriteBucket::new("(2 MiB, 3 MiB]", 2097153, 3145728),
+            WriteBucket::new("(3 MiB, 4 MiB]", 3145729, 4194304),
             WriteBucket::new("> 4 MiB", 4194305, u64::MAX),
         ];
 
         let find_bucket = |size: u64| -> &'static str { buckets.iter().find(|b| b.matches(size)).unwrap().label };
 
-        assert_eq!(find_bucket(0), "< 64 B");
-        assert_eq!(find_bucket(63), "< 64 B");
-        assert_eq!(find_bucket(64), "64 B .. 511 B");
-        assert_eq!(find_bucket(511), "64 B .. 511 B");
-        assert_eq!(find_bucket(512), "512 B .. 4 KiB");
-        assert_eq!(find_bucket(4095), "512 B .. 4 KiB");
-        assert_eq!(find_bucket(4096), "4 KiB .. 16 KiB");
-        assert_eq!(find_bucket(16383), "4 KiB .. 16 KiB");
-        assert_eq!(find_bucket(16384), "16 KiB .. 64 KiB");
-        assert_eq!(find_bucket(65535), "16 KiB .. 64 KiB");
-        assert_eq!(find_bucket(65536), "64 KiB .. 256 KiB");
-        assert_eq!(find_bucket(262143), "64 KiB .. 256 KiB");
-        assert_eq!(find_bucket(262144), "256 KiB .. 512 KiB");
-        assert_eq!(find_bucket(524287), "256 KiB .. 512 KiB");
-        assert_eq!(find_bucket(524288), "512 KiB .. 1 MiB");
-        assert_eq!(find_bucket(1048575), "512 KiB .. 1 MiB");
-        assert_eq!(find_bucket(1048576), "1 MiB .. 2 MiB");
-        assert_eq!(find_bucket(2097151), "1 MiB .. 2 MiB");
-        assert_eq!(find_bucket(2097152), "2 MiB .. 3 MiB");
-        assert_eq!(find_bucket(3145727), "2 MiB .. 3 MiB");
-        assert_eq!(find_bucket(3145728), "3 MiB .. 4 MiB");
-        assert_eq!(find_bucket(4194304), "3 MiB .. 4 MiB");
+        assert_eq!(find_bucket(0), "[0, 64 B]");
+        assert_eq!(find_bucket(64), "[0, 64 B]");
+        assert_eq!(find_bucket(65), "(64 B, 512 B]");
+        assert_eq!(find_bucket(512), "(64 B, 512 B]");
+        assert_eq!(find_bucket(513), "(512 B, 4 KiB]");
+        assert_eq!(find_bucket(4096), "(512 B, 4 KiB]");
+        assert_eq!(find_bucket(4097), "(4 KiB, 16 KiB]");
+        assert_eq!(find_bucket(16384), "(4 KiB, 16 KiB]");
+        assert_eq!(find_bucket(16385), "(16 KiB, 64 KiB]");
+        assert_eq!(find_bucket(65536), "(16 KiB, 64 KiB]");
+        assert_eq!(find_bucket(65537), "(64 KiB, 256 KiB]");
+        assert_eq!(find_bucket(262144), "(64 KiB, 256 KiB]");
+        assert_eq!(find_bucket(262145), "(256 KiB, 512 KiB]");
+        assert_eq!(find_bucket(524288), "(256 KiB, 512 KiB]");
+        assert_eq!(find_bucket(524289), "(512 KiB, 1 MiB]");
+        assert_eq!(find_bucket(1048576), "(512 KiB, 1 MiB]");
+        assert_eq!(find_bucket(1048577), "(1 MiB, 2 MiB]");
+        assert_eq!(find_bucket(2097152), "(1 MiB, 2 MiB]");
+        assert_eq!(find_bucket(2097153), "(2 MiB, 3 MiB]");
+        assert_eq!(find_bucket(3145728), "(2 MiB, 3 MiB]");
+        assert_eq!(find_bucket(3145729), "(3 MiB, 4 MiB]");
+        assert_eq!(find_bucket(4194304), "(3 MiB, 4 MiB]");
         assert_eq!(find_bucket(4194305), "> 4 MiB");
         assert_eq!(find_bucket(10 * 1024 * 1024), "> 4 MiB");
     }

@@ -24,20 +24,20 @@ FlushCommit             3         7.7%           72 B         0.2%
 Seal                    1         2.6%           16 B         0.0%
 
 --- Write Payload Size Histogram ---
-SIZE RANGE            COUNT    TOTAL BYTES   DISTRIBUTION
------------------- -------- --------------   --------------------
-< 64 B                    2           40 B   ███████              (33.3%)
-64 B .. 511 B             1          100 B   ███                  (16.7%)
-512 B .. 4 KiB            1       1.00 KiB   ███                  (16.7%)
-4 KiB .. 16 KiB           0            0 B                        (0.0%)
-16 KiB .. 64 KiB          2      32.00 KiB   ███████              (33.3%)
-64 KiB .. 256 KiB         0            0 B                        (0.0%)
-256 KiB .. 512 KiB        0            0 B                        (0.0%)
-512 KiB .. 1 MiB          0            0 B                        (0.0%)
-1 MiB .. 2 MiB            0            0 B                        (0.0%)
-2 MiB .. 3 MiB            0            0 B                        (0.0%)
-3 MiB .. 4 MiB            0            0 B                        (0.0%)
-> 4 MiB                   0            0 B                        (0.0%)
+SIZE RANGE              COUNT    TOTAL BYTES   DISTRIBUTION
+-------------------- -------- --------------   --------------------
+[0, 64 B]                   2           40 B   ███████              (33.3%)
+(64 B, 512 B]               1          100 B   ███                  (16.7%)
+(512 B, 4 KiB]              1       1.00 KiB   ███                  (16.7%)
+(4 KiB, 16 KiB]             2      32.00 KiB   ███████              (33.3%)
+(16 KiB, 64 KiB]            0            0 B                        (0.0%)
+(64 KiB, 256 KiB]           0            0 B                        (0.0%)
+(256 KiB, 512 KiB]          0            0 B                        (0.0%)
+(512 KiB, 1 MiB]            0            0 B                        (0.0%)
+(1 MiB, 2 MiB]              0            0 B                        (0.0%)
+(2 MiB, 3 MiB]              0            0 B                        (0.0%)
+(3 MiB, 4 MiB]              0            0 B                        (0.0%)
+> 4 MiB                     0            0 B                        (0.0%)
 
 === Sequential Record Stream ===
 #1     [0x0000001a / 26      ] Data           inode 4     len 16 B     tag d962b934 [COMMITTED]
