@@ -3,9 +3,20 @@ use crate::fs::{InMemoryFS, InodeCounts};
 use crate::log::LogManifest;
 use crate::log::manifest::GenerationLiveStats;
 use crate::node::{Node, NodeKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::sync::Arc;
+
+/// Default maximum number of top file extensions to display before grouping remaining extensions under `(other)`.
+pub const TOP_EXTENSIONS_LIMIT: usize = 15;
+
+/// File count and aggregate logical byte size for a specific file extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionStats {
+    pub extension: String,
+    pub file_count: usize,
+    pub total_bytes: u64,
+}
 
 /// Aggregate statistics and fragmentation status for an appendfs volume.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +32,7 @@ pub struct VolumeStats {
     pub total_live_bytes: u64,
     pub overall_live_ratio: f64,
     pub generations: Vec<GenerationLiveStats>,
+    pub extensions: Vec<ExtensionStats>,
 }
 
 impl VolumeStats {
@@ -30,7 +42,12 @@ impl VolumeStats {
     }
 
     /// Constructs VolumeStats from individual pre-computed parts.
-    pub fn from_parts(next_generation: u32, counts: &InodeCounts, generations: Vec<GenerationLiveStats>) -> Self {
+    pub fn from_parts(
+        next_generation: u32,
+        counts: &InodeCounts,
+        generations: Vec<GenerationLiveStats>,
+        extensions: Vec<ExtensionStats>,
+    ) -> Self {
         let mut total_disk_bytes = 0;
         let mut total_data_bytes = 0;
         let mut total_live_bytes = 0;
@@ -61,27 +78,31 @@ impl VolumeStats {
             total_live_bytes,
             overall_live_ratio,
             generations,
+            extensions,
         }
     }
 
     /// Collects volume statistics from an in-memory filesystem state.
     pub fn collect(fs: &InMemoryFS) -> Self {
+        let snapshot = fs.snapshot_all();
         let counts = fs.inode_counts();
         let generations = fs.calculate_generation_live_stats();
-        Self::from_parts(fs.next_generation(), &counts, generations)
+        let extensions = calculate_extension_stats_from_nodes(&snapshot);
+        Self::from_parts(fs.next_generation(), &counts, generations, extensions)
     }
 
     /// Collects volume statistics directly from a snapshot's inodes and manifest.
     pub fn collect_from_snapshot(inodes: &HashMap<u64, Arc<Node>>, manifest: &LogManifest) -> Self {
         let counts = InodeCounts::from_nodes(inodes.values().map(|a| a.as_ref()));
         let generations = calculate_generation_live_stats_from_nodes(inodes.values().map(|a| a.as_ref()), manifest);
+        let extensions = calculate_extension_stats_from_nodes(inodes);
         let next_generation = manifest
             .logs
             .iter()
             .map(|l| l.generation)
             .max()
             .map_or(1, |max| max + 1);
-        Self::from_parts(next_generation, &counts, generations)
+        Self::from_parts(next_generation, &counts, generations, extensions)
     }
 
     /// Formats stats into a clean, human-readable terminal table.
@@ -109,6 +130,12 @@ impl VolumeStats {
             writeln!(out, "Overall Live Ratio:  N/A (no data payload)").unwrap();
         }
         writeln!(out).unwrap();
+
+        let ext_table = format_extension_stats_table(&self.extensions, self.file_count, self.total_logical_bytes);
+        if !ext_table.is_empty() {
+            out.push_str(&ext_table);
+            writeln!(out).unwrap();
+        }
 
         out.push_str(&format_generations_table(&self.generations));
         out
@@ -204,6 +231,172 @@ pub fn format_generations_table(generations: &[GenerationLiveStats]) -> String {
             .unwrap();
         }
     }
+    out
+}
+
+/// Extracts normalized file extension (e.g. `".txt"`, `".bin"`) or `"(no extension)"` if none.
+pub fn extract_extension(filename: &str) -> String {
+    let path = std::path::Path::new(filename);
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if !ext.is_empty() => format!(".{}", ext.to_lowercase()),
+        _ => "(no extension)".to_string(),
+    }
+}
+
+/// Traverses reachable directories from root and collects aggregate file counts and logical byte sizes per extension.
+pub fn calculate_extension_stats_from_nodes(inodes: &HashMap<u64, Arc<Node>>) -> Vec<ExtensionStats> {
+    let mut ino_to_name: HashMap<u64, String> = HashMap::new();
+    let mut queue = VecDeque::new();
+    let mut visited_dirs = HashSet::new();
+
+    if inodes.contains_key(&1) {
+        queue.push_back(1u64);
+        visited_dirs.insert(1u64);
+    }
+
+    while let Some(dir_ino) = queue.pop_front() {
+        if let Some(sync_node) = inodes.get(&dir_ino) {
+            let node = sync_node.as_ref();
+            if let NodeKind::Directory { entries, .. } = &node.kind {
+                let mut sorted_entries = entries.clone();
+                sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, child_ino) in sorted_entries {
+                    ino_to_name.entry(child_ino).or_insert_with(|| name.clone());
+                    if let Some(child_sync) = inodes.get(&child_ino)
+                        && child_sync.is_dir()
+                        && visited_dirs.insert(child_ino)
+                    {
+                        queue.push_back(child_ino);
+                    }
+                }
+            }
+        }
+    }
+
+    // Inspect any remaining disconnected directories (e.g. in test fixture setups)
+    let mut remaining_dirs: Vec<u64> = inodes
+        .iter()
+        .filter_map(|(&ino, node)| {
+            if node.is_dir() && !visited_dirs.contains(&ino) {
+                Some(ino)
+            } else {
+                None
+            }
+        })
+        .collect();
+    remaining_dirs.sort_unstable();
+
+    for dir_ino in remaining_dirs {
+        if let Some(sync_node) = inodes.get(&dir_ino) {
+            let node = sync_node.as_ref();
+            if let NodeKind::Directory { entries, .. } = &node.kind {
+                let mut sorted_entries = entries.clone();
+                sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, child_ino) in sorted_entries {
+                    ino_to_name.entry(child_ino).or_insert(name);
+                }
+            }
+        }
+    }
+
+    let mut ext_map: HashMap<String, (usize, u64)> = HashMap::new();
+    let mut sorted_inodes: Vec<u64> = inodes.keys().copied().collect();
+    sorted_inodes.sort_unstable();
+
+    for ino in sorted_inodes {
+        if let Some(sync_node) = inodes.get(&ino) {
+            let node = sync_node.as_ref();
+            if let NodeKind::File { size, .. } = &node.kind {
+                let name = ino_to_name.get(&ino).map(|s| s.as_str()).unwrap_or("");
+                let ext = extract_extension(name);
+                let entry = ext_map.entry(ext).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += *size;
+            }
+        }
+    }
+
+    let mut result: Vec<ExtensionStats> = ext_map
+        .into_iter()
+        .map(|(extension, (file_count, total_bytes))| ExtensionStats {
+            extension,
+            file_count,
+            total_bytes,
+        })
+        .collect();
+
+    result.sort_by(|a, b| {
+        b.total_bytes
+            .cmp(&a.total_bytes)
+            .then_with(|| b.file_count.cmp(&a.file_count))
+            .then_with(|| a.extension.cmp(&b.extension))
+    });
+
+    result
+}
+
+/// Formats a table of file counts and logical byte sizes grouped by file extension.
+pub fn format_extension_stats_table(extensions: &[ExtensionStats], total_files: usize, total_bytes: u64) -> String {
+    let mut out = String::new();
+    if extensions.is_empty() || total_files == 0 {
+        return out;
+    }
+
+    writeln!(out, "--- File Extension Breakdown ---").unwrap();
+    writeln!(
+        out,
+        "{:<24} {:>8} {:>12} {:>14} {:>12}",
+        "EXTENSION", "FILES", "% OF FILES", "TOTAL BYTES", "% OF BYTES"
+    )
+    .unwrap();
+    writeln!(out, "{:-<24} {:-<8} {:-<12} {:-<14} {:-<12}", "", "", "", "", "").unwrap();
+
+    let (top, rest) = if extensions.len() > TOP_EXTENSIONS_LIMIT {
+        extensions.split_at(TOP_EXTENSIONS_LIMIT)
+    } else {
+        (extensions, &[][..])
+    };
+
+    for ext in top {
+        let file_pct = (ext.file_count as f64 / total_files as f64) * 100.0;
+        let byte_pct = if total_bytes > 0 {
+            (ext.total_bytes as f64 / total_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        writeln!(
+            out,
+            "{:<24} {:>8} {:>12} {:>14} {:>12}",
+            ext.extension,
+            ext.file_count,
+            format!("{:.1}%", file_pct),
+            format_bytes(ext.total_bytes),
+            format!("{:.1}%", byte_pct)
+        )
+        .unwrap();
+    }
+
+    if !rest.is_empty() {
+        let other_files: usize = rest.iter().map(|e| e.file_count).sum();
+        let other_bytes: u64 = rest.iter().map(|e| e.total_bytes).sum();
+        let file_pct = (other_files as f64 / total_files as f64) * 100.0;
+        let byte_pct = if total_bytes > 0 {
+            (other_bytes as f64 / total_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        writeln!(
+            out,
+            "{:<24} {:>8} {:>12} {:>14} {:>12}",
+            "(other)",
+            other_files,
+            format!("{:.1}%", file_pct),
+            format_bytes(other_bytes),
+            format!("{:.1}%", byte_pct)
+        )
+        .unwrap();
+    }
+
     out
 }
 
@@ -728,6 +921,20 @@ mod tests {
         assert_eq!(stats_snapshot.total_logical_bytes, 4096);
         assert_eq!(stats_snapshot.total_live_bytes, 4096);
         assert_eq!(stats_snapshot.overall_live_ratio, 1.0);
+        assert_eq!(stats_snapshot.extensions.len(), 1);
+        assert_eq!(stats_snapshot.extensions[0].extension, ".bin");
+        assert_eq!(stats_snapshot.extensions[0].file_count, 1);
+        assert_eq!(stats_snapshot.extensions[0].total_bytes, 4096);
+        assert!(
+            stats_snapshot
+                .display_text()
+                .contains("--- File Extension Breakdown ---")
+        );
+        assert!(
+            stats_snapshot
+                .display_text()
+                .contains(".bin                            1       100.0%       4.00 KiB       100.0%")
+        );
     }
 
     #[test]
@@ -1153,5 +1360,182 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         writer_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_extract_extension() {
+        assert_eq!(extract_extension("hello.txt"), ".txt");
+        assert_eq!(extract_extension("photo.PNG"), ".png");
+        assert_eq!(extract_extension("archive.tar.gz"), ".gz");
+        assert_eq!(extract_extension("README"), "(no extension)");
+        assert_eq!(extract_extension(".gitignore"), "(no extension)");
+        assert_eq!(extract_extension(".env"), "(no extension)");
+        assert_eq!(extract_extension(".vimrc.bak"), ".bak");
+        assert_eq!(extract_extension("trailing."), "(no extension)");
+        assert_eq!(extract_extension(""), "(no extension)");
+        assert_eq!(extract_extension("manual.1"), ".1");
+        assert_eq!(extract_extension("code.c++"), ".c++");
+    }
+
+    #[test]
+    fn test_calculate_extension_stats_from_nodes() {
+        use crate::extent_map::ExtentMap;
+        use crate::node::{InodeMeta, Node, NodeKind};
+        use std::time::SystemTime;
+
+        let now = SystemTime::UNIX_EPOCH;
+        let mut inodes = HashMap::new();
+
+        // Inode 1: root dir
+        inodes.insert(
+            1,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o755, 3, 0, 0, now),
+                kind: NodeKind::Directory {
+                    parent: 1,
+                    entries: vec![
+                        ("sub".to_string(), 2),
+                        ("a.txt".to_string(), 3),
+                        ("b.TXT".to_string(), 4),
+                        ("no_ext".to_string(), 5),
+                    ],
+                },
+            }),
+        );
+
+        // Inode 2: subdir
+        inodes.insert(
+            2,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o755, 2, 0, 0, now),
+                kind: NodeKind::Directory {
+                    parent: 1,
+                    entries: vec![
+                        ("image.png".to_string(), 6),
+                        ("hardlink_a.txt".to_string(), 3), // hardlink to inode 3
+                    ],
+                },
+            }),
+        );
+
+        // Inode 3: a.txt (file, size 100) - hardlinked twice
+        inodes.insert(
+            3,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o644, 2, 0, 0, now),
+                kind: NodeKind::File {
+                    extent_map: ExtentMap::new(),
+                    size: 100,
+                },
+            }),
+        );
+
+        // Inode 4: b.TXT (file, size 200)
+        inodes.insert(
+            4,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o644, 1, 0, 0, now),
+                kind: NodeKind::File {
+                    extent_map: ExtentMap::new(),
+                    size: 200,
+                },
+            }),
+        );
+
+        // Inode 5: no_ext (file, size 50)
+        inodes.insert(
+            5,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o644, 1, 0, 0, now),
+                kind: NodeKind::File {
+                    extent_map: ExtentMap::new(),
+                    size: 50,
+                },
+            }),
+        );
+
+        // Inode 6: image.png (file, size 500)
+        inodes.insert(
+            6,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o644, 1, 0, 0, now),
+                kind: NodeKind::File {
+                    extent_map: ExtentMap::new(),
+                    size: 500,
+                },
+            }),
+        );
+
+        let stats = calculate_extension_stats_from_nodes(&inodes);
+        assert_eq!(stats.len(), 3);
+
+        // Expected sorting: total_bytes desc, then file_count desc, then extension asc
+        // 1. .png: 1 file, 500 bytes
+        // 2. .txt: 2 files (inodes 3 and 4), 300 bytes (100 + 200)
+        // 3. (no extension): 1 file, 50 bytes
+        assert_eq!(stats[0].extension, ".png");
+        assert_eq!(stats[0].file_count, 1);
+        assert_eq!(stats[0].total_bytes, 500);
+
+        assert_eq!(stats[1].extension, ".txt");
+        assert_eq!(stats[1].file_count, 2);
+        assert_eq!(stats[1].total_bytes, 300);
+
+        assert_eq!(stats[2].extension, "(no extension)");
+        assert_eq!(stats[2].file_count, 1);
+        assert_eq!(stats[2].total_bytes, 50);
+    }
+
+    #[test]
+    fn test_format_extension_stats_table_top_limit_and_other() {
+        // Create 18 extensions to test the top 15 limit and (other) grouping
+        let mut extensions = Vec::new();
+        for i in 1..=18 {
+            extensions.push(ExtensionStats {
+                extension: format!(".ext{:02}", i),
+                file_count: 10,
+                total_bytes: (20 - i) as u64 * 1024,
+            });
+        }
+
+        let total_files: usize = extensions.iter().map(|e| e.file_count).sum(); // 180 files
+        let total_bytes: u64 = extensions.iter().map(|e| e.total_bytes).sum();
+
+        let table = format_extension_stats_table(&extensions, total_files, total_bytes);
+        assert!(table.contains("--- File Extension Breakdown ---"));
+        assert!(table.contains("EXTENSION                   FILES   % OF FILES    TOTAL BYTES   % OF BYTES"));
+        assert!(table.contains(".ext01"));
+        assert!(table.contains(".ext15"));
+        // .ext16, .ext17, .ext18 must be grouped under (other)
+        assert!(!table.contains(".ext16"));
+        assert!(!table.contains(".ext17"));
+        assert!(!table.contains(".ext18"));
+        assert!(table.contains("(other)"));
+
+        let other_files: usize = extensions[15..].iter().map(|e| e.file_count).sum();
+        let other_bytes: u64 = extensions[15..].iter().map(|e| e.total_bytes).sum();
+        let other_file_pct = (other_files as f64 / total_files as f64) * 100.0;
+        let other_byte_pct = (other_bytes as f64 / total_bytes as f64) * 100.0;
+
+        assert!(table.contains(&format!(
+            "{:<24} {:>8} {:>12} {:>14} {:>12}",
+            "(other)",
+            other_files,
+            format!("{:.1}%", other_file_pct),
+            format_bytes(other_bytes),
+            format!("{:.1}%", other_byte_pct)
+        )));
+    }
+
+    #[test]
+    fn test_format_extension_stats_table_empty() {
+        assert_eq!(format_extension_stats_table(&[], 0, 0), "");
+        assert_eq!(format_extension_stats_table(&[], 5, 1000), "");
+        let stats = vec![ExtensionStats {
+            extension: ".txt".to_string(),
+            file_count: 1,
+            total_bytes: 10,
+        }];
+        assert_eq!(format_extension_stats_table(&stats, 0, 10), "");
     }
 }

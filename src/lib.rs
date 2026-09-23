@@ -64,8 +64,9 @@ pub use shim::{
     FileAttr, FileType, Filesystem, FuseResponse, ReplyData, Request, RequestContext, StatfsAttr,
 };
 pub use stats::{
-    VolumeStats, calculate_generation_live_stats_from_nodes, format_generation_status, format_generations_table,
-    format_runtime_status,
+    ExtensionStats, TOP_EXTENSIONS_LIMIT, VolumeStats, calculate_extension_stats_from_nodes,
+    calculate_generation_live_stats_from_nodes, extract_extension, format_extension_stats_table,
+    format_generation_status, format_generations_table, format_runtime_status,
 };
 pub use storage::{
     BufferedStorageWriter, DEFAULT_STORAGE_BUFFER_CAPACITY, FaultStorage, MemoryStorage, OsStorage, OsStorageReader,

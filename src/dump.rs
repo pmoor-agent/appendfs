@@ -872,6 +872,13 @@ pub fn dump_summary_reader_with_path(
     writeln!(out, "Logical Data Size:   {}", format_bytes(total_logical_bytes)).unwrap();
     writeln!(out).unwrap();
 
+    let extensions = crate::stats::calculate_extension_stats_from_nodes(&inodes);
+    let ext_table = crate::stats::format_extension_stats_table(&extensions, file_count, total_logical_bytes);
+    if !ext_table.is_empty() {
+        out.push_str(&ext_table);
+        writeln!(out).unwrap();
+    }
+
     // File Extents & Fragmentation Stats
     writeln!(out, "--- File Extent & Fragmentation Statistics ---").unwrap();
     writeln!(out, "Total Regular Files: {}", file_count).unwrap();
@@ -1669,6 +1676,8 @@ mod tests {
         assert!(dump_snap_v0.contains("Avg Extents / File:  2.00"));
         assert!(dump_snap_v0.contains("Max Extents in File: 2"));
         assert!(dump_snap_v0.contains("2 - 4 extents"));
+        assert!(dump_snap_v0.contains("--- File Extension Breakdown ---"));
+        assert!(dump_snap_v0.contains(".bin                            1       100.0%       8.00 KiB       100.0%"));
         assert!(dump_snap_v0.contains("Top Fragmented Files"));
         assert!(dump_snap_v0.contains("/docs/fragmented.bin"));
         assert!(dump_snap_v0.contains("000001.log"));
