@@ -216,9 +216,6 @@ pub struct ReplicationPolicy {
     /// Keep sealed log files locally for at least this duration before eviction (e.g. "30d", "24h", "3600s", default: "30d").
     #[serde(default = "default_local_retention")]
     pub local_retention: String,
-    /// Maximum disk footprint in GB of the local volume before LRU pruning (default: 16 GB).
-    #[serde(default = "default_cache_max_gb")]
-    pub local_cache_max_gb: u64,
     /// Maximum time an active log can stay open before rolling (default: 86400s / 24 hours).
     #[serde(default = "default_max_log_age")]
     pub max_log_age_secs: u64,
@@ -244,9 +241,6 @@ fn default_min_synced() -> usize {
 fn default_local_retention() -> String {
     "30d".to_string()
 }
-fn default_cache_max_gb() -> u64 {
-    16
-}
 fn default_max_log_age() -> u64 {
     86400 // 24 hours
 }
@@ -262,7 +256,6 @@ impl Default for ReplicationPolicy {
         Self {
             min_synced_remotes: default_min_synced(),
             local_retention: default_local_retention(),
-            local_cache_max_gb: default_cache_max_gb(),
             max_log_age_secs: default_max_log_age(),
             active_sync_interval_secs: default_active_sync_interval(),
             audit_interval_secs: default_audit_interval(),
@@ -528,7 +521,6 @@ bucket = "legacy-bucket"
     #[test]
     fn test_replication_policy_defaults() {
         let policy = ReplicationPolicy::default();
-        assert_eq!(policy.local_cache_max_gb, 16);
         assert_eq!(policy.max_log_age_secs, 86400);
         assert_eq!(policy.active_sync_interval_secs, 3600);
         assert_eq!(policy.audit_interval_secs, 21600);

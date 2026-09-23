@@ -617,14 +617,17 @@ fn test_local_read_populates_block_cache_before_purge() {
     write_core(&fs, file2_ino, payload2, 0).unwrap();
     fs.quiesce().unwrap();
 
-    // 4. Attach LogFileCache with MemoryBlockCache (NO remotes configured!)
+    // 4. Attach LogFileCache with MemoryBlockCache (NO remotes configured!), caching local reads
     let block_cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
-    let log_cache = Arc::new(LogFileCache::with_remote_support(
-        storage.clone(),
-        Some(block_cache.clone()),
-        Vec::<appendfs::remote::RemoteReadTarget>::new(), // Zero remotes!
-        Some(Arc::clone(&fs.manifest)),
-    ));
+    let log_cache = Arc::new(
+        LogFileCache::with_remote_support(
+            storage.clone(),
+            Some(block_cache.clone()),
+            Vec::<appendfs::remote::RemoteReadTarget>::new(), // Zero remotes!
+            Some(Arc::clone(&fs.manifest)),
+        )
+        .with_cache_local_reads(true),
+    );
     fs.log_cache = Some(log_cache.clone());
 
     // Verify cache is empty before any reads
@@ -659,6 +662,52 @@ fn test_local_read_populates_block_cache_before_purge() {
         read_cached_after_purge, payload1,
         "Read succeeded directly from pre-warmed block cache after local log was purged!"
     );
+}
+
+#[test]
+fn test_local_read_skips_block_cache_by_default() {
+    let storage = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+
+    let ino = create_core(&fs, 1, "file.txt", 0o644, 0, 1000, 1000).unwrap().ino;
+    let payload = b"Sealed content read straight from the local log";
+    write_core(&fs, ino, payload, 0).unwrap();
+    fs.quiesce().unwrap();
+
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed);
+
+    let block_cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
+    let log_cache = Arc::new(LogFileCache::with_remote_support(
+        storage.clone(),
+        Some(block_cache.clone()),
+        Vec::<appendfs::remote::RemoteReadTarget>::new(),
+        Some(Arc::clone(&fs.manifest)),
+    ));
+    fs.log_cache = Some(log_cache.clone());
+
+    // The sealed log is still local, so it is read directly and nothing is copied into the cache.
+    assert_eq!(read_test(&fs, ino, 0, payload.len()).unwrap(), payload);
+    assert!(block_cache.read_block("000001", 0).unwrap().is_none());
+
+    // Once it is purged there is no second copy to fall back on, and no remote either.
+    log_cache.decrypted_cache.clear();
+    storage.remove_file("000001.log").unwrap();
+    log_cache.invalidate(1);
+    assert!(read_test(&fs, ino, 0, payload.len()).is_err());
 }
 
 #[test]

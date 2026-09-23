@@ -45,6 +45,9 @@ pub const DEFAULT_SMALL_BATCH_MAX_BYTES: usize = 32 * 1024;
 
 pub use crate::remote::block_cache::DEFAULT_DECRYPTED_CACHE_SIZE;
 
+/// Default maximum size of the on-disk block cache (16 GiB).
+pub const DEFAULT_DISK_CACHE_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Default interval in bytes of committed log data before generating a new .summary snapshot file during log rolls (10 GiB).
 pub const DEFAULT_SUMMARY_INTERVAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
@@ -358,6 +361,18 @@ pub struct MountCommonArgs {
     /// Maximum size in bytes of in-memory decrypted record cache (default: 128 MiB)
     #[arg(long = "decrypted-cache-size", default_value_t = DEFAULT_DECRYPTED_CACHE_SIZE)]
     pub decrypted_cache_size: usize,
+
+    /// Directory for the on-disk block cache of sealed log blocks (default: `.cache` inside the log directory)
+    #[arg(long = "disk-cache-dir")]
+    pub disk_cache_dir: Option<PathBuf>,
+
+    /// Maximum size in bytes of the on-disk block cache before the least recently used blocks are pruned (default: 16 GiB, 0 to disable)
+    #[arg(long = "disk-cache-size", default_value_t = DEFAULT_DISK_CACHE_SIZE)]
+    pub disk_cache_size: u64,
+
+    /// Also cache blocks read from sealed logs still present in the log directory, so they stay readable after the local log is pruned (default: false, only blocks fetched from remotes are cached)
+    #[arg(long = "disk-cache-local-reads", default_value_t = false)]
+    pub disk_cache_local_reads: bool,
 }
 
 impl MountCommonArgs {

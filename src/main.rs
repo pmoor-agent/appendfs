@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::too_many_lines))]
 use appendfs::cli::{
-    Cli, Commands, DumpArgs, FsckArgs, InitArgs, MountArgs, MountRoArgs, RemoteAddArgs, RemoteCommands, RemoteListArgs,
-    RemoteRmArgs, RemoteSubcommandArgs, StatsArgs,
+    Cli, Commands, DumpArgs, FsckArgs, InitArgs, MountArgs, MountCommonArgs, MountRoArgs, RemoteAddArgs,
+    RemoteCommands, RemoteListArgs, RemoteRmArgs, RemoteSubcommandArgs, StatsArgs,
 };
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{
@@ -456,6 +456,37 @@ fn start_replication_worker(
     ))
 }
 
+/// Builds the log reader cache for a mount: the in-memory decrypted record cache plus the
+/// on-disk block cache, both sized and placed by the mount flags.
+fn build_log_cache(
+    args: &MountCommonArgs,
+    storage: Arc<dyn Storage>,
+    remote_stores: Vec<appendfs::remote::RemoteReadTarget>,
+    manifest: &Arc<std::sync::RwLock<appendfs::log::LogManifest>>,
+) -> Arc<appendfs::log::LogFileCache> {
+    let cache_dir = args
+        .disk_cache_dir
+        .clone()
+        .unwrap_or_else(|| args.log_dir.join(".cache"));
+    let block_cache =
+        match appendfs::remote::OnDiskBlockCache::new(&cache_dir, args.disk_cache_size, Arc::new(SystemClock)) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                eprintln!("Failed to open disk cache directory '{}': {}", cache_dir.display(), e);
+                std::process::exit(1);
+            }
+        };
+    let log_cache = appendfs::log::LogFileCache::with_remote_support(
+        storage,
+        Some(block_cache),
+        remote_stores,
+        Some(Arc::clone(manifest)),
+    )
+    .with_cache_local_reads(args.disk_cache_local_reads);
+    log_cache.set_decrypted_cache_size(args.decrypted_cache_size);
+    Arc::new(log_cache)
+}
+
 fn cmd_mount(args: MountArgs) {
     let log_dir = &args.log_dir;
     println!(
@@ -518,26 +549,12 @@ fn cmd_mount(args: MountArgs) {
     fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
     fs_instance.track_atime = args.track_atime;
 
-    let remote_stores = registry.build_read_stores();
-
-    let cache_dir = log_dir.join(".cache");
-    let block_cache = Arc::new(
-        appendfs::remote::OnDiskBlockCache::new(
-            &cache_dir,
-            registry.policy.local_cache_max_gb * 1024 * 1024 * 1024,
-            Arc::new(SystemClock),
-        )
-        .unwrap(),
-    );
-
-    let log_cache = Arc::new(appendfs::log::LogFileCache::with_remote_support(
+    fs_instance.log_cache = Some(build_log_cache(
+        &args,
         storage.clone(),
-        Some(block_cache),
-        remote_stores,
-        Some(Arc::clone(&fs_instance.manifest)),
+        registry.build_read_stores(),
+        &fs_instance.manifest,
     ));
-    log_cache.set_decrypted_cache_size(args.decrypted_cache_size);
-    fs_instance.log_cache = Some(log_cache);
 
     let fs_instance = Arc::new(fs_instance);
 
@@ -632,23 +649,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
     fs_instance.set_storage(storage.clone());
     fs_instance.set_read_only();
 
-    let cache_dir = log_dir.join(".cache");
-    let block_cache = Arc::new(
-        appendfs::remote::OnDiskBlockCache::new(
-            &cache_dir,
-            registry.policy.local_cache_max_gb * 1024 * 1024 * 1024,
-            Arc::new(SystemClock),
-        )
-        .unwrap(),
-    );
-    let log_cache = Arc::new(appendfs::log::LogFileCache::with_remote_support(
-        storage,
-        Some(block_cache),
-        remote_stores,
-        Some(Arc::clone(&fs_instance.manifest)),
-    ));
-    log_cache.set_decrypted_cache_size(args.decrypted_cache_size);
-    fs_instance.log_cache = Some(log_cache);
+    fs_instance.log_cache = Some(build_log_cache(&args, storage, remote_stores, &fs_instance.manifest));
 
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
     fs_instance.set_remote_registry(Arc::clone(&registry_arc));

@@ -152,7 +152,9 @@ impl DecryptedRecordCache {
     }
 }
 
-/// Persistent on-disk LRU block cache storing raw encrypted 1 MiB chunks in `<log_dir>/.cache/`.
+/// Persistent on-disk LRU block cache storing raw encrypted 1 MiB chunks in a cache directory
+/// (`<log_dir>/.cache/` unless `--disk-cache-dir` says otherwise). A `max_bytes` of 0 disables
+/// it: no block is written, rather than each one being written and pruned straight away.
 pub struct OnDiskBlockCache {
     cache_dir: PathBuf,
     max_bytes: u64,
@@ -266,6 +268,9 @@ impl OnDiskBlockCache {
     }
 
     pub fn write_block(&self, file_stem: &str, block_idx: u64, data: &[u8]) -> io::Result<()> {
+        if self.max_bytes == 0 {
+            return Ok(());
+        }
         let _guard = self.access_lock.lock().unwrap();
         self.write_and_rename_block(file_stem, block_idx, data)?;
         self.prune_if_needed()?;
@@ -281,6 +286,9 @@ impl OnDiskBlockCache {
     }
 
     pub fn write_blocks(&self, file_stem: &str, start_block: u64, data: &[u8]) -> io::Result<()> {
+        if self.max_bytes == 0 {
+            return Ok(());
+        }
         let _guard = self.access_lock.lock().unwrap();
         let mut offset = 0;
         let mut block_idx = start_block;

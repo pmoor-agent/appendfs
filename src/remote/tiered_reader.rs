@@ -8,7 +8,7 @@ use std::sync::Arc;
 /// A `StorageReader` backed by local storage, remote S3/NFS stores, and a local on-disk block cache.
 ///
 /// For sealed log files, `TieredStorageReader` provides a unified read path:
-/// 1. Checks `OnDiskBlockCache` first (`.cache/`).
+/// 1. Checks `OnDiskBlockCache` first.
 /// 2. Falls back to local storage (if present). If found locally, it reads the chunk directly
 ///    and saves the 1 MiB block into `OnDiskBlockCache` (pre-warming the cache).
 /// 3. If missing locally, falls back to remote stores using streaming range queries (GET).
