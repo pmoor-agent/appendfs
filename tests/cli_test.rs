@@ -811,3 +811,95 @@ fn test_cli_mount_ro_batch_id_flag_and_no_tx_id_alias() {
     assert!(stdout.contains("--batch-id"));
     assert!(!stdout.contains("--tx-id"));
 }
+
+/// SIGKILLs every other process holding `path` open, found by scanning `/proc/*/fd`.
+fn kill_other_processes_holding(path: &std::path::Path) {
+    for proc_entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(pid) = proc_entry.file_name().to_string_lossy().parse::<libc::pid_t>() else {
+            continue;
+        };
+        if pid as u32 == std::process::id() {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(proc_entry.path().join("fd")) else {
+            continue;
+        };
+        if fds
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == path))
+        {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// A background mount (no `-f`) forks in `fuse_daemonize`, and `fork` carries only the
+/// calling thread into the daemon. Threads started before it - the delayed response queue's,
+/// the replication worker's - used to vanish, so replication never ran and unmount hung
+/// forever joining them, right after writing the final summary.
+#[test]
+fn test_cli_background_mount_exits_after_unmount_and_replicates() {
+    use std::os::unix::io::AsRawFd;
+    use std::time::Duration;
+
+    let log_dir = TempDir::new().unwrap();
+    let mount_dir = TempDir::new().unwrap();
+    let remote_dir = TempDir::new().unwrap();
+    let log = log_dir.path().to_str().unwrap();
+    let mount = mount_dir.path().to_str().unwrap();
+
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "appendfs {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init", log]);
+    run(&[
+        "remote",
+        "add",
+        log,
+        "backup",
+        "--path",
+        remote_dir.path().to_str().unwrap(),
+    ]);
+    // Without `-f`, this returns once the daemon it forked has taken over the mount.
+    run(&["mount", log, mount]);
+
+    std::fs::write(mount_dir.path().join("hello.txt"), b"written through the daemon").unwrap();
+    assert!(
+        Command::new("fusermount3")
+            .args(["-u", mount])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // The daemon holds the volume lock for as long as it runs.
+    let lock_path = log_dir.path().join(".lock");
+    let lock = std::fs::File::open(&lock_path).unwrap();
+    let exited = appendfs::wait_until(
+        || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        Duration::from_secs(10),
+    );
+    if !exited {
+        kill_other_processes_holding(&lock_path);
+    }
+    assert!(exited, "background mount daemon did not exit after unmount");
+
+    for name in ["000001.log", "000001.summary"] {
+        assert!(
+            remote_dir.path().join(name).exists(),
+            "{} was not replicated to the remote",
+            name
+        );
+    }
+}

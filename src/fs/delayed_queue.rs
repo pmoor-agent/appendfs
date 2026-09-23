@@ -109,22 +109,9 @@ impl DelayedResponseQueue {
         base_throttle_delay: Duration,
         max_throttle_delay: Duration,
     ) -> Self {
-        let state = Arc::new((Mutex::new(QueueState::default()), Condvar::new()));
-
-        let thread_state = Arc::clone(&state);
-        let thread_clock = Arc::clone(&clock);
-        let thread_op_metrics = Arc::clone(&op_metrics);
-
-        let thread = std::thread::Builder::new()
-            .name("appendfs-delayed-queue".to_string())
-            .spawn(move || {
-                Self::worker_loop(thread_state, thread_clock, thread_op_metrics);
-            })
-            .expect("failed to spawn delayed response queue worker thread");
-
         Self {
-            state,
-            thread: Mutex::new(Some(thread)),
+            state: Arc::new((Mutex::new(QueueState::default()), Condvar::new())),
+            thread: Mutex::new(None),
             flushing_saturated: AtomicBool::new(false),
             cached_ratio_bits: AtomicU64::new(0.0f64.to_bits()),
             clock,
@@ -132,6 +119,28 @@ impl DelayedResponseQueue {
             base_throttle_delay,
             max_throttle_delay,
         }
+    }
+
+    /// Starts the worker thread that dispatches delayed responses once their deadline passes.
+    /// Idempotent. Until it runs, delayed responses only go out through `notify_capacity`,
+    /// `drain`, or (in tests) `wake_expired`.
+    ///
+    /// Deliberately not done in the constructor: the queue is built during recovery, before
+    /// a background mount forks, and a thread started then would not exist in the daemon.
+    pub fn start(&self) {
+        let mut thread = self.thread.lock().unwrap();
+        if thread.is_some() {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let clock = Arc::clone(&self.clock);
+        let op_metrics = Arc::clone(&self.op_metrics);
+        *thread = Some(
+            std::thread::Builder::new()
+                .name("appendfs-delayed-queue".to_string())
+                .spawn(move || Self::worker_loop(state, clock, op_metrics))
+                .expect("failed to spawn delayed response queue worker thread"),
+        );
     }
 
     fn worker_loop(
@@ -446,6 +455,26 @@ mod tests {
 
         queue.drain();
         assert_eq!(queue.op_metrics().total_active_delayed(), 0);
+    }
+
+    #[test]
+    fn test_delayed_queue_dispatches_only_once_started() {
+        let metrics = Arc::new(FuseOpMetrics::new());
+        let queue = DelayedResponseQueue::new(Arc::new(crate::clock::SystemClock), metrics.clone());
+        let delay = ThrottleDecision::Delay(Duration::from_millis(1));
+
+        // No worker thread yet: an expired deadline stays queued.
+        queue.delay_response(FuseOp::Write, delay, Request::new_mock(), Ok(FuseResponse::ok()));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(metrics.total_active_delayed(), 1);
+
+        queue.start();
+        assert!(
+            crate::wait_until(|| metrics.total_active_delayed() == 0, Duration::from_secs(5)),
+            "the started worker thread must dispatch the expired response"
+        );
+
+        queue.drain();
     }
 
     #[test]

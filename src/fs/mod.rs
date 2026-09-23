@@ -39,7 +39,7 @@ use crate::sync::{ActionGuard, ActionMutex, OpTag, PostUnlockQueue};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
@@ -830,6 +830,11 @@ pub struct InMemoryFS {
     pub last_summary_generation: AtomicU32,
     /// Condition variable and flag to immediately notify the background replication worker of new logs/summaries.
     pub replication_notifier: Arc<(Mutex<bool>, Condvar)>,
+    /// Log directory for `init()` to start a replication worker on, replicating to the
+    /// remotes in `remote_registry`. `None` leaves replication off.
+    pub replication_log_dir: Option<PathBuf>,
+    /// The replication worker `init()` started, until `destroy()` stops it.
+    replication_worker: Mutex<Option<crate::remote::RemoteReplicationWorker>>,
     /// Tracks in-flight asynchronous operations (e.g. cold reads, async fsyncs) to ensure safe unmount without use-after-free.
     pub async_tracker: Arc<AsyncTracker>,
     /// Cumulative FUSE operation telemetry tracking calls and execution latency.
@@ -940,6 +945,8 @@ impl InMemoryFS {
             generations_since_last_summary: AtomicU64::new(0),
             last_summary_generation: AtomicU32::new(0),
             replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
+            replication_log_dir: None,
+            replication_worker: Mutex::new(None),
             async_tracker,
             op_metrics,
             delayed_queue,
