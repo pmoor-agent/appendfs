@@ -433,29 +433,6 @@ fn cmd_init(args: InitArgs) {
     }
 }
 
-/// Starts the background replication worker, unless syncing is disabled or no remotes are
-/// configured. The caller owns stopping it - see `cmd_mount`, where the ordering against
-/// unmount matters.
-fn start_replication_worker(
-    args: &MountArgs,
-    fs_instance: &Arc<appendfs::InMemoryFS>,
-    registry_arc: &Arc<std::sync::RwLock<appendfs::remote::RemoteRegistry>>,
-    log_dir: &std::path::Path,
-) -> Option<appendfs::remote::RemoteReplicationWorker> {
-    if args.no_sync || registry_arc.read().unwrap().remotes.is_empty() {
-        return None;
-    }
-    println!(
-        "Starting autonomous background replication worker for {} remote(s)...",
-        registry_arc.read().unwrap().remotes.len()
-    );
-    Some(appendfs::remote::RemoteReplicationWorker::start(
-        Arc::clone(fs_instance),
-        Arc::clone(registry_arc),
-        log_dir.to_path_buf(),
-    ))
-}
-
 /// Builds the log reader cache for a mount: the in-memory decrypted record cache plus the
 /// on-disk block cache, both sized and placed by the mount flags.
 fn build_log_cache(
@@ -556,12 +533,14 @@ fn cmd_mount(args: MountArgs) {
         &fs_instance.manifest,
     ));
 
+    // Only configured here: `init()` starts the worker once FUSE is up, since a thread started
+    // now would not survive `fuse_daemonize` forking a background mount.
+    if !args.no_sync && !registry.remotes.is_empty() {
+        fs_instance.replication_log_dir = Some(log_dir.clone());
+    }
+    fs_instance.set_remote_registry(Arc::new(std::sync::RwLock::new(registry)));
+
     let fs_instance = Arc::new(fs_instance);
-
-    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
-    fs_instance.set_remote_registry(Arc::clone(&registry_arc));
-
-    let mut worker = start_replication_worker(&args, &fs_instance, &registry_arc, log_dir);
 
     println!(
         "Mounting appendfs at '{}' with log-dir '{}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, max-extent-size: {} bytes, foreground: {})...",
@@ -577,18 +556,7 @@ fn cmd_mount(args: MountArgs) {
     );
 
     let fuse_args = args.to_fuse_args();
-    let result = appendfs::mount_arc(fuse_args, fs_instance);
-
-    // By the time `mount_arc` returns, `fs.destroy()` has already run (from FUSE's `destroy`
-    // callback, inside `run_fuse_ll`) and exported the final summary - so this final
-    // replication cycle pushes the actual last state rather than racing it. Stopped
-    // explicitly here, rather than left to drop at end of scope, so the ordering is
-    // deliberate instead of an accident of `worker`'s lexical lifetime.
-    if let Some(ref mut worker) = worker {
-        worker.stop();
-    }
-
-    if let Err(err) = result {
+    if let Err(err) = appendfs::mount_arc(fuse_args, fs_instance) {
         eprintln!("Failed to mount appendfs FUSE filesystem: {}", err);
         std::process::exit(1);
     }

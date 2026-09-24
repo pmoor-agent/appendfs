@@ -612,19 +612,44 @@ impl InMemoryFS {
         self.inner.lock(OpTag::Stats).unwrap().flushing.len()
     }
 
-    /// Starts the background flusher thread upon FUSE mount.
+    /// Starts the filesystem's background threads upon FUSE mount.
+    ///
+    /// This is the earliest safe point for them: FUSE calls it from the session loop, after
+    /// a background mount's `fuse_daemonize` has forked. `fork` carries only the calling
+    /// thread into the daemon, so a thread started any earlier silently stops existing, and
+    /// joining it at unmount hangs forever.
     pub fn init(self: &Arc<Self>) {
+        self.delayed_queue.start();
         if self.is_read_only() {
             return;
         }
         let secs = self.flush_interval.load(Ordering::SeqCst);
         self.flusher.start(self, (secs > 0).then(|| Duration::from_secs(secs)));
+
+        let registry = self.remote_registry.read().unwrap().clone();
+        if let Some(log_dir) = &self.replication_log_dir
+            && let Some(registry) = registry
+        {
+            let mut worker = self.replication_worker.lock().unwrap();
+            if worker.is_none() {
+                log::info!(
+                    "Starting background replication worker for {} remote(s)",
+                    registry.read().unwrap().remotes.len()
+                );
+                *worker = Some(crate::remote::RemoteReplicationWorker::start(
+                    Arc::clone(self),
+                    registry,
+                    log_dir.clone(),
+                ));
+            }
+        }
     }
 
     /// Formal shutdown sequence, run once per filesystem lifetime (idempotent against repeat
     /// calls from FUSE's `destroy` callback and `Drop` both firing): read-only, drain `live`
     /// and `flushing` to a final durable summary, stop accepting all requests including reads,
-    /// then stop the flusher and drain whatever background/lock work remains.
+    /// then drain whatever background/lock work remains and stop replication once it has
+    /// pushed that summary.
     pub fn destroy(&self) {
         let Some(mounted_read_only) = self.with_inner(OpTag::Other, |inner| match inner.shutdown_state {
             // Shutdown already ran to completion: `Drop` calling in after FUSE's `destroy`
@@ -672,6 +697,13 @@ impl InMemoryFS {
         // Drain the delayed response queue before drain_async_ops(): stalls have no timeout.
         self.delayed_queue.drain();
         self.drain_async_ops();
+
+        // Last, so the worker's final cycle replicates the summary exported above. Taking it
+        // out of `self` also releases the worker's `Arc` back to this filesystem.
+        let worker = self.replication_worker.lock().unwrap().take();
+        if let Some(mut worker) = worker {
+            worker.stop();
+        }
     }
 
     /// Dynamically calculates live extent statistics across all active files and log generations.
