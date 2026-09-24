@@ -903,3 +903,52 @@ fn test_cli_background_mount_exits_after_unmount_and_replicates() {
         );
     }
 }
+
+#[test]
+fn test_cli_stats_and_dump_extension_breakdown() {
+    let fixture_src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1");
+    let temp_dir = TempDir::new().unwrap();
+
+    // Copy fixture files to temp directory to avoid polluting fixture with logs
+    for entry in std::fs::read_dir(&fixture_src).unwrap().flatten() {
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), temp_dir.path().join(entry.file_name())).unwrap();
+        }
+    }
+
+    // Verify `appendfs stats` outputs the File Extension Breakdown table
+    let stats_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["stats", temp_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run appendfs stats");
+    assert!(stats_out.status.success());
+    let stats_str = String::from_utf8_lossy(&stats_out.stdout);
+    assert!(stats_str.contains("--- File Extension Breakdown ---"));
+    assert!(stats_str.contains("EXTENSION                   FILES   % OF FILES    TOTAL BYTES   % OF BYTES"));
+    assert!(stats_str.contains(".dat                            1        20.0%      32.00 KiB        86.2%"));
+    assert!(stats_str.contains(".bin                            2        40.0%       5.10 KiB        13.7%"));
+    assert!(stats_str.contains(".txt                            2        40.0%           40 B         0.1%"));
+
+    // Verify `appendfs dump` on .summary file outputs the File Extension Breakdown table
+    let summary_file = temp_dir.path().join("000001.summary");
+    let dump_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["dump", summary_file.to_str().unwrap()])
+        .output()
+        .expect("failed to run appendfs dump");
+    assert!(dump_out.status.success());
+    let dump_str = String::from_utf8_lossy(&dump_out.stdout);
+    assert!(dump_str.contains("--- File Extension Breakdown ---"));
+    assert!(dump_str.contains("EXTENSION                   FILES   % OF FILES    TOTAL BYTES   % OF BYTES"));
+    assert!(dump_str.contains(".dat                            1        20.0%      32.00 KiB        86.2%"));
+    assert!(dump_str.contains(".bin                            2        40.0%       5.10 KiB        13.7%"));
+    assert!(dump_str.contains(".txt                            2        40.0%           40 B         0.1%"));
+
+    // Verify `appendfs stats` and `appendfs dump` match identically from "--- Inode Breakdown ---" onwards
+    let dump_idx = dump_str
+        .find("--- Inode Breakdown ---")
+        .expect("dump must contain '--- Inode Breakdown ---'");
+    let stats_idx = stats_str
+        .find("--- Inode Breakdown ---")
+        .expect("stats must contain '--- Inode Breakdown ---'");
+    assert_eq!(&dump_str[dump_idx..], &stats_str[stats_idx..]);
+}

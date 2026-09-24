@@ -563,9 +563,8 @@ impl InMemoryFS {
         self.execute_read_plan_sync(plan)
     }
 
-    #[cfg(any(test, feature = "testing"))]
     pub fn snapshot_all(&self) -> HashMap<u64, Arc<Node>> {
-        self.inner.lock_for_tests().unwrap().snapshot_all()
+        self.inner.lock(OpTag::Stats).unwrap().snapshot_all()
     }
 }
 

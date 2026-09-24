@@ -12,6 +12,13 @@ Checksum (BLAKE3):   065e1148a1fa2190765910ca9047c5e8d297dfd8141b326a08b1f2abcef
 Total Inodes:        18 (6 directories, 5 regular files, 3 symlinks)
 Logical Data Size:   37.14 KiB
 
+--- File Extension Breakdown ---
+EXTENSION                   FILES   % OF FILES    TOTAL BYTES   % OF BYTES
+------------------------ -------- ------------ -------------- ------------
+.dat                            1        20.0%      32.00 KiB        86.2%
+.bin                            2        40.0%       5.10 KiB        13.7%
+.txt                            2        40.0%           40 B         0.1%
+
 --- File Extent & Fragmentation Statistics ---
 Total Regular Files: 5
 Total File Extents:  6

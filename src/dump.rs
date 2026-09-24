@@ -7,7 +7,6 @@ use crate::log::record::{
 use crate::log::summary::{SUMMARY_MAGIC, SummaryReader};
 use crate::node::NodeKind;
 use crate::storage::{Storage, StorageReader};
-use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::io;
 use std::sync::Arc;
@@ -45,38 +44,7 @@ pub fn dump_file(
     }
 }
 
-/// Generic bucket for histogram distributions (e.g. write payload sizes, extents per file).
-#[derive(Debug, Clone)]
-pub struct HistogramBucket<T> {
-    pub label: &'static str,
-    pub min: T,
-    pub max: T,
-    pub count: usize,
-    pub total_bytes: u64,
-}
-
-impl<T: PartialOrd + Copy> HistogramBucket<T> {
-    pub fn new(label: &'static str, min: T, max: T) -> Self {
-        Self {
-            label,
-            min,
-            max,
-            count: 0,
-            total_bytes: 0,
-        }
-    }
-
-    pub fn matches(&self, val: T) -> bool {
-        val >= self.min && val <= self.max
-    }
-
-    pub fn add(&mut self, bytes: u64) {
-        self.count += 1;
-        self.total_bytes += bytes;
-    }
-}
-
-pub type ExtentsBucket = HistogramBucket<usize>;
+pub use crate::stats::{ExtentsBucket, HistogramBucket};
 pub type WriteBucket = HistogramBucket<u64>;
 
 /// Represents the status of a single decoded record or EOF anomaly.
@@ -723,114 +691,6 @@ pub fn dump_summary_reader_with_path(
 
     let inodes = reader.read_all_inodes()?;
 
-    // Sort inodes ascending
-    let mut sorted_inodes: Vec<u64> = inodes.keys().copied().collect();
-    sorted_inodes.sort_unstable();
-
-    // Inode type counters
-    let mut dir_count = 0usize;
-    let mut file_count = 0usize;
-    let mut symlink_count = 0usize;
-    let mut total_logical_bytes = 0u64;
-
-    let mut total_file_extents = 0usize;
-    let mut max_file_extents = 0usize;
-
-    // Extents per file buckets
-    let mut extent_buckets = vec![
-        ExtentsBucket::new("1 extent (contiguous)", 1, 1),
-        ExtentsBucket::new("2 - 4 extents", 2, 4),
-        ExtentsBucket::new("5 - 16 extents", 5, 16),
-        ExtentsBucket::new("17 - 64 extents", 17, 64),
-        ExtentsBucket::new("> 64 extents", 65, usize::MAX),
-    ];
-
-    // File fragmentation list for top-N ranking
-    struct FileFragInfo {
-        inode: u64,
-        size: u64,
-        extents: usize,
-        path: String,
-    }
-    let mut file_frag_list: Vec<FileFragInfo> = Vec::new();
-
-    // Build path map by BFS traversal from root directory (inode 1)
-    let mut path_map: HashMap<u64, String> = HashMap::new();
-    path_map.insert(1, "/".to_string());
-    let mut queue = VecDeque::new();
-    queue.push_back(1u64);
-
-    while let Some(dir_ino) = queue.pop_front() {
-        let dir_path = path_map
-            .get(&dir_ino)
-            .cloned()
-            .unwrap_or_else(|| format!("<inode {}>", dir_ino));
-        if let Some(sync_node) = inodes.get(&dir_ino) {
-            let node = sync_node.as_ref();
-            if let NodeKind::Directory { entries, .. } = &node.kind {
-                for (name, child_ino) in entries {
-                    let child_path = if dir_ino == 1 {
-                        format!("/{}", name)
-                    } else {
-                        format!("{}/{}", dir_path, name)
-                    };
-                    path_map.insert(*child_ino, child_path);
-                    if let Some(child_sync) = inodes.get(child_ino) {
-                        let child_node = child_sync.as_ref();
-                        if child_node.is_dir() {
-                            queue.push_back(*child_ino);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for &ino in &sorted_inodes {
-        if let Some(sync_node) = inodes.get(&ino) {
-            let node = sync_node.as_ref();
-            match &node.kind {
-                NodeKind::Directory { .. } => {
-                    dir_count += 1;
-                }
-                NodeKind::Symlink { .. } => {
-                    symlink_count += 1;
-                }
-                NodeKind::File { extent_map, size, .. } => {
-                    file_count += 1;
-                    total_logical_bytes += *size;
-                    let num_extents = extent_map.len();
-                    total_file_extents += num_extents;
-                    if num_extents > max_file_extents {
-                        max_file_extents = num_extents;
-                    }
-                    if num_extents > 0 {
-                        for b in &mut extent_buckets {
-                            if b.matches(num_extents) {
-                                b.count += 1;
-                                break;
-                            }
-                        }
-                    }
-                    let p = path_map
-                        .get(&ino)
-                        .cloned()
-                        .unwrap_or_else(|| format!("<inode {}>", ino));
-                    file_frag_list.push(FileFragInfo {
-                        inode: ino,
-                        size: *size,
-                        extents: num_extents,
-                        path: p,
-                    });
-                }
-                NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
-            }
-        }
-    }
-
-    // Sort top fragmented files
-    file_frag_list.sort_by(|a, b| b.extents.cmp(&a.extents).then_with(|| b.size.cmp(&a.size)));
-
     let mut out = String::new();
     writeln!(out, "=== appendfs Summary File Dump ===").unwrap();
     if let Some(p) = display_path {
@@ -858,103 +718,15 @@ pub fn dump_summary_reader_with_path(
     writeln!(out, "Checksum (BLAKE3):   {} (VERIFIED)", checksum_hex).unwrap();
     writeln!(out).unwrap();
 
-    // Inode Breakdown
-    writeln!(out, "--- Inode Breakdown ---").unwrap();
-    writeln!(
-        out,
-        "Total Inodes:        {} ({} directories, {} regular files, {} symlinks)",
-        sorted_inodes.len(),
-        dir_count,
-        file_count,
-        symlink_count
-    )
-    .unwrap();
-    writeln!(out, "Logical Data Size:   {}", format_bytes(total_logical_bytes)).unwrap();
-    writeln!(out).unwrap();
-
-    // File Extents & Fragmentation Stats
-    writeln!(out, "--- File Extent & Fragmentation Statistics ---").unwrap();
-    writeln!(out, "Total Regular Files: {}", file_count).unwrap();
-    writeln!(out, "Total File Extents:  {}", total_file_extents).unwrap();
-    let avg_extents = if file_count > 0 {
-        total_file_extents as f64 / file_count as f64
-    } else {
-        0.0
-    };
-    writeln!(out, "Avg Extents / File:  {:.2}", avg_extents).unwrap();
-    writeln!(out, "Max Extents in File: {}", max_file_extents).unwrap();
-    writeln!(out).unwrap();
-
-    if file_count > 0 {
-        writeln!(out, "Extents / File Distribution:").unwrap();
-        writeln!(
-            out,
-            "{:<24} {:>8} {:>12}   DISTRIBUTION",
-            "EXTENTS RANGE", "FILES", "% OF FILES"
-        )
-        .unwrap();
-        writeln!(out, "{:-<24} {:-<8} {:-<12}   {:-<20}", "", "", "", "").unwrap();
-
-        for b in &extent_buckets {
-            let pct = (b.count as f64 / file_count as f64) * 100.0;
-            let bar_len = (pct / 5.0).round() as usize;
-            let bar: String = "█".repeat(bar_len);
-            let pct_str = format!("{:.1}%", pct);
-            writeln!(out, "{:<24} {:>8} {:>12}   {:<20}", b.label, b.count, pct_str, bar).unwrap();
-        }
-        writeln!(out).unwrap();
-
-        // Top fragmented files (if any have > 1 extent)
-        let multi_extent_files: Vec<_> = file_frag_list.iter().filter(|f| f.extents > 1).take(5).collect();
-        if !multi_extent_files.is_empty() {
-            writeln!(out, "--- Top Fragmented Files ---").unwrap();
-            writeln!(
-                out,
-                "{:<8} {:>12} {:>9} {:>16}   PATH",
-                "INODE", "SIZE", "EXTENTS", "AVG EXTENT SIZE"
-            )
-            .unwrap();
-            writeln!(out, "{:-<8} {:-<12} {:-<9} {:-<16}   {:-<30}", "", "", "", "", "").unwrap();
-            for f in multi_extent_files {
-                let avg_sz = if f.extents > 0 { f.size / f.extents as u64 } else { 0 };
-                writeln!(
-                    out,
-                    "{:<8} {:>12} {:>9} {:>16}   {}",
-                    f.inode,
-                    format_bytes(f.size),
-                    f.extents,
-                    format_bytes(avg_sz),
-                    f.path
-                )
-                .unwrap();
-            }
-            writeln!(out).unwrap();
-        }
-    }
-
-    // Log Manifest Section
-    writeln!(out, "--- Tracked Log Generations Manifest ---").unwrap();
-    if reader.manifest.logs.is_empty() {
-        writeln!(out, "Tracked Logs:        0 active log generation files").unwrap();
-    } else {
-        writeln!(
-            out,
-            "Tracked Logs:        {} log generation files",
-            reader.manifest.logs.len()
-        )
-        .unwrap();
-        writeln!(out).unwrap();
-
-        let generations = crate::stats::calculate_generation_live_stats_from_nodes(
-            inodes.values().map(|a| a.as_ref()),
-            &reader.manifest,
-        );
-        out.push_str(&crate::stats::format_generations_table(&generations));
-    }
-    writeln!(out).unwrap();
+    out.push_str(&crate::stats::format_volume_content_report(&inodes, &reader.manifest));
 
     // Verbose Level 1: Inode Tree / Details
     if verbosity >= 1 {
+        let mut sorted_inodes: Vec<u64> = inodes.keys().copied().collect();
+        sorted_inodes.sort_unstable();
+        let path_map = crate::stats::build_path_map(&inodes);
+
+        writeln!(out).unwrap();
         writeln!(out, "=== Summary Inode Records ===").unwrap();
         for (i, &ino) in sorted_inodes.iter().enumerate() {
             if let Some(sync_node) = inodes.get(&ino) {
@@ -1669,6 +1441,8 @@ mod tests {
         assert!(dump_snap_v0.contains("Avg Extents / File:  2.00"));
         assert!(dump_snap_v0.contains("Max Extents in File: 2"));
         assert!(dump_snap_v0.contains("2 - 4 extents"));
+        assert!(dump_snap_v0.contains("--- File Extension Breakdown ---"));
+        assert!(dump_snap_v0.contains(".bin                            1       100.0%       8.00 KiB       100.0%"));
         assert!(dump_snap_v0.contains("Top Fragmented Files"));
         assert!(dump_snap_v0.contains("/docs/fragmented.bin"));
         assert!(dump_snap_v0.contains("000001.log"));
