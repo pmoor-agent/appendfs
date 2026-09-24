@@ -350,12 +350,18 @@ impl VolumeStats {
     /// Collects volume statistics from an in-memory filesystem state.
     pub fn collect(fs: &InMemoryFS) -> Self {
         let snapshot = fs.snapshot_all();
-        let counts = fs.inode_counts();
-        let generations = fs.calculate_generation_live_stats();
-        let extensions = calculate_extension_stats_from_nodes(&snapshot);
         let manifest = fs.manifest.read().unwrap();
+        let counts = InodeCounts::from_nodes(snapshot.values().map(|a| a.as_ref()));
+        let generations = calculate_generation_live_stats_from_nodes(snapshot.values().map(|a| a.as_ref()), &manifest);
+        let extensions = calculate_extension_stats_from_nodes(&snapshot);
         let content_report = format_volume_content_report(&snapshot, &manifest);
-        Self::from_parts(fs.next_generation(), &counts, generations, extensions, content_report)
+        Self::from_parts(
+            fs.next_generation_locked(&manifest),
+            &counts,
+            generations,
+            extensions,
+            content_report,
+        )
     }
 
     /// Collects volume statistics directly from a snapshot's inodes and manifest.
@@ -523,32 +529,6 @@ pub fn calculate_extension_stats_from_nodes(inodes: &HashMap<u64, Arc<Node>>) ->
                     {
                         queue.push_back(child_ino);
                     }
-                }
-            }
-        }
-    }
-
-    // Inspect any remaining disconnected directories (e.g. in test fixture setups)
-    let mut remaining_dirs: Vec<u64> = inodes
-        .iter()
-        .filter_map(|(&ino, node)| {
-            if node.is_dir() && !visited_dirs.contains(&ino) {
-                Some(ino)
-            } else {
-                None
-            }
-        })
-        .collect();
-    remaining_dirs.sort_unstable();
-
-    for dir_ino in remaining_dirs {
-        if let Some(sync_node) = inodes.get(&dir_ino) {
-            let node = sync_node.as_ref();
-            if let NodeKind::Directory { entries, .. } = &node.kind {
-                let mut sorted_entries = entries.clone();
-                sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
-                for (name, child_ino) in sorted_entries {
-                    ino_to_name.entry(child_ino).or_insert(name);
                 }
             }
         }
@@ -1141,8 +1121,17 @@ mod tests {
             },
         });
 
+        let root_node = Arc::new(Node {
+            meta: InodeMeta::new(0o755, 1, 1000, 1000, now),
+            kind: NodeKind::Directory {
+                parent: 1,
+                entries: vec![("dir".to_string(), 3)],
+            },
+        });
+
         {
             let mut inner = fs.inner.lock_for_tests().unwrap();
+            inner.base.insert(1, root_node);
             inner.base.insert(2, file_node);
             inner.base.insert(3, dir_node);
         }
