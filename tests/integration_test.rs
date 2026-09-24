@@ -865,7 +865,7 @@ fn test_volume_init_mount_and_stats_flow() {
     assert_eq!(stats.total_logical_bytes, 21);
 
     let display = stats.display_text();
-    assert!(display.contains("Total Inodes:        3 (2 directories, 1 files, 0 symlinks)"));
+    assert!(display.contains("Total Inodes:        3 (2 directories, 1 regular files, 0 symlinks)"));
     assert!(display.contains("000001.log"));
 
     // 5. Test dump command on the generated 000001.log file

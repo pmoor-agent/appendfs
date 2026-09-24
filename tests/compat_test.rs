@@ -166,6 +166,11 @@ fn test_v1_recovery_from_latest_summary_snapshot() {
 }
 
 #[test]
+fn test_v1_stats_matches_latest_summary_dump() {
+    verify_stats_matches_latest_summary_dump(&fixture_v1_dir());
+}
+
+#[test]
 fn test_v1_deterministic_reproducibility() {
     let temp = tempfile::tempdir().unwrap();
     create_canonical_compat_volume(temp.path(), CompatFixtureConfig::UnencryptedUncompressed)
@@ -421,6 +426,57 @@ pub fn verify_fixture_dumps(fixture_dir: &Path) {
     }
 }
 
+/// Verifies that `appendfs stats` output is identical to `appendfs dump` on the latest summary file
+/// starting from the canonical "--- Inode Breakdown ---" report header.
+pub fn verify_stats_matches_latest_summary_dump(fixture_dir: &Path) {
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(fixture_dir));
+    let clock: Arc<dyn appendfs::Clock> = Arc::new(appendfs::SystemClock);
+    let volume_key = resolve_fixture_volume_key(fixture_dir);
+
+    // 1. Locate the latest summary file in fixture_dir
+    let mut latest_summary: Option<((u32, u16), String)> = None;
+    for file in storage.list_files().expect("list fixture files") {
+        if let Some((generation, rev)) = appendfs::log::parse_summary_filename(&file)
+            && latest_summary.as_ref().is_none_or(|(gr, _)| (generation, rev) > *gr)
+        {
+            latest_summary = Some(((generation, rev), file));
+        }
+    }
+    let (_, latest_summary_file) = latest_summary.expect("fixture must have at least one summary file");
+
+    // 2. Dump latest summary file at verbosity 0
+    let dump_output =
+        appendfs::dump_file(&storage, &latest_summary_file, 0, Some(volume_key.as_ref())).unwrap_or_else(|e| {
+            panic!(
+                "Failed to dump {} in {}: {}",
+                latest_summary_file,
+                fixture_dir.display(),
+                e
+            )
+        });
+
+    // 3. Recover filesystem to latest state and collect VolumeStats
+    let fs = recover_fs(storage, RecoveryTarget::Latest, clock, volume_key)
+        .unwrap_or_else(|e| panic!("Recovery failed in {}: {}", fixture_dir.display(), e));
+    let stats = appendfs::VolumeStats::collect(&fs);
+    let stats_output = stats.display_text();
+
+    // 4. Assert that the report starting from "--- Inode Breakdown ---" matches identically
+    let dump_idx = dump_output
+        .find("--- Inode Breakdown ---")
+        .expect("dump must contain '--- Inode Breakdown ---'");
+    let stats_idx = stats_output
+        .find("--- Inode Breakdown ---")
+        .expect("stats must contain '--- Inode Breakdown ---'");
+
+    assert_eq!(
+        &dump_output[dump_idx..],
+        &stats_output[stats_idx..],
+        "Stats report does not match latest summary dump in {}",
+        fixture_dir.display()
+    );
+}
+
 #[test]
 fn test_all_fixture_versions() {
     let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -446,6 +502,7 @@ fn test_all_fixture_versions() {
         verify_recovery_from_latest_summary_snapshot(version_dir);
         verify_no_plaintext_in_encrypted_fixture(version_dir);
         verify_fixture_dumps(version_dir);
+        verify_stats_matches_latest_summary_dump(version_dir);
         verify_python_restore_script(version_dir);
     }
 }

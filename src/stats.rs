@@ -18,6 +18,268 @@ pub struct ExtensionStats {
     pub total_bytes: u64,
 }
 
+/// Generic histogram bucket for range categorization.
+#[derive(Debug, Clone)]
+pub struct HistogramBucket<T> {
+    pub label: &'static str,
+    pub min: T,
+    pub max: T,
+    pub count: usize,
+    pub total_bytes: u64,
+}
+
+impl<T: PartialOrd + Copy> HistogramBucket<T> {
+    pub const fn new(label: &'static str, min: T, max: T) -> Self {
+        Self {
+            label,
+            min,
+            max,
+            count: 0,
+            total_bytes: 0,
+        }
+    }
+
+    pub fn matches(&self, val: T) -> bool {
+        val >= self.min && val <= self.max
+    }
+
+    pub fn add(&mut self, bytes: u64) {
+        self.count += 1;
+        self.total_bytes += bytes;
+    }
+}
+
+pub type ExtentsBucket = HistogramBucket<usize>;
+
+/// File fragmentation information for top-N ranking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFragInfo {
+    pub inode: u64,
+    pub size: u64,
+    pub extents: usize,
+    pub path: String,
+}
+
+/// Builds a mapping from inode ID to its relative POSIX path by BFS traversal from root directory (inode 1).
+pub fn build_path_map(inodes: &HashMap<u64, Arc<Node>>) -> HashMap<u64, String> {
+    let mut path_map: HashMap<u64, String> = HashMap::new();
+    path_map.insert(1, "/".to_string());
+    let mut queue = VecDeque::new();
+    queue.push_back(1u64);
+
+    while let Some(dir_ino) = queue.pop_front() {
+        let dir_path = path_map
+            .get(&dir_ino)
+            .cloned()
+            .unwrap_or_else(|| format!("<inode {}>", dir_ino));
+        if let Some(sync_node) = inodes.get(&dir_ino) {
+            let node = sync_node.as_ref();
+            if let NodeKind::Directory { entries, .. } = &node.kind {
+                for (name, child_ino) in entries {
+                    let child_path = if dir_ino == 1 {
+                        format!("/{}", name)
+                    } else {
+                        format!("{}/{}", dir_path, name)
+                    };
+                    path_map.insert(*child_ino, child_path);
+                    if let Some(child_sync) = inodes.get(child_ino) {
+                        let child_node = child_sync.as_ref();
+                        if child_node.is_dir() {
+                            queue.push_back(*child_ino);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    path_map
+}
+
+fn format_fragmentation_section(
+    file_count: usize,
+    total_file_extents: usize,
+    max_file_extents: usize,
+    extent_buckets: &[ExtentsBucket],
+    file_frag_list: &[FileFragInfo],
+) -> String {
+    let mut out = String::new();
+    writeln!(out, "--- File Extent & Fragmentation Statistics ---").unwrap();
+    writeln!(out, "Total Regular Files: {}", file_count).unwrap();
+    writeln!(out, "Total File Extents:  {}", total_file_extents).unwrap();
+    let avg_extents = if file_count > 0 {
+        total_file_extents as f64 / file_count as f64
+    } else {
+        0.0
+    };
+    writeln!(out, "Avg Extents / File:  {:.2}", avg_extents).unwrap();
+    writeln!(out, "Max Extents in File: {}", max_file_extents).unwrap();
+    writeln!(out).unwrap();
+
+    if file_count > 0 {
+        writeln!(out, "Extents / File Distribution:").unwrap();
+        writeln!(
+            out,
+            "{:<24} {:>8} {:>12}   DISTRIBUTION",
+            "EXTENTS RANGE", "FILES", "% OF FILES"
+        )
+        .unwrap();
+        writeln!(out, "{:-<24} {:-<8} {:-<12}   {:-<20}", "", "", "", "").unwrap();
+
+        for b in extent_buckets {
+            let pct = (b.count as f64 / file_count as f64) * 100.0;
+            let bar_len = (pct / 5.0).round() as usize;
+            let bar: String = "█".repeat(bar_len);
+            let pct_str = format!("{:.1}%", pct);
+            writeln!(out, "{:<24} {:>8} {:>12}   {:<20}", b.label, b.count, pct_str, bar).unwrap();
+        }
+        writeln!(out).unwrap();
+
+        let multi_extent_files: Vec<_> = file_frag_list.iter().filter(|f| f.extents > 1).take(5).collect();
+        if !multi_extent_files.is_empty() {
+            writeln!(out, "--- Top Fragmented Files ---").unwrap();
+            writeln!(
+                out,
+                "{:<8} {:>12} {:>9} {:>16}   PATH",
+                "INODE", "SIZE", "EXTENTS", "AVG EXTENT SIZE"
+            )
+            .unwrap();
+            writeln!(out, "{:-<8} {:-<12} {:-<9} {:-<16}   {:-<30}", "", "", "", "", "").unwrap();
+            for f in multi_extent_files {
+                let avg_sz = if f.extents > 0 { f.size / f.extents as u64 } else { 0 };
+                writeln!(
+                    out,
+                    "{:<8} {:>12} {:>9} {:>16}   {}",
+                    f.inode,
+                    format_bytes(f.size),
+                    f.extents,
+                    format_bytes(avg_sz),
+                    f.path
+                )
+                .unwrap();
+            }
+            writeln!(out).unwrap();
+        }
+    }
+    out
+}
+
+fn format_manifest_section(manifest: &LogManifest, inodes: &HashMap<u64, Arc<Node>>) -> String {
+    let mut out = String::new();
+    writeln!(out, "--- Tracked Log Generations Manifest ---").unwrap();
+    if manifest.logs.is_empty() {
+        writeln!(out, "Tracked Logs:        0 active log generation files").unwrap();
+    } else {
+        writeln!(out, "Tracked Logs:        {} log generation files", manifest.logs.len()).unwrap();
+        writeln!(out).unwrap();
+
+        let generations = calculate_generation_live_stats_from_nodes(inodes.values().map(|a| a.as_ref()), manifest);
+        out.push_str(&format_generations_table(&generations));
+    }
+    out
+}
+
+/// Formats the canonical content report for an appendfs volume or summary file.
+///
+/// Contains Inode Breakdown, File Extension Breakdown, File Extents & Fragmentation Statistics,
+/// and Tracked Log Generations Manifest.
+pub fn format_volume_content_report(inodes: &HashMap<u64, Arc<Node>>, manifest: &LogManifest) -> String {
+    let path_map = build_path_map(inodes);
+    let mut extent_buckets = vec![
+        ExtentsBucket::new("1 extent (contiguous)", 1, 1),
+        ExtentsBucket::new("2 - 4 extents", 2, 4),
+        ExtentsBucket::new("5 - 16 extents", 5, 16),
+        ExtentsBucket::new("17 - 64 extents", 17, 64),
+        ExtentsBucket::new("> 64 extents", 65, usize::MAX),
+    ];
+    let mut file_frag_list = Vec::new();
+
+    let mut sorted_inodes: Vec<u64> = inodes.keys().copied().collect();
+    sorted_inodes.sort_unstable();
+
+    let mut dir_count = 0usize;
+    let mut file_count = 0usize;
+    let mut symlink_count = 0usize;
+    let mut total_logical_bytes = 0u64;
+    let mut total_file_extents = 0usize;
+    let mut max_file_extents = 0usize;
+
+    for &ino in &sorted_inodes {
+        if let Some(sync_node) = inodes.get(&ino) {
+            let node = sync_node.as_ref();
+            match &node.kind {
+                NodeKind::Directory { .. } => {
+                    dir_count += 1;
+                }
+                NodeKind::Symlink { .. } => {
+                    symlink_count += 1;
+                }
+                NodeKind::File { extent_map, size, .. } => {
+                    file_count += 1;
+                    total_logical_bytes += *size;
+                    let num_extents = extent_map.len();
+                    total_file_extents += num_extents;
+                    if num_extents > max_file_extents {
+                        max_file_extents = num_extents;
+                    }
+                    if num_extents > 0 {
+                        for b in &mut extent_buckets {
+                            if b.matches(num_extents) {
+                                b.count += 1;
+                                break;
+                            }
+                        }
+                    }
+                    let p = path_map
+                        .get(&ino)
+                        .cloned()
+                        .unwrap_or_else(|| format!("<inode {}>", ino));
+                    file_frag_list.push(FileFragInfo {
+                        inode: ino,
+                        size: *size,
+                        extents: num_extents,
+                        path: p,
+                    });
+                }
+                NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket => {}
+            }
+        }
+    }
+
+    file_frag_list.sort_by(|a, b| b.extents.cmp(&a.extents).then_with(|| b.size.cmp(&a.size)));
+
+    let mut out = String::new();
+    writeln!(out, "--- Inode Breakdown ---").unwrap();
+    writeln!(
+        out,
+        "Total Inodes:        {} ({} directories, {} regular files, {} symlinks)",
+        sorted_inodes.len(),
+        dir_count,
+        file_count,
+        symlink_count
+    )
+    .unwrap();
+    writeln!(out, "Logical Data Size:   {}", format_bytes(total_logical_bytes)).unwrap();
+    writeln!(out).unwrap();
+
+    let extensions = calculate_extension_stats_from_nodes(inodes);
+    let ext_table = format_extension_stats_table(&extensions, file_count, total_logical_bytes);
+    if !ext_table.is_empty() {
+        out.push_str(&ext_table);
+        writeln!(out).unwrap();
+    }
+
+    out.push_str(&format_fragmentation_section(
+        file_count,
+        total_file_extents,
+        max_file_extents,
+        &extent_buckets,
+        &file_frag_list,
+    ));
+
+    out.push_str(&format_manifest_section(manifest, inodes));
+    out
+}
+
 /// Aggregate statistics and fragmentation status for an appendfs volume.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VolumeStats {
@@ -33,6 +295,7 @@ pub struct VolumeStats {
     pub overall_live_ratio: f64,
     pub generations: Vec<GenerationLiveStats>,
     pub extensions: Vec<ExtensionStats>,
+    pub content_report: String,
 }
 
 impl VolumeStats {
@@ -47,6 +310,7 @@ impl VolumeStats {
         counts: &InodeCounts,
         generations: Vec<GenerationLiveStats>,
         extensions: Vec<ExtensionStats>,
+        content_report: String,
     ) -> Self {
         let mut total_disk_bytes = 0;
         let mut total_data_bytes = 0;
@@ -79,6 +343,7 @@ impl VolumeStats {
             overall_live_ratio,
             generations,
             extensions,
+            content_report,
         }
     }
 
@@ -88,7 +353,9 @@ impl VolumeStats {
         let counts = fs.inode_counts();
         let generations = fs.calculate_generation_live_stats();
         let extensions = calculate_extension_stats_from_nodes(&snapshot);
-        Self::from_parts(fs.next_generation(), &counts, generations, extensions)
+        let manifest = fs.manifest.read().unwrap();
+        let content_report = format_volume_content_report(&snapshot, &manifest);
+        Self::from_parts(fs.next_generation(), &counts, generations, extensions, content_report)
     }
 
     /// Collects volume statistics directly from a snapshot's inodes and manifest.
@@ -96,13 +363,14 @@ impl VolumeStats {
         let counts = InodeCounts::from_nodes(inodes.values().map(|a| a.as_ref()));
         let generations = calculate_generation_live_stats_from_nodes(inodes.values().map(|a| a.as_ref()), manifest);
         let extensions = calculate_extension_stats_from_nodes(inodes);
+        let content_report = format_volume_content_report(inodes, manifest);
         let next_generation = manifest
             .logs
             .iter()
             .map(|l| l.generation)
             .max()
             .map_or(1, |max| max + 1);
-        Self::from_parts(next_generation, &counts, generations, extensions)
+        Self::from_parts(next_generation, &counts, generations, extensions, content_report)
     }
 
     /// Formats stats into a clean, human-readable terminal table.
@@ -116,13 +384,6 @@ impl VolumeStats {
             self.next_filename()
         )
         .unwrap();
-        writeln!(
-            out,
-            "Total Inodes:        {} ({} directories, {} files, {} symlinks)",
-            self.total_inodes, self.directory_count, self.file_count, self.symlink_count
-        )
-        .unwrap();
-        writeln!(out, "Logical Data Size:   {}", format_bytes(self.total_logical_bytes)).unwrap();
         writeln!(out, "Physical Log Size:   {}", format_bytes(self.total_disk_bytes)).unwrap();
         if self.total_data_bytes > 0 {
             writeln!(out, "Overall Live Ratio:  {:.1}%", self.overall_live_ratio * 100.0).unwrap();
@@ -131,13 +392,7 @@ impl VolumeStats {
         }
         writeln!(out).unwrap();
 
-        let ext_table = format_extension_stats_table(&self.extensions, self.file_count, self.total_logical_bytes);
-        if !ext_table.is_empty() {
-            out.push_str(&ext_table);
-            writeln!(out).unwrap();
-        }
-
-        out.push_str(&format_generations_table(&self.generations));
+        out.push_str(&self.content_report);
         out
     }
 }

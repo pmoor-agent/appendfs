@@ -942,4 +942,13 @@ fn test_cli_stats_and_dump_extension_breakdown() {
     assert!(dump_str.contains(".dat                            1        20.0%      32.00 KiB        86.2%"));
     assert!(dump_str.contains(".bin                            2        40.0%       5.10 KiB        13.7%"));
     assert!(dump_str.contains(".txt                            2        40.0%           40 B         0.1%"));
+
+    // Verify `appendfs stats` and `appendfs dump` match identically from "--- Inode Breakdown ---" onwards
+    let dump_idx = dump_str
+        .find("--- Inode Breakdown ---")
+        .expect("dump must contain '--- Inode Breakdown ---'");
+    let stats_idx = stats_str
+        .find("--- Inode Breakdown ---")
+        .expect("stats must contain '--- Inode Breakdown ---'");
+    assert_eq!(&dump_str[dump_idx..], &stats_str[stats_idx..]);
 }
