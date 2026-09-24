@@ -1484,7 +1484,7 @@ mod tests {
         writer.append_record(OpCode::Data, 2, &data_bytes).unwrap();
 
         // Commit batch
-        writer.emit_flush_commit(2, 100, &clock).unwrap();
+        writer.emit_flush_commit(2, 100, clock.now()).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
@@ -1862,7 +1862,7 @@ mod tests {
         let small_data = vec![0x42; 8];
         writer.append_record(OpCode::Data, 3, &small_data).unwrap();
 
-        writer.emit_flush_commit(2, uncompressed_len + 8, &clock).unwrap();
+        writer.emit_flush_commit(2, uncompressed_len + 8, clock.now()).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
@@ -1916,7 +1916,7 @@ mod tests {
         let compressible_data = "Repeating encrypted log data line. ".repeat(300).into_bytes();
         writer.append_record(OpCode::Data, 2, &compressible_data).unwrap();
         writer
-            .emit_flush_commit(1, compressible_data.len() as u64, &clock)
+            .emit_flush_commit(1, compressible_data.len() as u64, clock.now())
             .unwrap();
         writer.flush().unwrap();
         drop(writer);
@@ -1968,7 +1968,7 @@ mod tests {
         let data_bytes = vec![0xAB; 200];
         writer.append_record(OpCode::Data, 2, &data_bytes).unwrap();
 
-        writer.emit_flush_commit(2, 200, &clock).unwrap();
+        writer.emit_flush_commit(2, 200, clock.now()).unwrap();
         writer.flush().unwrap();
         drop(writer);
 

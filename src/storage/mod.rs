@@ -8,7 +8,7 @@ pub mod os;
 pub mod readonly;
 
 pub use buffered::{BufferedStorageWriter, DEFAULT_STORAGE_BUFFER_CAPACITY};
-pub use fault::FaultStorage;
+pub use fault::{FaultStorage, TruncatedTail};
 pub use memory::MemoryStorage;
 pub use os::{OsStorage, OsStorageReader, OsStorageWriter};
 pub use readonly::ReadOnlyStorage;

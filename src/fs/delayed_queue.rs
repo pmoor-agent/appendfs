@@ -490,6 +490,7 @@ mod tests {
                 completion,
                 reason: crate::fs::FlushReason::Threshold,
                 frozen_at: std::time::Duration::ZERO,
+                commit_timestamp: std::time::UNIX_EPOCH,
             }));
             inner.flushing_bytes = 100;
             inner.flushing_ops = 1;

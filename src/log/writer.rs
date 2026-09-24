@@ -573,13 +573,21 @@ impl LogWriter {
     /// and updates active log record and data byte counters.
     /// Assigns and returns the next monotonic `batch_id`.
     ///
+    /// `timestamp` is supplied by the caller rather than read from a clock here, so writing
+    /// the same batch again after a [`LogWriter::rollback_to`] reproduces the trailer
+    /// byte for byte - see `FlushBatch::commit_timestamp`.
+    ///
     /// Note: To physically sync records through to durable media, call [`LogWriter::flush`].
-    pub fn emit_flush_commit(&self, record_count: u32, data_bytes: u64, clock: &dyn Clock) -> io::Result<u64> {
+    pub fn emit_flush_commit(
+        &self,
+        record_count: u32,
+        data_bytes: u64,
+        timestamp: std::time::SystemTime,
+    ) -> io::Result<u64> {
         let batch_id = self.batch_id.fetch_add(1, Ordering::SeqCst);
-        let now = clock.now();
         let commit_payload = FlushCommitPayload {
             batch_id,
-            timestamp: now,
+            timestamp,
             record_count,
         };
 
@@ -811,7 +819,7 @@ mod tests {
 
         writer.append_record(OpCode::InodeDelta, 1, b"payload").unwrap();
         writer.append_record(OpCode::Data, 1, b"more").unwrap();
-        let committed_batch_id = writer.emit_flush_commit(2, 4, &clock).unwrap();
+        let committed_batch_id = writer.emit_flush_commit(2, 4, clock.now()).unwrap();
         writer.flush().unwrap();
         assert_eq!(committed_batch_id, 1);
 
@@ -861,7 +869,7 @@ mod tests {
         writer
             .append_record(OpCode::InodeDelta, 1, b"second record payload")
             .unwrap();
-        writer.emit_flush_commit(2, 20, &clock).unwrap();
+        writer.emit_flush_commit(2, 20, clock.now()).unwrap();
         writer.flush().unwrap();
 
         // Roll to generation 2 -> returns sealed LogFileInfo
@@ -983,7 +991,7 @@ mod tests {
 
         // Write some records and emit flush commit
         writer.append_record(OpCode::Data, 1, b"batch data").unwrap();
-        let committed_id = writer.emit_flush_commit(1, 10, &clock).unwrap();
+        let committed_id = writer.emit_flush_commit(1, 10, clock.now()).unwrap();
         writer.flush().unwrap();
         assert_eq!(committed_id, 1);
         assert_eq!(writer.last_batch_id(), 1);
@@ -997,7 +1005,7 @@ mod tests {
         assert_eq!(checkpoint2.offset, checkpoint1.offset);
         assert_eq!(checkpoint2.batch_id, 1);
         writer.append_record(OpCode::Data, 1, b"batch data retry").unwrap();
-        let retried_id = writer.emit_flush_commit(1, 16, &clock).unwrap();
+        let retried_id = writer.emit_flush_commit(1, 16, clock.now()).unwrap();
         writer.flush().unwrap();
         assert_eq!(retried_id, 1);
         assert_eq!(writer.last_batch_id(), 1);
@@ -1013,7 +1021,7 @@ mod tests {
         let cp_a = writer.checkpoint();
 
         writer.append_record(OpCode::Data, 1, b"batch 1 data").unwrap();
-        let b1 = writer.emit_flush_commit(1, 12, &clock).unwrap();
+        let b1 = writer.emit_flush_commit(1, 12, clock.now()).unwrap();
         assert_eq!(b1, 1);
 
         // Checkpoint B (after batch 1, before batch 2)
@@ -1022,7 +1030,7 @@ mod tests {
         assert!(cp_b.offset > cp_a.offset);
 
         writer.append_record(OpCode::Data, 2, b"batch 2 data").unwrap();
-        let b2 = writer.emit_flush_commit(1, 12, &clock).unwrap();
+        let b2 = writer.emit_flush_commit(1, 12, clock.now()).unwrap();
         assert_eq!(b2, 2);
 
         // Checkpoint C (after batch 2, before batch 3)

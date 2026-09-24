@@ -2040,7 +2040,7 @@ fn test_unsealed_manifest_logs_are_synced_and_pruned() {
     writer
         .append_record(appendfs::log::OpCode::InodeDelta, 1, b"unsealed record payload")
         .unwrap();
-    writer.emit_flush_commit(1, 23, &*clock).unwrap();
+    writer.emit_flush_commit(1, 23, clock.now()).unwrap();
     writer.flush().unwrap();
     // Drop writer directly without rolling/sealing -> simulates crash / unsealed log
     drop(writer);
