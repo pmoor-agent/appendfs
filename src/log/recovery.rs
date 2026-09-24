@@ -38,31 +38,64 @@ pub fn recover_fs(
 ) -> io::Result<InMemoryFS> {
     let files = storage.list_files()?;
 
-    // 1. Scan for eligible single-file .summary snapshots matching the target
-    let mut latest_summary: Option<(u32, u16, SummaryReader)> = None;
-    let mut unreadable: Vec<String> = Vec::new();
+    // 1. Scan for eligible single-file .summary snapshots matching the target.
+    // Collect all candidate summary files and sort them descending by (generation, revision)
+    // so we can walk backwards from newest to oldest and only open/decompress the latest eligible one.
+    let mut summary_candidates: Vec<((u32, u16), String)> = Vec::new();
     for file in &files {
         if let Some((gen_num, rev_num)) = parse_summary_filename(file) {
-            match SummaryReader::open(storage.as_ref(), file, volume_key.clone()) {
-                Ok(reader) => {
-                    let eligible = match target {
-                        RecoveryTarget::Latest => true,
-                        RecoveryTarget::BatchId(max_batch) => reader.header.last_batch_id <= max_batch,
-                        RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
-                        RecoveryTarget::Generation(max_gen) => gen_num <= max_gen,
-                    };
-                    if eligible
-                        && latest_summary
-                            .as_ref()
-                            .is_none_or(|(g, r, _)| (gen_num, rev_num) > (*g, *r))
-                    {
-                        latest_summary = Some((gen_num, rev_num, reader));
+            summary_candidates.push(((gen_num, rev_num), file.clone()));
+        }
+    }
+    summary_candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
+
+    let mut latest_summary: Option<(u32, u16, SummaryReader)> = None;
+    let mut unreadable: Vec<String> = Vec::new();
+
+    for ((gen_num, rev_num), file) in summary_candidates {
+        // Fast-path eligibility check before opening or decompressing the full summary body:
+        match target {
+            RecoveryTarget::Generation(max_gen) => {
+                if gen_num > max_gen {
+                    continue;
+                }
+            }
+            RecoveryTarget::BatchId(max_batch) => match SummaryReader::read_header(storage.as_ref(), &file) {
+                Ok(header) => {
+                    if header.last_batch_id > max_batch {
+                        continue;
                     }
                 }
                 Err(e) => {
                     log::warn!("Ignoring unreadable summary {}: {}", file, e);
                     unreadable.push(format!("{}: {}", file, e));
+                    continue;
                 }
+            },
+            RecoveryTarget::Timestamp(max_time) => match SummaryReader::read_header(storage.as_ref(), &file) {
+                Ok(header) => {
+                    if header.created_at > max_time {
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Ignoring unreadable summary {}: {}", file, e);
+                    unreadable.push(format!("{}: {}", file, e));
+                    continue;
+                }
+            },
+            RecoveryTarget::Latest => {}
+        }
+
+        // We found the newest eligible candidate: attempt to open, decrypt, and decompress it.
+        match SummaryReader::open(storage.as_ref(), &file, volume_key.clone()) {
+            Ok(reader) => {
+                latest_summary = Some((gen_num, rev_num, reader));
+                break;
+            }
+            Err(e) => {
+                log::warn!("Ignoring unreadable summary {}: {}", file, e);
+                unreadable.push(format!("{}: {}", file, e));
             }
         }
     }
@@ -994,5 +1027,193 @@ mod tests {
             "Expected record count mismatch error, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_recovery_walks_backwards_when_latest_summary_corrupted() {
+        let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
+        let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+
+        // Phase 1: create fs with writer at gen 1, write file1, export summary
+        {
+            let writer = Arc::new(
+                LogWriter::create(
+                    storage.clone(),
+                    1,
+                    &*clock,
+                    crate::cli::DEFAULT_MAX_LOG_SIZE,
+                    1,
+                    VolumeKey::plaintext_arc(),
+                )
+                .unwrap(),
+            );
+            let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+            fs.log_writer = Some(writer.clone());
+            fs.set_storage(storage.clone());
+
+            let f1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, f1.ino, b"data1", 0).unwrap();
+            fs.quiesce().unwrap();
+            fs.export_summary(storage.as_ref()).unwrap();
+            assert!(storage.exists("000001.summary"));
+
+            let _ = writer.seal_active(&*clock).unwrap();
+        }
+
+        // Phase 2: create fs at gen 2, write file2, export summary
+        {
+            let writer = Arc::new(
+                LogWriter::create(
+                    storage.clone(),
+                    2,
+                    &*clock,
+                    crate::cli::DEFAULT_MAX_LOG_SIZE,
+                    2,
+                    VolumeKey::plaintext_arc(),
+                )
+                .unwrap(),
+            );
+            let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+            fs.log_writer = Some(writer.clone());
+            fs.set_storage(storage.clone());
+
+            let f2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, f2.ino, b"data2", 0).unwrap();
+            fs.quiesce().unwrap();
+            fs.export_summary(storage.as_ref()).unwrap();
+            assert!(storage.exists("000002.summary"));
+
+            let _ = writer.seal_active(&*clock).unwrap();
+        }
+
+        // Corrupt 000002.summary body
+        let mut corrupt_bytes = mem_storage.get_file_bytes("000002.summary").unwrap();
+        for b in &mut corrupt_bytes[crate::log::summary::SUMMARY_HEADER_SIZE..] {
+            *b = 0xAA;
+        }
+        mem_storage.insert_file("000002.summary", corrupt_bytes);
+
+        // Recover with Latest -> should ignore unreadable 000002.summary, fall back to 000001.summary,
+        // replay log 000002.log, and have both file1.txt and file2.txt recovered!
+        let recovered = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            clock.clone(),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        assert!(recovered.lookup_child(1, "file1.txt").is_some());
+        assert!(recovered.lookup_child(1, "file2.txt").is_some());
+    }
+
+    #[test]
+    fn test_targeted_recovery_skips_unneeded_summary_decompression() {
+        let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
+        let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+
+        // Gen 1: batch 1, time 1000
+        let time_gen1 = clock.now();
+        let batch_gen1;
+        {
+            let writer = Arc::new(
+                LogWriter::create(
+                    storage.clone(),
+                    1,
+                    &*clock,
+                    crate::cli::DEFAULT_MAX_LOG_SIZE,
+                    1,
+                    VolumeKey::plaintext_arc(),
+                )
+                .unwrap(),
+            );
+            let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+            fs.log_writer = Some(writer.clone());
+            fs.set_storage(storage.clone());
+
+            let f1 = crate::operations::read_write::create_core(&fs, 1, "target.txt", 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, f1.ino, b"data1", 0).unwrap();
+            fs.quiesce().unwrap();
+            batch_gen1 = fs.log_writer.as_ref().unwrap().last_batch_id();
+            fs.export_summary(storage.as_ref()).unwrap();
+            assert!(storage.exists("000001.summary"));
+            let _ = writer.seal_active(&*clock).unwrap();
+        }
+
+        // Gen 2: batch 2, time 2000
+        clock.advance(Duration::from_secs(1000));
+        {
+            let writer = Arc::new(
+                LogWriter::create(
+                    storage.clone(),
+                    2,
+                    &*clock,
+                    crate::cli::DEFAULT_MAX_LOG_SIZE,
+                    batch_gen1 + 1,
+                    VolumeKey::plaintext_arc(),
+                )
+                .unwrap(),
+            );
+            let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+            fs.log_writer = Some(writer.clone());
+            fs.set_storage(storage.clone());
+
+            let f2 = crate::operations::read_write::create_core(&fs, 1, "future.txt", 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, f2.ino, b"data2", 0).unwrap();
+            fs.quiesce().unwrap();
+            fs.export_summary(storage.as_ref()).unwrap();
+            assert!(storage.exists("000002.summary"));
+            let _ = writer.seal_active(&*clock).unwrap();
+        }
+
+        // Keep 000002.summary's header intact (so read_header succeeds with last_batch_id > batch_gen1
+        // and created_at > time_gen1), but corrupt its body so SummaryReader::open would fail with error.
+        let mut corrupt_bytes = mem_storage.get_file_bytes("000002.summary").unwrap();
+        for b in &mut corrupt_bytes[crate::log::summary::SUMMARY_HEADER_SIZE..] {
+            *b = 0x55;
+        }
+        mem_storage.insert_file("000002.summary", corrupt_bytes);
+
+        // Targeted recovery to batch_gen1:
+        // Must inspect 000002.summary header, see last_batch_id > batch_gen1, and skip opening it.
+        // Then inspect 000001.summary header, see last_batch_id <= batch_gen1, and open it.
+        // It succeeds because 000002.summary body is NEVER opened!
+        let recovered_batch = recover_fs(
+            storage.clone(),
+            RecoveryTarget::BatchId(batch_gen1),
+            clock.clone(),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        assert!(recovered_batch.lookup_child(1, "target.txt").is_some());
+        assert!(recovered_batch.lookup_child(1, "future.txt").is_none());
+
+        // Targeted recovery to time_gen1:
+        // Must inspect 000002.summary header, see created_at > time_gen1, and skip opening it.
+        let recovered_time = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Timestamp(time_gen1),
+            clock.clone(),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        assert!(recovered_time.lookup_child(1, "target.txt").is_some());
+        assert!(recovered_time.lookup_child(1, "future.txt").is_none());
     }
 }

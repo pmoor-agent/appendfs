@@ -143,20 +143,21 @@ pub fn prepare_remote_recovery_for_target(
     local_summaries.sort_by_key(|(gr, _)| *gr);
 
     let mut best_local_eligible: Option<(u32, u16, crate::log::SummaryHeader)> = None;
-    for ((gen_num, rev_num), file) in &local_summaries {
-        if let Ok(reader) = SummaryReader::open(storage, file, volume_key.clone()) {
+    for ((gen_num, rev_num), file) in local_summaries.iter().rev() {
+        match target {
+            RecoveryTarget::Generation(max_gen) if *gen_num > max_gen => continue,
+            _ => {}
+        }
+        if let Ok(header) = SummaryReader::read_header(storage, file) {
             let eligible = match target {
                 RecoveryTarget::Latest => true,
-                RecoveryTarget::BatchId(max_batch) => reader.header.last_batch_id <= max_batch,
-                RecoveryTarget::Timestamp(max_time) => reader.header.created_at <= max_time,
+                RecoveryTarget::BatchId(max_batch) => header.last_batch_id <= max_batch,
+                RecoveryTarget::Timestamp(max_time) => header.created_at <= max_time,
                 RecoveryTarget::Generation(max_gen) => *gen_num <= max_gen,
             };
-            if eligible
-                && best_local_eligible
-                    .as_ref()
-                    .is_none_or(|(g, r, _)| (*gen_num, *rev_num) > (*g, *r))
-            {
-                best_local_eligible = Some((*gen_num, *rev_num, reader.header));
+            if eligible {
+                best_local_eligible = Some((*gen_num, *rev_num, header));
+                break;
             }
         }
     }

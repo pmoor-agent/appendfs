@@ -514,6 +514,22 @@ fn read_and_decompress_summary_body(
 }
 
 impl SummaryReader {
+    /// Reads and parses the `SummaryHeader` from offset 0 of a `.summary` file, validating
+    /// file size, magic, and format version without reading, decrypting, or decompressing the body.
+    pub fn read_header(storage: &dyn Storage, filename: &str) -> io::Result<SummaryHeader> {
+        let reader = storage.open_reader(filename)?;
+        if reader.len()? < (SUMMARY_HEADER_SIZE + SUMMARY_FOOTER_SIZE) as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("summary file {} is too short", filename),
+            ));
+        }
+
+        let mut header_buf = [0u8; SUMMARY_HEADER_SIZE];
+        reader.read_exact_at(0, &mut header_buf)?;
+        SummaryHeader::from_bytes(&header_buf)
+    }
+
     /// Reads the VolumeHeader metadata from a summary file without requiring full body decryption.
     pub fn read_volume_header(storage: &dyn Storage, filename: &str) -> io::Result<crate::crypto::VolumeHeader> {
         let reader = storage.open_reader(filename)?;
@@ -1173,5 +1189,37 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("mismatch"));
+    }
+
+    #[test]
+    fn test_summary_reader_read_header() {
+        let storage = Arc::new(MemoryStorage::new());
+        init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        // 1. Valid summary file: read_header parses without full decompression
+        let header = SummaryReader::read_header(storage.as_ref(), "000000.summary").unwrap();
+        assert_eq!(header.magic, *SUMMARY_MAGIC);
+        assert_eq!(header.version, CURRENT_SUMMARY_VERSION);
+        assert_eq!(header.generation, 0);
+        assert_eq!(header.revision, 0);
+        assert_eq!(header.last_batch_id, 0);
+        assert_eq!(header.next_inode, 2);
+
+        // 2. Truncated summary file (< header + footer size)
+        storage.insert_file("short.summary", vec![0u8; 10]);
+        let err = SummaryReader::read_header(storage.as_ref(), "short.summary").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // 3. Invalid magic
+        let mut bad_magic_bytes = storage.get_file_bytes("000000.summary").unwrap();
+        bad_magic_bytes[0..4].copy_from_slice(b"BAD!");
+        storage.insert_file("bad_magic.summary", bad_magic_bytes);
+        let err = SummaryReader::read_header(storage.as_ref(), "bad_magic.summary").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
