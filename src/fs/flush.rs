@@ -612,16 +612,23 @@ impl InMemoryFS {
         self.inner.lock(OpTag::Stats).unwrap().flushing.len()
     }
 
-    /// Starts the filesystem's background threads upon FUSE mount.
+    /// Finishes mounting in the process that will serve the mount: starts the background
+    /// threads and claims the volume lock.
     ///
-    /// This is the earliest safe point for them: FUSE calls it from the session loop, after
+    /// This is the earliest point in that process: FUSE calls it from the session loop, after
     /// a background mount's `fuse_daemonize` has forked. `fork` carries only the calling
     /// thread into the daemon, so a thread started any earlier silently stops existing, and
-    /// joining it at unmount hangs forever.
+    /// joining it at unmount hangs forever. The lock, taken before the fork so that a second
+    /// mount is refused on the terminal, still records the parent's pid until now.
     pub fn init(self: &Arc<Self>) {
         self.delayed_queue.start();
         if self.is_read_only() {
             return;
+        }
+        if let Some(ref writer) = self.log_writer
+            && let Err(e) = writer.record_lock_holder()
+        {
+            log::warn!("Failed to record this process as the volume lock holder: {}", e);
         }
         let secs = self.flush_interval.load(Ordering::SeqCst);
         self.flusher.start(self, (secs > 0).then(|| Duration::from_secs(secs)));
