@@ -41,18 +41,19 @@ pub fn recover_fs(
     // 1. Scan for eligible single-file .summary snapshots matching the target.
     // Collect all candidate summary files and sort them descending by (generation, revision)
     // so we can walk backwards from newest to oldest and only open/decompress the latest eligible one.
-    let mut summary_candidates: Vec<((u32, u16), String)> = Vec::new();
+    let mut summary_candidates: Vec<(u32, u16, String)> = Vec::new();
     for file in &files {
         if let Some((gen_num, rev_num)) = parse_summary_filename(file) {
-            summary_candidates.push(((gen_num, rev_num), file.clone()));
+            summary_candidates.push((gen_num, rev_num, file.clone()));
         }
     }
-    summary_candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
+    // Sort descending by generation, and descending by revision within generation:
+    summary_candidates.sort_by_key(|&(generation, rev, _)| std::cmp::Reverse((generation, rev)));
 
     let mut latest_summary: Option<(u32, u16, SummaryReader)> = None;
     let mut unreadable: Vec<String> = Vec::new();
 
-    for ((gen_num, rev_num), file) in summary_candidates {
+    for (gen_num, rev_num, file) in summary_candidates {
         // Fast-path eligibility check before opening or decompressing the full summary body:
         match target {
             RecoveryTarget::Generation(max_gen) => {
@@ -60,7 +61,7 @@ pub fn recover_fs(
                     continue;
                 }
             }
-            RecoveryTarget::BatchId(max_batch) => match SummaryReader::read_header(storage.as_ref(), &file) {
+            RecoveryTarget::BatchId(max_batch) => match SummaryReader::read_summary_header(storage.as_ref(), &file) {
                 Ok(header) => {
                     if header.last_batch_id > max_batch {
                         continue;
@@ -72,7 +73,7 @@ pub fn recover_fs(
                     continue;
                 }
             },
-            RecoveryTarget::Timestamp(max_time) => match SummaryReader::read_header(storage.as_ref(), &file) {
+            RecoveryTarget::Timestamp(max_time) => match SummaryReader::read_summary_header(storage.as_ref(), &file) {
                 Ok(header) => {
                     if header.created_at > max_time {
                         continue;
@@ -1215,5 +1216,107 @@ mod tests {
         .unwrap();
         assert!(recovered_time.lookup_child(1, "target.txt").is_some());
         assert!(recovered_time.lookup_child(1, "future.txt").is_none());
+    }
+
+    #[test]
+    fn test_recovery_walks_backwards_across_revisions() {
+        let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
+        let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+
+        // Phase 1: create fs with writer at gen 1, write rev0.txt, export rev 0 summary
+        let rev0_summary_bytes;
+        {
+            let writer = Arc::new(
+                LogWriter::create(
+                    storage.clone(),
+                    1,
+                    &*clock,
+                    crate::cli::DEFAULT_MAX_LOG_SIZE,
+                    1,
+                    VolumeKey::plaintext_arc(),
+                )
+                .unwrap(),
+            );
+            let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+            fs.log_writer = Some(writer.clone());
+            fs.set_storage(storage.clone());
+
+            let f1 = crate::operations::read_write::create_core(&fs, 1, "rev0.txt", 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, f1.ino, b"data0", 0).unwrap();
+            fs.quiesce().unwrap();
+            fs.export_summary(storage.as_ref()).unwrap();
+            assert!(storage.exists("000001.summary"));
+            rev0_summary_bytes = mem_storage.get_file_bytes("000001.summary").unwrap();
+
+            // In the same session, write rev1.txt and export another summary
+            let f2 = crate::operations::read_write::create_core(&fs, 1, "rev1.txt", 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, f2.ino, b"data1", 0).unwrap();
+            fs.quiesce().unwrap();
+            fs.export_summary(storage.as_ref()).unwrap();
+
+            // Take the new summary (which has rev0 + rev1) and make it 000001_r1.summary
+            let mut r1_bytes = mem_storage.get_file_bytes("000001.summary").unwrap();
+            r1_bytes[12..14].copy_from_slice(&1u16.to_be_bytes()); // revision: 1
+            let footer_offset = r1_bytes.len() - crate::log::summary::SUMMARY_FOOTER_SIZE;
+            let new_checksum = *blake3::hash(&r1_bytes[..footer_offset]).as_bytes();
+            let len = r1_bytes.len();
+            r1_bytes[len - 32..].copy_from_slice(&new_checksum);
+            mem_storage.insert_file("000001_r1.summary", r1_bytes);
+
+            let _ = writer.seal_active(&*clock).unwrap();
+            fs.log_writer = None;
+        }
+
+        // Restore 000001.summary after fs drops so destroy() does not overwrite it
+        mem_storage.insert_file("000001.summary", rev0_summary_bytes);
+
+        // Simulate log pruning so the filesystem relies strictly on summary contents
+        storage.remove_file("000001.log").unwrap();
+
+        // Case A: Both 000001.summary (rev 0) and 000001_r1.summary (rev 1) exist and are valid.
+        // Recovery must sort by reverse revision within generation, choosing 000001_r1.summary first.
+        {
+            let recovered = recover_fs(
+                storage.clone(),
+                RecoveryTarget::Latest,
+                clock.clone(),
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap();
+            assert!(recovered.lookup_child(1, "rev0.txt").is_some());
+            assert!(recovered.lookup_child(1, "rev1.txt").is_some());
+        }
+        // Remove any files emitted when `recovered` dropped
+        for f in storage.list_files().unwrap() {
+            if f.starts_with("000002") {
+                storage.remove_file(&f).unwrap();
+            }
+        }
+
+        // Case B: 000001_r1.summary body is corrupted.
+        // Recovery must fall back to 000001.summary (rev 0).
+        let mut corrupt_r1 = mem_storage.get_file_bytes("000001_r1.summary").unwrap();
+        for b in &mut corrupt_r1[crate::log::summary::SUMMARY_HEADER_SIZE..] {
+            *b = 0xEE;
+        }
+        mem_storage.insert_file("000001_r1.summary", corrupt_r1);
+
+        let recovered_fallback = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            clock.clone(),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        assert!(recovered_fallback.lookup_child(1, "rev0.txt").is_some());
+        assert!(recovered_fallback.lookup_child(1, "rev1.txt").is_none());
     }
 }
