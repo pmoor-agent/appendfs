@@ -1248,12 +1248,11 @@ mod tests {
                 ..Default::default()
             },
         }));
-        let delta_bytes = crate::wire::serialize(&dir_delta).unwrap();
-        writer.append_record(OpCode::InodeDelta, 1, &delta_bytes).unwrap();
+        writer.append_serialized(OpCode::InodeDelta, 1, &dir_delta).unwrap();
 
         // Write Data record with 100 bytes
         let data_bytes = vec![0x42; 100];
-        writer.append_record(OpCode::Data, 2, &data_bytes).unwrap();
+        writer.append_data(2, &data_bytes).unwrap();
 
         // Commit batch
         writer.emit_flush_commit(2, 100, clock.now()).unwrap();
@@ -1310,8 +1309,7 @@ mod tests {
                 ..Default::default()
             },
         }));
-        let delta_bytes = crate::wire::serialize(&dir_delta).unwrap();
-        writer.append_record(OpCode::InodeDelta, 1, &delta_bytes).unwrap();
+        writer.append_serialized(OpCode::InodeDelta, 1, &dir_delta).unwrap();
         drop(writer);
 
         let dump = dump_log_file(storage.as_ref(), "000001.log", 1, None).unwrap();
@@ -1630,11 +1628,11 @@ mod tests {
         // Highly compressible payload: 16 KiB of repeating text
         let compressible_data = "Hello compression savings test! ".repeat(512).into_bytes();
         let uncompressed_len = compressible_data.len() as u64;
-        writer.append_record(OpCode::Data, 2, &compressible_data).unwrap();
+        writer.append_data(2, &compressible_data).unwrap();
 
         // Small / incompressible payload that stays OpCode::Data
         let small_data = vec![0x42; 8];
-        writer.append_record(OpCode::Data, 3, &small_data).unwrap();
+        writer.append_data(3, &small_data).unwrap();
 
         writer.emit_flush_commit(2, uncompressed_len + 8, clock.now()).unwrap();
         writer.flush().unwrap();
@@ -1688,7 +1686,7 @@ mod tests {
         .with_compression(crate::compress::Compression::Zstd);
 
         let compressible_data = "Repeating encrypted log data line. ".repeat(300).into_bytes();
-        writer.append_record(OpCode::Data, 2, &compressible_data).unwrap();
+        writer.append_data(2, &compressible_data).unwrap();
         writer
             .emit_flush_commit(1, compressible_data.len() as u64, clock.now())
             .unwrap();
@@ -1735,12 +1733,11 @@ mod tests {
             removed: vec![],
             attr_delta: LogAttrDelta::default(),
         }));
-        let delta_bytes = crate::wire::serialize(&dir_delta).unwrap();
-        let delta_len = delta_bytes.len() as u64;
-        writer.append_record(OpCode::InodeDelta, 1, &delta_bytes).unwrap();
+        let (_, _, delta_rec_size) = writer.append_serialized(OpCode::InodeDelta, 1, &dir_delta).unwrap();
+        let delta_len = (delta_rec_size - crate::log::record::RECORD_HEADER_SIZE as u32) as u64;
 
         let data_bytes = vec![0xAB; 200];
-        writer.append_record(OpCode::Data, 2, &data_bytes).unwrap();
+        writer.append_data(2, &data_bytes).unwrap();
 
         writer.emit_flush_commit(2, 200, clock.now()).unwrap();
         writer.flush().unwrap();

@@ -75,8 +75,41 @@ impl From<CryptoError> for std::io::Error {
     }
 }
 
+/// Encrypts `buffer` in-place, producing a detached 16-byte authentication tag.
+/// For plaintext volumes (`CipherSuite::None`), produces a 16-byte BLAKE3 tag over `(aad || buffer)`.
+pub fn encrypt_payload_in_place(
+    cipher: CipherSuite,
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    buffer: &mut [u8],
+) -> Result<[u8; 16], CryptoError> {
+    match cipher {
+        CipherSuite::None => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(aad);
+            hasher.update(buffer);
+            let mut tag = [0u8; 16];
+            tag.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+            Ok(tag)
+        }
+        CipherSuite::ChaCha20Poly1305 => {
+            let key = Key::from_slice(key);
+            let cipher = ChaCha20Poly1305::new(key);
+            let nonce = Nonce::from_slice(nonce);
+            let tag = cipher
+                .encrypt_in_place_detached(nonce, aad, buffer)
+                .map_err(|_| CryptoError::AuthFailed)?;
+            let mut tag_bytes = [0u8; 16];
+            tag_bytes.copy_from_slice(&tag);
+            Ok(tag_bytes)
+        }
+    }
+}
+
 /// Encrypts `plaintext` producing ciphertext and a detached 16-byte authentication tag.
 /// For plaintext volumes (`CipherSuite::None`), produces a 16-byte BLAKE3 tag over `(aad || plaintext)`.
+#[cfg(any(test, feature = "testing"))]
 pub fn encrypt_payload(
     cipher: CipherSuite,
     key: &[u8; 32],
@@ -84,28 +117,9 @@ pub fn encrypt_payload(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, [u8; 16]), CryptoError> {
-    match cipher {
-        CipherSuite::None => {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(aad);
-            hasher.update(plaintext);
-            let mut tag = [0u8; 16];
-            tag.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-            Ok((plaintext.to_vec(), tag))
-        }
-        CipherSuite::ChaCha20Poly1305 => {
-            let key = Key::from_slice(key);
-            let cipher = ChaCha20Poly1305::new(key);
-            let nonce = Nonce::from_slice(nonce);
-            let mut buffer = plaintext.to_vec();
-            let tag = cipher
-                .encrypt_in_place_detached(nonce, aad, &mut buffer)
-                .map_err(|_| CryptoError::AuthFailed)?;
-            let mut tag_bytes = [0u8; 16];
-            tag_bytes.copy_from_slice(&tag);
-            Ok((buffer, tag_bytes))
-        }
-    }
+    let mut buffer = plaintext.to_vec();
+    let tag = encrypt_payload_in_place(cipher, key, nonce, aad, &mut buffer)?;
+    Ok((buffer, tag))
 }
 
 /// Decrypts and verifies `ciphertext` using a detached 16-byte authentication tag.

@@ -1200,8 +1200,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
         removed: vec![],
         attr_delta: LogAttrDelta::default(),
     }));
-    let bytes = appendfs::wire::serialize(&root_delta).unwrap();
-    writer.append_record(OpCode::InodeDelta, 1, &bytes).unwrap();
+    writer.append_serialized(OpCode::InodeDelta, 1, &root_delta).unwrap();
 
     let dir_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta {
         parent: Some(1),
@@ -1214,8 +1213,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
             ..Default::default()
         },
     }));
-    let bytes = appendfs::wire::serialize(&dir_delta).unwrap();
-    writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
+    writer.append_serialized(OpCode::InodeDelta, 2, &dir_delta).unwrap();
     writer.emit_flush_commit(2, 0, clock.now()).unwrap();
     writer.flush().unwrap();
 
@@ -1228,8 +1226,9 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
         removed: vec![],
         attr_delta: LogAttrDelta::default(),
     }));
-    let bytes = appendfs::wire::serialize(&uncommitted_delta).unwrap();
-    writer.append_record(OpCode::InodeDelta, 1, &bytes).unwrap();
+    writer
+        .append_serialized(OpCode::InodeDelta, 1, &uncommitted_delta)
+        .unwrap();
     // Deliberately no emit_flush_commit() call here - this is the crash point.
 
     writer.flush().unwrap();
@@ -1292,8 +1291,7 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
         },
         ..Default::default()
     }));
-    let bytes = appendfs::wire::serialize(&file_delta).unwrap();
-    writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
+    writer.append_serialized(OpCode::InodeDelta, 2, &file_delta).unwrap();
     // Claim 2 records preceded this trailer, when only 1 actually did.
     writer.emit_flush_commit(2, 0, clock.now()).unwrap();
     writer.flush().unwrap();
@@ -1338,8 +1336,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
         },
         ..Default::default()
     }));
-    let bytes = appendfs::wire::serialize(&file_delta).unwrap();
-    writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
+    writer.append_serialized(OpCode::InodeDelta, 2, &file_delta).unwrap();
     writer.emit_flush_commit(1, 0, clock.now()).unwrap();
     writer.flush().unwrap();
     let filename = writer.filename();

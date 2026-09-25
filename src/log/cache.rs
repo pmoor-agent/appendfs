@@ -364,9 +364,7 @@ mod tests {
         .unwrap();
 
         let payload = b"cached extent data 123456789";
-        let (gen_num, offset, rec_size) = writer
-            .append_record(crate::log::record::OpCode::Data, 10, payload)
-            .unwrap();
+        let (gen_num, offset, rec_size) = writer.append_data(10, payload).unwrap();
         writer.flush().unwrap();
 
         let cache = LogFileCache::with_storage(storage);

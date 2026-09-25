@@ -1,4 +1,6 @@
-use crate::crypto::cipher::{CipherSuite, CryptoError, decrypt_payload, encrypt_payload};
+#[cfg(any(test, feature = "testing"))]
+use crate::crypto::cipher::encrypt_payload;
+use crate::crypto::cipher::{CipherSuite, CryptoError, decrypt_payload, encrypt_payload_in_place};
 use crate::crypto::kdf::MasterKey;
 use crate::crypto::nonce::{generate_random_16, generate_random_iv, record_nonce};
 use serde::{Deserialize, Serialize};
@@ -26,8 +28,8 @@ fn derive_subkey(context: &str, master: &[u8; 32]) -> [u8; 32] {
 /// volumes to make a wrong key look right.
 fn compute_kcv(master: &[u8; 32], volume_id: &[u8; 16], iv: &[u8; 12]) -> Result<[u8; 16], CryptoError> {
     let kcv_key = derive_subkey(KCV_KEY_CONTEXT, master);
-    let (_, tag) = encrypt_payload(CipherSuite::ChaCha20Poly1305, &kcv_key, iv, volume_id, &[])?;
-    Ok(tag)
+    let mut empty = [];
+    encrypt_payload_in_place(CipherSuite::ChaCha20Poly1305, &kcv_key, iv, volume_id, &mut empty)
 }
 
 /// Which credentials a volume's key is built from.
@@ -329,7 +331,8 @@ impl VolumeKey {
         if self.cipher == CipherSuite::None {
             return Ok(plaintext.to_vec());
         }
-        let (mut ct, tag) = encrypt_payload(self.cipher, &self.key, iv, aad, plaintext)?;
+        let mut ct = plaintext.to_vec();
+        let tag = encrypt_payload_in_place(self.cipher, &self.key, iv, aad, &mut ct)?;
         ct.extend_from_slice(&tag);
         Ok(ct)
     }
@@ -371,9 +374,25 @@ impl std::fmt::Debug for LogFileKey {
 }
 
 impl LogFileKey {
+    /// Encrypts a record payload in-place. A plaintext volume returns it untouched.
+    ///
+    /// `op_code` and `inode` are authenticated but not encrypted - see [`record_aad`].
+    pub fn encrypt_record_in_place(
+        &self,
+        sequence: u64,
+        op_code: u8,
+        inode: u64,
+        buffer: &mut [u8],
+    ) -> Result<[u8; 16], CryptoError> {
+        let nonce = record_nonce(sequence);
+        let aad = record_aad(op_code, inode);
+        super::cipher::encrypt_payload_in_place(self.cipher, &self.key, &nonce, &aad, buffer)
+    }
+
     /// Encrypts a record payload. A plaintext volume returns it untouched.
     ///
     /// `op_code` and `inode` are authenticated but not encrypted - see [`record_aad`].
+    #[cfg(any(test, feature = "testing"))]
     pub fn encrypt_record(
         &self,
         sequence: u64,
