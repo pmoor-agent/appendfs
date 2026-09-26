@@ -1117,7 +1117,7 @@ fn test_background_flusher_in_mount_session() {
     fs.flush_interval.store(1, std::sync::atomic::Ordering::SeqCst);
 
     let fs = std::sync::Arc::new(fs);
-    fs.init();
+    fs.init().unwrap();
 
     // Perform only 2 operations
     let dir_attr = appendfs::operations::dir::mkdir_core(&fs, 1, "periodic_dir", 0o755, 1000, 1000).unwrap();
@@ -4105,4 +4105,45 @@ fn test_fuse_non_utf8_access_vectors() {
     fs::remove_file(&valid_file_2).unwrap();
 
     mount.unmount();
+}
+
+/// A mount whose `init` fails - here, because it cannot record itself as the holder of the
+/// volume lock - must come down again and report the error rather than keep serving.
+#[test]
+fn test_mount_fails_when_init_cannot_claim_the_volume_lock() {
+    let log_dir = tempfile::tempdir().unwrap();
+    let mount_dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(mount_dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let mount_path = mount_dir.path().to_str().unwrap().to_string();
+
+    let fault = appendfs::storage::FaultStorage::new(Arc::new(OsStorage::new(log_dir.path())));
+    let writer = appendfs::LogWriter::create_lazy(
+        Arc::new(fault.clone()),
+        1,
+        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+        1,
+        appendfs::VolumeKey::plaintext_arc(),
+    )
+    .unwrap();
+    let mut fs_instance = appendfs::InMemoryFS::new();
+    fs_instance.log_writer = Some(Arc::new(writer));
+    fault.fail_lock_records(true);
+
+    let initial_dev = fs::metadata(mount_dir.path()).unwrap().dev();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let args = vec!["test_fs".to_string(), mount_path.clone(), "-f".to_string()];
+    thread::spawn(move || {
+        let _ = tx.send(appendfs::mount(args, fs_instance));
+    });
+
+    let Ok(result) = rx.recv_timeout(Duration::from_secs(10)) else {
+        common::unmount_fuse(&mount_path);
+        panic!("a mount whose init fails must return");
+    };
+    assert!(result.is_err(), "a mount whose init fails must report it");
+    assert_eq!(
+        fs::metadata(mount_dir.path()).unwrap().dev(),
+        initial_dev,
+        "the failed mount must be torn down"
+    );
 }

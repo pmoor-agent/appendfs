@@ -164,10 +164,9 @@ impl Storage for OsStorage {
             return Err(err);
         }
 
+        // A failure drops `lock`, releasing the volume again rather than holding it anonymously.
         let lock = OsLock { file };
-        // The pid is only there to name the holder in the error above, so failing to write
-        // it is no reason to refuse a lock that is already held.
-        let _ = crate::storage::StorageLock::record_holder(&lock);
+        crate::storage::StorageLock::record_holder(&lock)?;
         Ok(Box::new(lock))
     }
 }

@@ -50,7 +50,7 @@ typedef void (*rust_setxattr_t)(shim_req_t req, uint64_t ino, const char *name, 
                                 int flags);
 typedef void (*rust_listxattr_t)(shim_req_t req, uint64_t ino, size_t size);
 typedef void (*rust_removexattr_t)(shim_req_t req, uint64_t ino, const char *name);
-typedef void (*rust_init_t)(void *userdata);
+typedef int (*rust_init_t)(void *userdata);
 typedef void (*rust_destroy_t)(void *userdata);
 
 struct rust_lowlevel_ops {
