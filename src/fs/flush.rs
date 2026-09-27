@@ -612,16 +612,21 @@ impl InMemoryFS {
         self.inner.lock(OpTag::Stats).unwrap().flushing.len()
     }
 
-    /// Starts the filesystem's background threads upon FUSE mount.
+    /// Finishes mounting in the process that will serve the mount: claims the volume lock and
+    /// starts the background threads. An error fails the mount, before anything has started.
     ///
-    /// This is the earliest safe point for them: FUSE calls it from the session loop, after
+    /// This is the earliest point in that process: FUSE calls it from the session loop, after
     /// a background mount's `fuse_daemonize` has forked. `fork` carries only the calling
     /// thread into the daemon, so a thread started any earlier silently stops existing, and
-    /// joining it at unmount hangs forever.
-    pub fn init(self: &Arc<Self>) {
+    /// joining it at unmount hangs forever. The lock, taken before the fork so that a second
+    /// mount is refused on the terminal, still records the parent's pid until now.
+    pub fn init(self: &Arc<Self>) -> std::io::Result<()> {
+        if let Some(ref writer) = self.log_writer {
+            writer.record_lock_holder()?;
+        }
         self.delayed_queue.start();
         if self.is_read_only() {
-            return;
+            return Ok(());
         }
         let secs = self.flush_interval.load(Ordering::SeqCst);
         self.flusher.start(self, (secs > 0).then(|| Duration::from_secs(secs)));
@@ -643,6 +648,7 @@ impl InMemoryFS {
                 ));
             }
         }
+        Ok(())
     }
 
     /// Formal shutdown sequence, run once per filesystem lifetime (idempotent against repeat
@@ -876,6 +882,31 @@ mod tests {
     use crate::operations::read_write::write_core;
     use crate::storage::Storage;
     use std::time::SystemTime;
+
+    #[test]
+    fn test_init_fails_before_starting_anything_if_it_cannot_claim_the_lock() {
+        let fault = crate::storage::FaultStorage::new(Arc::new(crate::storage::MemoryStorage::new()));
+        let writer = LogWriter::create_lazy(
+            Arc::new(fault.clone()),
+            1,
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let mut fs = InMemoryFS::new();
+        fs.log_writer = Some(Arc::new(writer));
+        let fs = Arc::new(fs);
+
+        fault.fail_lock_records(true);
+        assert!(fs.init().is_err(), "a mount that cannot claim its lock must fail");
+        assert!(!fs.flusher.stop(), "nothing may be started by a failed init");
+
+        fault.fail_lock_records(false);
+        fs.init().unwrap();
+        assert!(fs.flusher.stop(), "a successful init starts the flusher");
+        fs.destroy();
+    }
 
     #[test]
     fn test_flush_coalesces_micro_writes_into_single_base_range_entry() {

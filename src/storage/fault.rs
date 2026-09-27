@@ -11,6 +11,7 @@ pub struct FaultStorage {
     max_append_bytes: Arc<AtomicU64>,
     write_partial_on_fail: Arc<AtomicBool>,
     fail_sync: Arc<AtomicBool>,
+    fail_lock_records: Arc<AtomicBool>,
     fail_on_open: Arc<RwLock<HashMap<String, io::ErrorKind>>>,
     bitflips: Arc<RwLock<Vec<(String, u64, u8)>>>,
     truncated: Arc<Mutex<Vec<TruncatedTail>>>,
@@ -31,6 +32,7 @@ impl FaultStorage {
             max_append_bytes: Arc::new(AtomicU64::new(0)),
             write_partial_on_fail: Arc::new(AtomicBool::new(false)),
             fail_sync: Arc::new(AtomicBool::new(false)),
+            fail_lock_records: Arc::new(AtomicBool::new(false)),
             fail_on_open: Arc::new(RwLock::new(HashMap::new())),
             bitflips: Arc::new(RwLock::new(Vec::new())),
             truncated: Arc::new(Mutex::new(Vec::new())),
@@ -48,6 +50,11 @@ impl FaultStorage {
     /// Sets whether `sync` should fail with simulated I/O error.
     pub fn fail_syncs(&self, fail: bool) {
         self.fail_sync.store(fail, Ordering::SeqCst);
+    }
+
+    /// Sets whether recording a lock's holder should fail with a simulated I/O error.
+    pub fn fail_lock_records(&self, fail: bool) {
+        self.fail_lock_records.store(fail, Ordering::SeqCst);
     }
 
     /// Sets a byte threshold after which `append` will fail with simulated ENOSPC / EFBIG.
@@ -79,6 +86,7 @@ impl FaultStorage {
     pub fn clear_all_faults(&self) {
         self.clear_write_limit();
         self.fail_sync.store(false, Ordering::SeqCst);
+        self.fail_lock_records.store(false, Ordering::SeqCst);
         self.fail_on_open.write().unwrap().clear();
         self.bitflips.write().unwrap().clear();
     }
@@ -221,6 +229,24 @@ impl Storage for FaultStorage {
     }
 
     fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn crate::storage::StorageLock>> {
-        self.inner.acquire_exclusive_lock()
+        Ok(Box::new(FaultLock {
+            inner: self.inner.acquire_exclusive_lock()?,
+            fail_records: Arc::clone(&self.fail_lock_records),
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub struct FaultLock {
+    inner: Box<dyn crate::storage::StorageLock>,
+    fail_records: Arc<AtomicBool>,
+}
+
+impl crate::storage::StorageLock for FaultLock {
+    fn record_holder(&self) -> io::Result<()> {
+        if self.fail_records.load(Ordering::SeqCst) {
+            return Err(io::Error::other("simulated failure recording the lock holder"));
+        }
+        self.inner.record_holder()
     }
 }

@@ -5,10 +5,9 @@
 //! was being discarded. Long-running mounts are exactly the ones worth having logs for, so
 //! they write to a file inside the volume's own log directory instead.
 //!
-//! Each run gets its own file, named for the time it started and its pid. There is no
-//! rotation to reason about, two mounts of the same volume cannot interleave their records,
-//! and a crashed run's log stays exactly as it was left rather than being overwritten by the
-//! restart.
+//! Each run gets its own file, named for the millisecond it started. There is no rotation to
+//! reason about, runs do not interleave their records, and a crashed run's log stays exactly
+//! as it was left rather than being overwritten by the restart.
 //!
 //! A file is the only destination. Anything a user is meant to read is printed directly, so
 //! logging has no reason to compete for the terminal - and `--log-file` reaches the terminal
@@ -30,7 +29,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Subdirectory of the volume log directory holding diagnostic logs.
 pub const LOG_SUBDIR: &str = "logs";
@@ -43,17 +42,25 @@ pub fn log_directory(log_dir: &Path) -> PathBuf {
     log_dir.join(LOG_SUBDIR)
 }
 
-/// Names one run's log file: `appendfs-<YYYYMMDD>-<HHMMSS>-<pid>.log`.
+/// Names one run's log file: `appendfs-<YYYYMMDD>-<HHMMSS>.<mmm>.log`, which sorts
+/// chronologically.
 ///
-/// The timestamp sorts chronologically and the pid disambiguates two mounts started within
-/// the same second, so a name is never reused and no run can clobber another's log.
-pub fn log_file_name(started: SystemTime, pid: u32) -> String {
-    format!("appendfs-{}-{}.log", crate::clock::format_utc_compact(started), pid)
+/// The milliseconds keep two runs started within the same second - `init` followed by
+/// `mount` in a script - in files of their own. A pid would too, but a backgrounded mount
+/// opens its log before libfuse forks it into the daemon, so the pid at hand would be the
+/// parent's, which exits straight away.
+pub fn log_file_name(started: SystemTime) -> String {
+    let millis = started.duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_millis());
+    format!(
+        "appendfs-{}.{:03}.log",
+        crate::clock::format_utc_compact(started),
+        millis
+    )
 }
 
-/// The log file for a run starting now.
-pub fn log_file_path(log_dir: &Path, started: SystemTime, pid: u32) -> PathBuf {
-    log_directory(log_dir).join(log_file_name(started, pid))
+/// The log file for a run starting at `started`.
+pub fn log_file_path(log_dir: &Path, started: SystemTime) -> PathBuf {
+    log_directory(log_dir).join(log_file_name(started))
 }
 
 /// A log file that drops records rather than failing.
@@ -125,7 +132,7 @@ pub fn init(path: &Path, level: &str) -> Option<PathBuf> {
 /// Canonicalized because `fuse_daemonize` chdirs to `/` shortly after a mount sets this up.
 pub fn run_log_path(log_dir: &Path) -> PathBuf {
     let root = fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
-    log_file_path(&root, SystemTime::now(), std::process::id())
+    log_file_path(&root, SystemTime::now())
 }
 
 /// Whether a flag's value is a credential that must not reach a log file.
@@ -172,23 +179,23 @@ fn redact_args<I: IntoIterator<Item = String>>(args: I) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
 
     #[test]
     fn test_log_file_name_identifies_the_run() {
-        let started = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
-        assert_eq!(log_file_name(started, 4242), "appendfs-20251217-193320-4242.log");
+        let started = UNIX_EPOCH + Duration::from_millis(1_766_000_000_042);
+        assert_eq!(log_file_name(started), "appendfs-20251217-193320.042.log");
     }
 
     #[test]
-    fn test_concurrent_runs_never_share_a_file() {
-        // Two mounts of the same volume starting in the same second must not interleave
-        // their records, which is what the pid is for.
-        let started = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
-        assert_ne!(log_file_name(started, 1), log_file_name(started, 2));
+    fn test_runs_in_the_same_second_get_files_of_their_own() {
+        let started = UNIX_EPOCH + Duration::from_millis(1_766_000_000_042);
+        let next = started + Duration::from_millis(1);
+        assert_ne!(log_file_name(started), log_file_name(next));
 
-        // And a later run sorts after an earlier one.
-        assert!(log_file_name(started, 9) < log_file_name(started + Duration::from_secs(1), 1));
+        // And a later run sorts after an earlier one, across a second boundary too.
+        assert!(log_file_name(started) < log_file_name(next));
+        assert!(log_file_name(started + Duration::from_millis(957)) < log_file_name(started + Duration::from_secs(1)));
     }
 
     #[test]
@@ -253,7 +260,7 @@ mod tests {
         // file: `list_files` is non-recursive and file-only, so a subdirectory is invisible.
         let dir = tempfile::tempdir().unwrap();
         let storage = crate::storage::OsStorage::new(dir.path());
-        let path = log_file_path(dir.path(), SystemTime::now(), std::process::id());
+        let path = log_file_path(dir.path(), SystemTime::now());
 
         let mut sink = LogSink::create(&path).unwrap();
         sink.write_all(b"a log record\n").unwrap();
@@ -274,13 +281,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let started = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
 
-        let first = log_file_path(dir.path(), started, 1);
+        let first = log_file_path(dir.path(), started);
         let mut sink = LogSink::create(&first).unwrap();
         sink.write_all(b"from the first run\n").unwrap();
         sink.flush().unwrap();
         drop(sink);
 
-        let second = log_file_path(dir.path(), started + Duration::from_secs(5), 2);
+        let second = log_file_path(dir.path(), started + Duration::from_secs(5));
         let mut sink = LogSink::create(&second).unwrap();
         sink.write_all(b"from the second run\n").unwrap();
         sink.flush().unwrap();
@@ -293,7 +300,7 @@ mod tests {
     fn test_writes_keep_succeeding_after_the_file_is_lost() {
         // A filesystem must not fail because its log file did.
         let dir = tempfile::tempdir().unwrap();
-        let path = log_file_path(dir.path(), SystemTime::now(), std::process::id());
+        let path = log_file_path(dir.path(), SystemTime::now());
         let mut sink = LogSink::create(&path).unwrap();
         sink.write_all(b"before\n").unwrap();
         sink.file = None;

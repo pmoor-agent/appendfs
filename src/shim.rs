@@ -136,7 +136,7 @@ struct RustLowlevelOps {
         Option<extern "C" fn(req: Request, ino: u64, name: *const c_char, value: *const u8, size: usize, flags: c_int)>,
     listxattr: Option<extern "C" fn(req: Request, ino: u64, size: usize)>,
     removexattr: Option<extern "C" fn(req: Request, ino: u64, name: *const c_char)>,
-    init: Option<extern "C" fn(userdata: *mut c_void)>,
+    init: Option<extern "C" fn(userdata: *mut c_void) -> c_int>,
     destroy: Option<extern "C" fn(userdata: *mut c_void)>,
 }
 
@@ -1329,9 +1329,16 @@ extern "C" fn removexattr_bridge(req: Request, ino: u64, name: *const c_char) {
     });
 }
 
-extern "C" fn init_bridge(userdata: *mut c_void) {
+/// Returns 0, or the errno that `run_fuse_ll` should fail the mount with.
+extern "C" fn init_bridge(userdata: *mut c_void) -> c_int {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    fs.init();
+    match fs.init() {
+        Ok(()) => 0,
+        Err(e) => {
+            log::error!("Failed to initialize the mount: {}", e);
+            FsError::from(e).raw()
+        }
+    }
 }
 
 extern "C" fn destroy_bridge(userdata: *mut c_void) {

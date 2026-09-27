@@ -522,14 +522,18 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
     let before = log_file_count(log_dir.path());
 
     // No `-f`: the process daemonizes and the parent exits straight away.
-    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+    let parent = Command::new(env!("CARGO_BIN_EXE_appendfs"))
         .args([
             "mount",
             log_dir.path().to_str().unwrap(),
             mount_dir.path().to_str().unwrap(),
         ])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("failed to spawn appendfs mount");
+    let parent_pid = parent.id();
+    let out = parent.wait_with_output().unwrap();
     assert!(
         out.status.success(),
         "mount failed: {}",
@@ -558,6 +562,21 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
 
     std::fs::write(mount_dir.path().join("payload.txt"), b"logged activity").unwrap();
 
+    // The volume lock names the daemon serving the mount, not the parent that forked it and
+    // exited - otherwise a second mount's "already locked by PID" points nowhere.
+    let lock_pid: u32 = std::fs::read_to_string(log_dir.path().join(".lock"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(lock_pid, parent_pid, "the lock must not name the exited parent");
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", lock_pid)).unwrap_or_default();
+    assert!(
+        String::from_utf8_lossy(&cmdline).contains("mount"),
+        "the lock must name the running mount daemon, PID {}",
+        lock_pid
+    );
+
     let unmounted = appendfs::wait_until(
         || {
             matches!(Command::new("fusermount3").arg("-u").arg(mount_dir.path()).status(),
@@ -567,7 +586,7 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
     );
     assert!(unmounted, "failed to unmount");
 
-    // One file for this run, named for when it started and which process it was.
+    // One file for this run, named for when it started.
     let logs_dir = log_dir.path().join("logs");
     assert!(
         appendfs::wait_until(
@@ -875,12 +894,13 @@ fn test_cli_background_mount_exits_after_unmount_and_replicates() {
     run(&["mount", log, mount]);
 
     std::fs::write(mount_dir.path().join("hello.txt"), b"written through the daemon").unwrap();
+    // Retried: the kernel can briefly report the mount busy right after a file on it closes.
     assert!(
-        Command::new("fusermount3")
-            .args(["-u", mount])
-            .status()
-            .unwrap()
-            .success()
+        appendfs::wait_until(
+            || matches!(Command::new("fusermount3").args(["-u", mount]).status(), Ok(s) if s.success()),
+            Duration::from_secs(5),
+        ),
+        "failed to unmount"
     );
 
     // The daemon holds the volume lock for as long as it runs.

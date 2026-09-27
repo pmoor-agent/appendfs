@@ -98,7 +98,8 @@ typedef void (*shim_setxattr_fn)(shim_req_t req, uint64_t ino, const char *name,
                                  int flags);
 typedef void (*shim_listxattr_fn)(shim_req_t req, uint64_t ino, size_t size);
 typedef void (*shim_removexattr_fn)(shim_req_t req, uint64_t ino, const char *name);
-typedef void (*shim_init_fn)(void *userdata);
+// Returns 0, or an errno to fail the mount with.
+typedef int (*shim_init_fn)(void *userdata);
 typedef void (*shim_destroy_fn)(void *userdata);
 
 struct RustLowlevelOps {
@@ -143,6 +144,9 @@ struct ShimContext {
   RustLowlevelOps ops;
   void *userdata;
   std::atomic<bool> destroyed;
+  struct fuse_session *se;
+  // The errno `ops.init` failed the mount with, or 0.
+  int init_error;
 };
 
 static std::mutex global_mount_lock;
@@ -491,7 +495,13 @@ static void ll_init(void *userdata, struct fuse_conn_info *conn) {
   }
   auto *ctx = static_cast<ShimContext *>(userdata);
   if (ctx && ctx->ops.init) {
-    ctx->ops.init(ctx->userdata);
+    // libfuse has no way for `init` to refuse the connection, so ending the session is how a
+    // failure unwinds the mount: the loop stops as soon as this INIT has been answered, and
+    // `run_fuse_ll` returns the error once the mount is torn down.
+    ctx->init_error = ctx->ops.init(ctx->userdata);
+    if (ctx->init_error != 0) {
+      fuse_session_exit(ctx->se);
+    }
   }
 }
 
@@ -525,6 +535,8 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   }
   ctx.userdata = userdata;
   ctx.destroyed.store(false);
+  ctx.se = nullptr;
+  ctx.init_error = 0;
 
   if (fuse_parse_cmdline(&args, &opts) != 0) {
     goto err_out1;
@@ -594,6 +606,7 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   if (se == nullptr) {
     goto err_out1;
   }
+  ctx.se = se;
 
   signals_installed = (fuse_set_signal_handlers(se) == 0);
 
@@ -609,6 +622,9 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   ret = fuse_session_loop(se);
   if (signals_installed && (ret == SIGINT || ret == SIGTERM || ret == SIGHUP)) {
     ret = 0;
+  }
+  if (ctx.init_error != 0) {
+    ret = ctx.init_error;
   }
 
   // Drain in-flight asynchronous operations and clean up filesystem state
