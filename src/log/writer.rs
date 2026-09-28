@@ -10,7 +10,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 struct ActiveLogFile {
     writer: Box<dyn StorageWriter>,
     generation: u32,
-    revision: u16,
+    /// The key this file's records are encrypted under, derived from the salt in its header.
+    file_key: LogFileKey,
+    /// Sequence number the next record in this file will be encrypted under.
+    ///
+    /// Advanced whenever a record is encoded and never moved back, not even by
+    /// [`LogWriter::rollback_to`]: a retried write must not re-encrypt a different payload under
+    /// a nonce the failed attempt already used, since those bytes may already be on disk.
+    next_sequence: u64,
     current_offset: u64,
     filename: String,
     created_at: std::time::SystemTime,
@@ -22,22 +29,25 @@ struct ActiveLogFile {
 impl ActiveLogFile {
     fn append_record(
         &mut self,
-        volume_key: &VolumeKey,
         compression: crate::compress::Compression,
         op_code: OpCode,
         inode: u64,
         payload: &[u8],
     ) -> io::Result<(u32, u64, u32)> {
         let generation = self.generation;
-        let revision = self.revision;
         let record_log_offset = self.current_offset;
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("generation {} has used every record sequence number", generation),
+            )
+        })?;
         let (actual_op, cipher_payload, auth_tag) = crate::log::codec::encode(
-            volume_key,
+            &self.file_key,
             compression,
             crate::log::codec::RecordId {
-                generation,
-                revision,
-                record_offset: record_log_offset,
+                sequence,
                 op_code: op_code as u8,
                 inode,
             },
@@ -48,6 +58,7 @@ impl ActiveLogFile {
             op_code: actual_op,
             inode,
             payload_len: cipher_payload.len() as u32,
+            sequence,
             auth_tag,
         };
         let header_bytes = header.to_bytes();
@@ -76,11 +87,7 @@ impl ActiveLogFile {
         Ok((generation, record_log_offset, total_bytes as u32))
     }
 
-    fn seal(
-        mut self,
-        volume_key: &VolumeKey,
-        timestamp: std::time::SystemTime,
-    ) -> io::Result<super::manifest::LogFileInfo> {
+    fn seal(mut self, timestamp: std::time::SystemTime) -> io::Result<super::manifest::LogFileInfo> {
         if self.current_offset > FILE_HEADER_SIZE as u64 {
             let seal_payload = crate::log::record::SealPayload {
                 timestamp,
@@ -89,13 +96,7 @@ impl ActiveLogFile {
             let payload_bytes =
                 crate::wire::serialize(&seal_payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-            self.append_record(
-                volume_key,
-                crate::compress::Compression::None,
-                OpCode::Seal,
-                0,
-                &payload_bytes,
-            )?;
+            self.append_record(crate::compress::Compression::None, OpCode::Seal, 0, &payload_bytes)?;
         }
         self.writer.sync()?;
         drop(self.writer);
@@ -131,14 +132,14 @@ enum ActiveLogState {
 fn seal_and_open_next(
     active: ActiveLogFile,
     storage: &Arc<dyn Storage>,
-    volume_key: &VolumeKey,
+    keying: &FileKeying,
     clock: &dyn Clock,
     reason: &str,
 ) -> io::Result<(ActiveLogFile, super::manifest::LogFileInfo)> {
     let next_gen = next_generation(active.generation)?;
     let now = clock.now();
-    let sealed_info = active.seal(volume_key, now)?;
-    let next_active = open_generation_file(storage, next_gen, now)?;
+    let sealed_info = active.seal(now)?;
+    let next_active = open_generation_file(storage, keying, next_gen, now)?;
     log::info!(
         "{} log file to generation {} ({})",
         reason,
@@ -152,11 +153,7 @@ fn seal_and_open_next(
 /// lazy (unopened) so no file exists for it until something is written.
 ///
 /// On failure the writer is left lazy on the successor, as [`seal_and_open_next`] does.
-fn seal_into_lazy(
-    state: &mut ActiveLogState,
-    volume_key: &VolumeKey,
-    clock: &dyn Clock,
-) -> io::Result<Option<super::manifest::LogFileInfo>> {
+fn seal_into_lazy(state: &mut ActiveLogState, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
     let ActiveLogState::Open(active) = &*state else {
         return Ok(None);
     };
@@ -173,7 +170,7 @@ fn seal_into_lazy(
     ) else {
         unreachable!();
     };
-    let sealed_info = active.seal(volume_key, clock.now())?;
+    let sealed_info = active.seal(clock.now())?;
     log::info!(
         "Sealed log generation {}, next generation {} is lazy (unopened)",
         sealed_info.generation,
@@ -202,15 +199,17 @@ fn next_generation(generation: u32) -> io::Result<u32> {
 
 fn open_generation_file(
     storage: &Arc<dyn Storage>,
+    keying: &FileKeying,
     generation: u32,
     created_at: std::time::SystemTime,
 ) -> io::Result<ActiveLogFile> {
+    let key_salt = (keying.key_salts)(generation);
     let filename = super::log_filename(generation);
     let raw_writer = storage.open_writer(&filename, WriteMode::CreateNew)?;
     let mut writer = BufferedStorageWriter::new(raw_writer)?;
     let mut md5_hasher = md5::Context::new();
 
-    let file_header = FileHeader::new(generation, created_at);
+    let file_header = FileHeader::new(generation, created_at, key_salt);
     let header_bytes = file_header.to_bytes();
     writer.append(&header_bytes)?;
     writer.sync()?;
@@ -219,7 +218,8 @@ fn open_generation_file(
     Ok(ActiveLogFile {
         writer: Box::new(writer),
         generation,
-        revision: file_header.revision,
+        file_key: keying.volume_key.log_file_key(&key_salt),
+        next_sequence: 0,
         current_offset: FILE_HEADER_SIZE as u64,
         filename,
         created_at,
@@ -229,7 +229,29 @@ fn open_generation_file(
     })
 }
 
-use crate::crypto::VolumeKey;
+use crate::crypto::{LogFileKey, VolumeKey};
+
+/// Produces the key salt for each log file a [`LogWriter`] creates, given its generation.
+///
+/// Random by default. Replaceable only so fixture generation and tests can produce the same
+/// bytes on every run - see [`LogWriter::with_key_salts`]. A source that ever returned the
+/// same salt twice would put two files under one key.
+type KeySaltSource = Box<dyn Fn(u32) -> [u8; 16] + Send + Sync>;
+
+/// Everything needed to key a newly created log file.
+struct FileKeying {
+    volume_key: Arc<VolumeKey>,
+    key_salts: KeySaltSource,
+}
+
+impl FileKeying {
+    fn random(volume_key: Arc<VolumeKey>) -> Self {
+        Self {
+            volume_key,
+            key_salts: Box::new(|_| crate::crypto::generate_random_16()),
+        }
+    }
+}
 
 /// Point-in-time snapshot of [`LogWriter`] state for atomic rollback on write failures.
 #[derive(Clone)]
@@ -261,7 +283,7 @@ pub struct LogWriter {
     storage: Arc<dyn Storage>,
     max_log_size: u64,
     max_log_age: Option<std::time::Duration>,
-    volume_key: Arc<VolumeKey>,
+    keying: FileKeying,
     /// Compression applied to payloads before encryption. Set from the volume header via
     /// [`LogWriter::with_compression`] rather than passed to every constructor, which would
     /// reintroduce the telescoping shape this module deliberately avoids.
@@ -274,7 +296,7 @@ impl std::fmt::Debug for LogWriter {
         f.debug_struct("LogWriter")
             .field("batch_id", &self.batch_id.load(Ordering::Relaxed))
             .field("max_log_size", &self.max_log_size)
-            .field("cipher", &self.volume_key.cipher())
+            .field("cipher", &self.keying.volume_key.cipher())
             .finish()
     }
 }
@@ -290,14 +312,15 @@ impl LogWriter {
         volume_key: Arc<VolumeKey>,
     ) -> io::Result<Self> {
         let lock = storage.acquire_exclusive_lock()?;
-        let active_file = open_generation_file(&storage, generation, clock.now())?;
+        let keying = FileKeying::random(volume_key);
+        let active_file = open_generation_file(&storage, &keying, generation, clock.now())?;
         Ok(Self {
             active_state: Mutex::new(ActiveLogState::Open(active_file)),
             batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
-            volume_key,
+            keying,
             compression: crate::compress::Compression::None,
             lock: Some(lock),
         })
@@ -322,7 +345,7 @@ impl LogWriter {
             storage,
             max_log_size,
             max_log_age: None,
-            volume_key,
+            keying: FileKeying::random(volume_key),
             compression: crate::compress::Compression::None,
             lock: Some(lock),
         })
@@ -348,7 +371,7 @@ impl LogWriter {
             storage,
             max_log_size,
             max_log_age: None,
-            volume_key,
+            keying: FileKeying::random(volume_key),
             compression: crate::compress::Compression::None,
             lock: Some(lock),
         })
@@ -360,6 +383,19 @@ impl LogWriter {
         self
     }
 
+    /// Replaces the random source of per-file key salts with `key_salts`.
+    ///
+    /// For fixture generation and tests that need identical bytes on every run. Takes effect
+    /// for files opened from now on, so pair it with a lazy constructor to cover the first.
+    ///
+    /// Crate-private rather than `cfg`-gated to tests: the `generate_compat_fixture` binary is
+    /// built without the `testing` feature and reaches this through [`crate::compat`]. Nothing
+    /// outside the crate can replace the salt source.
+    pub(crate) fn with_key_salts(mut self, key_salts: impl Fn(u32) -> [u8; 16] + Send + Sync + 'static) -> Self {
+        self.keying.key_salts = Box::new(key_salts);
+        self
+    }
+
     /// Sets the compression applied to record payloads before they are encrypted.
     pub fn with_compression(mut self, compression: crate::compress::Compression) -> Self {
         self.compression = compression;
@@ -368,7 +404,7 @@ impl LogWriter {
 
     /// Returns the volume key used to encrypt record payloads.
     pub fn volume_key(&self) -> &Arc<VolumeKey> {
-        &self.volume_key
+        &self.keying.volume_key
     }
 
     /// Returns the underlying storage instance.
@@ -420,7 +456,7 @@ impl LogWriter {
         if !size_exceeded && !age_exceeded {
             return Ok(None);
         }
-        seal_into_lazy(&mut state, &self.volume_key, clock)
+        seal_into_lazy(&mut state, clock)
     }
 
     /// Ensures that the active log file is open. If it is currently lazy/unopened,
@@ -433,7 +469,7 @@ impl LogWriter {
 
         if let ActiveLogState::Unopened { generation, created_at } = *state {
             let c_time = created_at.unwrap_or_else(|| clock.now());
-            let active_file = open_generation_file(&self.storage, generation, c_time)?;
+            let active_file = open_generation_file(&self.storage, &self.keying, generation, c_time)?;
             *state = ActiveLogState::Open(active_file);
             log::info!("Lazily opened log file for generation {}", generation);
         }
@@ -469,7 +505,7 @@ impl LogWriter {
         };
 
         let next_gen = next_generation(active.generation)?;
-        match seal_and_open_next(active, &self.storage, &self.volume_key, clock, "Force-rolled") {
+        match seal_and_open_next(active, &self.storage, &self.keying, clock, "Force-rolled") {
             Ok((next_active, sealed_info)) => {
                 *state = ActiveLogState::Open(next_active);
                 Ok(Some(sealed_info))
@@ -492,7 +528,7 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        seal_into_lazy(&mut state, &self.volume_key, clock)
+        seal_into_lazy(&mut state, clock)
     }
 
     /// Captures a point-in-time snapshot of the log writer state (generation, offset,
@@ -537,7 +573,7 @@ impl LogWriter {
             ActiveLogState::Unopened { generation, created_at } => {
                 let gen_num = *generation;
                 let c_time = created_at.unwrap_or_else(std::time::SystemTime::now);
-                let active_file = open_generation_file(&self.storage, gen_num, c_time)?;
+                let active_file = open_generation_file(&self.storage, &self.keying, gen_num, c_time)?;
                 *state = ActiveLogState::Open(active_file);
                 match &mut *state {
                     ActiveLogState::Open(a) => a,
@@ -546,13 +582,16 @@ impl LogWriter {
             }
         };
 
-        active.append_record(&self.volume_key, self.compression, op_code, inode, payload)
+        active.append_record(self.compression, op_code, inode, payload)
     }
 
     /// Rolls back the active log file to the given `checkpoint`.
     ///
     /// Truncates the underlying file on disk back to `checkpoint.offset`, restoring
     /// the running MD5 hasher, counters, and next `batch_id`.
+    ///
+    /// The record sequence is deliberately not restored, so records written after a rollback
+    /// take fresh nonces rather than reusing those of the records that were discarded.
     pub fn rollback_to(&self, checkpoint: &LogCheckpoint) -> io::Result<()> {
         self.batch_id.store(checkpoint.batch_id, Ordering::SeqCst);
         let mut state = match self.active_state.lock() {
@@ -579,9 +618,9 @@ impl LogWriter {
     /// and updates active log record and data byte counters.
     /// Assigns and returns the next monotonic `batch_id`.
     ///
-    /// `timestamp` is supplied by the caller rather than read from a clock here, so writing
-    /// the same batch again after a [`LogWriter::rollback_to`] reproduces the trailer
-    /// byte for byte - see `FlushBatch::commit_timestamp`.
+    /// `timestamp` is supplied by the caller rather than read from a clock here, so a batch
+    /// written again after a [`LogWriter::rollback_to`] records the same commit time - see
+    /// `FlushBatch::commit_timestamp`.
     ///
     /// Note: To physically sync records through to durable media, call [`LogWriter::flush`].
     pub fn emit_flush_commit(

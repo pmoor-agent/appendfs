@@ -4,9 +4,9 @@ Generation:          1
 Format Version:      1
 Last Batch ID:       3
 Next Inode:          19
-File Size:           976 B
+File Size:           972 B
 Encryption:          Plaintext (None)
-Checksum (BLAKE3):   065e1148a1fa2190765910ca9047c5e8d297dfd8141b326a08b1f2abcef84604 (VERIFIED)
+Checksum (BLAKE3):   4ec42aae634bc238ebf4ebd3c1a5bfb080c1edb9596c995501ab29c5ecd7417f (VERIFIED)
 
 --- Inode Breakdown ---
 Total Inodes:        18 (6 directories, 5 regular files, 3 symlinks)
@@ -45,7 +45,7 @@ Tracked Logs:        1 log generation files
 
 LOG FILE          RECORDS     LOG SIZE    DATA SIZE    LIVE DATA  EXTENTS   LIVE RATIO  STATUS
 -------------- ---------- ------------ ------------ ------------ -------- ------------  ------------------------
-000001.log             38    37.42 KiB    33.14 KiB    33.14 KiB        6       100.0%  Healthy
+000001.log             38    37.74 KiB    33.14 KiB    33.14 KiB        6       100.0%  Healthy
 
 === Summary Inode Records ===
 #1     [Inode 1    ] Directory  "/" (mode 0o755, uid 1000, gid 1000, entries: 10, mtime: 1700000330.000000000s (2023-11-14 22:18:50 UTC))

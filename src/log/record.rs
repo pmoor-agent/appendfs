@@ -5,9 +5,10 @@ use std::time::SystemTime;
 
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
 pub const CURRENT_VERSION: u32 = 1;
-/// magic(4) + version(4) + generation(4) + revision(2) + created_at seconds(8) + nanoseconds(4).
-pub const FILE_HEADER_SIZE: usize = 26;
-pub const RECORD_HEADER_SIZE: usize = 29;
+/// magic(4) + version(4) + generation(4) + revision(2) + created_at seconds(8) + nanoseconds(4)
+/// + key_salt(16).
+pub const FILE_HEADER_SIZE: usize = 42;
+pub const RECORD_HEADER_SIZE: usize = 37;
 pub const AUTH_TAG_SIZE: usize = 16;
 
 /// Fixed-size header written at offset 0 of every `.log` file.
@@ -20,16 +21,21 @@ pub struct FileHeader {
     pub revision: u16,
     #[serde(with = "crate::clock::serde_system_time")]
     pub created_at: SystemTime,
+    /// Random salt, drawn when the file is created, from which the key for this file's
+    /// records is derived (see [`crate::crypto::VolumeKey::log_file_key`]). Stored in the
+    /// clear: it is not secret, only unique.
+    pub key_salt: [u8; 16],
 }
 
 impl FileHeader {
-    pub fn new(generation: u32, created_at: SystemTime) -> Self {
+    pub fn new(generation: u32, created_at: SystemTime, key_salt: [u8; 16]) -> Self {
         Self {
             magic: FILE_MAGIC,
             version: CURRENT_VERSION,
             generation,
             revision: 0,
             created_at,
+            key_salt,
         }
     }
 
@@ -46,6 +52,7 @@ impl FileHeader {
         let (secs, nsecs) = crate::clock::system_time_to_unix(self.created_at);
         buf[14..22].copy_from_slice(&secs.to_be_bytes());
         buf[22..26].copy_from_slice(&nsecs.to_be_bytes());
+        buf[26..42].copy_from_slice(&self.key_salt);
         buf
     }
 
@@ -63,12 +70,14 @@ impl FileHeader {
         let secs = i64::from_be_bytes(bytes[14..22].try_into().unwrap());
         let nsecs = u32::from_be_bytes(bytes[22..26].try_into().unwrap());
         let created_at = crate::clock::unix_to_system_time(secs, nsecs);
+        let key_salt = bytes[26..42].try_into().unwrap();
         Ok(Self {
             magic,
             version,
             generation,
             revision,
             created_at,
+            key_salt,
         })
     }
 }
@@ -117,21 +126,31 @@ impl std::fmt::Display for OpCode {
     }
 }
 
-/// Compact per-record header (29 bytes).
+/// Per-record header (37 bytes).
+///
+/// ```text
+/// byte  0 | 1..9  | 9..13       | 13..21   | 21..37
+///      op | inode | payload_len | sequence | auth_tag
+/// ```
 ///
 /// Deliberately carries no `key_id`: whether a payload is encrypted is a property of the
 /// volume, recorded once in the volume header where the key check value vouches for it.
 /// A per-record copy would be unauthenticated - this header is not covered by `auth_tag` -
 /// and clearing it used to downgrade an encrypted read into a raw one.
 ///
-/// The 16-byte `auth_tag` protects both header metadata (via AEAD AAD: `[op_code, record_offset, inode]`)
-/// and payload bytes across both encrypted (Poly1305 detached tag) and unencrypted (BLAKE3 16-byte hash) volumes.
+/// The 16-byte `auth_tag` protects both header metadata (`op_code` and `inode` via the AAD,
+/// `sequence` via the nonce) and payload bytes across both encrypted (Poly1305 detached tag)
+/// and unencrypted (BLAKE3 16-byte hash) volumes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordHeader {
     pub op_code: OpCode,
     pub inode: u64,
     pub payload_len: u32,
+    /// The record's position in its generation's nonce sequence; the low 64 bits of the
+    /// record nonce (see [`crate::crypto::record_nonce`]). Strictly increasing within a
+    /// generation file, though not contiguous: a rolled-back write leaves a gap.
+    pub sequence: u64,
     /// 16-byte authentication tag (Poly1305 or BLAKE3) covering `AAD || payload`.
     pub auth_tag: [u8; AUTH_TAG_SIZE],
 }
@@ -142,7 +161,8 @@ impl RecordHeader {
         buf[0] = self.op_code as u8;
         buf[1..9].copy_from_slice(&self.inode.to_be_bytes());
         buf[9..13].copy_from_slice(&self.payload_len.to_be_bytes());
-        buf[13..29].copy_from_slice(&self.auth_tag);
+        buf[13..21].copy_from_slice(&self.sequence.to_be_bytes());
+        buf[21..37].copy_from_slice(&self.auth_tag);
         buf
     }
 
@@ -150,12 +170,14 @@ impl RecordHeader {
         let op_code = OpCode::try_from(bytes[0])?;
         let inode = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
         let payload_len = u32::from_be_bytes(bytes[9..13].try_into().unwrap());
-        let auth_tag = bytes[13..29].try_into().unwrap();
+        let sequence = u64::from_be_bytes(bytes[13..21].try_into().unwrap());
+        let auth_tag = bytes[21..37].try_into().unwrap();
 
         Ok(Self {
             op_code,
             inode,
             payload_len,
+            sequence,
             auth_tag,
         })
     }
@@ -641,7 +663,7 @@ mod tests {
     #[test]
     fn test_file_header_serialization() {
         let time = crate::clock::unix_to_system_time(1721838000, 0);
-        let header = FileHeader::new(42, time);
+        let header = FileHeader::new(42, time, [0x5A; 16]);
         let bytes = header.to_bytes();
         assert_eq!(bytes.len(), FILE_HEADER_SIZE);
 
@@ -665,7 +687,7 @@ mod tests {
 
         for (name, secs) in cases {
             let created_at = crate::clock::unix_to_system_time(secs, 123_456_789);
-            let header = FileHeader::new(7, created_at);
+            let header = FileHeader::new(7, created_at, [0x5A; 16]);
             let round_tripped = FileHeader::from_bytes(&header.to_bytes()).unwrap();
             assert_eq!(round_tripped.created_at, created_at, "{} did not round-trip", name);
             assert_eq!(round_tripped.generation, 7, "{}", name);
@@ -678,10 +700,12 @@ mod tests {
             op_code: OpCode::Data,
             inode: 5,
             payload_len: 4096,
+            sequence: 0x0102_0304_0506_0708,
             auth_tag: [0xAA; AUTH_TAG_SIZE],
         };
         let bytes = header.to_bytes();
         assert_eq!(bytes.len(), RECORD_HEADER_SIZE);
+        assert_eq!(&bytes[13..21], &[1, 2, 3, 4, 5, 6, 7, 8]);
 
         let deserialized = RecordHeader::from_bytes(&bytes).unwrap();
         assert_eq!(header, deserialized);

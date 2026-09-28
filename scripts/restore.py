@@ -38,8 +38,8 @@ import zstandard as zstd
 
 FILE_MAGIC = b"APPF"
 SUMMARY_MAGIC = b"APPS"
-FILE_HEADER_SIZE = 26
-RECORD_HEADER_SIZE = 29
+FILE_HEADER_SIZE = 42
+RECORD_HEADER_SIZE = 37
 SUMMARY_HEADER_SIZE = 66
 VOLUME_HEADER_SIZE = 72
 
@@ -60,6 +60,7 @@ TAG_SOCKET = 7
 
 DATA_KEY_CONTEXT = "appendfs volume data key v1"
 KCV_KEY_CONTEXT = "appendfs key check value v1"
+LOG_FILE_KEY_CONTEXT = "appendfs log file key v1"
 
 
 class WireReader:
@@ -194,27 +195,18 @@ def parse_entry_delta(payload: bytes) -> tuple:
         raise ValueError(f"Unknown LogEntryDelta tag: {tag}")
 
 
-MAX_NONCE_RECORD_OFFSET = 1 << 48
+def record_nonce(sequence: int) -> bytes:
+    """Builds the 12-byte record nonce matching AppendFS's record_nonce.
 
-
-def derive_record_nonce(generation: int, revision: int, record_offset: int) -> bytes:
-    """Derives a deterministic 12-byte nonce matching AppendFS's derive_record_nonce.
-
-    Format: [generation (4 bytes BE) || revision (2 bytes BE) || record_offset (6 bytes BE)]
-
-    `generation` and `revision` need no check: they are 32- and 16-bit fields on disk, so
-    neither can exceed its slot here. Only the offset raises rather than wrapping. Masking it
-    - as this did while it was a 32-bit field - would silently derive a nonce belonging to a
-    different record, so a restore would decrypt to garbage and blame the volume.
+    Format: [zero (4 bytes) || sequence (8 bytes BE)]. The sequence is stored in the record
+    header; uniqueness across files comes from each file having its own key.
     """
-    if not 0 <= record_offset < MAX_NONCE_RECORD_OFFSET:
-        raise ValueError(f"record offset {record_offset} is not encodable in a record nonce")
-    return struct.pack(">IH", generation, revision) + record_offset.to_bytes(6, "big")
+    return struct.pack(">IQ", 0, sequence)
 
 
-def derive_record_aad(op_code: int, record_offset: int, inode: int) -> bytes:
-    """Constructs 17-byte Associated Data matching AppendFS's record_aad."""
-    return struct.pack(">BQQ", op_code, record_offset, inode)
+def record_aad(op_code: int, inode: int) -> bytes:
+    """Constructs the 9-byte Associated Data matching AppendFS's record_aad."""
+    return struct.pack(">BQ", op_code, inode)
 
 
 def parse_log_filename(name: str) -> Optional[Tuple[int, int]]:
@@ -267,30 +259,40 @@ class VolumeDecryptor:
     def __init__(self, key_bytes: Optional[bytes] = None, no_verify: bool = False):
         self.key_bytes = key_bytes
         self.no_verify = no_verify
-        self.cipher = ChaCha20Poly1305(key_bytes) if key_bytes else None
+        self.file_ciphers: Dict[bytes, ChaCha20Poly1305] = {}
+
+    def file_cipher(self, key_salt: bytes) -> Optional[ChaCha20Poly1305]:
+        """The cipher for one log file, keyed as AppendFS's VolumeKey::log_file_key."""
+        if not self.key_bytes:
+            return None
+        if key_salt not in self.file_ciphers:
+            file_key = blake3.blake3(self.key_bytes + key_salt, derive_key_context=LOG_FILE_KEY_CONTEXT).digest()
+            self.file_ciphers[key_salt] = ChaCha20Poly1305(file_key)
+        return self.file_ciphers[key_salt]
 
     def decode_record(
-        self, generation: int, revision: int, record_offset: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
+        self, key_salt: bytes, sequence: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
     ) -> bytes:
-        if self.cipher is not None:
-            nonce = derive_record_nonce(generation, revision, record_offset)
-            aad = derive_record_aad(op_code, record_offset, inode)
+        cipher = self.file_cipher(key_salt)
+        if cipher is not None:
+            nonce = record_nonce(sequence)
+            aad = record_aad(op_code, inode)
             ciphertext_with_tag = payload + auth_tag
             try:
-                decrypted = self.cipher.decrypt(nonce, ciphertext_with_tag, aad)
+                decrypted = cipher.decrypt(nonce, ciphertext_with_tag, aad)
             except Exception as e:
-                raise ValueError(f"Decryption / authentication failed for record (gen={generation}, offset=0x{record_offset:x}, ino={inode}): {e}")
+                raise ValueError(f"Decryption / authentication failed for record (seq={sequence}, ino={inode}): {e}")
             data = decrypted
         else:
             # Plaintext volume
             if not self.no_verify:
-                aad = derive_record_aad(op_code, record_offset, inode)
+                aad = record_aad(op_code, inode)
                 hasher = blake3.blake3()
                 hasher.update(aad)
                 hasher.update(payload)
                 expected_tag = hasher.digest()[:16]
                 if expected_tag != auth_tag:
-                    raise ValueError(f"BLAKE3 checksum mismatch for record (gen={generation}, offset=0x{record_offset:x}, ino={inode})")
+                    raise ValueError(f"BLAKE3 checksum mismatch for record (seq={sequence}, ino={inode})")
             data = payload
 
         # Decompress if Zstd
@@ -438,7 +440,7 @@ class Restorer:
             hdr = f.read(FILE_HEADER_SIZE)
             if len(hdr) < FILE_HEADER_SIZE:
                 return
-            magic, ver, gen, rev, secs, nsecs = struct.unpack(">4sIIHqI", hdr)
+            magic, ver, gen, rev, secs, nsecs, key_salt = struct.unpack(">4sIIHqI16s", hdr)
             if magic != FILE_MAGIC:
                 raise ValueError(f"Invalid file magic {magic} in {log_path.name}")
 
@@ -450,17 +452,27 @@ class Restorer:
             records_in_batch = 0
             committed_records_count = 0
             is_sealed = False
+            last_sequence = None
 
             while True:
                 rh_bytes = f.read(RECORD_HEADER_SIZE)
                 if not rh_bytes or len(rh_bytes) < RECORD_HEADER_SIZE:
                     break
                 rec_log_offset = f.tell() - RECORD_HEADER_SIZE
-                op, ino, plen, tag = struct.unpack(">BQI16s", rh_bytes)
+                op, ino, plen, seq, tag = struct.unpack(">BQIQ16s", rh_bytes)
                 raw_payload = f.read(plen)
                 if len(raw_payload) < plen:
                     # Truncated record at end of log due to crash mid-flush; discard
                     break
+
+                # The writer only ever advances the sequence; one that does not means two
+                # records may share a nonce.
+                if last_sequence is not None and seq <= last_sequence:
+                    raise ValueError(
+                        f"Integrity violation in {log_path.name} @ offset 0x{rec_log_offset:x}: "
+                        f"record sequence {seq} is not above its predecessor's {last_sequence}"
+                    )
+                last_sequence = seq
 
                 if is_sealed:
                     raise ValueError(
@@ -485,7 +497,7 @@ class Restorer:
                         )
 
                 try:
-                    payload = self.decryptor.decode_record(gen, rev, rec_log_offset, op, ino, raw_payload, tag)
+                    payload = self.decryptor.decode_record(key_salt, seq, op, ino, raw_payload, tag)
                 except Exception as e:
                     raise ValueError(
                         f"Failed to decode/decrypt record in {log_path.name} @ offset 0x{rec_log_offset:x}: {e}"

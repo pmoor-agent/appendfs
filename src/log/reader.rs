@@ -36,15 +36,18 @@ impl LogRecord {
     }
 }
 
-use crate::crypto::VolumeKey;
+use crate::crypto::{LogFileKey, VolumeKey};
 
 /// Iterator for sequentially reading records from a `.log` generation file.
 pub struct LogReader {
     reader: Arc<dyn StorageReader>,
     header: FileHeader,
     current_offset: u64,
-    volume_key: Arc<VolumeKey>,
+    /// Key for this file's records, derived from the salt in its header.
+    file_key: LogFileKey,
     md5_hasher: md5::Context,
+    /// Sequence number of the last record read, which the next one must exceed.
+    last_sequence: Option<u64>,
 }
 
 impl LogReader {
@@ -64,8 +67,9 @@ impl LogReader {
             reader,
             header,
             current_offset: FILE_HEADER_SIZE as u64,
-            volume_key,
+            file_key: volume_key.log_file_key(&header.key_salt),
             md5_hasher,
+            last_sequence: None,
         })
     }
 
@@ -137,16 +141,30 @@ impl Iterator for LogReader {
             return Some(Err(e));
         }
 
+        // The writer only ever advances the sequence, so a record that does not exceed its
+        // predecessor means two records may share a nonce - a writer bug that would leak the
+        // XOR of their plaintexts. Refused loudly rather than read past.
+        if let Some(last) = self.last_sequence
+            && header.sequence <= last
+        {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "record at offset {} in generation {} has sequence {}, not above its predecessor's {}",
+                    record_offset, self.header.generation, header.sequence, last
+                ),
+            )));
+        }
+        self.last_sequence = Some(header.sequence);
+
         self.md5_hasher.consume(header_buf);
         self.md5_hasher.consume(&raw_payload);
         self.current_offset += RECORD_HEADER_SIZE as u64 + header.payload_len as u64;
 
         let decrypted_payload = match crate::log::codec::decode(
-            &self.volume_key,
+            &self.file_key,
             crate::log::codec::RecordId {
-                generation: self.header.generation,
-                revision: self.header.revision,
-                record_offset,
+                sequence: header.sequence,
                 op_code: header.op_code as u8,
                 inode: header.inode,
             },
@@ -201,6 +219,8 @@ mod tests {
         assert_eq!(records[0].payload, b"payload1");
         assert_eq!(records[1].header.op_code, OpCode::InodeDelta);
         assert_eq!(records[1].payload, b"payload22");
+        assert_eq!(records[0].header.sequence, 0);
+        assert_eq!(records[1].header.sequence, 1);
 
         let computed_md5 = reader.finish_md5().unwrap();
         let expected_md5 = *md5::compute(storage.get_file_bytes(&writer.filename()).unwrap());
@@ -237,5 +257,44 @@ mod tests {
         let computed_md5 = reader.finish_md5().unwrap();
         let expected_md5 = *md5::compute(storage.get_file_bytes(&filename).unwrap());
         assert_eq!(computed_md5, expected_md5);
+    }
+
+    /// A record that does not advance the sequence is refused even though it authenticates:
+    /// the writer never produces one, so it means two records may share a nonce.
+    #[test]
+    fn test_log_reader_rejects_a_sequence_that_does_not_increase() {
+        let storage = Arc::new(MemoryStorage::new());
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            &SystemClock,
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        writer.append_record(OpCode::Data, 2, b"payload1").unwrap();
+        writer.append_record(OpCode::Data, 2, b"payload2").unwrap();
+        writer.flush().unwrap();
+        let filename = writer.filename();
+        drop(writer);
+
+        // Append an intact copy of the first record, sequence 0 and all.
+        let mut bytes = storage.get_file_bytes(&filename).unwrap();
+        let first_record = bytes[FILE_HEADER_SIZE..FILE_HEADER_SIZE + RECORD_HEADER_SIZE + 8].to_vec();
+        bytes.extend_from_slice(&first_record);
+        storage.insert_file(&filename, bytes);
+
+        let mut reader = LogReader::open(&storage, &filename, VolumeKey::plaintext_arc()).unwrap();
+        assert!(reader.next().unwrap().is_ok());
+        assert!(reader.next().unwrap().is_ok());
+        let err = reader.next().unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("has sequence 0, not above its predecessor's 1"),
+            "{}",
+            err
+        );
     }
 }

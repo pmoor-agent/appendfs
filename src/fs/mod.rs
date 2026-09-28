@@ -432,11 +432,9 @@ pub struct FlushBatch {
     pub frozen_at: Duration,
     /// Wall-clock time the batch was frozen, written into its `FlushCommit` trailer.
     ///
-    /// Fixed here rather than read when the trailer is written, because a failed flush rolls
-    /// the log back and rewrites the batch at the same offsets, under the same record nonces.
-    /// Every other byte of the batch comes out identical on the retry, so the rewrite leaks
-    /// nothing; a fresh timestamp would make the trailer the one record that re-encrypts a
-    /// different plaintext under a nonce already used.
+    /// Fixed here rather than read when the trailer is written: the batch holds the state as
+    /// of its freeze, and a batch retried after a failed flush still records that moment
+    /// rather than whenever the disk finally took it.
     pub commit_timestamp: SystemTime,
 }
 

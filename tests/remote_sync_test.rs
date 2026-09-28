@@ -324,6 +324,102 @@ fn test_read_only_remote_and_cloud_forking() {
     assert!(down.upload_partial_logs);
 }
 
+/// Bootstrapping an encrypted volume whose newest generation exists only as active parts
+/// must reproduce that generation's own file header: the header carries the salt its
+/// records' key is derived from, so a header made up during bootstrap would leave every
+/// record in the rebuilt file unreadable.
+#[test]
+fn test_bootstrap_rebuilds_encrypted_active_log_from_parts() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let master = appendfs::crypto::MasterKey::new([0x42u8; 32]);
+    let (header, key) = VolumeHeader::new_encrypted(
+        &master,
+        [0u8; 16],
+        appendfs::crypto::KeySource::KeyFile,
+        appendfs::compress::Compression::None,
+    )
+    .unwrap();
+    let volume_key = Arc::new(key);
+
+    init_volume(storage.clone(), &volume_key, header).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer);
+    fs.set_storage(storage.clone());
+
+    let remote = Arc::new(MockRemoteStore::new());
+    upload_storage_file(storage.as_ref(), remote.as_ref(), "000000.summary", None).unwrap();
+
+    let mut registry = RemoteRegistry::new();
+    registry.policy.active_sync_interval_secs = 0;
+    registry.policy.min_synced_remotes = 1;
+    registry.add_remote("primary", RemoteTargetConfig::new("my-bucket"));
+    registry.set_store_override("primary", remote.clone());
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    let fs_arc = Arc::new(fs);
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+
+    // Two batches, each shipped as its own part of the still-active generation 1.
+    let file = create_core(&fs_arc, 1, "active.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs_arc, file.ino, b"first part ", 0).unwrap();
+    fs_arc.quiesce().unwrap();
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/memory"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+    write_core(&fs_arc, file.ino, b"second part", 11).unwrap();
+    fs_arc.quiesce().unwrap();
+    last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/memory"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+    assert!(remote.head_object("000001.part0001.log").unwrap().is_some());
+    assert!(
+        remote.head_object("000001.log").unwrap().is_none(),
+        "generation 1 must still be active"
+    );
+
+    let fresh_storage = Arc::new(MemoryStorage::new());
+    bootstrap_from_remote(
+        remote.as_ref(),
+        fresh_storage.as_ref(),
+        "origin",
+        RemoteTargetConfig::new("my-bucket"),
+    )
+    .unwrap();
+    let original = storage.open_reader("000001.log").unwrap();
+    let mut original_bytes = vec![0u8; original.len().unwrap() as usize];
+    original.read_exact_at(0, &mut original_bytes).unwrap();
+    assert!(
+        fresh_storage.get_file_bytes("000001.log").unwrap() == original_bytes,
+        "the rebuilt active log must match the original byte for byte, header included"
+    );
+
+    let recovered = appendfs::recover_fs(fresh_storage, appendfs::RecoveryTarget::Latest, clock, volume_key).unwrap();
+    assert_eq!(
+        recovered.read_file_data(file.ino, 0, 22).unwrap(),
+        b"first part second part"
+    );
+}
+
 #[test]
 fn test_active_log_part_sync_and_consolidation_on_seal() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());

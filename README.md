@@ -4,7 +4,7 @@
 [![Nightly soak](https://github.com/pmoor/appendfs/actions/workflows/soak.yml/badge.svg?branch=main)](https://github.com/pmoor/appendfs/actions/workflows/soak.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**AppendFS** is a high-performance, log-structured in-memory FUSE filesystem designed around an **append-only backing store** for personal archival storage, tamper-evident data durability, and disaster recovery.
+**AppendFS** is a high-performance, log-structured in-memory FUSE filesystem designed around an **append-only backing store** for personal archival storage, corruption-evident data durability, and disaster recovery.
 
 Instead of mutating files in place on disk, AppendFS stages all filesystem operations (file writes, metadata updates, directory creations, deletions, renames, extended attributes) in memory and flushes changes as an append-only sequence of immutable log files ordered by a **monotonic generation sequence number**.
 
@@ -16,7 +16,7 @@ Instead of mutating files in place on disk, AppendFS stages all filesystem opera
 - **In-Memory Staging & Performance**: Operations are staged in memory and served at memory speed while asynchronously committing batches to disk.
 - **Instant Crash Recovery**: Power cuts or crashes mid-flush cleanly discard uncommitted trailing batches while preserving all previously committed transactions. Periodic `.summary` checkpoint files enable near-instantaneous startup.
 - **Point-in-Time Time Travel**: Mount the filesystem read-only at any past timestamp (`--at-time`) for auditing or backup extraction.
-- **Zero-Trust Authenticated Encryption**: AEAD encryption with secure key derivation. Volumes can be unlocked via a passphrase, a 256-bit key file, or two-factor authentication (key file + passphrase), with immediate key validation before reading records.
+- **Client-Side Authenticated Encryption**: AEAD encryption with secure key derivation. Volumes can be unlocked via a passphrase, a 256-bit key file, or two-factor authentication (key file + passphrase), with immediate key validation before reading records.
 - **Transparent Compression**: Payloads are compressed on the fly using **Zstandard (zstd)**, saving storage space and network transfer costs.
 - **Multi-Cloud Replication**: An autonomous background replication worker fans out sealed logs and summaries to S3-compatible cloud providers (AWS S3, Backblaze B2, Cloudflare R2, MinIO, Wasabi, Google Cloud Storage) or local/NFS paths.
 - **Tiered Storage & Range Reads**: Local disk space can be reclaimed by pruning uploaded log files. Missing extents are transparently fetched on demand.

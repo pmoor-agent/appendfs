@@ -894,14 +894,18 @@ mod tests {
 
         // Append an extraneous record after seal directly to 000001.log
         let mut log_bytes = mem_storage.get_file_bytes("000001.log").unwrap();
+        let file_salt = crate::log::record::FileHeader::from_bytes(
+            log_bytes[..crate::log::record::FILE_HEADER_SIZE].try_into().unwrap(),
+        )
+        .unwrap()
+        .key_salt;
         let extra_payload = b"extraneous";
         let (_, cipher, tag) = crate::log::codec::encode(
-            &VolumeKey::plaintext(),
+            &VolumeKey::plaintext().log_file_key(&file_salt),
             crate::compress::Compression::None,
             crate::log::codec::RecordId {
-                generation: 1,
-                revision: 0,
-                record_offset: log_bytes.len() as u64,
+                // Past every sequence the writer used in this generation.
+                sequence: 1_000,
                 op_code: OpCode::Data as u8,
                 inode: 2,
             },
@@ -912,6 +916,7 @@ mod tests {
             op_code: OpCode::Data,
             inode: 2,
             payload_len: cipher.len() as u32,
+            sequence: 1_000,
             auth_tag: tag,
         };
         log_bytes.extend_from_slice(&extra_header.to_bytes());
@@ -982,7 +987,13 @@ mod tests {
         drop(reader);
 
         // Reconstruct 000001.log with valid records + bad seal
-        let file_header = crate::log::record::FileHeader::new(1, clock.now());
+        // Keep the original header: it carries the salt the kept records are keyed by.
+        let original = mem_storage.get_file_bytes("000001.log").unwrap();
+        let file_header = crate::log::record::FileHeader::from_bytes(
+            original[..crate::log::record::FILE_HEADER_SIZE].try_into().unwrap(),
+        )
+        .unwrap();
+        let file_salt = file_header.key_salt;
         let mut new_bytes = file_header.to_bytes().to_vec();
         for rec in valid_records {
             let h = rec.header.to_bytes();
@@ -991,12 +1002,11 @@ mod tests {
         }
         // Use encode to compute valid tag for bad seal
         let (_, cipher, tag) = crate::log::codec::encode(
-            &VolumeKey::plaintext(),
+            &VolumeKey::plaintext().log_file_key(&file_salt),
             crate::compress::Compression::None,
             crate::log::codec::RecordId {
-                generation: 1,
-                revision: 0,
-                record_offset: new_bytes.len() as u64,
+                // Past every sequence the writer used in this generation.
+                sequence: 1_000,
                 op_code: OpCode::Seal as u8,
                 inode: 0,
             },
@@ -1007,6 +1017,7 @@ mod tests {
             op_code: OpCode::Seal,
             inode: 0,
             payload_len: cipher.len() as u32,
+            sequence: 1_000,
             auth_tag: tag,
         };
         new_bytes.extend_from_slice(&tagged_header.to_bytes());
