@@ -1,30 +1,18 @@
 //! Bounded worker threadpool for asynchronous cold disk and remote reads.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use crate::error::FsError;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-type Task = Box<dyn FnOnce() + Send + 'static>;
-
-#[derive(Default)]
-struct PoolState {
-    queue: VecDeque<Task>,
-    shutdown: bool,
-}
-
-struct WorkerState {
-    handles: Vec<JoinHandle<()>>,
-    pid: u32,
-}
+type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// A dedicated threadpool for offloading cold disk and remote read requests
 /// away from the single-threaded FUSE event loop.
 pub struct ReadThreadPool {
-    state: Arc<(Mutex<PoolState>, Condvar)>,
-    workers: Mutex<Option<WorkerState>>,
+    sender: Mutex<Option<Sender<Job>>>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
     num_workers: usize,
-    is_shutdown: AtomicBool,
 }
 
 impl ReadThreadPool {
@@ -32,99 +20,52 @@ impl ReadThreadPool {
     ///
     /// The worker count is clamped to `1..=16`.
     ///
-    /// Note: Worker threads are not started immediately in `new()`, but on `start()` or lazily
-    /// on the first `spawn()`. This ensures that a thread started prior to a background mount's
-    /// `fuse_daemonize` fork does not become orphaned in the child process.
+    /// Note: Worker threads are not started here, but on an explicit call to [`start`](Self::start)
+    /// during filesystem initialization.
     pub fn new(workers: usize) -> Self {
-        let num_workers = workers.clamp(1, 16);
-        let state = Arc::new((Mutex::new(PoolState::default()), Condvar::new()));
-
         Self {
-            state,
-            workers: Mutex::new(None),
-            num_workers,
-            is_shutdown: AtomicBool::new(false),
+            sender: Mutex::new(None),
+            workers: Mutex::new(Vec::new()),
+            num_workers: workers.clamp(1, 16),
         }
     }
 
-    /// Starts the worker threads if not already running in the current process.
-    ///
-    /// If called after a `fork()`, any handles from the parent process are dropped
-    /// (preventing deadlocks when joining) and new threads are spawned for this process.
+    /// Starts the worker threads. Idempotent.
     pub fn start(&self) {
-        if self.is_shutdown.load(Ordering::SeqCst) {
+        let mut sender_guard = self.sender.lock().unwrap();
+        if sender_guard.is_some() {
             return;
         }
-        let current_pid = std::process::id();
-        let mut workers_guard = self.workers.lock().unwrap();
-        if let Some(ref inner) = *workers_guard {
-            if inner.pid == current_pid {
-                return;
-            }
-            // Fork occurred: reset pool state for the child process.
-            let mut state_lock = self.state.0.lock().unwrap();
-            state_lock.shutdown = false;
-            state_lock.queue.clear();
-            self.is_shutdown.store(false, Ordering::SeqCst);
-        }
 
-        let num_workers = self.num_workers;
-        let mut handles = Vec::with_capacity(num_workers);
-        for i in 0..num_workers {
-            let state_clone = Arc::clone(&self.state);
+        let (tx, rx) = mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        let mut workers = self.workers.lock().unwrap();
+
+        for i in 0..self.num_workers {
+            let rx = Arc::clone(&rx);
             let handle = thread::Builder::new()
                 .name(format!("appendfs-read-{}", i))
                 .spawn(move || {
-                    loop {
-                        let mut lock = state_clone.0.lock().unwrap();
-                        while lock.queue.is_empty() && !lock.shutdown {
-                            lock = state_clone.1.wait(lock).unwrap();
-                        }
-                        if lock.shutdown && lock.queue.is_empty() {
-                            break;
-                        }
-                        let task = match lock.queue.pop_front() {
-                            Some(t) => t,
-                            None => continue,
-                        };
-                        drop(lock);
-
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+                    while let Ok(job) = rx.lock().unwrap().recv() {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                     }
                 })
                 .expect("failed to spawn read worker thread");
-            handles.push(handle);
+            workers.push(handle);
         }
 
-        *workers_guard = Some(WorkerState {
-            handles,
-            pid: current_pid,
-        });
-    }
-
-    fn ensure_started(&self) {
-        let current_pid = std::process::id();
-        let needs_start = match self.workers.lock().unwrap().as_ref() {
-            Some(inner) => inner.pid != current_pid,
-            None => true,
-        };
-        if needs_start {
-            self.start();
-        }
+        *sender_guard = Some(tx);
     }
 
     /// Submits a task for asynchronous execution on the threadpool.
     ///
-    /// If the pool is shutting down, the task is dropped without execution.
-    pub fn spawn(&self, f: impl FnOnce() + Send + 'static) {
-        if self.is_shutdown.load(Ordering::SeqCst) {
-            return;
-        }
-        self.ensure_started();
-        let mut lock = self.state.0.lock().unwrap();
-        if !lock.shutdown {
-            lock.queue.push_back(Box::new(f));
-            self.state.1.notify_one();
+    /// Returns [`FsError::EIO`] if the pool has not been started or has been shut down.
+    pub fn spawn(&self, f: impl FnOnce() + Send + 'static) -> Result<(), FsError> {
+        let sender = self.sender.lock().unwrap();
+        if let Some(ref tx) = *sender {
+            tx.send(Box::new(f)).map_err(|_| FsError::EIO)
+        } else {
+            Err(FsError::EIO)
         }
     }
 
@@ -135,20 +76,10 @@ impl ReadThreadPool {
 
     /// Signals all workers to stop and joins their threads.
     pub fn shutdown(&self) {
-        if self.is_shutdown.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        {
-            let mut lock = self.state.0.lock().unwrap();
-            lock.shutdown = true;
-            self.state.1.notify_all();
-        }
-        let current_pid = std::process::id();
-        let mut workers_guard = self.workers.lock().unwrap();
-        if let Some(inner) = workers_guard.take()
-            && inner.pid == current_pid
-        {
-            for handle in inner.handles {
+        if let Some(tx) = self.sender.lock().unwrap().take() {
+            drop(tx);
+            let mut workers = self.workers.lock().unwrap();
+            for handle in workers.drain(..) {
                 let _ = handle.join();
             }
         }
@@ -165,7 +96,7 @@ impl std::fmt::Debug for ReadThreadPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadThreadPool")
             .field("num_workers", &self.num_workers)
-            .field("is_shutdown", &self.is_shutdown.load(Ordering::Relaxed))
+            .field("is_started", &self.sender.lock().unwrap().is_some())
             .finish()
     }
 }
@@ -173,13 +104,13 @@ impl std::fmt::Debug for ReadThreadPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_read_thread_pool_execution() {
         let pool = ReadThreadPool::new(4);
         assert_eq!(pool.num_workers(), 4);
+        pool.start();
 
         let counter = Arc::new(AtomicUsize::new(0));
         let num_tasks = 20;
@@ -188,7 +119,8 @@ mod tests {
             let counter_clone = Arc::clone(&counter);
             pool.spawn(move || {
                 counter_clone.fetch_add(1, Ordering::SeqCst);
-            });
+            })
+            .unwrap();
         }
 
         // Wait for all tasks to complete
@@ -196,10 +128,26 @@ mod tests {
             if counter.load(Ordering::SeqCst) == num_tasks {
                 break;
             }
-            thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(counter.load(Ordering::SeqCst), num_tasks);
 
+        assert_eq!(counter.load(Ordering::SeqCst), num_tasks);
         pool.shutdown();
+    }
+
+    #[test]
+    fn test_read_thread_pool_unstarted_spawn_fails() {
+        let pool = ReadThreadPool::new(4);
+        let res = pool.spawn(|| {});
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_read_thread_pool_shutdown_spawn_fails() {
+        let pool = ReadThreadPool::new(4);
+        pool.start();
+        pool.shutdown();
+        let res = pool.spawn(|| {});
+        assert!(res.is_err());
     }
 }

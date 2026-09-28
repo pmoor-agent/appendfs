@@ -111,6 +111,7 @@ impl TestFS {
 
         let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
         fs.set_storage(storage.clone());
+        fs.read_pool.start();
 
         // Export initial 000000.summary snapshot to initialize volume at clock.now()
         let snapshot = fs.snapshot_all();
@@ -215,6 +216,7 @@ impl TestFS {
 
         let registry_arc = Arc::new(RwLock::new(registry));
         fs.set_remote_registry(Arc::clone(&registry_arc));
+        fs.read_pool.start();
 
         Self {
             fs,
@@ -268,6 +270,7 @@ impl TestFS {
     }
 
     pub fn from_instance(fs: InMemoryFS, log_dir: &Path, temp_dir: Option<Arc<tempfile::TempDir>>) -> Self {
+        fs.read_pool.start();
         let storage = fs
             .log_cache
             .as_ref()
@@ -308,6 +311,7 @@ impl TestFS {
     }
 
     pub fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+        self.fs.read_pool.start();
         let fh = self.open(ino, libc::O_RDONLY as u32)?;
         let res = appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset as i64, len);
         let _ = self.release(ino, fh);
@@ -315,11 +319,13 @@ impl TestFS {
     }
 
     pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+        self.fs.read_pool.start();
         appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset as i64, len)
             .and_then(|resp| resp.into_bytes().ok_or(FsError::EIO))
     }
 
     pub fn read_all(&self, ino: u64) -> Result<Vec<u8>, FsError> {
+        self.fs.read_pool.start();
         let fh = self.open(ino, libc::O_RDONLY as u32)?;
         let mut result = Vec::new();
         let chunk_size = 64 * 1024;
@@ -603,6 +609,7 @@ impl TestFS {
         );
         recovered.attach_log_writer(writer);
         recovered.set_storage(storage.clone());
+        recovered.read_pool.start();
         recovered.max_extent_size = max_extent_size;
         recovered.next_inode.store(
             recovered.next_inode.load(Ordering::SeqCst).max(next_inode),
@@ -684,6 +691,7 @@ impl TestFS {
         );
         recovered.attach_log_writer(writer);
         recovered.set_storage(storage.clone());
+        recovered.read_pool.start();
         Self {
             fs: recovered,
             log_dir: log_dir.to_path_buf(),

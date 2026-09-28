@@ -414,7 +414,7 @@ impl<'a> InodeLayerStack<'a> {
     /// Reads file data resolving extents across layers.
     pub fn read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<Vec<u8>, FsError> {
         let plan = self.plan_read_file_data(offset, size, fs.log_cache.as_deref())?;
-        fs.execute_read_plan_sync(plan)
+        execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key)
     }
 }
 
@@ -514,13 +514,6 @@ impl ReadPlan {
             }
             ReadSliceSource::Disk { .. } => panic!("disk slice cannot be borrowed directly"),
         }
-    }
-}
-
-impl InMemoryFS {
-    /// Executes a [`ReadPlan`] synchronously, reading any cold disk extents via [`LogFileCache`].
-    pub fn execute_read_plan_sync(&self, plan: ReadPlan) -> Result<Vec<u8>, FsError> {
-        execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key)
     }
 }
 
@@ -729,7 +722,7 @@ mod tests {
         assert_eq!(plan.slices[2].len, 40);
         assert!(matches!(plan.slices[2].source, ReadSliceSource::Memory { .. }));
 
-        let read_buf = fs.execute_read_plan_sync(plan).unwrap();
+        let read_buf = execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).unwrap();
         assert_eq!(&read_buf[0..40], &[0xAA; 40]);
         assert_eq!(&read_buf[40..60], &[0x00; 20]);
         assert_eq!(&read_buf[60..100], &[0xAA; 40]);
@@ -744,7 +737,7 @@ mod tests {
         assert!(!plan.has_cold_slices);
         assert!(plan.slices.is_empty());
 
-        let res = fs.execute_read_plan_sync(plan).unwrap();
+        let res = execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).unwrap();
         assert!(res.is_empty());
     }
 
@@ -917,12 +910,12 @@ mod tests {
         assert_eq!(plan.slices[0].len, 100);
         assert!(matches!(plan.slices[0].source, ReadSliceSource::Cache { .. }));
 
-        let buf = fs.execute_read_plan_sync(plan).unwrap();
+        let buf = execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).unwrap();
         assert_eq!(buf, vec![0xCC; 100]);
     }
 
     #[test]
-    fn test_execute_read_plan_multi_extent_parallel() {
+    fn test_execute_read_plan_multi_extent() {
         use crate::crypto::{VolumeHeader, VolumeKey};
         use crate::log::RecoveryTarget;
         use crate::storage::MemoryStorage;
@@ -968,7 +961,7 @@ mod tests {
         crate::operations::read_write::write_core(&fs, attr.ino, &data4, 600).unwrap();
         fs.quiesce().unwrap();
 
-        // Clear decrypted record cache to force actual cold disk decoding in parallel
+        // Clear decrypted record cache to force actual cold disk decoding
         fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
 
         let plan = fs.plan_read_file_data(attr.ino, 0, 800).unwrap();
@@ -976,8 +969,7 @@ mod tests {
         assert!(plan.has_cold_slices);
         assert!(plan.slices.len() >= 4);
 
-        // Execute synchronously (which dispatches parallel worker threads under the hood)
-        let read_buf = fs.execute_read_plan_sync(plan.clone()).unwrap();
+        let read_buf = execute_read_plan(plan.clone(), fs.log_cache.as_deref(), &fs.volume_key).unwrap();
         assert_eq!(&read_buf[0..200], &data1[..]);
         assert_eq!(&read_buf[200..400], &data2[..]);
         assert_eq!(&read_buf[400..600], &data3[..]);
@@ -1134,7 +1126,7 @@ mod tests {
         assert_eq!(plan.slices.len(), 1);
         assert!(plan.has_cold_slices);
 
-        let res = fs.execute_read_plan_sync(plan).unwrap();
+        let res = execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).unwrap();
         assert_eq!(res, payload);
     }
 

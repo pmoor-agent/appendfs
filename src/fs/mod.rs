@@ -1190,13 +1190,10 @@ impl InMemoryFS {
         self.read_parallelism
     }
 
-    /// Sets the read parallelism for cold disk extent reads and reconfigures the read threadpool.
-    /// Passing 0 enables auto-detection.
+    /// Sets the read parallelism for cold disk extent reads. Passing 0 enables auto-detection.
     pub fn set_read_parallelism(&mut self, workers: usize) {
         self.read_parallelism = workers;
-        let count = self.effective_read_parallelism();
-        let old_pool = std::mem::replace(&mut self.read_pool, Arc::new(ReadThreadPool::new(count)));
-        old_pool.shutdown();
+        self.read_pool = Arc::new(ReadThreadPool::new(self.effective_read_parallelism()));
     }
 
     /// Returns the effective read threadpool worker count.

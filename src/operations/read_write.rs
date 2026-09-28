@@ -47,7 +47,9 @@ pub fn read_response(
 
     if !plan.has_cold_slices {
         // Fast path: 100% in-memory (zeros, staged buffers, or decrypted record cache hits)
-        return DeferredResult::ready(fs.execute_read_plan_sync(plan).map(FuseResponse::buf));
+        return DeferredResult::ready(
+            execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).map(FuseResponse::buf),
+        );
     }
 
     // Cold read offload: dispatch to the dedicated read threadpool
@@ -56,15 +58,18 @@ pub fn read_response(
     let log_cache = fs.log_cache.clone();
     let volume_key = fs.volume_key.clone();
 
-    fs.read_pool.spawn(move || {
+    if let Err(e) = fs.read_pool.spawn(move || {
         let _guard = guard;
         let res = execute_read_plan(plan, log_cache.as_deref(), &volume_key);
         token.complete(res.map(FuseResponse::buf));
-    });
+    }) {
+        return DeferredResult::err(e);
+    }
 
     DeferredResult::deferred(receiver)
 }
 
+#[cfg(any(test, feature = "testing"))]
 pub fn read_core(
     fs: &InMemoryFS,
     ino: u64,

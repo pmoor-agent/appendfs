@@ -7,7 +7,7 @@
 use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, is_virtual_ino};
 // Only the test-only by-inode read helpers at the bottom of this file return these.
 #[cfg(any(test, feature = "testing"))]
-use super::ReadPlan;
+use super::{ReadPlan, execute_read_plan};
 #[cfg(any(test, feature = "testing"))]
 use crate::error::FsError;
 use crate::extent_map::ExtentMap;
@@ -560,7 +560,7 @@ impl InMemoryFS {
     #[cfg(any(test, feature = "testing"))]
     pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, FsError> {
         let plan = self.plan_read_file_data(ino, offset, size)?;
-        self.execute_read_plan_sync(plan)
+        execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key)
     }
 
     pub fn snapshot_all(&self) -> HashMap<u64, Arc<Node>> {

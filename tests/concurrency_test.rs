@@ -664,6 +664,7 @@ fn run_concurrent_stress(seed: u64) {
     );
     let mut fs = InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
     fs.set_storage(storage.clone());
+    fs.read_pool.start();
     // Reads bump atime in memory but are never logged (logging every read would defeat
     // the point of an append-only log), so with atime tracking on, a live instance and
     // its log replay would legitimately differ on atime alone - disabling it here keeps

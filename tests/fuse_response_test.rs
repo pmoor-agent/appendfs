@@ -623,7 +623,13 @@ fn test_cold_read_deferred_threadpool_execution() {
     fs.quiesce().unwrap();
     fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
 
-    // 3. Cold read: must be Deferred and executed on ReadThreadPool
+    // 3. Cold read with unstarted pool: must immediately fail with EIO
+    let cold_unstarted = read_response(&fs, file.ino, fh, 0, payload.len());
+    assert!(cold_unstarted.is_ready());
+    assert_eq!(cold_unstarted.wait().unwrap_err(), appendfs::error::FsError::EIO);
+
+    // 4. Start read pool and execute cold read: must be Deferred and executed on ReadThreadPool
+    fs.read_pool.start();
     let cold_res = read_response(&fs, file.ino, fh, 0, payload.len());
     assert!(cold_res.is_deferred());
 
