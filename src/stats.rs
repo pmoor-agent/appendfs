@@ -10,6 +10,9 @@ use std::sync::Arc;
 /// Default maximum number of top file extensions to display before grouping remaining extensions under `(other)`.
 pub const TOP_EXTENSIONS_LIMIT: usize = 15;
 
+/// Maximum average extent size (1 MiB) for a file to be considered fragmented in volume statistics.
+pub const FRAGMENTED_AVG_EXTENT_THRESHOLD: u64 = 1024 * 1024;
+
 /// File count and aggregate logical byte size for a specific file extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionStats {
@@ -58,6 +61,17 @@ pub struct FileFragInfo {
     pub size: u64,
     pub extents: usize,
     pub path: String,
+}
+
+impl FileFragInfo {
+    /// Computes the average extent size in bytes, or 0 if the file has no extents.
+    pub fn avg_extent_size(&self) -> u64 {
+        if self.extents > 0 {
+            self.size / self.extents as u64
+        } else {
+            0
+        }
+    }
 }
 
 /// Builds a mapping from inode ID to its relative POSIX path by BFS traversal from root directory (inode 1).
@@ -136,30 +150,51 @@ fn format_fragmentation_section(
 
         let multi_extent_files: Vec<_> = file_frag_list.iter().filter(|f| f.extents > 1).take(5).collect();
         if !multi_extent_files.is_empty() {
-            writeln!(out, "--- Top Fragmented Files ---").unwrap();
-            writeln!(
-                out,
-                "{:<8} {:>12} {:>9} {:>16}   PATH",
-                "INODE", "SIZE", "EXTENTS", "AVG EXTENT SIZE"
-            )
-            .unwrap();
-            writeln!(out, "{:-<8} {:-<12} {:-<9} {:-<16}   {:-<30}", "", "", "", "", "").unwrap();
-            for f in multi_extent_files {
-                let avg_sz = if f.extents > 0 { f.size / f.extents as u64 } else { 0 };
-                writeln!(
-                    out,
-                    "{:<8} {:>12} {:>9} {:>16}   {}",
-                    f.inode,
-                    format_bytes(f.size),
-                    f.extents,
-                    format_bytes(avg_sz),
-                    f.path
-                )
-                .unwrap();
-            }
-            writeln!(out).unwrap();
+            out.push_str(&format_file_frag_table(
+                "Top Files by Extent Count",
+                &multi_extent_files,
+            ));
+        }
+
+        let fragmented_files: Vec<_> = file_frag_list
+            .iter()
+            .filter(|f| f.extents > 1 && f.avg_extent_size() < FRAGMENTED_AVG_EXTENT_THRESHOLD)
+            .take(5)
+            .collect();
+        if !fragmented_files.is_empty() {
+            out.push_str(&format_file_frag_table(
+                "Top Fragmented Files (< 1 MiB Avg Extent)",
+                &fragmented_files,
+            ));
         }
     }
+    out
+}
+
+fn format_file_frag_table(title: &str, files: &[&FileFragInfo]) -> String {
+    let mut out = String::new();
+    writeln!(out, "--- {} ---", title).unwrap();
+    writeln!(
+        out,
+        "{:<8} {:>12} {:>9} {:>16}   PATH",
+        "INODE", "SIZE", "EXTENTS", "AVG EXTENT SIZE"
+    )
+    .unwrap();
+    writeln!(out, "{:-<8} {:-<12} {:-<9} {:-<16}   {:-<30}", "", "", "", "", "").unwrap();
+    for f in files {
+        let avg_sz = f.avg_extent_size();
+        writeln!(
+            out,
+            "{:<8} {:>12} {:>9} {:>16}   {}",
+            f.inode,
+            format_bytes(f.size),
+            f.extents,
+            format_bytes(avg_sz),
+            f.path
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
     out
 }
 
@@ -1781,5 +1816,100 @@ mod tests {
             total_bytes: 10,
         }];
         assert_eq!(format_extension_stats_table(&stats, 0, 10), "");
+    }
+
+    #[test]
+    fn test_file_frag_info_avg_extent_size() {
+        let f0 = FileFragInfo {
+            inode: 10,
+            size: 100,
+            extents: 0,
+            path: "/empty".to_string(),
+        };
+        assert_eq!(f0.avg_extent_size(), 0);
+
+        let f1 = FileFragInfo {
+            inode: 11,
+            size: 4096,
+            extents: 2,
+            path: "/file1".to_string(),
+        };
+        assert_eq!(f1.avg_extent_size(), 2048);
+    }
+
+    #[test]
+    fn test_format_fragmentation_section_large_vs_small_extents() {
+        let extent_buckets = vec![
+            ExtentsBucket::new("1 extent (contiguous)", 1, 1),
+            ExtentsBucket::new("2 - 4 extents", 2, 4),
+            ExtentsBucket::new("> 64 extents", 65, usize::MAX),
+        ];
+
+        let files = vec![
+            // Large sequential file (4 MiB avg extent size, 1000 extents)
+            FileFragInfo {
+                inode: 100,
+                size: 4 * 1024 * 1024 * 1000,
+                extents: 1000,
+                path: "/backups/large.tar".to_string(),
+            },
+            // Truly fragmented file (4 KiB avg extent size, 50 extents)
+            FileFragInfo {
+                inode: 101,
+                size: 200 * 1024,
+                extents: 50,
+                path: "/var/db/fragmented.sqlite".to_string(),
+            },
+            // Contiguous file (1 extent, should not be in either table)
+            FileFragInfo {
+                inode: 102,
+                size: 1024 * 1024,
+                extents: 1,
+                path: "/contiguous.bin".to_string(),
+            },
+        ];
+
+        let report = format_fragmentation_section(3, 1051, 1000, &extent_buckets, &files);
+
+        // "Top Files by Extent Count" should list both multi-extent files, starting with large.tar
+        assert!(report.contains("--- Top Files by Extent Count ---"));
+        let top_files_pos = report.find("--- Top Files by Extent Count ---").unwrap();
+        let frag_files_pos = report
+            .find("--- Top Fragmented Files (< 1 MiB Avg Extent) ---")
+            .unwrap();
+        assert!(top_files_pos < frag_files_pos);
+
+        // Verify content within "Top Files by Extent Count"
+        let top_section = &report[top_files_pos..frag_files_pos];
+        assert!(top_section.contains("/backups/large.tar"));
+        assert!(top_section.contains("/var/db/fragmented.sqlite"));
+        assert!(!top_section.contains("/contiguous.bin"));
+
+        // Verify content within "Top Fragmented Files (< 1 MiB Avg Extent)"
+        let frag_section = &report[frag_files_pos..];
+        assert!(!frag_section.contains("/backups/large.tar"));
+        assert!(frag_section.contains("/var/db/fragmented.sqlite"));
+        assert!(!frag_section.contains("/contiguous.bin"));
+    }
+
+    #[test]
+    fn test_format_fragmentation_section_no_fragmented_files() {
+        let extent_buckets = vec![
+            ExtentsBucket::new("1 extent (contiguous)", 1, 1),
+            ExtentsBucket::new("> 64 extents", 65, usize::MAX),
+        ];
+
+        let files = vec![FileFragInfo {
+            inode: 100,
+            size: 10 * 1024 * 1024 * 1024,
+            extents: 2500, // 4 MiB avg extent size
+            path: "/backups/backup.tar".to_string(),
+        }];
+
+        let report = format_fragmentation_section(1, 2500, 2500, &extent_buckets, &files);
+        assert!(report.contains("--- Top Files by Extent Count ---"));
+        assert!(report.contains("/backups/backup.tar"));
+        // Since avg extent is 4 MiB, no files qualify as < 1 MiB avg extent
+        assert!(!report.contains("--- Top Fragmented Files (< 1 MiB Avg Extent) ---"));
     }
 }

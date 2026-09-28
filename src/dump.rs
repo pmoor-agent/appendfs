@@ -588,7 +588,7 @@ pub fn dump_log_reader_with_path(
 }
 
 /// Reads and analyzes a single `.summary` snapshot file, formatting the output based on `verbosity`:
-/// - `verbosity == 0`: Summary metadata, whole-file checksum, inode breakdown, extent fragmentation stats, histogram, top fragmented files, manifest table.
+/// - `verbosity == 0`: Summary metadata, whole-file checksum, inode breakdown, extent fragmentation stats, histogram, top files by extent count, top fragmented files, manifest table.
 /// - `verbosity == 1`: Summary + complete inode listing / directory tree.
 /// - `verbosity >= 2`: Summary + complete inode listing + detailed physical extent range mappings for all files.
 pub fn dump_summary_file(
@@ -1444,7 +1444,8 @@ mod tests {
         assert!(dump_snap_v0.contains("2 - 4 extents"));
         assert!(dump_snap_v0.contains("--- File Extension Breakdown ---"));
         assert!(dump_snap_v0.contains(".bin                            1       100.0%       8.00 KiB       100.0%"));
-        assert!(dump_snap_v0.contains("Top Fragmented Files"));
+        assert!(dump_snap_v0.contains("--- Top Files by Extent Count ---"));
+        assert!(dump_snap_v0.contains("--- Top Fragmented Files (< 1 MiB Avg Extent) ---"));
         assert!(dump_snap_v0.contains("/docs/fragmented.bin"));
         assert!(dump_snap_v0.contains("000001.log"));
         assert!(dump_snap_v0.contains("000002.log"));
