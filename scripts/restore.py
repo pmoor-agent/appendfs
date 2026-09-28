@@ -271,7 +271,7 @@ class VolumeDecryptor:
         return self.file_ciphers[key_salt]
 
     def decode_record(
-        self, key_salt: bytes, generation: int, sequence: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
+        self, key_salt: bytes, sequence: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
     ) -> bytes:
         cipher = self.file_cipher(key_salt)
         if cipher is not None:
@@ -281,7 +281,7 @@ class VolumeDecryptor:
             try:
                 decrypted = cipher.decrypt(nonce, ciphertext_with_tag, aad)
             except Exception as e:
-                raise ValueError(f"Decryption / authentication failed for record (gen={generation}, seq={sequence}, ino={inode}): {e}")
+                raise ValueError(f"Decryption / authentication failed for record (seq={sequence}, ino={inode}): {e}")
             data = decrypted
         else:
             # Plaintext volume
@@ -292,7 +292,7 @@ class VolumeDecryptor:
                 hasher.update(payload)
                 expected_tag = hasher.digest()[:16]
                 if expected_tag != auth_tag:
-                    raise ValueError(f"BLAKE3 checksum mismatch for record (gen={generation}, seq={sequence}, ino={inode})")
+                    raise ValueError(f"BLAKE3 checksum mismatch for record (seq={sequence}, ino={inode})")
             data = payload
 
         # Decompress if Zstd
@@ -497,7 +497,7 @@ class Restorer:
                         )
 
                 try:
-                    payload = self.decryptor.decode_record(key_salt, gen, seq, op, ino, raw_payload, tag)
+                    payload = self.decryptor.decode_record(key_salt, seq, op, ino, raw_payload, tag)
                 except Exception as e:
                     raise ValueError(
                         f"Failed to decode/decrypt record in {log_path.name} @ offset 0x{rec_log_offset:x}: {e}"

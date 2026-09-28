@@ -236,7 +236,7 @@ use crate::crypto::{LogFileKey, VolumeKey};
 /// Random by default. Replaceable only so fixture generation and tests can produce the same
 /// bytes on every run - see [`LogWriter::with_key_salts`]. A source that ever returned the
 /// same salt twice would put two files under one key.
-pub type KeySaltSource = Box<dyn Fn(u32) -> [u8; 16] + Send + Sync>;
+type KeySaltSource = Box<dyn Fn(u32) -> [u8; 16] + Send + Sync>;
 
 /// Everything needed to key a newly created log file.
 struct FileKeying {
@@ -387,7 +387,11 @@ impl LogWriter {
     ///
     /// For fixture generation and tests that need identical bytes on every run. Takes effect
     /// for files opened from now on, so pair it with a lazy constructor to cover the first.
-    pub fn with_key_salts(mut self, key_salts: impl Fn(u32) -> [u8; 16] + Send + Sync + 'static) -> Self {
+    ///
+    /// Crate-private rather than `cfg`-gated to tests: the `generate_compat_fixture` binary is
+    /// built without the `testing` feature and reaches this through [`crate::compat`]. Nothing
+    /// outside the crate can replace the salt source.
+    pub(crate) fn with_key_salts(mut self, key_salts: impl Fn(u32) -> [u8; 16] + Send + Sync + 'static) -> Self {
         self.keying.key_salts = Box::new(key_salts);
         self
     }
