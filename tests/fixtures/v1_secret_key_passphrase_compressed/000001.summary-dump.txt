@@ -35,7 +35,7 @@ EXTENTS RANGE               FILES   % OF FILES   DISTRIBUTION
 17 - 64 extents                 0         0.0%                       
 > 64 extents                    0         0.0%                       
 
---- Top Fragmented Files ---
+--- Top Files by Extent Count ---
 INODE            SIZE   EXTENTS  AVG EXTENT SIZE   PATH
 -------- ------------ --------- ----------------   ------------------------------
 11           8.10 KiB         3         2.70 KiB   /dir_b/regrown.bin
