@@ -520,7 +520,7 @@ impl ReadPlan {
 impl InMemoryFS {
     /// Executes a [`ReadPlan`] synchronously, reading any cold disk extents via [`LogFileCache`].
     pub fn execute_read_plan_sync(&self, plan: ReadPlan) -> Result<Vec<u8>, FsError> {
-        execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key, self.read_parallelism)
+        execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key)
     }
 }
 
@@ -529,14 +529,10 @@ impl InMemoryFS {
 /// Phase 1: Copies all in-memory slices into `dst_buf` and drops their backing buffers
 /// immediately, allowing staged buffers to be freed before any disk I/O.
 /// Phase 2: Resolves cold disk slices from cache or disk directly into `dst_buf`.
-///
-/// `read_parallelism` controls concurrency for cold disk slice fetching: `0` auto-detects
-/// based on available CPU cores (capped at 16); values `> 0` specify explicit worker counts.
 pub fn execute_read_plan(
     mut plan: ReadPlan,
     log_cache: Option<&crate::log::LogFileCache>,
     volume_key: &crate::crypto::VolumeKey,
-    read_parallelism: usize,
 ) -> Result<Vec<u8>, FsError> {
     if plan.total_len == 0 || plan.slices.is_empty() {
         return Ok(Vec::new());
@@ -577,7 +573,7 @@ pub fn execute_read_plan(
     // disk or remote S3 reads below take significant time.
     if !cold_slices.is_empty() {
         let cache = log_cache.ok_or(FsError::EIO)?;
-        execute_cold_slices(cold_slices, &mut dst_buf, cache, volume_key, read_parallelism)?;
+        execute_cold_slices(cold_slices, &mut dst_buf, cache, volume_key)?;
     }
 
     Ok(dst_buf)
@@ -603,7 +599,6 @@ fn execute_cold_slices(
     dst_buf: &mut [u8],
     cache: &crate::log::LogFileCache,
     volume_key: &crate::crypto::VolumeKey,
-    read_parallelism: usize,
 ) -> Result<(), FsError> {
     if cold_slices.is_empty() {
         return Ok(());
@@ -628,7 +623,7 @@ fn execute_cold_slices(
     }
 
     // Sort jobs by (generation, record_log_offset) so that slices referencing the same
-    // record land in the same worker chunk to maximize decrypted_cache hits.
+    // record are decoded in sequence to maximize decrypted_cache hits.
     jobs.sort_by_key(|job| match &job.slice.source {
         ReadSliceSource::Disk {
             generation,
@@ -638,54 +633,32 @@ fn execute_cold_slices(
         _ => (0, 0),
     });
 
-    let max_workers = if read_parallelism > 0 {
-        read_parallelism
-    } else {
-        default_read_parallelism()
-    };
-    let num_workers = max_workers.min(jobs.len()).max(1);
-
-    let chunk_size = jobs.len().div_ceil(num_workers);
-
-    std::thread::scope(|s| -> Result<(), FsError> {
-        let mut handles = Vec::with_capacity(num_workers);
-
-        for chunk in jobs.chunks_mut(chunk_size) {
-            let handle = s.spawn(move || -> Result<(), FsError> {
-                for job in chunk {
-                    match &job.slice.source {
-                        ReadSliceSource::Disk {
-                            generation,
-                            record_log_offset,
-                            record_size,
-                            payload_offset,
-                            slice_inner_offset,
-                        } => {
-                            cache
-                                .read_extent_payload(
-                                    *generation,
-                                    *record_log_offset,
-                                    *record_size,
-                                    *payload_offset,
-                                    *slice_inner_offset,
-                                    &mut *job.target,
-                                    volume_key,
-                                )
-                                .map_err(|_| FsError::EIO)?;
-                        }
-                        _ => panic!("expected Disk slice in cold_slices"),
-                    }
-                }
-                Ok(())
-            });
-            handles.push(handle);
+    for job in jobs {
+        match &job.slice.source {
+            ReadSliceSource::Disk {
+                generation,
+                record_log_offset,
+                record_size,
+                payload_offset,
+                slice_inner_offset,
+            } => {
+                cache
+                    .read_extent_payload(
+                        *generation,
+                        *record_log_offset,
+                        *record_size,
+                        *payload_offset,
+                        *slice_inner_offset,
+                        &mut *job.target,
+                        volume_key,
+                    )
+                    .map_err(|_| FsError::EIO)?;
+            }
+            _ => panic!("expected Disk slice in cold_slices"),
         }
+    }
 
-        for h in handles {
-            h.join().map_err(|_| FsError::EIO)??;
-        }
-        Ok(())
-    })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1015,7 +988,7 @@ mod tests {
         let log_cache_bg = fs.log_cache.clone();
         let volume_key_bg = fs.volume_key.clone();
         let thread_buf =
-            std::thread::spawn(move || execute_read_plan(plan_bg, log_cache_bg.as_deref(), &volume_key_bg, 0))
+            std::thread::spawn(move || execute_read_plan(plan_bg, log_cache_bg.as_deref(), &volume_key_bg))
                 .join()
                 .unwrap()
                 .unwrap();
@@ -1178,15 +1151,18 @@ mod tests {
         // Default is 0 (auto-detect)
         assert_eq!(fs.read_parallelism, 0);
         assert_eq!(fs.read_parallelism(), 0);
+        assert_eq!(fs.read_pool.num_workers(), default);
 
-        // Explicit configuration via direct field or setter
-        fs.read_parallelism = 8;
+        // Explicit configuration via setter
+        fs.set_read_parallelism(8);
         assert_eq!(fs.read_parallelism, 8);
         assert_eq!(fs.read_parallelism(), 8);
+        assert_eq!(fs.read_pool.num_workers(), 8);
 
         // Reset to 0 (auto-detect)
         fs.set_read_parallelism(0);
         assert_eq!(fs.read_parallelism, 0);
         assert_eq!(fs.read_parallelism(), 0);
+        assert_eq!(fs.read_pool.num_workers(), default);
     }
 }

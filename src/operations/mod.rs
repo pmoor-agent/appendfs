@@ -33,8 +33,8 @@ impl Filesystem for InMemoryFS {
         dir::readdirplus_response(self, ino, size, offset, fh)
     }
 
-    fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
-        read_write::read_core(self, ino, fh, offset, size)
+    fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> DeferredResult<FuseResponse<'static>> {
+        read_write::read_response(self, ino, fh, offset, size)
     }
 
     fn open(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {

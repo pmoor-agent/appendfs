@@ -1028,7 +1028,7 @@ pub trait Filesystem {
     fn opendir(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError>;
     fn readdir(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError>;
     fn readdirplus(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError>;
-    fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError>;
+    fn read(&self, ino: u64, size: usize, offset: i64, fh: u64) -> DeferredResult<FuseResponse<'static>>;
     fn open(&self, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError>;
     fn write(&self, ino: u64, buf: &[u8], offset: i64, fh: u64) -> Result<FuseResponse<'static>, FsError>;
     #[allow(clippy::too_many_arguments)]

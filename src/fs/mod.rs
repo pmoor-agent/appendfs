@@ -18,6 +18,7 @@ mod flusher;
 mod handles;
 mod layers;
 mod overlay;
+pub mod read_pool;
 pub mod virtual_files;
 
 pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
@@ -27,6 +28,7 @@ pub use async_tracker::{AsyncOpGuard, AsyncTracker};
 pub use delayed_queue::DelayedResponseQueue;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource, default_read_parallelism, execute_read_plan};
 pub use overlay::{InnerStatsSnapshot, InodeCounts};
+pub use read_pool::ReadThreadPool;
 pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry, is_virtual_ino};
 
 use crate::clock::{Clock, SystemClock};
@@ -852,6 +854,8 @@ pub struct InMemoryFS {
     pub delayed_queue: Arc<DelayedResponseQueue>,
     /// Concurrency level for parallel cold disk reads (0 = auto-detect based on CPU cores, max 16).
     pub read_parallelism: usize,
+    /// Dedicated threadpool for offloading cold disk and remote reads from the FUSE event loop.
+    pub read_pool: Arc<ReadThreadPool>,
     /// Optional fixed IV for exported summary files (used for deterministic golden fixture generation and testing).
     pub deterministic_summary_iv: Option<[u8; 12]>,
 }
@@ -962,6 +966,7 @@ impl InMemoryFS {
             op_metrics,
             delayed_queue,
             read_parallelism: 0,
+            read_pool: Arc::new(ReadThreadPool::new(default_read_parallelism())),
             deterministic_summary_iv: None,
         };
         fs.register_runtime_status();
@@ -1185,9 +1190,22 @@ impl InMemoryFS {
         self.read_parallelism
     }
 
-    /// Sets the read parallelism for cold disk extent reads. Passing 0 enables auto-detection.
+    /// Sets the read parallelism for cold disk extent reads and reconfigures the read threadpool.
+    /// Passing 0 enables auto-detection.
     pub fn set_read_parallelism(&mut self, workers: usize) {
         self.read_parallelism = workers;
+        let count = self.effective_read_parallelism();
+        let old_pool = std::mem::replace(&mut self.read_pool, Arc::new(ReadThreadPool::new(count)));
+        old_pool.shutdown();
+    }
+
+    /// Returns the effective read threadpool worker count.
+    pub fn effective_read_parallelism(&self) -> usize {
+        if self.read_parallelism > 0 {
+            self.read_parallelism
+        } else {
+            default_read_parallelism()
+        }
     }
 
     pub fn recovered_time(&self) -> Option<SystemTime> {
