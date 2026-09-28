@@ -14,13 +14,13 @@ use std::io;
 
 /// The fields that identify a record for authentication.
 ///
-/// Exactly what gets bound into the AEAD's associated data, so a payload cannot be
-/// relabelled as a different record type or reattributed to another inode.
+/// `generation` and `sequence` form the nonce; `op_code` and `inode` are bound into the
+/// AEAD's associated data, so a payload cannot be relabelled as a different record type or
+/// reattributed to another inode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordId {
     pub generation: u32,
-    pub revision: u16,
-    pub record_offset: u64,
+    pub sequence: u64,
     pub op_code: u8,
     pub inode: u64,
 }
@@ -43,14 +43,7 @@ pub fn encode(
     };
 
     let (ciphertext, auth_tag) = key
-        .encrypt_record(
-            id.generation,
-            id.revision,
-            id.record_offset,
-            actual_op as u8,
-            id.inode,
-            &data_to_encrypt,
-        )
+        .encrypt_record(id.generation, id.sequence, actual_op as u8, id.inode, &data_to_encrypt)
         .map_err(io::Error::from)?;
     Ok((actual_op, ciphertext, auth_tag))
 }
@@ -58,15 +51,7 @@ pub fn encode(
 /// Recovers the original payload from bytes read out of the log.
 pub fn decode(key: &VolumeKey, id: RecordId, stored: &[u8], auth_tag: &[u8; 16]) -> io::Result<Vec<u8>> {
     let plain = key
-        .decrypt_record(
-            id.generation,
-            id.revision,
-            id.record_offset,
-            id.op_code,
-            id.inode,
-            stored,
-            auth_tag,
-        )
+        .decrypt_record(id.generation, id.sequence, id.op_code, id.inode, stored, auth_tag)
         .map_err(io::Error::from)?;
     if id.op_code == OpCode::DataZstd as u8 {
         crate::compress::decompress_zstd(&plain)
@@ -82,8 +67,7 @@ mod tests {
 
     const ID: RecordId = RecordId {
         generation: 3,
-        revision: 0,
-        record_offset: 128,
+        sequence: 17,
         op_code: 1,
         inode: 42,
     };
@@ -157,8 +141,8 @@ mod tests {
             ..ID
         };
 
-        // The identity is bound into the AAD, so an intact record cannot be moved onto
-        // another inode, relabelled as another record type, or moved to another offset.
+        // The identity is bound into the nonce and AAD, so an intact record cannot be moved
+        // onto another inode, relabelled as another record type, or read under another nonce.
         let other_inode = RecordId {
             inode: ID.inode + 1,
             ..actual_id
@@ -173,15 +157,15 @@ mod tests {
             ..actual_id
         };
         assert!(decode(&key, other_op, &stored, &tag).is_err());
-        let other_offset = RecordId {
-            record_offset: ID.record_offset + 1,
+        let other_sequence = RecordId {
+            sequence: ID.sequence + 1,
             ..actual_id
         };
-        assert!(decode(&key, other_offset, &stored, &tag).is_err());
-        let other_revision = RecordId {
-            revision: ID.revision + 1,
+        assert!(decode(&key, other_sequence, &stored, &tag).is_err());
+        let other_generation = RecordId {
+            generation: ID.generation + 1,
             ..actual_id
         };
-        assert!(decode(&key, other_revision, &stored, &tag).is_err());
+        assert!(decode(&key, other_generation, &stored, &tag).is_err());
     }
 }

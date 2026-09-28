@@ -900,8 +900,8 @@ mod tests {
             crate::compress::Compression::None,
             crate::log::codec::RecordId {
                 generation: 1,
-                revision: 0,
-                record_offset: log_bytes.len() as u64,
+                // Past every sequence the writer used in this generation.
+                sequence: 1_000,
                 op_code: OpCode::Data as u8,
                 inode: 2,
             },
@@ -912,6 +912,7 @@ mod tests {
             op_code: OpCode::Data,
             inode: 2,
             payload_len: cipher.len() as u32,
+            sequence: 1_000,
             auth_tag: tag,
         };
         log_bytes.extend_from_slice(&extra_header.to_bytes());
@@ -995,8 +996,8 @@ mod tests {
             crate::compress::Compression::None,
             crate::log::codec::RecordId {
                 generation: 1,
-                revision: 0,
-                record_offset: new_bytes.len() as u64,
+                // Past every sequence the writer used in this generation.
+                sequence: 1_000,
                 op_code: OpCode::Seal as u8,
                 inode: 0,
             },
@@ -1007,6 +1008,7 @@ mod tests {
             op_code: OpCode::Seal,
             inode: 0,
             payload_len: cipher.len() as u32,
+            sequence: 1_000,
             auth_tag: tag,
         };
         new_bytes.extend_from_slice(&tagged_header.to_bytes());

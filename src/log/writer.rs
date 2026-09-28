@@ -10,7 +10,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 struct ActiveLogFile {
     writer: Box<dyn StorageWriter>,
     generation: u32,
-    revision: u16,
+    /// Sequence number the next record in this file will be encrypted under.
+    ///
+    /// Advanced whenever a record is encoded and never moved back, not even by
+    /// [`LogWriter::rollback_to`]: a retried write must not re-encrypt a different payload under
+    /// a nonce the failed attempt already used, since those bytes may already be on disk.
+    next_sequence: u64,
     current_offset: u64,
     filename: String,
     created_at: std::time::SystemTime,
@@ -29,15 +34,20 @@ impl ActiveLogFile {
         payload: &[u8],
     ) -> io::Result<(u32, u64, u32)> {
         let generation = self.generation;
-        let revision = self.revision;
         let record_log_offset = self.current_offset;
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("generation {} has used every record sequence number", generation),
+            )
+        })?;
         let (actual_op, cipher_payload, auth_tag) = crate::log::codec::encode(
             volume_key,
             compression,
             crate::log::codec::RecordId {
                 generation,
-                revision,
-                record_offset: record_log_offset,
+                sequence,
                 op_code: op_code as u8,
                 inode,
             },
@@ -48,6 +58,7 @@ impl ActiveLogFile {
             op_code: actual_op,
             inode,
             payload_len: cipher_payload.len() as u32,
+            sequence,
             auth_tag,
         };
         let header_bytes = header.to_bytes();
@@ -219,7 +230,7 @@ fn open_generation_file(
     Ok(ActiveLogFile {
         writer: Box::new(writer),
         generation,
-        revision: file_header.revision,
+        next_sequence: 0,
         current_offset: FILE_HEADER_SIZE as u64,
         filename,
         created_at,
@@ -553,6 +564,9 @@ impl LogWriter {
     ///
     /// Truncates the underlying file on disk back to `checkpoint.offset`, restoring
     /// the running MD5 hasher, counters, and next `batch_id`.
+    ///
+    /// The record sequence is deliberately not restored, so records written after a rollback
+    /// take fresh nonces rather than reusing those of the records that were discarded.
     pub fn rollback_to(&self, checkpoint: &LogCheckpoint) -> io::Result<()> {
         self.batch_id.store(checkpoint.batch_id, Ordering::SeqCst);
         let mut state = match self.active_state.lock() {
@@ -579,9 +593,9 @@ impl LogWriter {
     /// and updates active log record and data byte counters.
     /// Assigns and returns the next monotonic `batch_id`.
     ///
-    /// `timestamp` is supplied by the caller rather than read from a clock here, so writing
-    /// the same batch again after a [`LogWriter::rollback_to`] reproduces the trailer
-    /// byte for byte - see `FlushBatch::commit_timestamp`.
+    /// `timestamp` is supplied by the caller rather than read from a clock here, so a batch
+    /// written again after a [`LogWriter::rollback_to`] records the same commit time - see
+    /// `FlushBatch::commit_timestamp`.
     ///
     /// Note: To physically sync records through to durable media, call [`LogWriter::flush`].
     pub fn emit_flush_commit(

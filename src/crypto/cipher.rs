@@ -40,12 +40,6 @@ pub enum CryptoError {
     /// you provided is wrong" call for different things from the user.
     KeyRequired,
     InvalidKeyLength,
-    /// A record's coordinates do not fit the 96-bit record nonce.
-    ///
-    /// Fails the write rather than wrapping: two records sharing a nonce under
-    /// ChaCha20-Poly1305 leak the XOR of their plaintexts and the Poly1305 one-time key,
-    /// so a refused flush is by far the cheaper outcome.
-    NonceOverflow(String),
     IoError(String),
 }
 
@@ -62,7 +56,6 @@ impl fmt::Display for CryptoError {
                 "This volume is encrypted - a passphrase or key file is required to read it"
             ),
             CryptoError::InvalidKeyLength => write!(f, "Invalid cryptographic key length"),
-            CryptoError::NonceOverflow(s) => write!(f, "Record nonce space exhausted: {}", s),
             CryptoError::IoError(s) => write!(f, "Crypto I/O error: {}", s),
         }
     }
@@ -77,7 +70,6 @@ impl From<CryptoError> for std::io::Error {
             CryptoError::WrongKey | CryptoError::KeyRequired => {
                 std::io::Error::new(std::io::ErrorKind::PermissionDenied, err)
             }
-            CryptoError::NonceOverflow(_) => std::io::Error::new(std::io::ErrorKind::InvalidInput, err),
             _ => std::io::Error::other(err),
         }
     }

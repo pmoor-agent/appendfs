@@ -253,8 +253,7 @@ impl LogFileCache {
                     volume_key,
                     crate::log::codec::RecordId {
                         generation,
-                        revision,
-                        record_offset: record_log_offset,
+                        sequence: header.sequence,
                         op_code: header.op_code as u8,
                         inode: header.inode,
                     },

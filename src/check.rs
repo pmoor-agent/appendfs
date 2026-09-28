@@ -576,15 +576,12 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                     }
 
                     if verify_data && let Some(ref c) = cache {
-                        let (log_filename, revision) = fs
+                        let log_filename = fs
                             .manifest
                             .read()
                             .ok()
-                            .and_then(|m| {
-                                m.get_by_generation(generation)
-                                    .map(|l| (l.filename.clone(), l.revision))
-                            })
-                            .unwrap_or_else(|| (crate::log::log_filename(generation), 0));
+                            .and_then(|m| m.get_by_generation(generation).map(|l| l.filename.clone()))
+                            .unwrap_or_else(|| crate::log::log_filename(generation));
                         if !c.storage().exists(&log_filename) {
                             report.issues.push(IntegrityIssue::error(
                                     "MISSING_LOG_FILE",
@@ -686,8 +683,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                                             ));
                                                         } else if let Err(e) = fs.volume_key.decrypt_record(
                                                             generation,
-                                                            revision,
-                                                            record_log_offset,
+                                                            rec_header.sequence,
                                                             rec_header.op_code as u8,
                                                             rec_ino,
                                                             &payload,
@@ -1200,7 +1196,7 @@ mod tests {
 
         // 2. Corrupt a byte in 000001.log inside the Write record payload
         let mut bytes = storage.get_file_bytes("000001.log").unwrap();
-        bytes[(record_offset + 30) as usize] ^= 0xFF;
+        bytes[record_offset as usize + RECORD_HEADER_SIZE + 1] ^= 0xFF;
         storage.insert_file("000001.log", bytes);
 
         // 3. Re-check: must catch CORRUPT_LOG_RECORD

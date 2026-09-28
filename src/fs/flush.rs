@@ -2007,15 +2007,15 @@ mod tests {
         assert!(report.is_clean(), "Integrity check must be clean: {:?}", report.issues);
     }
 
-    /// A batch rewritten after a failed sync must reproduce the failed attempt byte for byte.
+    /// A batch rewritten after a failed sync must be encrypted under fresh nonces.
     ///
-    /// The rollback puts the batch back at the same offsets, and so under the same record
-    /// nonces. Identical plaintext re-encrypts to identical ciphertext and leaks nothing, but
-    /// any record whose plaintext changed would reuse a ChaCha20-Poly1305 nonce - exposing the
-    /// XOR of the two plaintexts and the Poly1305 one-time key. The clock advances between
-    /// the attempts to catch anything, like the `FlushCommit` timestamp, read at write time.
+    /// The rollback truncates the failed attempt away, but on a real disk its bytes can
+    /// outlive the truncate. Any retried record that reused one of the failed attempt's nonces
+    /// for a different plaintext would expose the XOR of the two plaintexts and the Poly1305
+    /// one-time key, so every sequence number in the retry must lie past all of the failed
+    /// attempt's.
     #[test]
-    fn test_batch_retried_after_failed_sync_rewrites_identical_bytes() {
+    fn test_batch_retried_after_failed_sync_uses_fresh_nonces() {
         let mem = Arc::new(crate::storage::MemoryStorage::new());
         let fault_storage = crate::storage::FaultStorage::new(mem);
         let storage = Arc::new(fault_storage.clone());
@@ -2060,21 +2060,49 @@ mod tests {
         let failed = &tails[0];
         assert_eq!(failed.filename, "000001.log");
 
-        clock.advance(Duration::from_secs(3600));
         fs.quiesce().unwrap();
 
         let log = storage.open_reader("000001.log").unwrap();
-        let mut retried = vec![0u8; failed.bytes.len()];
+        let mut retried = vec![0u8; (log.len().unwrap() - failed.offset) as usize];
         log.read_exact_at(failed.offset, &mut retried).unwrap();
-        assert!(
-            retried == failed.bytes,
-            "the retry must rewrite the rolled-back batch byte for byte, or it reuses record nonces"
-        );
+
+        let failed_sequences = record_sequences(&failed.bytes);
+        let retried_sequences = record_sequences(&retried);
         assert_eq!(
-            log.len().unwrap(),
-            failed.offset + failed.bytes.len() as u64,
-            "nothing beyond the retried batch was staged, so nothing else may be written"
+            failed_sequences.len(),
+            retried_sequences.len(),
+            "the retry writes the same records as the failed attempt"
         );
+        let last_failed = *failed_sequences.last().unwrap();
+        assert!(
+            retried_sequences.iter().all(|&s| s > last_failed),
+            "the retry reused a sequence of the failed attempt: failed {:?}, retried {:?}",
+            failed_sequences,
+            retried_sequences
+        );
+
+        let recovered = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(clock.clone()),
+            fs.log_writer.as_ref().unwrap().volume_key().clone(),
+        )
+        .unwrap();
+        assert!(recovered.lookup_child(dir.ino, "inner.txt").is_some());
+    }
+
+    /// The sequence number of every record in `bytes`, a run of whole records.
+    fn record_sequences(bytes: &[u8]) -> Vec<u64> {
+        use crate::log::record::{RECORD_HEADER_SIZE, RecordHeader};
+        let mut sequences = Vec::new();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let header = RecordHeader::from_bytes(bytes[pos..pos + RECORD_HEADER_SIZE].try_into().unwrap()).unwrap();
+            sequences.push(header.sequence);
+            pos += RECORD_HEADER_SIZE + header.payload_len as usize;
+        }
+        assert_eq!(pos, bytes.len(), "a truncated record");
+        sequences
     }
 
     #[test]

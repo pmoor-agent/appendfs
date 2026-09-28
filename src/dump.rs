@@ -211,8 +211,7 @@ pub fn dump_log_reader_with_path(
         let decrypted = if let Some(key) = volume_key {
             match key.decrypt_record(
                 file_header.generation,
-                file_header.revision,
-                record_offset,
+                header.sequence,
                 header.op_code as u8,
                 header.inode,
                 &raw_payload,
@@ -536,12 +535,13 @@ pub fn dump_log_reader_with_path(
 
                     writeln!(
                         out,
-                        "#{:<5} [0x{:08x} / {:<8}] {:<14} inode {:<5} len {:<8} tag {:02x}{:02x}{:02x}{:02x} {}",
+                        "#{:<5} [0x{:08x} / {:<8}] {:<14} inode {:<5} seq {:<5} len {:<8} tag {:02x}{:02x}{:02x}{:02x} {}",
                         i + 1,
                         offset,
                         offset,
                         header.op_code,
                         header.inode,
+                        header.sequence,
                         format_bytes(header.payload_len as u64),
                         header.auth_tag[0],
                         header.auth_tag[1],

@@ -11,7 +11,7 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 - **In-Memory Staging & Deferred Flushing:** Writes are staged in memory and flushed to disk periodically or when requested by `fsync()` / POSIX sync semantics.
 - **Complete Reconstructability & Time-Travel:** The full filesystem state (or any past point-in-time state) can be deterministically rebuilt by replaying logs up to a target sequence number.
 - **Copy-On-Write Branching (Forking):** New read-write instances can fork from historical checkpoints, sharing ancestor logs while appending new mutations to a divergent branch sequence.
-- **Zero-Trust Security & Multi-Cloud Archival:** Log payloads are compressed and encrypted at rest locally before fan-out replication to multiple S3-compatible cloud providers (e.g., AWS S3, Google Cloud Storage, Backblaze B2).
+- **Client-Side Encryption & Multi-Cloud Archival:** Log payloads are compressed and encrypted at rest locally before fan-out replication to multiple S3-compatible cloud providers (e.g., AWS S3, Google Cloud Storage, Backblaze B2).
 - **Deduplication & FastCDC:** Content-Defined Chunking de-duplicates identical blocks across files and generations.
 - **Bitrot Resistance & Disaster Recovery:** Every record carries a 16-byte authentication tag - Poly1305 on encrypted volumes, a truncated BLAKE3 hash on plaintext ones - and every summary carries a full BLAKE3 checksum, enabling standalone disaster recovery from raw log files using only the volume's passphrase or key file.
 
@@ -82,10 +82,11 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 - **Safe Concurrency & Elimination of Lock Pools:** Stripped unsafe raw cell locks in favor of idiomatic Rust `Arc<Node>` CoW semantics.
 
 ### 3.3 Log Record Types & Extended Attributes (`xattrs`)
-Each entry in the log file consists of a fixed 29-byte header and an optional compressed/encrypted payload:
-- **`RecordHeader` (29 bytes):** `op_code` (1) · `inode` (8) · `payload_len` (4) · `auth_tag` (16).
-  - It deliberately carries **no nonce and no key id**. The nonce is *derived* from `(generation, revision, record_offset)` - coordinates a reader already knows - so it costs no bytes on disk and cannot be tampered with independently of the record it belongs to. A per-record key id would be unauthenticated, since the header is not covered by the tag, and clearing it used to downgrade an encrypted read into a raw one; whether a volume is encrypted is instead recorded once in the volume header, where the key check value vouches for it.
-  - The header is authenticated indirectly: `op_code` and `inode` are bound as AEAD associated data (§5.1.2), and `payload_len` is implicit in the ciphertext length, so truncating or extending a record breaks its tag.
+Each entry in the log file consists of a fixed 37-byte header and an optional compressed/encrypted payload:
+- **`RecordHeader` (37 bytes):** `op_code` (1) · `inode` (8) · `payload_len` (4) · `sequence` (8) · `auth_tag` (16).
+  - `sequence` is the low 64 bits of the record's nonce (§5.1.2). It is stored rather than derived from the record's byte offset, so a record can be encrypted before anyone knows where in the file it will land.
+  - It deliberately carries **no key id**. A per-record key id would be unauthenticated, since the header is not covered by the tag, and clearing it used to downgrade an encrypted read into a raw one; whether a volume is encrypted is instead recorded once in the volume header, where the key check value vouches for it.
+  - The header is authenticated indirectly: `sequence` feeds the nonce, `op_code` and `inode` are bound as AEAD associated data (§5.1.2), and `payload_len` is implicit in the ciphertext length, so altering any of them, or truncating or extending a record, breaks its tag.
 - **OpCodes:** `Data`, `DataZstd`, `InodeDelta`, `FlushCommit`, `Seal`.
 - **`Data` / `DataZstd` payload:** the bytes of one inode's write, capped at `max_extent_size` (4 MiB default). The cap exists for the read path: a record is the unit of decryption, so an uncapped coalesced write would make reading any single byte decrypt the whole run.
 - **`InodeDelta` payload:** a serialized `LogEntryDelta` carrying directory entries (**names**), symlink targets, xattr keys and values, mode, UID/GID, timestamps, and extent map updates. All of it sits inside the encrypted envelope; none of it appears in the header.
@@ -125,7 +126,20 @@ Each entry in the log file consists of a fixed 29-byte header and an optional co
 
 ## 5. Multi-Cloud Replication & Data Protection
 
-### 5.1 Zero-Trust Data Protection Pipeline
+### 5.1 Data Protection Pipeline
+
+#### Threat Model
+appendfs protects against two things, and design trade-offs are judged against them:
+- **Privacy.** Nobody without the volume's credential can read file contents or the metadata listed in §5.1.3 - not a thief holding the disk, not a cloud provider holding the replicated log files, not anyone else who ends up with a copy.
+- **Durability.** Data acknowledged by a flush survives crashes, power loss, and bitrot detection, and can be recovered from the raw log files alone (§6.3).
+
+It deliberately does **not** try to defend against an adversary who can *write* to the volume. Someone able to modify log files can delete generations, truncate the tail, or move and replay intact records, and appendfs does not attempt to detect that cryptographically. The per-record tags and file checksums exist to catch corruption and bugs, not forgery: on a plaintext volume they are unkeyed hashes anyone can recompute.
+
+Consequences worth keeping in mind:
+- **Nonce uniqueness is a privacy property, and non-negotiable.** Two records encrypted under the same nonce leak the XOR of their plaintexts to anyone holding both, so every mechanism that could repeat a nonce - rollbacks, retries, crashes, restarts - has to be closed off even though tampering is out of scope.
+- **Records are not bound to their position.** Nothing ties a record to its byte offset (§5.1.2), which is what lets payloads be encrypted before their placement is known.
+- **A volume must not split into two writers.** Mounting two copies of the same volume read-write - a copied directory, or a remote restore while the original is still in use - lets both continue from the same generation number under the same key, and so reuse nonces. **This currently includes forks (§4.4):** a fork shares its upstream's key and continues from the generation after its fork point, which is exactly the generation an upstream that keeps writing uses next. Giving each branch its own nonce space is open work.
+
 All data flushed to physical log files passes through the Data Protection Pipeline before hitting disk or cloud:
 
 ```
@@ -140,22 +154,27 @@ The two stages are exposed as **one operation** (`log::codec::encode`), not two 
 
 #### 5.1.1 Key Hierarchy
 - **Credential → master key.** A passphrase is stretched with `Argon2id` (64 MiB, t=3, p=1) over the volume's random 16-byte salt. A key file is 64 hex characters used directly as 256 bits, with no stretching - it already carries full entropy. Two-factor volumes run `Argon2id` over `key_file_bytes(32) || passphrase`, fixed-width part first so that no two distinct credential pairs can concatenate to the same material. The volume header records which of the three a volume needs (`KeySource`), so a mount asks for the right credential instead of inferring it from whichever flags were passed.
-- **Master key → subkeys.** The master key encrypts nothing directly. `BLAKE3::derive_key` produces a **data key** and a **key-check key** under separate domain-separation contexts, which keeps the key check value's random IV and the data path's derived nonces in disjoint key spaces where they can never collide.
+- **Master key → subkeys.** The master key encrypts nothing directly. `BLAKE3::derive_key` produces a **data key** and a **key-check key** under separate domain-separation contexts, which keeps the key check value's random IV and the data path's record nonces in disjoint key spaces where they can never collide.
 - **Key check value.** A bare Poly1305 tag over an *empty* message, with the volume ID as associated data, stored in the plaintext volume header. Encrypting nothing means it reveals no plaintext and costs exactly one tag. It is verified at mount, before recovery reads a single record, so a wrong credential is reported as **`WrongKey`** rather than surfacing as an authentication failure mid-replay - which is indistinguishable from bitrot and reads to a user like data loss. Binding the volume ID prevents a check value being transplanted between volumes to make a wrong key look right.
 - **No wrapped key, no indirection.** The user's credential *is* the volume key. Losing it loses the volume, and changing it means re-encrypting every generation.
 
 #### 5.1.2 Record Nonces & Associated Data
-- **Derived nonces.** ChaCha20-Poly1305 fixes the nonce at 96 bits, shared between three coordinates:
+- **Nonces.** ChaCha20-Poly1305 fixes the nonce at 96 bits, split between two fields:
 
   ```
-  byte  0    1    2    3  |  4    5  |  6    7    8    9   10   11
-       [ generation: 32 ] [ rev: 16 ] [    record_offset: 48     ]
+  byte  0    1    2    3  |  4    5    6    7    8    9   10   11
+       [ generation: 32 ] [              sequence: 64              ]
   ```
 
-  Uniqueness rests on `(generation, revision, record_offset)`: records are strictly append-only within a generation revision, so every record starts at a unique byte offset; `generation` increases monotonically across rolls; and `revision` advances when a generation is compacted or rewritten. Deriving beats storing a random nonce per record - a random 96-bit nonce would put the birthday bound within reach at filesystem record rates, quite apart from costing 12 bytes per record.
-- **Bounds are types where they can be, checks where they cannot.** `generation` and `revision` are a `u32` and a `u16` end to end (§3.1), so neither has an out-of-range value to reject. `record_offset` is naturally a `u64`, so its 48-bit field is a real limit and is checked: an offset at or past 256 TiB within one generation is refused (`CryptoError::NonceOverflow`) rather than wrapped. Two records sharing a nonce under ChaCha20-Poly1305 leak the XOR of their plaintexts and the Poly1305 one-time key with it, so a refused flush is by far the cheaper outcome.
-- **Associated data.** Each record binds `[op_code, record_offset, inode]`. The nonce already covers generation, revision and offset, and `payload_len` is covered implicitly by the ciphertext length, but `op_code` and `inode` have no such protection - without binding them an intact ciphertext could be relabelled as another record type or reattributed to another inode, grafting one file's data onto another. `payload_len` and the checksum are deliberately *excluded*, since both are derived from the ciphertext and feeding them in would make the associated data depend on the encryption's own output.
-- **Tags.** A detached 16-byte tag per record, stored in the header. Plaintext volumes put a truncated BLAKE3 hash of `AAD || payload` in the same field, so every volume is tamper-evident whether or not it is encrypted.
+  `generation` is that of the log file the record lives in; `sequence` is a counter stored in the record header. Uniqueness rests on the pair:
+  - **A generation number is never written twice.** Each log file is created with `CreateNew`, and every mount starts at a generation past the newest one on disk, so a mount that crashed never has its generation reused.
+  - **A sequence number is never used twice within a generation.** The writer starts each generation file at 0 and only ever advances the counter. A write that fails and is rolled back gives up its sequence numbers rather than handing them out again - the bytes of the failed attempt may already be on disk even after the truncate.
+
+  No counter state needs persisting or restoring: a fresh generation starts a fresh sequence. Recovery - and so every mount and `appendfs check` - and `restore.py` reject a file whose sequence does not strictly increase from record to record, since that is how a nonce-reuse bug in the writer would show. The sequence is not contiguous - a rollback leaves a gap.
+- **Bounds are types where they can be.** `generation` is a `u32` end to end (§3.1), and a roll past the last one fails rather than wrapping to 0. `sequence` is a `u64`, which one generation - capped by `max_log_size` - cannot come close to exhausting; the increment is still checked.
+- **Future rewrites of a generation** (compaction into a new revision, §6.1) must either copy records verbatim, keeping their stored sequence, or continue the sequence past the highest one in the generation being rewritten. `revision` is not part of the nonce.
+- **Associated data.** Each record binds `[op_code, inode]`. The nonce covers generation and sequence, and `payload_len` is covered implicitly by the ciphertext length, but `op_code` and `inode` have no such protection - without binding them a writer bug that mislabelled a record's type or attributed it to the wrong inode would decrypt cleanly and graft one file's data onto another. `payload_len` and the checksum are deliberately *excluded*, since both are derived from the ciphertext and feeding them in would make the associated data depend on the encryption's own output. The record's byte offset is excluded too (see Threat Model).
+- **Tags.** A detached 16-byte tag per record, stored in the header. Plaintext volumes put a truncated BLAKE3 hash of `AAD || payload` in the same field, so corruption is detected whether or not a volume is encrypted. Only the Poly1305 tag is keyed; the plaintext hash can be recomputed by anyone who edits the record.
 - **Summaries.** The whole summary body - every inode, its names, and the manifest - is compressed and then encrypted under the data key with a random 96-bit IV, authenticated with the summary header as associated data. Only the volume header blob ahead of it is plaintext.
 
 #### 5.1.3 What Is Stored in the Clear

@@ -1049,8 +1049,8 @@ fn test_python_restore_rejects_record_after_seal() {
         appendfs::compress::Compression::None,
         appendfs::log::codec::RecordId {
             generation: 1,
-            revision: 0,
-            record_offset: log_bytes.len() as u64,
+            // Past every sequence the writer used in this generation.
+            sequence: 1_000,
             op_code: appendfs::log::OpCode::Data as u8,
             inode: 2,
         },
@@ -1061,6 +1061,7 @@ fn test_python_restore_rejects_record_after_seal() {
         op_code: appendfs::log::OpCode::Data,
         inode: 2,
         payload_len: cipher.len() as u32,
+        sequence: 1_000,
         auth_tag: tag,
     };
     log_bytes.extend_from_slice(&extra_header.to_bytes());
@@ -1167,8 +1168,8 @@ fn test_python_restore_rejects_seal_record_count_mismatch() {
         appendfs::compress::Compression::None,
         appendfs::log::codec::RecordId {
             generation: 1,
-            revision: 0,
-            record_offset: new_bytes.len() as u64,
+            // Past every sequence the writer used in this generation.
+            sequence: 1_000,
             op_code: appendfs::log::OpCode::Seal as u8,
             inode: 0,
         },
@@ -1179,6 +1180,7 @@ fn test_python_restore_rejects_seal_record_count_mismatch() {
         op_code: appendfs::log::OpCode::Seal,
         inode: 0,
         payload_len: cipher.len() as u32,
+        sequence: 1_000,
         auth_tag: tag,
     };
     new_bytes.extend_from_slice(&tagged_header.to_bytes());
