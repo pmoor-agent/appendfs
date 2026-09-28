@@ -13,6 +13,9 @@ pub const TOP_EXTENSIONS_LIMIT: usize = 15;
 /// Maximum average extent size (1 MiB) for a file to be considered fragmented in volume statistics.
 pub const FRAGMENTED_AVG_EXTENT_THRESHOLD: u64 = 1024 * 1024;
 
+/// Minimum number of extents (5) for a file to be considered fragmented in volume statistics.
+pub const FRAGMENTED_MIN_EXTENTS: usize = 5;
+
 /// File count and aggregate logical byte size for a specific file extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionStats {
@@ -158,7 +161,7 @@ fn format_fragmentation_section(
 
         let fragmented_files: Vec<_> = file_frag_list
             .iter()
-            .filter(|f| f.extents > 1 && f.avg_extent_size() < FRAGMENTED_AVG_EXTENT_THRESHOLD)
+            .filter(|f| f.extents >= FRAGMENTED_MIN_EXTENTS && f.avg_extent_size() < FRAGMENTED_AVG_EXTENT_THRESHOLD)
             .take(5)
             .collect();
         if !fragmented_files.is_empty() {
@@ -1853,25 +1856,32 @@ mod tests {
                 extents: 1000,
                 path: "/backups/large.tar".to_string(),
             },
-            // Truly fragmented file (4 KiB avg extent size, 50 extents)
+            // Truly fragmented file (4 KiB avg extent size, 50 extents >= 5)
             FileFragInfo {
                 inode: 101,
                 size: 200 * 1024,
                 extents: 50,
                 path: "/var/db/fragmented.sqlite".to_string(),
             },
-            // Contiguous file (1 extent, should not be in either table)
+            // Slightly fragmented file (3 extents < 5, small avg extent size 1 KiB)
             FileFragInfo {
                 inode: 102,
+                size: 3 * 1024,
+                extents: 3,
+                path: "/docs/few_extents.txt".to_string(),
+            },
+            // Contiguous file (1 extent, should not be in either table)
+            FileFragInfo {
+                inode: 103,
                 size: 1024 * 1024,
                 extents: 1,
                 path: "/contiguous.bin".to_string(),
             },
         ];
 
-        let report = format_fragmentation_section(3, 1051, 1000, &extent_buckets, &files);
+        let report = format_fragmentation_section(4, 1054, 1000, &extent_buckets, &files);
 
-        // "Top Files by Extent Count" should list both multi-extent files, starting with large.tar
+        // "Top Files by Extent Count" should list all multi-extent files, starting with large.tar
         assert!(report.contains("--- Top Files by Extent Count ---"));
         let top_files_pos = report.find("--- Top Files by Extent Count ---").unwrap();
         let frag_files_pos = report
@@ -1883,12 +1893,14 @@ mod tests {
         let top_section = &report[top_files_pos..frag_files_pos];
         assert!(top_section.contains("/backups/large.tar"));
         assert!(top_section.contains("/var/db/fragmented.sqlite"));
+        assert!(top_section.contains("/docs/few_extents.txt"));
         assert!(!top_section.contains("/contiguous.bin"));
 
         // Verify content within "Top Fragmented Files (< 1 MiB Avg Extent)"
         let frag_section = &report[frag_files_pos..];
         assert!(!frag_section.contains("/backups/large.tar"));
         assert!(frag_section.contains("/var/db/fragmented.sqlite"));
+        assert!(!frag_section.contains("/docs/few_extents.txt"));
         assert!(!frag_section.contains("/contiguous.bin"));
     }
 

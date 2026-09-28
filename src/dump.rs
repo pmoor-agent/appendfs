@@ -1445,7 +1445,7 @@ mod tests {
         assert!(dump_snap_v0.contains("--- File Extension Breakdown ---"));
         assert!(dump_snap_v0.contains(".bin                            1       100.0%       8.00 KiB       100.0%"));
         assert!(dump_snap_v0.contains("--- Top Files by Extent Count ---"));
-        assert!(dump_snap_v0.contains("--- Top Fragmented Files (< 1 MiB Avg Extent) ---"));
+        assert!(!dump_snap_v0.contains("--- Top Fragmented Files (< 1 MiB Avg Extent) ---"));
         assert!(dump_snap_v0.contains("/docs/fragmented.bin"));
         assert!(dump_snap_v0.contains("000001.log"));
         assert!(dump_snap_v0.contains("000002.log"));
