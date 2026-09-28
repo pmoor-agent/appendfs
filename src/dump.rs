@@ -1099,22 +1099,25 @@ fn push_attr_delta_fields(attr: &LogAttrDelta, fields: &mut Vec<String>) {
 }
 
 fn format_log_extent(ext: &LogExtent) -> String {
-    let end = ext.file_offset.saturating_add(ext.length);
-    if ext.record_log_offset == 0 {
-        format!(
-            "[0x{:x}..0x{:x} ({}) -> hole]",
-            ext.file_offset,
-            end,
-            format_bytes(ext.length)
-        )
-    } else {
-        format!(
+    match *ext {
+        LogExtent::Disk {
+            file_offset,
+            record_log_offset,
+            length,
+            ..
+        } => format!(
             "[0x{:x}..0x{:x} ({}) -> log offset 0x{:08x}]",
-            ext.file_offset,
-            end,
-            format_bytes(ext.length),
-            ext.record_log_offset
-        )
+            file_offset,
+            file_offset.saturating_add(length as u64),
+            format_bytes(length as u64),
+            record_log_offset
+        ),
+        LogExtent::Zero { file_offset, length } => format!(
+            "[0x{:x}..0x{:x} ({}) -> hole]",
+            file_offset,
+            file_offset.saturating_add(length),
+            format_bytes(length)
+        ),
     }
 }
 
@@ -1508,16 +1511,14 @@ mod tests {
 
         let delta = LogEntryDelta::Node(LogNodeDelta::File(LogFileDelta {
             extents: vec![
-                LogExtent {
+                LogExtent::Disk {
                     file_offset: 0,
                     record_log_offset: 28,
                     record_size: 4124,
                     length: 4096,
                 },
-                LogExtent {
+                LogExtent::Zero {
                     file_offset: 4096,
-                    record_log_offset: 0,
-                    record_size: 0,
                     length: 8192,
                 },
             ],

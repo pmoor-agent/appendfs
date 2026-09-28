@@ -5,34 +5,34 @@ Revision:            0
 Format Version:      1
 Created At:          1700000000.000000000s (2023-11-14 22:13:20 UTC)
 Key Salt:            617070656e6466732d636f6d00000001
-File Size:           5.46 KiB
-Total Valid Records: 39
-Total Data Payload:  33.14 KiB
+File Size:           5.94 KiB
+Total Valid Records: 43
+Total Data Payload:  41.23 KiB
 
 --- Flush Batch Statistics ---
 Committed Flushes:   3
-Avg Records / Flush: 13.0
-Avg Data / Flush:    11.04 KiB
+Avg Records / Flush: 14.3
+Avg Data / Flush:    13.74 KiB
 Trailing Batch:      None (cleanly committed at EOF)
 
 --- Record Breakdown by OpCode ---
 OP CODE             COUNT % OF RECORDS    TOTAL BYTES   % OF BYTES
 -------------- ---------- ------------ -------------- ------------
-Data                    2         5.1%           40 B         1.0%
-DataZstd                4        10.3%          835 B        20.4%
-InodeDelta             29        74.4%       3.07 KiB        76.5%
-FlushCommit             3         7.7%           72 B         1.8%
-Seal                    1         2.6%           16 B         0.4%
+Data                    2         4.7%           40 B         0.9%
+DataZstd                6        14.0%          871 B        19.6%
+InodeDelta             31        72.1%       3.37 KiB        77.5%
+FlushCommit             3         7.0%           72 B         1.6%
+Seal                    1         2.3%           16 B         0.4%
 
-DataZstd Compression: 33.10 KiB -> 835 B, saved 32.28 KiB / 97.5%, 40.59x
+DataZstd Compression: 41.20 KiB -> 871 B, saved 40.34 KiB / 97.9%, 48.43x
 
 --- Write Payload Size Histogram ---
 SIZE RANGE              COUNT    TOTAL BYTES   DISTRIBUTION
 -------------------- -------- --------------   --------------------
-[0, 64 B]                   2           40 B   ███████              (33.3%)
-(64 B, 512 B]               1          100 B   ███                  (16.7%)
-(512 B, 4 KiB]              1       1.00 KiB   ███                  (16.7%)
-(4 KiB, 16 KiB]             2      32.00 KiB   ███████              (33.3%)
+[0, 64 B]                   2           40 B   █████                (25.0%)
+(64 B, 512 B]               2          200 B   █████                (25.0%)
+(512 B, 4 KiB]              1       1.00 KiB   ███                  (12.5%)
+(4 KiB, 16 KiB]             3      40.00 KiB   ████████             (37.5%)
 (16 KiB, 64 KiB]            0            0 B                        (0.0%)
 (64 KiB, 256 KiB]           0            0 B                        (0.0%)
 (256 KiB, 512 KiB]          0            0 B                        (0.0%)
@@ -51,7 +51,7 @@ SIZE RANGE              COUNT    TOTAL BYTES   DISTRIBUTION
       delta: Directory { parent: 1, mode: 0o755, uid: 1000, gid: 1000, nlink: 2, atime: 1700000010.000000000s (2023-11-14 22:13:30 UTC), mtime: 1700000020.000000000s (2023-11-14 22:13:40 UTC), ctime: 1700000010.000000000s (2023-11-14 22:13:30 UTC), created_at: 1700000010.000000000s (2023-11-14 22:13:30 UTC) }
 #4     [0x0000018a / 394     ] InodeDelta     inode 3     seq 3     len 149 B    tag 660aa507 [COMMITTED]
       delta: Directory { parent: 1, mode: 0o755, uid: 1001, gid: 1001, nlink: 2, atime: 1700000030.000000000s (2023-11-14 22:13:50 UTC), mtime: 1700000040.000000000s (2023-11-14 22:14:00 UTC), ctime: 1700000030.000000000s (2023-11-14 22:13:50 UTC), created_at: 1700000030.000000000s (2023-11-14 22:13:50 UTC), xattrs: [set "user.dir_attr" (12 B)] }
-#5     [0x00000244 / 580     ] InodeDelta     inode 4     seq 4     len 167 B    tag c4f8994f [COMMITTED]
+#5     [0x00000244 / 580     ] InodeDelta     inode 4     seq 4     len 167 B    tag b641c065 [COMMITTED]
       delta: File { extents: [[0x0..0x10 (16 B) -> log offset 0x0000002a]], size: 16 B, mode: 0o644, uid: 1001, gid: 1001, nlink: 1, atime: 1700000050.000000000s (2023-11-14 22:14:10 UTC), mtime: 1700000050.000000000s (2023-11-14 22:14:10 UTC), ctime: 1700000050.000000000s (2023-11-14 22:14:10 UTC), created_at: 1700000050.000000000s (2023-11-14 22:14:10 UTC), xattrs: [set "user.test_attr" (9 B)] }
 #6     [0x00000310 / 784     ] FlushCommit    inode 0     seq 5     len 24 B     tag 566267f8 [COMMITTED]
       batch_id: 1, batch_record_count: 5, commit_timestamp: 1700000050.000000000s (2023-11-14 22:14:10 UTC)
@@ -61,63 +61,71 @@ SIZE RANGE              COUNT    TOTAL BYTES   DISTRIBUTION
       data_len: 1.00 KiB (saved 748 B / 73.0%)
 #9     [0x000004c3 / 1219    ] DataZstd       inode 10    seq 8     len 271 B    tag 86e79eb6 [COMMITTED]
       data_len: 16.00 KiB (saved 15.74 KiB / 98.3%)
-#10    [0x000005f7 / 1527    ] InodeDelta     inode 1     seq 9     len 76 B     tag 4fdcd6a9 [COMMITTED]
+#10    [0x000005f7 / 1527    ] DataZstd       inode 11    seq 9     len 19 B     tag e1b392cf [COMMITTED]
+      data_len: 8.00 KiB (saved 7.98 KiB / 99.8%)
+#11    [0x0000062f / 1583    ] InodeDelta     inode 1     seq 10    len 76 B     tag dbd4b736 [COMMITTED]
       delta: Directory { added: ["dir_b" -> Inode 7], nlink: 5, mtime: 1700000090.000000000s (2023-11-14 22:14:50 UTC), ctime: 1700000090.000000000s (2023-11-14 22:14:50 UTC) }
-#11    [0x00000668 / 1640    ] InodeDelta     inode 3     seq 10    len 109 B    tag ff6eb87c [COMMITTED]
+#12    [0x000006a0 / 1696    ] InodeDelta     inode 3     seq 11    len 109 B    tag 56550eb6 [COMMITTED]
       delta: Directory { added: ["empty_file.txt" -> Inode 8, "subdir_1" -> Inode 5], nlink: 3, mtime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), ctime: 1700000110.000000000s (2023-11-14 22:15:10 UTC) }
-#12    [0x000006fa / 1786    ] InodeDelta     inode 4     seq 11    len 79 B     tag dfec1e54 [COMMITTED]
+#13    [0x00000732 / 1842    ] InodeDelta     inode 4     seq 12    len 79 B     tag e8f60262 [COMMITTED]
       delta: File { extents: [[0x10..0x28 (24 B) -> log offset 0x0000034d]], size: 40 B, mtime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), ctime: 1700000110.000000000s (2023-11-14 22:15:10 UTC) }
-#13    [0x0000076e / 1902    ] InodeDelta     inode 5     seq 12    len 143 B    tag 6880d1e5 [COMMITTED]
+#14    [0x000007a6 / 1958    ] InodeDelta     inode 5     seq 13    len 143 B    tag 69ff8141 [COMMITTED]
       delta: Directory { parent: 3, added: ["data.bin" -> Inode 9, "deep" -> Inode 6], mode: 0o700, uid: 1001, gid: 1001, nlink: 3, atime: 1700000050.000000000s (2023-11-14 22:14:10 UTC), mtime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), ctime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), created_at: 1700000060.000000000s (2023-11-14 22:14:20 UTC) }
-#14    [0x00000822 / 2082    ] InodeDelta     inode 6     seq 13    len 99 B     tag b2205b2b [COMMITTED]
+#15    [0x0000085a / 2138    ] InodeDelta     inode 6     seq 14    len 99 B     tag 532fd4f7 [COMMITTED]
       delta: Directory { parent: 5, mode: 0o750, uid: 1002, gid: 1002, nlink: 2, atime: 1700000070.000000000s (2023-11-14 22:14:30 UTC), mtime: 1700000080.000000000s (2023-11-14 22:14:40 UTC), ctime: 1700000070.000000000s (2023-11-14 22:14:30 UTC), created_at: 1700000070.000000000s (2023-11-14 22:14:30 UTC) }
-#15    [0x000008aa / 2218    ] InodeDelta     inode 7     seq 14    len 131 B    tag d50bd17b [COMMITTED]
-      delta: Directory { parent: 1, added: ["multi_extent.dat" -> Inode 10], mode: 0o750, uid: 1003, gid: 1003, nlink: 2, atime: 1700000090.000000000s (2023-11-14 22:14:50 UTC), mtime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), ctime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), created_at: 1700000090.000000000s (2023-11-14 22:14:50 UTC) }
-#16    [0x00000952 / 2386    ] InodeDelta     inode 8     seq 15    len 91 B     tag 625beb87 [COMMITTED]
+#16    [0x000008e2 / 2274    ] InodeDelta     inode 7     seq 15    len 158 B    tag fa7849f0 [COMMITTED]
+      delta: Directory { parent: 1, added: ["multi_extent.dat" -> Inode 10, "regrown.bin" -> Inode 11], mode: 0o750, uid: 1003, gid: 1003, nlink: 2, atime: 1700000090.000000000s (2023-11-14 22:14:50 UTC), mtime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), ctime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), created_at: 1700000090.000000000s (2023-11-14 22:14:50 UTC) }
+#17    [0x000009a5 / 2469    ] InodeDelta     inode 8     seq 16    len 91 B     tag 0f52c6c7 [COMMITTED]
       delta: File { size: 0 B, mode: 0o640, uid: 1001, gid: 1001, nlink: 1, atime: 1700000130.000000000s (2023-11-14 22:15:30 UTC), mtime: 1700000140.000000000s (2023-11-14 22:15:40 UTC), ctime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), created_at: 1700000110.000000000s (2023-11-14 22:15:10 UTC) }
-#17    [0x000009d2 / 2514    ] InodeDelta     inode 9     seq 16    len 119 B    tag 9374b9cc [COMMITTED]
+#18    [0x00000a25 / 2597    ] InodeDelta     inode 9     seq 17    len 119 B    tag e6cbab9c [COMMITTED]
       delta: File { extents: [[0x0..0x400 (1.00 KiB) -> log offset 0x0000038a]], size: 1024 (1.00 KiB), mode: 0o600, uid: 1002, gid: 1002, nlink: 1, atime: 1700000150.000000000s (2023-11-14 22:15:50 UTC), mtime: 1700000160.000000000s (2023-11-14 22:16:00 UTC), ctime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), created_at: 1700000110.000000000s (2023-11-14 22:15:10 UTC) }
-#18    [0x00000a6e / 2670    ] InodeDelta     inode 10    seq 17    len 119 B    tag 5b9799c6 [COMMITTED]
+#19    [0x00000ac1 / 2753    ] InodeDelta     inode 10    seq 18    len 119 B    tag 481b4d99 [COMMITTED]
       delta: File { extents: [[0x0..0x4000 (16.00 KiB) -> log offset 0x000004c3]], size: 16384 (16.00 KiB), mode: 0o644, uid: 1003, gid: 1003, nlink: 1, atime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), mtime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), ctime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), created_at: 1700000110.000000000s (2023-11-14 22:15:10 UTC) }
-#19    [0x00000b0a / 2826    ] FlushCommit    inode 0     seq 18    len 24 B     tag 729d8154 [COMMITTED]
-      batch_id: 2, batch_record_count: 12, commit_timestamp: 1700000110.000000000s (2023-11-14 22:15:10 UTC)
-#20    [0x00000b47 / 2887    ] DataZstd       inode 10    seq 19    len 271 B    tag 128a7088 [COMMITTED]
+#20    [0x00000b5d / 2909    ] InodeDelta     inode 11    seq 19    len 119 B    tag fdd70577 [COMMITTED]
+      delta: File { extents: [[0x0..0x2000 (8.00 KiB) -> log offset 0x000005f7]], size: 8192 (8.00 KiB), mode: 0o644, uid: 1003, gid: 1003, nlink: 1, atime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), mtime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), ctime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), created_at: 1700000110.000000000s (2023-11-14 22:15:10 UTC) }
+#21    [0x00000bf9 / 3065    ] FlushCommit    inode 0     seq 20    len 24 B     tag 24726c29 [COMMITTED]
+      batch_id: 2, batch_record_count: 14, commit_timestamp: 1700000110.000000000s (2023-11-14 22:15:10 UTC)
+#22    [0x00000c36 / 3126    ] DataZstd       inode 10    seq 21    len 271 B    tag 1dc66c69 [COMMITTED]
       data_len: 16.00 KiB (saved 15.74 KiB / 98.3%)
-#21    [0x00000c7b / 3195    ] DataZstd       inode 11    seq 20    len 17 B     tag 79cb1e3d [COMMITTED]
+#23    [0x00000d6a / 3434    ] DataZstd       inode 11    seq 22    len 17 B     tag f3b91065 [COMMITTED]
       data_len: 100 B (saved 83 B / 83.0%)
-#22    [0x00000cb1 / 3249    ] InodeDelta     inode 1     seq 21    len 219 B    tag b0252c8e [COMMITTED]
-      delta: Directory { added: ["sparse_file.bin" -> Inode 11, "special_blk" -> Inode 17, "special_chr" -> Inode 16, "special_fifo" -> Inode 15, "special_sock" -> Inode 18, "symlink_rel" -> Inode 12], mtime: 1700000330.000000000s (2023-11-14 22:18:50 UTC), ctime: 1700000330.000000000s (2023-11-14 22:18:50 UTC) }
-#23    [0x00000db1 / 3505    ] InodeDelta     inode 2     seq 22    len 75 B     tag 98f7bf5a [COMMITTED]
-      delta: Directory { mode: 0o755, uid: 1000, gid: 1000, atime: 1700000010.000000000s (2023-11-14 22:13:30 UTC), mtime: 1700000020.000000000s (2023-11-14 22:13:40 UTC), ctime: 1700000330.000000000s (2023-11-14 22:18:50 UTC) }
-#24    [0x00000e21 / 3617    ] InodeDelta     inode 3     seq 23    len 129 B    tag dde420da [COMMITTED]
-      delta: Directory { added: ["symlink_abs" -> Inode 13, "symlink_dir" -> Inode 14], mode: 0o755, uid: 1001, gid: 1001, atime: 1700000030.000000000s (2023-11-14 22:13:50 UTC), mtime: 1700000040.000000000s (2023-11-14 22:14:00 UTC), ctime: 1700000330.000000000s (2023-11-14 22:18:50 UTC) }
-#25    [0x00000ec7 / 3783    ] InodeDelta     inode 4     seq 24    len 120 B    tag 38a26788 [COMMITTED]
+#24    [0x00000da0 / 3488    ] DataZstd       inode 12    seq 23    len 17 B     tag 5fd0c0e4 [COMMITTED]
+      data_len: 100 B (saved 83 B / 83.0%)
+#25    [0x00000dd6 / 3542    ] InodeDelta     inode 1     seq 24    len 219 B    tag 78f39c5a [COMMITTED]
+      delta: Directory { added: ["sparse_file.bin" -> Inode 12, "special_blk" -> Inode 18, "special_chr" -> Inode 17, "special_fifo" -> Inode 16, "special_sock" -> Inode 19, "symlink_rel" -> Inode 13], mtime: 1700000330.000000000s (2023-11-14 22:18:50 UTC), ctime: 1700000330.000000000s (2023-11-14 22:18:50 UTC) }
+#26    [0x00000ed6 / 3798    ] InodeDelta     inode 2     seq 25    len 75 B     tag d830e610 [COMMITTED]
+      delta: Directory { mode: 0o755, uid: 1000, gid: 1000, atime: 1700000010.000000000s (2023-11-14 22:13:30 UTC), mtime: 1700000020.000000000s (2023-11-14 22:13:40 UTC), ctime: 1700000350.000000000s (2023-11-14 22:19:10 UTC) }
+#27    [0x00000f46 / 3910    ] InodeDelta     inode 3     seq 26    len 129 B    tag a679cc94 [COMMITTED]
+      delta: Directory { added: ["symlink_abs" -> Inode 14, "symlink_dir" -> Inode 15], mode: 0o755, uid: 1001, gid: 1001, atime: 1700000030.000000000s (2023-11-14 22:13:50 UTC), mtime: 1700000040.000000000s (2023-11-14 22:14:00 UTC), ctime: 1700000350.000000000s (2023-11-14 22:19:10 UTC) }
+#28    [0x00000fec / 4076    ] InodeDelta     inode 4     seq 27    len 120 B    tag 9ba8280c [COMMITTED]
       delta: File { mode: 0o644, uid: 1001, gid: 1001, nlink: 2, atime: 1700000110.000000000s (2023-11-14 22:15:10 UTC), mtime: 1700000120.000000000s (2023-11-14 22:15:20 UTC), ctime: 1700000190.000000000s (2023-11-14 22:16:30 UTC), xattrs: [set "user.second_attr" (8 B)] }
-#26    [0x00000f64 / 3940    ] InodeDelta     inode 5     seq 25    len 75 B     tag cfbe4388 [COMMITTED]
-      delta: Directory { mode: 0o700, uid: 1001, gid: 1001, atime: 1700000050.000000000s (2023-11-14 22:14:10 UTC), mtime: 1700000060.000000000s (2023-11-14 22:14:20 UTC), ctime: 1700000330.000000000s (2023-11-14 22:18:50 UTC) }
-#27    [0x00000fd4 / 4052    ] InodeDelta     inode 6     seq 26    len 75 B     tag f854a616 [COMMITTED]
-      delta: Directory { mode: 0o750, uid: 1002, gid: 1002, atime: 1700000070.000000000s (2023-11-14 22:14:30 UTC), mtime: 1700000080.000000000s (2023-11-14 22:14:40 UTC), ctime: 1700000330.000000000s (2023-11-14 22:18:50 UTC) }
-#28    [0x00001044 / 4164    ] InodeDelta     inode 7     seq 27    len 109 B    tag eee7a8f1 [COMMITTED]
-      delta: Directory { added: ["hello_hardlink.txt" -> Inode 4], mode: 0o750, uid: 1003, gid: 1003, atime: 1700000090.000000000s (2023-11-14 22:14:50 UTC), mtime: 1700000100.000000000s (2023-11-14 22:15:00 UTC), ctime: 1700000330.000000000s (2023-11-14 22:18:50 UTC) }
-#29    [0x000010d6 / 4310    ] InodeDelta     inode 10    seq 28    len 103 B    tag 5e8d2aeb [COMMITTED]
-      delta: File { extents: [[0x4000..0x8000 (16.00 KiB) -> log offset 0x00000b47]], size: 32768 (32.00 KiB), mode: 0o644, uid: 1003, gid: 1003, atime: 1700000170.000000000s (2023-11-14 22:16:10 UTC), mtime: 1700000180.000000000s (2023-11-14 22:16:20 UTC), ctime: 1700000170.000000000s (2023-11-14 22:16:10 UTC) }
-#30    [0x00001162 / 4450    ] InodeDelta     inode 11    seq 29    len 119 B    tag 2c2199d7 [COMMITTED]
-      delta: File { extents: [[0x1000..0x1064 (100 B) -> log offset 0x00000c7b]], size: 4196 (4.10 KiB), mode: 0o644, uid: 1001, gid: 1001, nlink: 1, atime: 1700000190.000000000s (2023-11-14 22:16:30 UTC), mtime: 1700000200.000000000s (2023-11-14 22:16:40 UTC), ctime: 1700000190.000000000s (2023-11-14 22:16:30 UTC), created_at: 1700000190.000000000s (2023-11-14 22:16:30 UTC) }
-#31    [0x000011fe / 4606    ] InodeDelta     inode 12    seq 30    len 92 B     tag 2f3f5cfb [COMMITTED]
+#29    [0x00001089 / 4233    ] InodeDelta     inode 5     seq 28    len 75 B     tag ca2a4d0e [COMMITTED]
+      delta: Directory { mode: 0o700, uid: 1001, gid: 1001, atime: 1700000050.000000000s (2023-11-14 22:14:10 UTC), mtime: 1700000060.000000000s (2023-11-14 22:14:20 UTC), ctime: 1700000350.000000000s (2023-11-14 22:19:10 UTC) }
+#30    [0x000010f9 / 4345    ] InodeDelta     inode 6     seq 29    len 75 B     tag 188f527f [COMMITTED]
+      delta: Directory { mode: 0o750, uid: 1002, gid: 1002, atime: 1700000070.000000000s (2023-11-14 22:14:30 UTC), mtime: 1700000080.000000000s (2023-11-14 22:14:40 UTC), ctime: 1700000350.000000000s (2023-11-14 22:19:10 UTC) }
+#31    [0x00001169 / 4457    ] InodeDelta     inode 7     seq 30    len 109 B    tag a790ff68 [COMMITTED]
+      delta: Directory { added: ["hello_hardlink.txt" -> Inode 4], mode: 0o750, uid: 1003, gid: 1003, atime: 1700000090.000000000s (2023-11-14 22:14:50 UTC), mtime: 1700000100.000000000s (2023-11-14 22:15:00 UTC), ctime: 1700000350.000000000s (2023-11-14 22:19:10 UTC) }
+#32    [0x000011fb / 4603    ] InodeDelta     inode 10    seq 31    len 103 B    tag ec17ae32 [COMMITTED]
+      delta: File { extents: [[0x4000..0x8000 (16.00 KiB) -> log offset 0x00000c36]], size: 32768 (32.00 KiB), mode: 0o644, uid: 1003, gid: 1003, atime: 1700000170.000000000s (2023-11-14 22:16:10 UTC), mtime: 1700000180.000000000s (2023-11-14 22:16:20 UTC), ctime: 1700000170.000000000s (2023-11-14 22:16:10 UTC) }
+#33    [0x00001287 / 4743    ] InodeDelta     inode 11    seq 32    len 143 B    tag f399695f [COMMITTED]
+      delta: File { extents: [[0x1000..0x2000 (4.00 KiB) -> hole], [0x2000..0x2064 (100 B) -> log offset 0x00000d6a], [0x2064..0xffffffffffffffff (17179869184.00 GiB) -> hole]], size: 8292 (8.10 KiB), mode: 0o644, uid: 1003, gid: 1003, atime: 1700000350.000000000s (2023-11-14 22:19:10 UTC), mtime: 1700000360.000000000s (2023-11-14 22:19:20 UTC), ctime: 1700000350.000000000s (2023-11-14 22:19:10 UTC) }
+#34    [0x0000133b / 4923    ] InodeDelta     inode 12    seq 33    len 139 B    tag b3cc0656 [COMMITTED]
+      delta: File { extents: [[0x0..0x1000 (4.00 KiB) -> hole], [0x1000..0x1064 (100 B) -> log offset 0x00000da0]], size: 4196 (4.10 KiB), mode: 0o644, uid: 1001, gid: 1001, nlink: 1, atime: 1700000190.000000000s (2023-11-14 22:16:30 UTC), mtime: 1700000200.000000000s (2023-11-14 22:16:40 UTC), ctime: 1700000190.000000000s (2023-11-14 22:16:30 UTC), created_at: 1700000190.000000000s (2023-11-14 22:16:30 UTC) }
+#35    [0x000013eb / 5099    ] InodeDelta     inode 13    seq 34    len 92 B     tag b78c8a3c [COMMITTED]
       delta: Symlink { target: "hello.txt", mode: 0o777, uid: 1001, gid: 1001, nlink: 1, atime: 1700000210.000000000s (2023-11-14 22:16:50 UTC), mtime: 1700000220.000000000s (2023-11-14 22:17:00 UTC), ctime: 1700000210.000000000s (2023-11-14 22:16:50 UTC), created_at: 1700000210.000000000s (2023-11-14 22:16:50 UTC) }
-#32    [0x0000127f / 4735    ] InodeDelta     inode 13    seq 31    len 106 B    tag f8da9cb5 [COMMITTED]
+#36    [0x0000146c / 5228    ] InodeDelta     inode 14    seq 35    len 106 B    tag 44f37851 [COMMITTED]
       delta: Symlink { target: "/dir_b/multi_extent.dat", mode: 0o777, uid: 1001, gid: 1001, nlink: 1, atime: 1700000230.000000000s (2023-11-14 22:17:10 UTC), mtime: 1700000240.000000000s (2023-11-14 22:17:20 UTC), ctime: 1700000230.000000000s (2023-11-14 22:17:10 UTC), created_at: 1700000230.000000000s (2023-11-14 22:17:10 UTC) }
-#33    [0x0000130e / 4878    ] InodeDelta     inode 14    seq 32    len 98 B     tag bbdfe969 [COMMITTED]
+#37    [0x000014fb / 5371    ] InodeDelta     inode 15    seq 36    len 98 B     tag 9476cc21 [COMMITTED]
       delta: Symlink { target: "/dir_a/subdir_1", mode: 0o777, uid: 1001, gid: 1001, nlink: 1, atime: 1700000250.000000000s (2023-11-14 22:17:30 UTC), mtime: 1700000260.000000000s (2023-11-14 22:17:40 UTC), ctime: 1700000250.000000000s (2023-11-14 22:17:30 UTC), created_at: 1700000250.000000000s (2023-11-14 22:17:30 UTC) }
-#34    [0x00001395 / 5013    ] InodeDelta     inode 15    seq 33    len 78 B     tag 00147d6b [COMMITTED]
+#38    [0x00001582 / 5506    ] InodeDelta     inode 16    seq 37    len 78 B     tag a8f05096 [COMMITTED]
       delta: Fifo { mode: 0o644, uid: 1000, gid: 1000, nlink: 1, atime: 1700000270.000000000s (2023-11-14 22:17:50 UTC), mtime: 1700000280.000000000s (2023-11-14 22:18:00 UTC), ctime: 1700000270.000000000s (2023-11-14 22:17:50 UTC), created_at: 1700000270.000000000s (2023-11-14 22:17:50 UTC) }
-#35    [0x00001408 / 5128    ] InodeDelta     inode 16    seq 34    len 78 B     tag 97f223ea [COMMITTED]
+#39    [0x000015f5 / 5621    ] InodeDelta     inode 17    seq 38    len 78 B     tag 4b3e18fb [COMMITTED]
       delta: CharDevice { rdev: 0x1234, mode: 0o660, uid: 1000, gid: 1000, nlink: 1, atime: 1700000290.000000000s (2023-11-14 22:18:10 UTC), mtime: 1700000300.000000000s (2023-11-14 22:18:20 UTC), ctime: 1700000290.000000000s (2023-11-14 22:18:10 UTC), created_at: 1700000290.000000000s (2023-11-14 22:18:10 UTC) }
-#36    [0x0000147b / 5243    ] InodeDelta     inode 17    seq 35    len 78 B     tag 9e9eb57b [COMMITTED]
+#40    [0x00001668 / 5736    ] InodeDelta     inode 18    seq 39    len 78 B     tag b73b50da [COMMITTED]
       delta: BlockDevice { rdev: 0x5678, mode: 0o660, uid: 1000, gid: 1000, nlink: 1, atime: 1700000310.000000000s (2023-11-14 22:18:30 UTC), mtime: 1700000320.000000000s (2023-11-14 22:18:40 UTC), ctime: 1700000310.000000000s (2023-11-14 22:18:30 UTC), created_at: 1700000310.000000000s (2023-11-14 22:18:30 UTC) }
-#37    [0x000014ee / 5358    ] InodeDelta     inode 18    seq 36    len 78 B     tag 71114305 [COMMITTED]
+#41    [0x000016db / 5851    ] InodeDelta     inode 19    seq 40    len 78 B     tag d01e7eff [COMMITTED]
       delta: Socket { mode: 0o755, uid: 1000, gid: 1000, nlink: 1, atime: 1700000330.000000000s (2023-11-14 22:18:50 UTC), mtime: 1700000340.000000000s (2023-11-14 22:19:00 UTC), ctime: 1700000330.000000000s (2023-11-14 22:18:50 UTC), created_at: 1700000330.000000000s (2023-11-14 22:18:50 UTC) }
-#38    [0x00001561 / 5473    ] FlushCommit    inode 0     seq 37    len 24 B     tag e285cae6 [COMMITTED]
-      batch_id: 3, batch_record_count: 18, commit_timestamp: 1700000330.000000000s (2023-11-14 22:18:50 UTC)
-#39    [0x0000159e / 5534    ] Seal           inode 0     seq 38    len 16 B     tag 43300089 [COMMITTED]
-      sealed_record_count: 38, seal_timestamp: 1700000500.000000000s (2023-11-14 22:21:40 UTC)
+#42    [0x0000174e / 5966    ] FlushCommit    inode 0     seq 41    len 24 B     tag 7175a940 [COMMITTED]
+      batch_id: 3, batch_record_count: 20, commit_timestamp: 1700000350.000000000s (2023-11-14 22:19:10 UTC)
+#43    [0x0000178b / 6027    ] Seal           inode 0     seq 42    len 16 B     tag 5da014fd [COMMITTED]
+      sealed_record_count: 42, seal_timestamp: 1700000500.000000000s (2023-11-14 22:21:40 UTC)

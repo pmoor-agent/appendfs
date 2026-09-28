@@ -325,8 +325,8 @@ impl InMemoryFS {
             // 1. Flush raw file data chunks
             // Note: Sparse holes (`Extent::Zero`) carry no payload bytes and do not emit
             // `OpCode::Data` records. They remain in `f.extents` and are serialized into the
-            // log in step 2 below within `OpCode::InodeDelta` records as `LogExtent` entries
-            // with `record_log_offset: 0` and `record_size: 0`.
+            // log in step 2 below within `OpCode::InodeDelta` records as `LogExtent::Zero`
+            // entries.
             for &ino in &inos {
                 if let Some(EntryDelta::Node(NodeDelta::File(f))) = frozen.get_mut(&ino) {
                     let staged_runs = collect_staged_runs(&f.extents, max_extent_size);
@@ -1277,8 +1277,8 @@ mod tests {
 
         // And it has to survive replay - this is where a silently-dropped Zero extent would
         // show up, with the old data reappearing. Check both routes: replaying the `.log`
-        // (LogExtent) and loading a `.summary` (SerializedExtent), which encode the hole
-        // sentinel independently of each other.
+        // (LogExtent) and loading a `.summary` (SerializedExtent), which encode holes
+        // independently of each other.
         let from_log = crate::log::recover_fs(
             Arc::clone(&storage),
             crate::RecoveryTarget::Latest,

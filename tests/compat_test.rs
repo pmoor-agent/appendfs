@@ -565,6 +565,9 @@ pub fn verify_python_restore_script(fixture_dir: &Path) {
     assert_eq!(&sparse[..4096], &[0u8; 4096]);
     assert_eq!(&sparse[4096..], &[0xAA; 100]);
 
+    let regrown = fs::read(dest_path.join("dir_b/regrown.bin")).expect("read regrown.bin");
+    assert_eq!(regrown, appendfs::compat::compat_regrown_full());
+
     assert!(dest_path.join("dir_empty").is_dir());
     assert!(dest_path.join("dir_a/subdir_1/deep").is_dir());
     assert_eq!(

@@ -5,8 +5,9 @@ use crate::log::{LogWriter, init_volume_with_clock_and_uids};
 use crate::operations::dir::mkdir_core;
 use crate::operations::links::{link_core, readlink_core, symlink_core};
 use crate::operations::read_write::{
-    FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_UID, create_core,
-    open_core, read_core, release_core, setattr_core, write_handle_core,
+    FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_SIZE,
+    FUSE_SET_ATTR_UID, create_core, open_core, punch_hole_core, read_core, release_core, setattr_core,
+    write_handle_core,
 };
 use crate::operations::special::mknod_core;
 use crate::operations::xattr::setxattr_core;
@@ -259,6 +260,14 @@ pub fn compat_multi_extent_full() -> Vec<u8> {
     data
 }
 
+/// Final contents of `/dir_b/regrown.bin`.
+pub fn compat_regrown_full() -> Vec<u8> {
+    let mut data = vec![0xBB; 4096];
+    data.resize(8192, 0);
+    data.extend_from_slice(&[0xCC; 100]);
+    data
+}
+
 /// Populates the canonical compatibility filesystem tree on `fs` across 3 distinct flush cycles.
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
@@ -380,6 +389,10 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     let p1 = compat_multi_extent_part1();
     compat_write(fs, multi_extent.ino, &p1, 0)?;
 
+    // Written in full here; batch 3 truncates it to half and writes past the old end.
+    let regrown = create_core(fs, dir_b.ino, "regrown.bin", 0o644, 0, 1003, 1003)?;
+    compat_write(fs, regrown.ino, &[0xBB; 8192], 0)?;
+
     // Commit Batch 2 to log
     fs.quiesce()?;
 
@@ -413,10 +426,13 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
     )?;
     setxattr_core(fs, hello_file.ino, "user.second_attr", b"verified", 0)?;
 
-    // Sparse file: 4096-byte hole, 100 bytes of 0xAA at offset 4096
+    // Sparse file: 4096-byte hole, 100 bytes of 0xAA at offset 4096. The hole is punched
+    // over written data rather than left unwritten, so it is persisted as an explicit hole
+    // extent in both the log and the summary.
     clock.set_offset(190);
     let sparse_file = create_core(fs, 1, "sparse_file.bin", 0o644, 0, 1001, 1001)?;
-    compat_write(fs, sparse_file.ino, &[0xAA; 100], 4096)?;
+    compat_write(fs, sparse_file.ino, &[0xAA; 4196], 0)?;
+    punch_hole_core(fs, sparse_file.ino, 0, 4096)?;
     setattr_core(
         fs,
         sparse_file.ino,
@@ -529,6 +545,34 @@ pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), 
         0,
         compat_time(330),
         compat_time(340),
+        FUSE_SET_ATTR_MODE | FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID | FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME,
+    )?;
+
+    // Truncate /dir_b/regrown.bin to half, then write at its old end. The log carries the
+    // cut-off half as a hole over data flushed in batch 2, and the truncation's own hole
+    // running from the new tail to u64::MAX.
+    clock.set_offset(350);
+    setattr_core(
+        fs,
+        regrown.ino,
+        0,
+        0,
+        0,
+        4096,
+        UNIX_EPOCH,
+        UNIX_EPOCH,
+        FUSE_SET_ATTR_SIZE,
+    )?;
+    compat_write(fs, regrown.ino, &[0xCC; 100], 8192)?;
+    setattr_core(
+        fs,
+        regrown.ino,
+        0o644,
+        1003,
+        1003,
+        0,
+        compat_time(350),
+        compat_time(360),
         FUSE_SET_ATTR_MODE | FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID | FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME,
     )?;
 
@@ -989,4 +1033,16 @@ pub fn verify_compat_tree(fs: &InMemoryFS) {
     assert_eq!(attr.gid, 1000);
     assert_eq!(attr.atime, compat_time(330));
     assert_eq!(attr.mtime, compat_time(340));
+
+    // /dir_b/regrown.bin (data 0..4096, hole 4096..8192, data 8192..8292)
+    let ino_regrown = lookup_path(fs, "/dir_b/regrown.bin").expect("/dir_b/regrown.bin must exist");
+    let attr = fs.get_attr(ino_regrown).unwrap();
+    assert_eq!(attr.file_type, FileType::RegularFile);
+    assert_eq!(attr.size, 8292);
+    assert_eq!(attr.perm & 0o777, 0o644);
+    assert_eq!(attr.uid, 1003);
+    assert_eq!(attr.gid, 1003);
+    assert_eq!(attr.atime, compat_time(350));
+    assert_eq!(attr.mtime, compat_time(360));
+    assert_eq!(read_compat_file(fs, ino_regrown, 8292, 0), compat_regrown_full());
 }

@@ -945,9 +945,9 @@ fn test_cli_stats_and_dump_extension_breakdown() {
     let stats_str = String::from_utf8_lossy(&stats_out.stdout);
     assert!(stats_str.contains("--- File Extension Breakdown ---"));
     assert!(stats_str.contains("EXTENSION                   FILES   % OF FILES    TOTAL BYTES   % OF BYTES"));
-    assert!(stats_str.contains(".dat                            1        20.0%      32.00 KiB        86.2%"));
-    assert!(stats_str.contains(".bin                            2        40.0%       5.10 KiB        13.7%"));
-    assert!(stats_str.contains(".txt                            2        40.0%           40 B         0.1%"));
+    assert!(stats_str.contains(".dat                            1        16.7%      32.00 KiB        70.7%"));
+    assert!(stats_str.contains(".bin                            3        50.0%      13.20 KiB        29.2%"));
+    assert!(stats_str.contains(".txt                            2        33.3%           40 B         0.1%"));
 
     // Verify `appendfs dump` on .summary file outputs the File Extension Breakdown table
     let summary_file = temp_dir.path().join("000001.summary");
@@ -959,9 +959,9 @@ fn test_cli_stats_and_dump_extension_breakdown() {
     let dump_str = String::from_utf8_lossy(&dump_out.stdout);
     assert!(dump_str.contains("--- File Extension Breakdown ---"));
     assert!(dump_str.contains("EXTENSION                   FILES   % OF FILES    TOTAL BYTES   % OF BYTES"));
-    assert!(dump_str.contains(".dat                            1        20.0%      32.00 KiB        86.2%"));
-    assert!(dump_str.contains(".bin                            2        40.0%       5.10 KiB        13.7%"));
-    assert!(dump_str.contains(".txt                            2        40.0%           40 B         0.1%"));
+    assert!(dump_str.contains(".dat                            1        16.7%      32.00 KiB        70.7%"));
+    assert!(dump_str.contains(".bin                            3        50.0%      13.20 KiB        29.2%"));
+    assert!(dump_str.contains(".txt                            2        33.3%           40 B         0.1%"));
 
     // Verify `appendfs stats` and `appendfs dump` match identically from "--- Inode Breakdown ---" onwards
     let dump_idx = dump_str
