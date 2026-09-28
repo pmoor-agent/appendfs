@@ -8,18 +8,17 @@
 //! half of the transformation.
 
 use crate::compress::Compression;
-use crate::crypto::VolumeKey;
+use crate::crypto::LogFileKey;
 use crate::log::record::OpCode;
 use std::io;
 
 /// The fields that identify a record for authentication.
 ///
-/// `generation` and `sequence` form the nonce; `op_code` and `inode` are bound into the
-/// AEAD's associated data, so a payload cannot be relabelled as a different record type or
-/// reattributed to another inode.
+/// `sequence` forms the nonce; `op_code` and `inode` are bound into the AEAD's associated
+/// data, so a payload cannot be relabelled as a different record type or reattributed to
+/// another inode. Which file the record belongs to is carried by the [`LogFileKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordId {
-    pub generation: u32,
     pub sequence: u64,
     pub op_code: u8,
     pub inode: u64,
@@ -27,7 +26,7 @@ pub struct RecordId {
 
 /// Turns a payload into the bytes written to the log, returning `(actual_op, ciphertext, auth_tag)`.
 pub fn encode(
-    key: &VolumeKey,
+    key: &LogFileKey,
     compression: Compression,
     id: RecordId,
     payload: &[u8],
@@ -43,15 +42,15 @@ pub fn encode(
     };
 
     let (ciphertext, auth_tag) = key
-        .encrypt_record(id.generation, id.sequence, actual_op as u8, id.inode, &data_to_encrypt)
+        .encrypt_record(id.sequence, actual_op as u8, id.inode, &data_to_encrypt)
         .map_err(io::Error::from)?;
     Ok((actual_op, ciphertext, auth_tag))
 }
 
 /// Recovers the original payload from bytes read out of the log.
-pub fn decode(key: &VolumeKey, id: RecordId, stored: &[u8], auth_tag: &[u8; 16]) -> io::Result<Vec<u8>> {
+pub fn decode(key: &LogFileKey, id: RecordId, stored: &[u8], auth_tag: &[u8; 16]) -> io::Result<Vec<u8>> {
     let plain = key
-        .decrypt_record(id.generation, id.sequence, id.op_code, id.inode, stored, auth_tag)
+        .decrypt_record(id.sequence, id.op_code, id.inode, stored, auth_tag)
         .map_err(io::Error::from)?;
     if id.op_code == OpCode::DataZstd as u8 {
         crate::compress::decompress_zstd(&plain)
@@ -63,10 +62,11 @@ pub fn decode(key: &VolumeKey, id: RecordId, stored: &[u8], auth_tag: &[u8; 16])
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{KeySource, MasterKey, VolumeHeader};
+    use crate::crypto::{KeySource, MasterKey, VolumeHeader, VolumeKey};
+
+    const SALT: [u8; 16] = [0x5A; 16];
 
     const ID: RecordId = RecordId {
-        generation: 3,
         sequence: 17,
         op_code: 1,
         inode: 42,
@@ -85,7 +85,7 @@ mod tests {
 
         for compression in [Compression::None, Compression::Zstd] {
             // Unencrypted volume.
-            let plain_key = VolumeKey::plaintext();
+            let plain_key = VolumeKey::plaintext().log_file_key(&SALT);
             let (op, stored, tag) = encode(&plain_key, compression, ID, &data).unwrap();
             let rec_id = RecordId {
                 op_code: op as u8,
@@ -100,6 +100,7 @@ mod tests {
 
             // Encrypted volume.
             let (_h, key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile, compression).unwrap();
+            let key = key.log_file_key(&SALT);
             let (op, stored, tag) = encode(&key, compression, ID, &data).unwrap();
             assert_ne!(stored, data, "encrypted/{} left the payload readable", compression);
             let rec_id = RecordId {
@@ -117,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_compression_shrinks_the_stored_bytes() {
-        let key = VolumeKey::plaintext();
+        let key = VolumeKey::plaintext().log_file_key(&SALT);
         let data = payload();
         let (op_plain, plain, _) = encode(&key, Compression::None, ID, &data).unwrap();
         assert_eq!(op_plain, OpCode::Data);
@@ -134,7 +135,9 @@ mod tests {
     #[test]
     fn test_decode_rejects_a_reattributed_record() {
         let master = MasterKey::new([0x21u8; 32]);
-        let (_h, key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile, Compression::Zstd).unwrap();
+        let (_h, volume_key) =
+            VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile, Compression::Zstd).unwrap();
+        let key = volume_key.log_file_key(&SALT);
         let (op, stored, tag) = encode(&key, Compression::Zstd, ID, &payload()).unwrap();
         let actual_id = RecordId {
             op_code: op as u8,
@@ -162,10 +165,7 @@ mod tests {
             ..actual_id
         };
         assert!(decode(&key, other_sequence, &stored, &tag).is_err());
-        let other_generation = RecordId {
-            generation: ID.generation + 1,
-            ..actual_id
-        };
-        assert!(decode(&key, other_generation, &stored, &tag).is_err());
+        let other_file = volume_key.log_file_key(&[0xA5; 16]);
+        assert!(decode(&other_file, actual_id, &stored, &tag).is_err());
     }
 }

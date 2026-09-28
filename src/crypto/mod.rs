@@ -6,4 +6,4 @@ pub mod volume;
 pub use cipher::{CipherSuite, CryptoError, decrypt_payload, encrypt_payload};
 pub use kdf::{MasterKey, prompt_passphrase};
 pub use nonce::{generate_random_16, generate_random_iv, record_nonce};
-pub use volume::{KeySource, VolumeHeader, VolumeKey};
+pub use volume::{KeySource, LogFileKey, VolumeHeader, VolumeKey};

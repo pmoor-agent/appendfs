@@ -36,14 +36,15 @@ impl LogRecord {
     }
 }
 
-use crate::crypto::VolumeKey;
+use crate::crypto::{LogFileKey, VolumeKey};
 
 /// Iterator for sequentially reading records from a `.log` generation file.
 pub struct LogReader {
     reader: Arc<dyn StorageReader>,
     header: FileHeader,
     current_offset: u64,
-    volume_key: Arc<VolumeKey>,
+    /// Key for this file's records, derived from the salt in its header.
+    file_key: LogFileKey,
     md5_hasher: md5::Context,
     /// Sequence number of the last record read, which the next one must exceed.
     last_sequence: Option<u64>,
@@ -66,7 +67,7 @@ impl LogReader {
             reader,
             header,
             current_offset: FILE_HEADER_SIZE as u64,
-            volume_key,
+            file_key: volume_key.log_file_key(&header.key_salt),
             md5_hasher,
             last_sequence: None,
         })
@@ -161,9 +162,8 @@ impl Iterator for LogReader {
         self.current_offset += RECORD_HEADER_SIZE as u64 + header.payload_len as u64;
 
         let decrypted_payload = match crate::log::codec::decode(
-            &self.volume_key,
+            &self.file_key,
             crate::log::codec::RecordId {
-                generation: self.header.generation,
                 sequence: header.sequence,
                 op_code: header.op_code as u8,
                 inode: header.inode,

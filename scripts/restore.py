@@ -38,7 +38,7 @@ import zstandard as zstd
 
 FILE_MAGIC = b"APPF"
 SUMMARY_MAGIC = b"APPS"
-FILE_HEADER_SIZE = 26
+FILE_HEADER_SIZE = 42
 RECORD_HEADER_SIZE = 37
 SUMMARY_HEADER_SIZE = 66
 VOLUME_HEADER_SIZE = 72
@@ -60,6 +60,7 @@ TAG_SOCKET = 7
 
 DATA_KEY_CONTEXT = "appendfs volume data key v1"
 KCV_KEY_CONTEXT = "appendfs key check value v1"
+LOG_FILE_KEY_CONTEXT = "appendfs log file key v1"
 
 
 class WireReader:
@@ -194,13 +195,13 @@ def parse_entry_delta(payload: bytes) -> tuple:
         raise ValueError(f"Unknown LogEntryDelta tag: {tag}")
 
 
-def record_nonce(generation: int, sequence: int) -> bytes:
+def record_nonce(sequence: int) -> bytes:
     """Builds the 12-byte record nonce matching AppendFS's record_nonce.
 
-    Format: [generation (4 bytes BE) || sequence (8 bytes BE)]. The generation is that of
-    the log file the record is in; the sequence is stored in the record header.
+    Format: [zero (4 bytes) || sequence (8 bytes BE)]. The sequence is stored in the record
+    header; uniqueness across files comes from each file having its own key.
     """
-    return struct.pack(">IQ", generation, sequence)
+    return struct.pack(">IQ", 0, sequence)
 
 
 def record_aad(op_code: int, inode: int) -> bytes:
@@ -258,17 +259,27 @@ class VolumeDecryptor:
     def __init__(self, key_bytes: Optional[bytes] = None, no_verify: bool = False):
         self.key_bytes = key_bytes
         self.no_verify = no_verify
-        self.cipher = ChaCha20Poly1305(key_bytes) if key_bytes else None
+        self.file_ciphers: Dict[bytes, ChaCha20Poly1305] = {}
+
+    def file_cipher(self, key_salt: bytes) -> Optional[ChaCha20Poly1305]:
+        """The cipher for one log file, keyed as AppendFS's VolumeKey::log_file_key."""
+        if not self.key_bytes:
+            return None
+        if key_salt not in self.file_ciphers:
+            file_key = blake3.blake3(self.key_bytes + key_salt, derive_key_context=LOG_FILE_KEY_CONTEXT).digest()
+            self.file_ciphers[key_salt] = ChaCha20Poly1305(file_key)
+        return self.file_ciphers[key_salt]
 
     def decode_record(
-        self, generation: int, sequence: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
+        self, key_salt: bytes, generation: int, sequence: int, op_code: int, inode: int, payload: bytes, auth_tag: bytes
     ) -> bytes:
-        if self.cipher is not None:
-            nonce = record_nonce(generation, sequence)
+        cipher = self.file_cipher(key_salt)
+        if cipher is not None:
+            nonce = record_nonce(sequence)
             aad = record_aad(op_code, inode)
             ciphertext_with_tag = payload + auth_tag
             try:
-                decrypted = self.cipher.decrypt(nonce, ciphertext_with_tag, aad)
+                decrypted = cipher.decrypt(nonce, ciphertext_with_tag, aad)
             except Exception as e:
                 raise ValueError(f"Decryption / authentication failed for record (gen={generation}, seq={sequence}, ino={inode}): {e}")
             data = decrypted
@@ -429,7 +440,7 @@ class Restorer:
             hdr = f.read(FILE_HEADER_SIZE)
             if len(hdr) < FILE_HEADER_SIZE:
                 return
-            magic, ver, gen, rev, secs, nsecs = struct.unpack(">4sIIHqI", hdr)
+            magic, ver, gen, rev, secs, nsecs, key_salt = struct.unpack(">4sIIHqI16s", hdr)
             if magic != FILE_MAGIC:
                 raise ValueError(f"Invalid file magic {magic} in {log_path.name}")
 
@@ -486,7 +497,7 @@ class Restorer:
                         )
 
                 try:
-                    payload = self.decryptor.decode_record(gen, seq, op, ino, raw_payload, tag)
+                    payload = self.decryptor.decode_record(key_salt, gen, seq, op, ino, raw_payload, tag)
                 except Exception as e:
                     raise ValueError(
                         f"Failed to decode/decrypt record in {log_path.name} @ offset 0x{rec_log_offset:x}: {e}"

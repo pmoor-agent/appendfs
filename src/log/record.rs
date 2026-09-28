@@ -5,8 +5,9 @@ use std::time::SystemTime;
 
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
 pub const CURRENT_VERSION: u32 = 1;
-/// magic(4) + version(4) + generation(4) + revision(2) + created_at seconds(8) + nanoseconds(4).
-pub const FILE_HEADER_SIZE: usize = 26;
+/// magic(4) + version(4) + generation(4) + revision(2) + created_at seconds(8) + nanoseconds(4)
+/// + key_salt(16).
+pub const FILE_HEADER_SIZE: usize = 42;
 pub const RECORD_HEADER_SIZE: usize = 37;
 pub const AUTH_TAG_SIZE: usize = 16;
 
@@ -20,16 +21,21 @@ pub struct FileHeader {
     pub revision: u16,
     #[serde(with = "crate::clock::serde_system_time")]
     pub created_at: SystemTime,
+    /// Random salt, drawn when the file is created, from which the key for this file's
+    /// records is derived (see [`crate::crypto::VolumeKey::log_file_key`]). Stored in the
+    /// clear: it is not secret, only unique.
+    pub key_salt: [u8; 16],
 }
 
 impl FileHeader {
-    pub fn new(generation: u32, created_at: SystemTime) -> Self {
+    pub fn new(generation: u32, created_at: SystemTime, key_salt: [u8; 16]) -> Self {
         Self {
             magic: FILE_MAGIC,
             version: CURRENT_VERSION,
             generation,
             revision: 0,
             created_at,
+            key_salt,
         }
     }
 
@@ -46,6 +52,7 @@ impl FileHeader {
         let (secs, nsecs) = crate::clock::system_time_to_unix(self.created_at);
         buf[14..22].copy_from_slice(&secs.to_be_bytes());
         buf[22..26].copy_from_slice(&nsecs.to_be_bytes());
+        buf[26..42].copy_from_slice(&self.key_salt);
         buf
     }
 
@@ -63,12 +70,14 @@ impl FileHeader {
         let secs = i64::from_be_bytes(bytes[14..22].try_into().unwrap());
         let nsecs = u32::from_be_bytes(bytes[22..26].try_into().unwrap());
         let created_at = crate::clock::unix_to_system_time(secs, nsecs);
+        let key_salt = bytes[26..42].try_into().unwrap();
         Ok(Self {
             magic,
             version,
             generation,
             revision,
             created_at,
+            key_salt,
         })
     }
 }
@@ -654,7 +663,7 @@ mod tests {
     #[test]
     fn test_file_header_serialization() {
         let time = crate::clock::unix_to_system_time(1721838000, 0);
-        let header = FileHeader::new(42, time);
+        let header = FileHeader::new(42, time, [0x5A; 16]);
         let bytes = header.to_bytes();
         assert_eq!(bytes.len(), FILE_HEADER_SIZE);
 
@@ -678,7 +687,7 @@ mod tests {
 
         for (name, secs) in cases {
             let created_at = crate::clock::unix_to_system_time(secs, 123_456_789);
-            let header = FileHeader::new(7, created_at);
+            let header = FileHeader::new(7, created_at, [0x5A; 16]);
             let round_tripped = FileHeader::from_bytes(&header.to_bytes()).unwrap();
             assert_eq!(round_tripped.created_at, created_at, "{} did not round-trip", name);
             assert_eq!(round_tripped.generation, 7, "{}", name);

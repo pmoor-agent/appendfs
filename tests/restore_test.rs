@@ -1043,12 +1043,15 @@ fn test_python_restore_rejects_record_after_seal() {
     // Append an extraneous record after seal directly to 000001.log
     let log_file = vol_dir.join("000001.log");
     let mut log_bytes = fs::read(&log_file).unwrap();
+    let file_salt =
+        appendfs::log::record::FileHeader::from_bytes(log_bytes[..appendfs::log::FILE_HEADER_SIZE].try_into().unwrap())
+            .unwrap()
+            .key_salt;
     let extra_payload = b"extraneous";
     let (_, cipher, tag) = appendfs::log::codec::encode(
-        &VolumeKey::plaintext(),
+        &VolumeKey::plaintext().log_file_key(&file_salt),
         appendfs::compress::Compression::None,
         appendfs::log::codec::RecordId {
-            generation: 1,
             // Past every sequence the writer used in this generation.
             sequence: 1_000,
             op_code: appendfs::log::OpCode::Data as u8,
@@ -1150,7 +1153,12 @@ fn test_python_restore_rejects_seal_record_count_mismatch() {
     drop(reader);
 
     // Reconstruct 000001.log with valid records + bad seal count
-    let file_header = appendfs::log::record::FileHeader::new(1, clock.now());
+    // Keep the original header: it carries the salt the kept records are keyed by.
+    let original = fs::read(&log_file).unwrap();
+    let file_header =
+        appendfs::log::record::FileHeader::from_bytes(original[..appendfs::log::FILE_HEADER_SIZE].try_into().unwrap())
+            .unwrap();
+    let file_salt = file_header.key_salt;
     let mut new_bytes = file_header.to_bytes().to_vec();
     for rec in valid_records {
         let h = rec.header.to_bytes();
@@ -1164,10 +1172,9 @@ fn test_python_restore_rejects_seal_record_count_mismatch() {
     };
     let bad_payload = appendfs::wire::serialize(&bad_seal).unwrap();
     let (_, cipher, tag) = appendfs::log::codec::encode(
-        &VolumeKey::plaintext(),
+        &VolumeKey::plaintext().log_file_key(&file_salt),
         appendfs::compress::Compression::None,
         appendfs::log::codec::RecordId {
-            generation: 1,
             // Past every sequence the writer used in this generation.
             sequence: 1_000,
             op_code: appendfs::log::OpCode::Seal as u8,

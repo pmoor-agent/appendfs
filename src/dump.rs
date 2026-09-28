@@ -209,8 +209,7 @@ pub fn dump_log_reader_with_path(
         }
 
         let decrypted = if let Some(key) = volume_key {
-            match key.decrypt_record(
-                file_header.generation,
+            match key.log_file_key(&file_header.key_salt).decrypt_record(
                 header.sequence,
                 header.op_code as u8,
                 header.inode,
@@ -343,6 +342,7 @@ pub fn dump_log_reader_with_path(
         format_system_time(file_header.created_at)
     )
     .unwrap();
+    writeln!(out, "Key Salt:            {}", hex::encode(file_header.key_salt)).unwrap();
     writeln!(out, "File Size:           {}", format_bytes(file_len)).unwrap();
     writeln!(
         out,

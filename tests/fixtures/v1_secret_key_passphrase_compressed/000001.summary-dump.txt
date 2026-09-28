@@ -4,10 +4,10 @@ Generation:          1
 Format Version:      1
 Last Batch ID:       3
 Next Inode:          19
-File Size:           991 B
+File Size:           990 B
 Encryption:          ChaCha20-Poly1305
 Unlocked by:         Key file + passphrase
-Checksum (BLAKE3):   75e417cccd1379fc13db20c2d0180eadf34e0ad3350e1712dc60fcd3a3c2a1d8 (VERIFIED)
+Checksum (BLAKE3):   f6fe526760c1a50f57ae3f6f8acc06df71d125b1d0aa05bd157804f520e7fb11 (VERIFIED)
 
 --- Inode Breakdown ---
 Total Inodes:        18 (6 directories, 5 regular files, 3 symlinks)
@@ -46,7 +46,7 @@ Tracked Logs:        1 log generation files
 
 LOG FILE          RECORDS     LOG SIZE    DATA SIZE    LIVE DATA  EXTENTS   LIVE RATIO  STATUS
 -------------- ---------- ------------ ------------ ------------ -------- ------------  ------------------------
-000001.log             38     5.44 KiB    33.14 KiB    33.14 KiB        6       100.0%  Healthy
+000001.log             38     5.46 KiB    33.14 KiB    33.14 KiB        6       100.0%  Healthy
 
 === Summary Inode Records ===
 #1     [Inode 1    ] Directory  "/" (mode 0o755, uid 1000, gid 1000, entries: 10, mtime: 1700000330.000000000s (2023-11-14 22:18:50 UTC))

@@ -8,13 +8,21 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
+/// An open log file: its reader, and the salt from its header that its records' key is
+/// derived from (see [`crate::crypto::VolumeKey::log_file_key`]).
+#[derive(Clone)]
+pub struct OpenLog {
+    pub reader: Arc<dyn StorageReader>,
+    pub key_salt: [u8; 16],
+}
+
 /// Thread-safe cache holding open log file reader handles to eliminate repeated open calls,
 /// with two-tiered caching (in-memory decrypted payload LRU + on-disk raw block cache)
 /// and sparse remote reading.
 #[allow(clippy::type_complexity)]
 pub struct LogFileCache {
     storage: Arc<dyn Storage>,
-    cache: Mutex<HashMap<u32, Arc<dyn StorageReader>>>,
+    cache: Mutex<HashMap<u32, OpenLog>>,
     pub decrypted_cache: Arc<DecryptedRecordCache>,
     pub block_cache: Option<Arc<dyn BlockCache>>,
     pub remotes: Arc<RwLock<Vec<RemoteReadTarget>>>,
@@ -83,14 +91,28 @@ impl LogFileCache {
         self.cache.lock().unwrap().len()
     }
 
-    /// Retrieves an open log reader handle, verifying the `FileHeader` on first open.
+    /// Retrieves an open log file, reading and verifying its `FileHeader` on first open.
     /// If the log file was pruned locally, falls back to `TieredStorageReader` over S3 range requests.
-    pub fn get_or_open(&self, generation: u32) -> io::Result<Arc<dyn StorageReader>> {
+    pub fn get_or_open(&self, generation: u32) -> io::Result<OpenLog> {
         let mut guard = self.cache.lock().unwrap();
-        if let Some(reader) = guard.get(&generation) {
-            return Ok(Arc::clone(reader));
+        if let Some(open) = guard.get(&generation) {
+            return Ok(open.clone());
         }
+        let reader = self.open_reader(generation)?;
+        let mut header_buf = [0u8; FILE_HEADER_SIZE];
+        reader.read_exact_at(0, &mut header_buf)?;
+        let header = FileHeader::from_bytes(&header_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let open = OpenLog {
+            reader,
+            key_salt: header.key_salt,
+        };
+        guard.insert(generation, open.clone());
+        Ok(open)
+    }
 
+    /// Opens a reader for `generation`, locally or - once the local file has been pruned -
+    /// over the remotes.
+    fn open_reader(&self, generation: u32) -> io::Result<Arc<dyn StorageReader>> {
         let (filename, in_manifest, mut expected_len) = if let Some(ref m) = self.manifest {
             let man = m.read().unwrap();
             let log_entry = man.get_by_generation(generation);
@@ -123,27 +145,20 @@ impl LogFileCache {
             && expected_len > 0
         {
             let remotes = self.remotes.read().unwrap().clone();
-            let reader: Arc<dyn StorageReader> = Arc::new(TieredStorageReader::with_local_storage(
+            return Ok(Arc::new(TieredStorageReader::with_local_storage(
                 generation,
                 filename.clone(),
                 expected_len,
                 Some(self.storage.clone()),
                 remotes,
                 Arc::clone(bc),
-            ));
-            guard.insert(generation, Arc::clone(&reader));
-            return Ok(reader);
+            )));
         }
 
         let open_res = self.storage.open_reader(&filename);
 
         let reader: Arc<dyn StorageReader> = match open_res {
-            Ok(r) => {
-                let mut header_buf = [0u8; FILE_HEADER_SIZE];
-                r.read_exact_at(0, &mut header_buf)?;
-                FileHeader::from_bytes(&header_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                r
-            }
+            Ok(r) => r,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let remotes = self.remotes.read().unwrap().clone();
                 if remotes.is_empty() {
@@ -180,8 +195,6 @@ impl LogFileCache {
             }
             Err(e) => return Err(e),
         };
-
-        guard.insert(generation, Arc::clone(&reader));
         Ok(reader)
     }
 
@@ -227,9 +240,9 @@ impl LogFileCache {
                         format!("record_size {} is smaller than record header size", record_size),
                     ));
                 }
-                let reader = self.get_or_open(generation)?;
+                let open = self.get_or_open(generation)?;
                 let mut raw_record = vec![0u8; record_size as usize];
-                reader.read_exact_at(record_log_offset, &mut raw_record)?;
+                open.reader.read_exact_at(record_log_offset, &mut raw_record)?;
 
                 let mut header_buf = [0u8; crate::log::record::RECORD_HEADER_SIZE];
                 header_buf.copy_from_slice(&raw_record[..crate::log::record::RECORD_HEADER_SIZE]);
@@ -250,9 +263,8 @@ impl LogFileCache {
                 }
 
                 let dec = crate::log::codec::decode(
-                    volume_key,
+                    &volume_key.log_file_key(&open.key_salt),
                     crate::log::codec::RecordId {
-                        generation,
                         sequence: header.sequence,
                         op_code: header.op_code as u8,
                         inode: header.inode,
@@ -330,7 +342,7 @@ mod tests {
 
         // Second access returns cached handle
         let file2 = cache.get_or_open(1).unwrap();
-        assert!(Arc::ptr_eq(&file1, &file2));
+        assert!(Arc::ptr_eq(&file1.reader, &file2.reader));
     }
 
     #[test]

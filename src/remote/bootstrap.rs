@@ -123,10 +123,10 @@ fn restore_next_generation_log(
             active_log_name
         );
 
+        // The first part starts at offset 0 and so carries the original file header. It has to:
+        // the header holds the salt the file's records are encrypted under, so a header made
+        // up here would leave every record unreadable.
         let mut log_writer = storage.open_writer(&active_log_name, WriteMode::Overwrite)?;
-        let header = crate::log::record::FileHeader::new(next_gen, std::time::SystemTime::now());
-        log_writer.append(&header.to_bytes())?;
-
         for part in part_objects {
             let mut adapter = StorageWriterAdapter(&mut log_writer);
             remote.get_object(&part.key, &mut adapter)?;

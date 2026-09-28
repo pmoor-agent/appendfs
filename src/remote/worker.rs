@@ -786,8 +786,11 @@ impl RemoteReplicationWorker {
         if time_since_last_part.as_secs() >= policy.active_sync_interval_secs {
             let (last_offset, part_idx) = uploaded_parts
                 .entry(active_gen)
-                .or_insert((crate::log::record::FILE_HEADER_SIZE as u64, 0));
-            if active_offset > *last_offset {
+                // From offset 0: the first part carries the file header, whose key salt a
+                // bootstrap needs to decrypt the records in the parts that follow.
+                .or_insert((0, 0));
+            // A file holding only its header has nothing worth shipping yet.
+            if active_offset > crate::log::record::FILE_HEADER_SIZE as u64 && active_offset > *last_offset {
                 let part_len = active_offset - *last_offset;
                 let part_filename = format!("{:06}.part{:04}.log", active_gen, *part_idx);
 

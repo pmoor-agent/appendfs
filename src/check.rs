@@ -613,7 +613,8 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                             } else {
                                 // Deep verification: Check record header & BLAKE3 checksum
                                 match c.get_or_open(generation) {
-                                    Ok(reader) => {
+                                    Ok(open) => {
+                                        let reader = &open.reader;
                                         let mut hdr_buf = [0u8; RECORD_HEADER_SIZE];
                                         if let Err(e) = reader.read_exact_at(record_log_offset, &mut hdr_buf) {
                                             report.issues.push(IntegrityIssue::error(
@@ -681,14 +682,15 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                                                     record_log_offset, log_filename, e
                                                                 ),
                                                             ));
-                                                        } else if let Err(e) = fs.volume_key.decrypt_record(
-                                                            generation,
-                                                            rec_header.sequence,
-                                                            rec_header.op_code as u8,
-                                                            rec_ino,
-                                                            &payload,
-                                                            &rec_header.auth_tag,
-                                                        ) {
+                                                        } else if let Err(e) =
+                                                            fs.volume_key.log_file_key(&open.key_salt).decrypt_record(
+                                                                rec_header.sequence,
+                                                                rec_header.op_code as u8,
+                                                                rec_ino,
+                                                                &payload,
+                                                                &rec_header.auth_tag,
+                                                            )
+                                                        {
                                                             report.issues.push(IntegrityIssue::error(
                                                                 "CORRUPT_LOG_RECORD",
                                                                 Some(ino),

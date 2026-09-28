@@ -124,6 +124,14 @@ pub const COMPAT_SUMMARY_0_IV: [u8; 12] = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0
 /// Fixed 12-byte IV for generation 1 summary snapshot in canonical encrypted compatibility fixtures.
 pub const COMPAT_SUMMARY_1_IV: [u8; 12] = [0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc];
 
+/// Fixed key salt for each log generation in compatibility fixtures, in place of the random
+/// one a real volume draws, so the fixtures come out byte-identical on every run.
+pub fn compat_key_salt(generation: u32) -> [u8; 16] {
+    let mut salt = *b"appendfs-compat-";
+    salt[12..].copy_from_slice(&generation.to_be_bytes());
+    salt
+}
+
 /// Canonical list of fixture volume file basenames.
 pub const COMPAT_FIXTURE_FILES: &[&str] = &["000000.summary", "000001.log", "000001.summary"];
 
@@ -639,8 +647,9 @@ fn create_canonical_encrypted_compat_volume(out_dir: &Path, config: CompatFixtur
     )?;
 
     // 2. Open log writer for generation 1 with deterministic clock, volume encryption key, and compression
+    // Lazy, so the fixed key salts are in place before the first file is created.
     let writer = Arc::new(
-        LogWriter::create(
+        LogWriter::create_lazy_with_clock(
             storage.clone(),
             1,
             clock.as_ref(),
@@ -649,6 +658,7 @@ fn create_canonical_encrypted_compat_volume(out_dir: &Path, config: CompatFixtur
             volume_key_arc.clone(),
         )
         .map_err(io::Error::other)?
+        .with_key_salts(compat_key_salt)
         .with_compression(config.compression()),
     );
 
@@ -694,8 +704,9 @@ fn create_canonical_plaintext_compat_volume(out_dir: &Path, config: CompatFixtur
     )?;
 
     // 2. Open log writer for generation 1 with deterministic clock and compression
+    // Lazy, so the fixed key salts are in place before the first file is created.
     let writer = Arc::new(
-        LogWriter::create(
+        LogWriter::create_lazy_with_clock(
             storage.clone(),
             1,
             clock.as_ref(),
@@ -704,6 +715,7 @@ fn create_canonical_plaintext_compat_volume(out_dir: &Path, config: CompatFixtur
             volume_key_arc,
         )
         .map_err(io::Error::other)?
+        .with_key_salts(compat_key_salt)
         .with_compression(config.compression()),
     );
 
