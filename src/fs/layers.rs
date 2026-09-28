@@ -14,7 +14,8 @@ use crate::extent_map::Extent;
 use crate::node::{EntryDelta, Node, NodeDelta, NodeKind};
 use crate::shim::{FileAttr, FileType};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
 // --- Layer Stack Snapshot & Fold Abstraction ---
 
@@ -520,7 +521,12 @@ impl ReadPlan {
 impl InMemoryFS {
     /// Executes a [`ReadPlan`] synchronously, reading any cold disk extents via [`LogFileCache`].
     pub fn execute_read_plan_sync(&self, plan: ReadPlan) -> Result<Vec<u8>, FsError> {
-        execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key)
+        execute_read_plan(
+            plan,
+            self.log_cache.as_deref(),
+            &self.volume_key,
+            self.read_parallelism.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -529,10 +535,14 @@ impl InMemoryFS {
 /// Phase 1: Copies all in-memory slices into `dst_buf` and drops their backing buffers
 /// immediately, allowing staged buffers to be freed before any disk I/O.
 /// Phase 2: Resolves cold disk slices from cache or disk directly into `dst_buf`.
+///
+/// `read_parallelism` controls concurrency for cold disk slice fetching: `0` auto-detects
+/// based on available CPU cores (capped at 16); values `> 0` specify explicit worker counts.
 pub fn execute_read_plan(
     mut plan: ReadPlan,
     log_cache: Option<&crate::log::LogFileCache>,
     volume_key: &crate::crypto::VolumeKey,
+    read_parallelism: usize,
 ) -> Result<Vec<u8>, FsError> {
     if plan.total_len == 0 || plan.slices.is_empty() {
         return Ok(Vec::new());
@@ -573,10 +583,25 @@ pub fn execute_read_plan(
     // disk or remote S3 reads below take significant time.
     if !cold_slices.is_empty() {
         let cache = log_cache.ok_or(FsError::EIO)?;
-        execute_cold_slices(cold_slices, &mut dst_buf, cache, volume_key)?;
+        execute_cold_slices(cold_slices, &mut dst_buf, cache, volume_key, read_parallelism)?;
     }
 
     Ok(dst_buf)
+}
+
+static DEFAULT_READ_PARALLELISM: OnceLock<usize> = OnceLock::new();
+
+/// Returns the detected default read concurrency for cold disk slice fetching.
+///
+/// Memoizes the system CPU core count on first access via [`OnceLock`] so that
+/// the `/sys/fs/cgroup` and `/proc` filesystem walk is not repeated on every read.
+pub fn default_read_parallelism() -> usize {
+    *DEFAULT_READ_PARALLELISM.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .clamp(1, 16)
+    })
 }
 
 fn execute_cold_slices(
@@ -584,6 +609,7 @@ fn execute_cold_slices(
     dst_buf: &mut [u8],
     cache: &crate::log::LogFileCache,
     volume_key: &crate::crypto::VolumeKey,
+    read_parallelism: usize,
 ) -> Result<(), FsError> {
     if cold_slices.is_empty() {
         return Ok(());
@@ -618,11 +644,12 @@ fn execute_cold_slices(
         _ => (0, 0),
     });
 
-    let num_workers = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4)
-        .min(jobs.len())
-        .clamp(1, 16);
+    let max_workers = if read_parallelism > 0 {
+        read_parallelism
+    } else {
+        default_read_parallelism()
+    };
+    let num_workers = max_workers.min(jobs.len()).max(1);
 
     let chunk_size = jobs.len().div_ceil(num_workers);
 
@@ -994,7 +1021,7 @@ mod tests {
         let log_cache_bg = fs.log_cache.clone();
         let volume_key_bg = fs.volume_key.clone();
         let thread_buf =
-            std::thread::spawn(move || execute_read_plan(plan_bg, log_cache_bg.as_deref(), &volume_key_bg))
+            std::thread::spawn(move || execute_read_plan(plan_bg, log_cache_bg.as_deref(), &volume_key_bg, 0))
                 .join()
                 .unwrap()
                 .unwrap();
@@ -1142,5 +1169,27 @@ mod tests {
 
         let res = fs.execute_read_plan_sync(plan).unwrap();
         assert_eq!(res, payload);
+    }
+
+    #[test]
+    fn test_read_parallelism_memoization_and_configuration() {
+        let default = default_read_parallelism();
+        assert!(default >= 1);
+        assert!(default <= 16);
+
+        // Calling default_read_parallelism again returns the identical memoized value
+        assert_eq!(default_read_parallelism(), default);
+
+        let fs = InMemoryFS::new();
+        // Default is 0 (auto-detect)
+        assert_eq!(fs.read_parallelism(), 0);
+
+        // Explicit configuration
+        fs.set_read_parallelism(8);
+        assert_eq!(fs.read_parallelism(), 8);
+
+        // Reset to 0 (auto-detect)
+        fs.set_read_parallelism(0);
+        assert_eq!(fs.read_parallelism(), 0);
     }
 }

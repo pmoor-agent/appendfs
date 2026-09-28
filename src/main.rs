@@ -525,6 +525,9 @@ fn cmd_mount(args: MountArgs) {
     fs_instance.flush_interval.store(args.flush_interval, Ordering::SeqCst);
     fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
     fs_instance.track_atime = args.track_atime;
+    fs_instance
+        .read_parallelism
+        .store(args.read_parallelism, Ordering::Relaxed);
 
     fs_instance.log_cache = Some(build_log_cache(
         &args,
@@ -543,7 +546,7 @@ fn cmd_mount(args: MountArgs) {
     let fs_instance = Arc::new(fs_instance);
 
     println!(
-        "Mounting appendfs at '{}' with log-dir '{}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, max-extent-size: {} bytes, foreground: {})...",
+        "Mounting appendfs at '{}' with log-dir '{}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, max-extent-size: {} bytes, read-parallelism: {}, foreground: {})...",
         args.mount_point.display(),
         args.log_dir.display(),
         next_gen,
@@ -552,6 +555,7 @@ fn cmd_mount(args: MountArgs) {
         args.flush_interval,
         args.max_log_size,
         args.max_extent_size,
+        args.read_parallelism,
         args.foreground
     );
 
@@ -616,6 +620,9 @@ fn cmd_mount_ro(args: MountRoArgs) {
     };
     fs_instance.set_storage(storage.clone());
     fs_instance.set_read_only();
+    fs_instance
+        .read_parallelism
+        .store(args.read_parallelism, Ordering::Relaxed);
 
     fs_instance.log_cache = Some(build_log_cache(&args, storage, remote_stores, &fs_instance.manifest));
 
