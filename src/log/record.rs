@@ -293,18 +293,19 @@ impl From<LogDirectoryDelta> for DirectoryDelta {
     }
 }
 
-/// Persisted on-disk descriptor for a single data extent in a delta record (28 bytes).
-///
-/// A `record_log_offset` of 0 marks a hole rather than a reference into a `.log` file
-/// (since valid records start at offset >= 28 past FileHeader). `record_size` holds the
-/// physical on-disk size (header + payload) of the record. `length` holds the extent
-/// or hole length in bytes (u64 allows holes > 32 bits).
+/// Persisted on-disk descriptor for a single extent in a file delta record.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LogExtent {
-    pub file_offset: u64,
-    pub record_log_offset: u64,
-    pub record_size: u32,
-    pub length: u64,
+pub enum LogExtent {
+    /// `length` bytes held by the record at `record_log_offset` in the same `.log` file.
+    /// `record_size` is that record's physical on-disk size (header + payload).
+    Disk {
+        file_offset: u64,
+        record_log_offset: u64,
+        record_size: u32,
+        length: u32,
+    },
+    /// A hole: `length` bytes that read as zeros. `u64` because a hole may exceed 4 GiB.
+    Zero { file_offset: u64, length: u64 },
 }
 
 /// Persisted on-disk representation of a regular file delta.
@@ -328,16 +329,14 @@ impl From<&FileDelta> for LogFileDelta {
                     record_size,
                     length,
                     ..
-                } => LogExtent {
+                } => LogExtent::Disk {
                     file_offset: start,
                     record_log_offset: *record_log_offset,
                     record_size: *record_size,
-                    length: *length as u64,
+                    length: *length,
                 },
-                Extent::Zero { length } => LogExtent {
+                Extent::Zero { length } => LogExtent::Zero {
                     file_offset: start,
-                    record_log_offset: 0,
-                    record_size: 0,
                     length: *length,
                 },
                 // The flush that emits this record converts staged extents to `Disk`
@@ -359,12 +358,18 @@ impl LogFileDelta {
     pub fn into_file_delta(self, generation: u32) -> FileDelta {
         let mut extents = ExtentMap::with_capacity(self.extents.len());
         for ext in self.extents {
-            let state = if ext.record_log_offset == 0 {
-                Extent::new_zero(ext.length)
-            } else {
-                Extent::new_disk(generation, ext.record_log_offset, ext.record_size, 0, ext.length as u32)
-            };
-            extents.insert(ext.file_offset, state);
+            match ext {
+                LogExtent::Disk {
+                    file_offset,
+                    record_log_offset,
+                    record_size,
+                    length,
+                } => extents.insert(
+                    file_offset,
+                    Extent::new_disk(generation, record_log_offset, record_size, 0, length),
+                ),
+                LogExtent::Zero { file_offset, length } => extents.insert(file_offset, Extent::new_zero(length)),
+            }
         }
         FileDelta {
             extents,
@@ -740,6 +745,44 @@ mod tests {
             crate::wire::deserialize::<LogEntryDelta>(&file_bytes).unwrap(),
             file_delta
         );
+    }
+
+    /// Pins the byte layout `scripts/restore.py` parses: a big-endian `u32` variant tag, then
+    /// the variant's fields.
+    #[test]
+    fn test_log_extent_wire_layout() {
+        let disk = LogExtent::Disk {
+            file_offset: 1,
+            record_log_offset: 2,
+            record_size: 3,
+            length: 4,
+        };
+        let bytes = crate::wire::serialize(&disk).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0u32.to_be_bytes());
+        expected.extend_from_slice(&1u64.to_be_bytes());
+        expected.extend_from_slice(&2u64.to_be_bytes());
+        expected.extend_from_slice(&3u32.to_be_bytes());
+        expected.extend_from_slice(&4u32.to_be_bytes());
+        assert_eq!(bytes, expected);
+        assert_eq!(crate::wire::deserialize::<LogExtent>(&bytes).unwrap(), disk);
+
+        // A truncation's hole runs to u64::MAX, well past what a u32 length could hold.
+        let hole = LogExtent::Zero {
+            file_offset: 5,
+            length: u64::MAX - 5,
+        };
+        let bytes = crate::wire::serialize(&hole).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&1u32.to_be_bytes());
+        expected.extend_from_slice(&5u64.to_be_bytes());
+        expected.extend_from_slice(&(u64::MAX - 5).to_be_bytes());
+        assert_eq!(bytes, expected);
+        assert_eq!(crate::wire::deserialize::<LogExtent>(&bytes).unwrap(), hole);
+
+        let mut unknown = bytes;
+        unknown[..4].copy_from_slice(&2u32.to_be_bytes());
+        assert!(crate::wire::deserialize::<LogExtent>(&unknown).is_err());
     }
 
     #[test]

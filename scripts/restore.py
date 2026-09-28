@@ -58,6 +58,9 @@ TAG_CHARDEV = 5
 TAG_BLOCKDEV = 6
 TAG_SOCKET = 7
 
+EXTENT_DISK = 0
+EXTENT_ZERO = 1
+
 DATA_KEY_CONTEXT = "appendfs volume data key v1"
 KCV_KEY_CONTEXT = "appendfs key check value v1"
 LOG_FILE_KEY_CONTEXT = "appendfs log file key v1"
@@ -174,11 +177,20 @@ def parse_entry_delta(payload: bytes) -> tuple:
         extents_cnt = r.read_u64()
         extents = []
         for _ in range(extents_cnt):
-            file_off = r.read_u64()
-            rec_log_off = r.read_u64()
-            rec_size = r.read_u32()
-            length = r.read_u64()
-            extents.append((file_off, rec_log_off, rec_size, length))
+            # (file_off, rec_log_off, length); rec_log_off is None for a hole.
+            kind = r.read_u32()
+            if kind == EXTENT_DISK:
+                file_off = r.read_u64()
+                rec_log_off = r.read_u64()
+                _rec_size = r.read_u32()
+                length = r.read_u32()
+                extents.append((file_off, rec_log_off, length))
+            elif kind == EXTENT_ZERO:
+                file_off = r.read_u64()
+                length = r.read_u64()
+                extents.append((file_off, None, length))
+            else:
+                raise ValueError(f"Unknown LogExtent tag: {kind}")
         size = r.read_opt_u64()
         attrs = parse_attr_delta(r)
         return ("file", extents, size, attrs)
@@ -814,17 +826,19 @@ class Restorer:
                         pass
                 open_mode = "r+b" if primary.exists() else "w+b"
                 with open(primary, open_mode) as f:
-                    for file_off, rec_log_off, _rec_size, length in extents:
-                        if rec_log_off != 0:
+                    for file_off, rec_log_off, length in extents:
+                        if rec_log_off is not None:
                             chunk = batch_chunks.get((ino, rec_log_off))
                             if chunk is not None:
                                 f.seek(file_off)
                                 f.write(chunk[:length])
                         else:
-                            # Zero extent (hole)
+                            # Only bytes already in the file need zeroing: past EOF reads as
+                            # zeros anyway, and a truncation's hole runs to u64::MAX.
+                            eof = f.seek(0, os.SEEK_END)
                             f.seek(file_off)
-                            zero_chunk = b"\0" * min(length, 65536)
-                            rem = length
+                            rem = max(0, min(file_off + length, eof) - file_off)
+                            zero_chunk = b"\0" * min(rem, 65536)
                             while rem > 0:
                                 to_write = min(rem, len(zero_chunk))
                                 f.write(zero_chunk[:to_write])

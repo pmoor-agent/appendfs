@@ -5,15 +5,6 @@ use std::sync::{Arc, RwLock};
 /// Thread-safe buffer reference for staged extent payloads in memory.
 pub type StagedBuffer = Arc<RwLock<Vec<u8>>>;
 
-/// Generation number reserved to mean "this extent is a hole" on disk.
-pub const ZERO_EXTENT_GENERATION: u32 = 0;
-
-/// Decodes a hole's length from an on-disk extent descriptor.
-#[inline]
-pub fn zero_extent_len(record_log_offset: u64) -> u64 {
-    record_log_offset
-}
-
 /// Represents the physical location and state of a file extent slice.
 ///
 /// Plain value enum with zero heap allocations on clone for `Disk` and `Zero` variants,
@@ -80,26 +71,20 @@ impl PartialEq for Extent {
 
 impl Eq for Extent {}
 
+/// Persisted `.summary` form of an [`Extent`]. `Staged` has no on-disk form: a summary is only
+/// ever exported from flushed state.
 #[derive(Serialize, Deserialize)]
-struct SerializedExtent {
-    generation: u32,
-    record_log_offset: u64,
-    record_size: u32,
-    payload_offset: u32,
-    length: u32,
-}
-
-impl SerializedExtent {
-    #[inline]
-    fn zero(length: u64) -> Self {
-        Self {
-            generation: ZERO_EXTENT_GENERATION,
-            record_log_offset: length,
-            record_size: 0,
-            payload_offset: 0,
-            length: 0,
-        }
-    }
+enum SerializedExtent {
+    Disk {
+        generation: u32,
+        record_log_offset: u64,
+        record_size: u32,
+        payload_offset: u32,
+        length: u32,
+    },
+    Zero {
+        length: u64,
+    },
 }
 
 impl Serialize for Extent {
@@ -114,7 +99,7 @@ impl Serialize for Extent {
                 record_size,
                 payload_offset,
                 length,
-            } => SerializedExtent {
+            } => SerializedExtent::Disk {
                 generation: *generation,
                 record_log_offset: *record_log_offset,
                 record_size: *record_size,
@@ -122,7 +107,7 @@ impl Serialize for Extent {
                 length: *length,
             }
             .serialize(serializer),
-            Extent::Zero { length } => SerializedExtent::zero(*length).serialize(serializer),
+            Extent::Zero { length } => SerializedExtent::Zero { length: *length }.serialize(serializer),
             Extent::Staged { .. } => Err(serde::ser::Error::custom(
                 "cannot serialize an extent that has not been flushed to disk",
             )),
@@ -135,18 +120,16 @@ impl<'de> Deserialize<'de> for Extent {
     where
         D: serde::Deserializer<'de>,
     {
-        let s = SerializedExtent::deserialize(deserializer)?;
-        if s.generation == ZERO_EXTENT_GENERATION {
-            Ok(Self::new_zero(zero_extent_len(s.record_log_offset)))
-        } else {
-            Ok(Self::new_disk(
-                s.generation,
-                s.record_log_offset,
-                s.record_size,
-                s.payload_offset,
-                s.length,
-            ))
-        }
+        Ok(match SerializedExtent::deserialize(deserializer)? {
+            SerializedExtent::Disk {
+                generation,
+                record_log_offset,
+                record_size,
+                payload_offset,
+                length,
+            } => Self::new_disk(generation, record_log_offset, record_size, payload_offset, length),
+            SerializedExtent::Zero { length } => Self::new_zero(length),
+        })
     }
 }
 
@@ -961,6 +944,20 @@ impl<'de> Deserialize<'de> for ExtentMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_summary_extent_round_trip() {
+        let disk = Extent::new_disk(7, 1024, 137, 20, 100);
+        let bytes = crate::wire::serialize(&disk).unwrap();
+        assert_eq!(crate::wire::deserialize::<Extent>(&bytes).unwrap(), disk);
+
+        // Longer than a u32 can hold, which the `Disk` variant's `length` could not carry.
+        let hole = Extent::new_zero(u64::MAX - 5);
+        let bytes = crate::wire::serialize(&hole).unwrap();
+        assert_eq!(crate::wire::deserialize::<Extent>(&bytes).unwrap(), hole);
+
+        assert!(crate::wire::serialize(&Extent::new_staged_buffer(vec![1], 0, 1)).is_err());
+    }
 
     #[test]
     fn test_appends_stay_in_single_and_vector_mode() {

@@ -1,8 +1,6 @@
 //! File extent descriptor and state representation.
 
-pub use crate::extent_map::{
-    Extent, Extent as ExtentState, Extent as SharedExtentState, StagedBuffer, ZERO_EXTENT_GENERATION, zero_extent_len,
-};
+pub use crate::extent_map::{Extent, Extent as ExtentState, Extent as SharedExtentState, StagedBuffer};
 
 #[cfg(test)]
 mod tests {
