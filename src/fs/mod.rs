@@ -25,7 +25,7 @@ pub use crate::operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetri
 pub use arena::WriteArena;
 pub use async_tracker::{AsyncOpGuard, AsyncTracker};
 pub use delayed_queue::DelayedResponseQueue;
-pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
+pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource, default_read_parallelism, execute_read_plan};
 pub use overlay::{InnerStatsSnapshot, InodeCounts};
 pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry, is_virtual_ino};
 
@@ -850,6 +850,8 @@ pub struct InMemoryFS {
     pub op_metrics: Arc<FuseOpMetrics>,
     /// Asynchronous queue delaying FUSE responses during buffer saturation.
     pub delayed_queue: Arc<DelayedResponseQueue>,
+    /// Concurrency level for parallel cold disk reads (0 = auto-detect based on CPU cores, max 16).
+    pub read_parallelism: usize,
     /// Optional fixed IV for exported summary files (used for deterministic golden fixture generation and testing).
     pub deterministic_summary_iv: Option<[u8; 12]>,
 }
@@ -959,6 +961,7 @@ impl InMemoryFS {
             async_tracker,
             op_metrics,
             delayed_queue,
+            read_parallelism: 0,
             deterministic_summary_iv: None,
         };
         fs.register_runtime_status();
@@ -1175,6 +1178,16 @@ impl InMemoryFS {
     /// True once the filesystem is read-only or fully stopped.
     pub fn is_read_only(&self) -> bool {
         self.with_inner(OpTag::Other, |inner| inner.shutdown_state != ShutdownState::Running)
+    }
+
+    /// Returns the configured read parallelism for cold disk extent reads (0 = auto-detect).
+    pub fn read_parallelism(&self) -> usize {
+        self.read_parallelism
+    }
+
+    /// Sets the read parallelism for cold disk extent reads. Passing 0 enables auto-detection.
+    pub fn set_read_parallelism(&mut self, workers: usize) {
+        self.read_parallelism = workers;
     }
 
     pub fn recovered_time(&self) -> Option<SystemTime> {

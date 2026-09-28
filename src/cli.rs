@@ -373,6 +373,10 @@ pub struct MountCommonArgs {
     /// Also cache blocks read from sealed logs still present in the log directory, so they stay readable after the local log is pruned (default: false, only blocks fetched from remotes are cached)
     #[arg(long = "disk-cache-local-reads", default_value_t = false)]
     pub disk_cache_local_reads: bool,
+
+    /// Maximum worker threads for parallel cold disk reads (default: 0 = auto-detect based on CPU cores, max 16)
+    #[arg(long = "read-parallelism", default_value_t = 0)]
+    pub read_parallelism: usize,
 }
 
 impl MountCommonArgs {
@@ -595,6 +599,23 @@ mod tests {
         assert_eq!(args.max_flush_queue_ops, 32_768);
         assert_eq!(args.max_log_age, "24h");
         assert!(!args.track_atime);
+        assert_eq!(args.read_parallelism, 0);
+    }
+
+    #[test]
+    fn test_mount_args_read_parallelism() {
+        let cli = Cli::parse_from([
+            "appendfs",
+            "mount",
+            "--read-parallelism",
+            "8",
+            "/path/to/log",
+            "/path/to/mnt",
+        ]);
+        let Commands::Mount(args) = cli.command else {
+            panic!("expected Mount command");
+        };
+        assert_eq!(args.read_parallelism, 8);
     }
 
     #[test]
