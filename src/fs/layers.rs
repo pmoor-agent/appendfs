@@ -14,7 +14,6 @@ use crate::extent_map::Extent;
 use crate::node::{EntryDelta, Node, NodeDelta, NodeKind};
 use crate::shim::{FileAttr, FileType};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 // --- Layer Stack Snapshot & Fold Abstraction ---
@@ -521,12 +520,7 @@ impl ReadPlan {
 impl InMemoryFS {
     /// Executes a [`ReadPlan`] synchronously, reading any cold disk extents via [`LogFileCache`].
     pub fn execute_read_plan_sync(&self, plan: ReadPlan) -> Result<Vec<u8>, FsError> {
-        execute_read_plan(
-            plan,
-            self.log_cache.as_deref(),
-            &self.volume_key,
-            self.read_parallelism.load(Ordering::Relaxed),
-        )
+        execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key, self.read_parallelism)
     }
 }
 
@@ -1180,16 +1174,19 @@ mod tests {
         // Calling default_read_parallelism again returns the identical memoized value
         assert_eq!(default_read_parallelism(), default);
 
-        let fs = InMemoryFS::new();
+        let mut fs = InMemoryFS::new();
         // Default is 0 (auto-detect)
+        assert_eq!(fs.read_parallelism, 0);
         assert_eq!(fs.read_parallelism(), 0);
 
-        // Explicit configuration
-        fs.set_read_parallelism(8);
+        // Explicit configuration via direct field or setter
+        fs.read_parallelism = 8;
+        assert_eq!(fs.read_parallelism, 8);
         assert_eq!(fs.read_parallelism(), 8);
 
         // Reset to 0 (auto-detect)
         fs.set_read_parallelism(0);
+        assert_eq!(fs.read_parallelism, 0);
         assert_eq!(fs.read_parallelism(), 0);
     }
 }
