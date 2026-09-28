@@ -270,67 +270,54 @@ impl<'a> InodeLayerStack<'a> {
         }
 
         let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
-        let mut filled = vec![false; read_len];
-        let mut raw_slices = Vec::new();
+        let mut unfilled = vec![(offset, offset + read_len as u64)];
+        let mut raw_slices: Vec<ReadSlice> = Vec::with_capacity(4);
 
-        let mut add_extent = |ext_start: u64, ext_len: u64, extent: &Extent| {
-            let seg_start = std::cmp::max(offset, ext_start);
-            let seg_end = std::cmp::min(offset + read_len as u64, ext_start + ext_len);
-            if seg_start >= seg_end {
+        let add_extent = |unfilled: &mut Vec<(u64, u64)>,
+                          raw_slices: &mut Vec<ReadSlice>,
+                          ext_start: u64,
+                          ext_len: u64,
+                          extent: &Extent| {
+            if unfilled.is_empty() || ext_len == 0 {
                 return;
             }
+            let ext_end = ext_start + ext_len;
 
-            let dst_offset = (seg_start - offset) as usize;
-            let seg_len = (seg_end - seg_start) as usize;
-            let slice_inner_offset = (seg_start - ext_start) as usize;
+            let mut i = 0;
+            while i < unfilled.len() {
+                let (u_start, u_end) = unfilled[i];
 
-            if filled[dst_offset..dst_offset + seg_len].iter().all(|&b| b) {
-                return;
-            }
+                let seg_start = std::cmp::max(u_start, ext_start);
+                let seg_end = std::cmp::min(u_end, ext_end);
 
-            // Find all contiguous unfilled intervals within [dst_offset..dst_offset + seg_len]
-            let mut idx = dst_offset;
-            let end_idx = dst_offset + seg_len;
-            while idx < end_idx {
-                if filled[idx] {
-                    idx += 1;
+                if seg_start >= seg_end {
+                    i += 1;
                     continue;
                 }
-                let sub_start = idx;
-                while idx < end_idx && !filled[idx] {
-                    filled[idx] = true;
-                    idx += 1;
-                }
-                let sub_end = idx;
-                let sub_len = sub_end - sub_start;
-                let inner_offset = slice_inner_offset + (sub_start - dst_offset);
+
+                let seg_len = (seg_end - seg_start) as usize;
+                let inner_offset = (seg_start - ext_start) as usize;
 
                 let source = match extent {
                     Extent::Zero { .. } => ReadSliceSource::Zero,
                     Extent::Staged {
-                        data,
-                        payload_offset,
-                        length: _,
-                    } => {
-                        let src_offset = *payload_offset as usize + inner_offset;
-                        ReadSliceSource::Memory {
-                            data: data.clone(),
-                            src_offset,
-                        }
-                    }
+                        data, payload_offset, ..
+                    } => ReadSliceSource::Memory {
+                        data: data.clone(),
+                        src_offset: *payload_offset as usize + inner_offset,
+                    },
                     Extent::Disk {
                         generation,
                         record_log_offset,
                         record_size,
                         payload_offset,
-                        length: _,
+                        ..
                     } => {
                         let cached = log_cache.and_then(|c| c.get_cached_record(*generation, *record_log_offset));
                         if let Some(cached_data) = cached {
-                            let src_offset = *payload_offset as usize + inner_offset;
                             ReadSliceSource::Cache {
                                 data: cached_data,
-                                src_offset,
+                                src_offset: *payload_offset as usize + inner_offset,
                             }
                         } else {
                             ReadSliceSource::Disk {
@@ -345,15 +332,32 @@ impl<'a> InodeLayerStack<'a> {
                 };
 
                 raw_slices.push(ReadSlice {
-                    dst_offset: sub_start,
-                    len: sub_len,
+                    dst_offset: (seg_start - offset) as usize,
+                    len: seg_len,
                     source,
                 });
+
+                if seg_start > u_start && seg_end < u_end {
+                    unfilled[i] = (u_start, seg_start);
+                    unfilled.insert(i + 1, (seg_end, u_end));
+                    i += 2;
+                } else if seg_start > u_start {
+                    unfilled[i] = (u_start, seg_start);
+                    i += 1;
+                } else if seg_end < u_end {
+                    unfilled[i] = (seg_end, u_end);
+                    i += 1;
+                } else {
+                    unfilled.remove(i);
+                }
             }
         };
 
         let mut hit_tombstone = false;
         for delta in self.deltas.iter().rev() {
+            if unfilled.is_empty() {
+                break;
+            }
             match delta {
                 EntryDelta::Tombstone => {
                     hit_tombstone = true;
@@ -361,36 +365,35 @@ impl<'a> InodeLayerStack<'a> {
                 }
                 EntryDelta::Node(NodeDelta::File(f)) => {
                     for (ext_start, ext_len, extent) in f.extents.query(offset, read_len as u64) {
-                        add_extent(ext_start, ext_len, &extent);
+                        add_extent(&mut unfilled, &mut raw_slices, ext_start, ext_len, &extent);
+                        if unfilled.is_empty() {
+                            break;
+                        }
                     }
                 }
                 _ => {}
             }
         }
 
-        if !hit_tombstone && let Some(arc) = self.base {
+        if !hit_tombstone
+            && !unfilled.is_empty()
+            && let Some(arc) = self.base
+        {
             let node = arc.as_ref();
             if let NodeKind::File { extent_map, .. } = &node.kind {
                 for (ext_start, ext_len, extent) in extent_map.query(offset, read_len as u64) {
-                    add_extent(ext_start, ext_len, &extent);
+                    add_extent(&mut unfilled, &mut raw_slices, ext_start, ext_len, &extent);
+                    if unfilled.is_empty() {
+                        break;
+                    }
                 }
             }
         }
 
-        // Any bytes never covered by any extent are holes (Zero)
-        let mut idx = 0;
-        while idx < read_len {
-            if filled[idx] {
-                idx += 1;
-                continue;
-            }
-            let hole_start = idx;
-            while idx < read_len && !filled[idx] {
-                idx += 1;
-            }
+        for (u_start, u_end) in unfilled {
             raw_slices.push(ReadSlice {
-                dst_offset: hole_start,
-                len: idx - hole_start,
+                dst_offset: (u_start - offset) as usize,
+                len: (u_end - u_start) as usize,
                 source: ReadSliceSource::Zero,
             });
         }
