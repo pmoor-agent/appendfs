@@ -1,11 +1,15 @@
 use crate::clock::Clock;
-use crate::log::record::{FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCode, RecordHeader};
+use crate::crypto::{LogFileKey, VolumeKey};
+use crate::log::record::{FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCode, RECORD_HEADER_SIZE, RecordHeader};
 use crate::storage::{BufferedStorageWriter, Storage, StorageWriter, WriteMode};
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Initial capacity for the reusable per-record staging buffer (4.25 MiB).
+/// Accommodates max 4 MiB payload + zstd compression expansion bound + header.
+const INITIAL_RECORD_BUFFER_CAPACITY: usize = 4 * 1024 * 1024 + 256 * 1024;
 
 struct ActiveLogFile {
     writer: Box<dyn StorageWriter>,
@@ -24,15 +28,15 @@ struct ActiveLogFile {
     record_count: u32,
     total_data_bytes: u64,
     md5_hasher: md5::Context,
+    record_buf: Vec<u8>,
 }
 
 impl ActiveLogFile {
-    fn append_record(
+    fn append_serialized<T: serde::Serialize>(
         &mut self,
-        compression: crate::compress::Compression,
         op_code: OpCode,
         inode: u64,
-        payload: &[u8],
+        value: &T,
     ) -> io::Result<(u32, u64, u32)> {
         let generation = self.generation;
         let record_log_offset = self.current_offset;
@@ -43,48 +47,192 @@ impl ActiveLogFile {
                 format!("generation {} has used every record sequence number", generation),
             )
         })?;
-        let (actual_op, cipher_payload, auth_tag) = crate::log::codec::encode(
-            &self.file_key,
-            compression,
-            crate::log::codec::RecordId {
-                sequence,
-                op_code: op_code as u8,
-                inode,
-            },
-            payload,
-        )?;
+        let header_size = RECORD_HEADER_SIZE;
+
+        if self.record_buf.len() < header_size {
+            self.record_buf.resize(header_size, 0);
+        } else {
+            self.record_buf.truncate(header_size);
+        }
+
+        crate::wire::serialize_into(&mut self.record_buf, value)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let payload_len = (self.record_buf.len() - header_size) as u32;
+
+        let auth_tag = self
+            .file_key
+            .encrypt_record_in_place(sequence, op_code as u8, inode, &mut self.record_buf[header_size..])
+            .map_err(io::Error::from)?;
 
         let header = RecordHeader {
-            op_code: actual_op,
+            op_code,
             inode,
-            payload_len: cipher_payload.len() as u32,
+            payload_len,
             sequence,
             auth_tag,
         };
-        let header_bytes = header.to_bytes();
-        let total_bytes = header_bytes.len() + cipher_payload.len();
+        self.record_buf[..header_size].copy_from_slice(&header.to_bytes());
 
-        let write_result = (|| -> io::Result<()> {
-            self.writer.append(&header_bytes)?;
-            if !cipher_payload.is_empty() {
-                self.writer.append(&cipher_payload)?;
-            }
-            Ok(())
-        })();
-
+        let total_bytes = self.record_buf.len();
+        let write_result = self.writer.append(&self.record_buf);
         if let Err(e) = write_result {
             let _ = self.writer.truncate(record_log_offset);
             self.current_offset = record_log_offset;
             return Err(e);
         }
 
-        self.md5_hasher.consume(header_bytes);
-        if !cipher_payload.is_empty() {
-            self.md5_hasher.consume(&cipher_payload);
-        }
+        self.md5_hasher.consume(&self.record_buf);
         self.current_offset += total_bytes as u64;
 
         Ok((generation, record_log_offset, total_bytes as u32))
+    }
+
+    fn append_data_slices(
+        &mut self,
+        compression: crate::compress::Compression,
+        inode: u64,
+        slices: &[&[u8]],
+        total_uncompressed_len: usize,
+    ) -> io::Result<(u32, u64, u32)> {
+        let generation = self.generation;
+        let record_log_offset = self.current_offset;
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("generation {} has used every record sequence number", generation),
+            )
+        })?;
+        let header_size = RECORD_HEADER_SIZE;
+
+        let mut actual_op = OpCode::Data;
+        let mut payload_len = total_uncompressed_len;
+        let mut compressed_successfully = false;
+
+        if compression == crate::compress::Compression::Zstd && total_uncompressed_len > 0 {
+            if self.record_buf.len() < header_size {
+                self.record_buf.resize(header_size, 0);
+            } else {
+                self.record_buf.truncate(header_size);
+            }
+
+            let compress_result = (|| -> io::Result<usize> {
+                let mut encoder = zstd::stream::Encoder::new(&mut self.record_buf, crate::compress::ZSTD_LEVEL)?;
+                encoder.set_pledged_src_size(Some(total_uncompressed_len as u64))?;
+                for slice in slices {
+                    std::io::Write::write_all(&mut encoder, slice)?;
+                }
+                encoder.finish()?;
+                Ok(self.record_buf.len() - header_size)
+            })();
+
+            if let Ok(comp_len) = compress_result
+                && crate::compress::is_compression_beneficial(total_uncompressed_len, comp_len)
+            {
+                actual_op = OpCode::DataZstd;
+                payload_len = comp_len;
+                compressed_successfully = true;
+            }
+        }
+
+        if !compressed_successfully {
+            actual_op = OpCode::Data;
+            payload_len = total_uncompressed_len;
+            let total_needed = header_size + total_uncompressed_len;
+            if self.record_buf.len() < total_needed {
+                self.record_buf.resize(total_needed, 0);
+            }
+            let mut offset = header_size;
+            for slice in slices {
+                self.record_buf[offset..offset + slice.len()].copy_from_slice(slice);
+                offset += slice.len();
+            }
+        }
+
+        let auth_tag = self
+            .file_key
+            .encrypt_record_in_place(
+                sequence,
+                actual_op as u8,
+                inode,
+                &mut self.record_buf[header_size..header_size + payload_len],
+            )
+            .map_err(io::Error::from)?;
+
+        let header = RecordHeader {
+            op_code: actual_op,
+            inode,
+            payload_len: payload_len as u32,
+            sequence,
+            auth_tag,
+        };
+        self.record_buf[..header_size].copy_from_slice(&header.to_bytes());
+
+        let total_bytes = header_size + payload_len;
+        let write_result = self.writer.append(&self.record_buf[..total_bytes]);
+        if let Err(e) = write_result {
+            let _ = self.writer.truncate(record_log_offset);
+            self.current_offset = record_log_offset;
+            return Err(e);
+        }
+
+        self.md5_hasher.consume(&self.record_buf[..total_bytes]);
+        self.current_offset += total_bytes as u64;
+
+        Ok((generation, record_log_offset, total_bytes as u32))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    fn append_raw_payload(&mut self, op_code: OpCode, inode: u64, payload: &[u8]) -> io::Result<(u32, u64, u32)> {
+        let generation = self.generation;
+        let record_log_offset = self.current_offset;
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("generation {} has used every record sequence number", generation),
+            )
+        })?;
+        let header_size = RECORD_HEADER_SIZE;
+        let total_needed = header_size + payload.len();
+
+        if self.record_buf.len() < total_needed {
+            self.record_buf.resize(total_needed, 0);
+        }
+
+        self.record_buf[header_size..total_needed].copy_from_slice(payload);
+
+        let auth_tag = self
+            .file_key
+            .encrypt_record_in_place(
+                sequence,
+                op_code as u8,
+                inode,
+                &mut self.record_buf[header_size..total_needed],
+            )
+            .map_err(io::Error::from)?;
+
+        let header = RecordHeader {
+            op_code,
+            inode,
+            payload_len: payload.len() as u32,
+            sequence,
+            auth_tag,
+        };
+        self.record_buf[..header_size].copy_from_slice(&header.to_bytes());
+
+        let write_result = self.writer.append(&self.record_buf[..total_needed]);
+        if let Err(e) = write_result {
+            let _ = self.writer.truncate(record_log_offset);
+            self.current_offset = record_log_offset;
+            return Err(e);
+        }
+
+        self.md5_hasher.consume(&self.record_buf[..total_needed]);
+        self.current_offset += total_needed as u64;
+
+        Ok((generation, record_log_offset, total_needed as u32))
     }
 
     fn seal(mut self, timestamp: std::time::SystemTime) -> io::Result<super::manifest::LogFileInfo> {
@@ -93,10 +241,7 @@ impl ActiveLogFile {
                 timestamp,
                 record_count: self.record_count,
             };
-            let payload_bytes =
-                crate::wire::serialize(&seal_payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            self.append_record(crate::compress::Compression::None, OpCode::Seal, 0, &payload_bytes)?;
+            self.append_serialized(OpCode::Seal, 0, &seal_payload)?;
         }
         self.writer.sync()?;
         drop(self.writer);
@@ -125,12 +270,30 @@ enum ActiveLogState {
     Open(ActiveLogFile),
 }
 
+impl ActiveLogState {
+    fn get_or_open(&mut self, storage: &Arc<dyn Storage>, keying: &FileKeying) -> io::Result<&mut ActiveLogFile> {
+        match self {
+            ActiveLogState::Open(a) => Ok(a),
+            ActiveLogState::Unopened { generation, created_at } => {
+                let gen_num = *generation;
+                let c_time = created_at.unwrap_or_else(std::time::SystemTime::now);
+                let active_file = open_generation_file(storage, keying, gen_num, c_time)?;
+                *self = ActiveLogState::Open(active_file);
+                match self {
+                    ActiveLogState::Open(a) => Ok(a),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
 /// Syncs and seals `active`, then replaces it with a freshly opened next generation.
 ///
 /// Shared by the three ways a generation ends - size, age, and an explicit force-roll - so
 /// they cannot drift on how a log file is closed out.
 fn seal_and_open_next(
-    active: ActiveLogFile,
+    mut active: ActiveLogFile,
     storage: &Arc<dyn Storage>,
     keying: &FileKeying,
     clock: &dyn Clock,
@@ -138,8 +301,10 @@ fn seal_and_open_next(
 ) -> io::Result<(ActiveLogFile, super::manifest::LogFileInfo)> {
     let next_gen = next_generation(active.generation)?;
     let now = clock.now();
+    let record_buf = std::mem::take(&mut active.record_buf);
     let sealed_info = active.seal(now)?;
-    let next_active = open_generation_file(storage, keying, next_gen, now)?;
+    let mut next_active = open_generation_file(storage, keying, next_gen, now)?;
+    next_active.record_buf = record_buf;
     log::info!(
         "{} log file to generation {} ({})",
         reason,
@@ -226,10 +391,9 @@ fn open_generation_file(
         record_count: 0,
         total_data_bytes: 0,
         md5_hasher,
+        record_buf: Vec::with_capacity(INITIAL_RECORD_BUFFER_CAPACITY),
     })
 }
-
-use crate::crypto::{LogFileKey, VolumeKey};
 
 /// Produces the key salt for each log file a [`LogWriter`] creates, given its generation.
 ///
@@ -385,8 +549,8 @@ impl LogWriter {
 
     /// Replaces the random source of per-file key salts with `key_salts`.
     ///
-    /// For fixture generation and tests that need identical bytes on every run. Takes effect
-    /// for files opened from now on, so pair it with a lazy constructor to cover the first.
+    /// For fixture generation and tests that need identical bytes on every run - see [`LogWriter::with_key_salts`].
+    /// Takes effect for files opened from now on, so pair it with a lazy constructor to cover the first.
     ///
     /// Crate-private rather than `cfg`-gated to tests: the `generate_compat_fixture` binary is
     /// built without the `testing` feature and reaches this through [`crate::compat`]. Nothing
@@ -430,17 +594,6 @@ impl LogWriter {
     /// Seals the active generation if it has reached `max_log_size` or `max_log_age`, leaving
     /// its successor lazy (unopened) until [`LogWriter::open_if_unopened`] has something to
     /// write to it. Returns the sealed `LogFileInfo` if a rollover occurred.
-    ///
-    /// The flusher runs this after every synced group and at the end of every cycle, including
-    /// idle ones, so an untouched filesystem still seals its generation on schedule. Leaving the
-    /// successor unopened means neither an idle filesystem nor a shutdown drain leaves empty
-    /// log files behind.
-    ///
-    /// `max_log_size` is a soft limit: this runs after a batch group has been written, not
-    /// before, so the group that crosses `max_log_size` lands in full. A single batch can be
-    /// as large as the flush threshold (`--flush-threshold`, 128 MiB by default), and up to
-    /// about twice that when a slow flush lets staged writes pile up, so a generation can
-    /// overshoot by that much before it is rolled.
     pub fn roll_if_needed(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
@@ -559,30 +712,61 @@ impl LogWriter {
         }
     }
 
-    /// Appends a record (`RecordHeader` + payload bytes) to the active log file.
+    /// Appends a serializable struct as a record payload directly into the internal reusable buffer
+    /// without intermediate heap allocations.
     ///
     /// Returns `(generation, record_log_offset, record_size)`.
-    pub fn append_record(&self, op_code: OpCode, inode: u64, payload: &[u8]) -> io::Result<(u32, u64, u32)> {
+    pub fn append_serialized<T: serde::Serialize>(
+        &self,
+        op_code: OpCode,
+        inode: u64,
+        value: &T,
+    ) -> io::Result<(u32, u64, u32)> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
+        let active = state.get_or_open(&self.storage, &self.keying)?;
+        active.append_serialized(op_code, inode, value)
+    }
 
-        let active = match &mut *state {
-            ActiveLogState::Open(a) => a,
-            ActiveLogState::Unopened { generation, created_at } => {
-                let gen_num = *generation;
-                let c_time = created_at.unwrap_or_else(std::time::SystemTime::now);
-                let active_file = open_generation_file(&self.storage, &self.keying, gen_num, c_time)?;
-                *state = ActiveLogState::Open(active_file);
-                match &mut *state {
-                    ActiveLogState::Open(a) => a,
-                    _ => unreachable!(),
-                }
-            }
+    /// Appends a raw file data record from one or more contiguous slices, compressing
+    /// optimistically directly into the internal reusable buffer if compression is enabled.
+    ///
+    /// Returns `(generation, record_log_offset, record_size)`.
+    pub fn append_data_slices(
+        &self,
+        inode: u64,
+        slices: &[&[u8]],
+        total_uncompressed_len: usize,
+    ) -> io::Result<(u32, u64, u32)> {
+        let mut state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
         };
+        let active = state.get_or_open(&self.storage, &self.keying)?;
+        active.append_data_slices(self.compression, inode, slices, total_uncompressed_len)
+    }
 
-        active.append_record(self.compression, op_code, inode, payload)
+    /// Appends a data record from a single payload slice to the active log file,
+    /// compressing optimistically directly into the internal reusable buffer if enabled.
+    ///
+    /// Returns `(generation, record_log_offset, record_size)`.
+    pub fn append_data(&self, inode: u64, data: &[u8]) -> io::Result<(u32, u64, u32)> {
+        self.append_data_slices(inode, &[data], data.len())
+    }
+
+    /// Appends a raw record with explicit opcode and byte payload without compression.
+    ///
+    /// Intended for test suites constructing arbitrary or edge-case records directly.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn append_raw_for_test(&self, op_code: OpCode, inode: u64, payload: &[u8]) -> io::Result<(u32, u64, u32)> {
+        let mut state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let active = state.get_or_open(&self.storage, &self.keying)?;
+        active.append_raw_payload(op_code, inode, payload)
     }
 
     /// Rolls back the active log file to the given `checkpoint`.
@@ -636,10 +820,7 @@ impl LogWriter {
             record_count,
         };
 
-        let payload_bytes =
-            crate::wire::serialize(&commit_payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        if let Err(e) = self.append_record(OpCode::FlushCommit, 0, &payload_bytes) {
+        if let Err(e) = self.append_serialized(OpCode::FlushCommit, 0, &commit_payload) {
             self.batch_id.store(batch_id, Ordering::SeqCst);
             return Err(e);
         }
@@ -656,23 +837,19 @@ impl LogWriter {
         Ok(batch_id)
     }
 
-    /// Flushes unwritten internal buffers through to persistent media.
-    ///
-    /// This is a physical sync, not a buffer hand-off: the flusher calls it on every batch,
-    /// which is what makes a completed batch durable.
+    /// Synchronously flushes in-memory buffers through to durable media.
     pub fn flush(&self) -> io::Result<()> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
         if let ActiveLogState::Open(active) = &mut *state {
-            active.writer.sync()
-        } else {
-            Ok(())
+            active.writer.sync()?;
         }
+        Ok(())
     }
 
-    /// Returns the active generation sequence number.
+    /// Returns the current active generation number.
     pub fn generation(&self) -> u32 {
         let state = match self.active_state.lock() {
             Ok(g) => g,
@@ -684,31 +861,7 @@ impl LogWriter {
         }
     }
 
-    /// Returns the creation timestamp of the active log file if known.
-    pub fn created_at(&self) -> Option<std::time::SystemTime> {
-        let state = match self.active_state.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-        match &*state {
-            ActiveLogState::Unopened { created_at, .. } => *created_at,
-            ActiveLogState::Open(active) => Some(active.created_at),
-        }
-    }
-
-    /// Returns the current byte offset of the active log file.
-    pub fn current_offset(&self) -> u64 {
-        let state = match self.active_state.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-        match &*state {
-            ActiveLogState::Unopened { .. } => 0,
-            ActiveLogState::Open(active) => active.current_offset,
-        }
-    }
-
-    /// Returns the current log filename.
+    /// Returns the active log file name.
     pub fn filename(&self) -> String {
         let state = match self.active_state.lock() {
             Ok(g) => g,
@@ -720,29 +873,26 @@ impl LogWriter {
         }
     }
 
-    /// Returns the filesystem path to the active log file if OsStorage is used.
-    pub fn path(&self) -> PathBuf {
-        PathBuf::from(self.filename())
-    }
-
-    /// Returns the last batch ID assigned by this writer.
-    pub fn last_batch_id(&self) -> u64 {
-        self.batch_id.load(Ordering::SeqCst).saturating_sub(1)
-    }
-
-    /// Returns the streaming MD5 digest of all bytes written to the active log file so far.
-    pub fn current_md5(&self) -> Option<[u8; 16]> {
+    /// Returns the current byte offset in the active generation log file.
+    ///
+    /// For unopened writers, returns `0` (before the initial `FileHeader`).
+    pub fn current_offset(&self) -> u64 {
         let state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
         match &*state {
-            ActiveLogState::Unopened { .. } => None,
-            ActiveLogState::Open(active) => Some(active.md5_hasher.clone().compute().0),
+            ActiveLogState::Unopened { .. } => 0,
+            ActiveLogState::Open(active) => active.current_offset,
         }
     }
 
-    /// Returns the number of records committed in the active log file.
+    /// Returns the ID of the last committed flush batch, or 0 if none has been committed yet.
+    pub fn last_batch_id(&self) -> u64 {
+        self.batch_id.load(Ordering::SeqCst).saturating_sub(1)
+    }
+
+    /// Returns the number of user and flush records written to the active log file.
     pub fn record_count(&self) -> u32 {
         let state = match self.active_state.lock() {
             Ok(g) => g,
@@ -803,7 +953,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(writer.generation(), 1);
-        let (gen_num, offset, rec_size) = writer.append_record(OpCode::Data, 100, b"test_data").unwrap();
+        let (gen_num, offset, rec_size) = writer.append_data(100, b"test_data").unwrap();
         assert_eq!(gen_num, 1);
         assert_eq!(offset, FILE_HEADER_SIZE as u64);
         assert_eq!(rec_size, (crate::log::record::RECORD_HEADER_SIZE + 9) as u32);
@@ -820,13 +970,13 @@ mod tests {
     }
 
     #[test]
-    fn test_append_record_never_rolls_mid_batch() {
+    fn test_append_data_never_rolls_mid_batch() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
         let writer = LogWriter::create(storage.clone(), 1, &clock, 30, 1, VolumeKey::plaintext_arc()).unwrap();
 
         for _ in 0..5 {
-            let (gen_num, _, _) = writer.append_record(OpCode::Data, 1, b"0123456789").unwrap();
+            let (gen_num, _, _) = writer.append_data(1, b"0123456789").unwrap();
             assert_eq!(gen_num, 1);
         }
         assert_eq!(writer.generation(), 1);
@@ -838,13 +988,13 @@ mod tests {
         let clock = SystemClock;
         let writer = LogWriter::create(storage.clone(), 1, &clock, 40, 1, VolumeKey::plaintext_arc()).unwrap();
 
-        writer.append_record(OpCode::Data, 1, b"0123456789").unwrap();
+        writer.append_data(1, b"0123456789").unwrap();
         assert_eq!(writer.generation(), 1);
 
         writer.roll_if_needed(&clock).unwrap();
         assert_eq!(writer.generation(), 2);
 
-        let (gen_num, _, _) = writer.append_record(OpCode::Data, 2, b"0123456789").unwrap();
+        let (gen_num, _, _) = writer.append_data(2, b"0123456789").unwrap();
         assert_eq!(gen_num, 2);
     }
 
@@ -862,8 +1012,8 @@ mod tests {
         )
         .unwrap();
 
-        writer.append_record(OpCode::InodeDelta, 1, b"payload").unwrap();
-        writer.append_record(OpCode::Data, 1, b"more").unwrap();
+        writer.append_raw_for_test(OpCode::InodeDelta, 1, b"payload").unwrap();
+        writer.append_data(1, b"more").unwrap();
         let committed_batch_id = writer.emit_flush_commit(2, 4, clock.now()).unwrap();
         writer.flush().unwrap();
         assert_eq!(committed_batch_id, 1);
@@ -910,9 +1060,9 @@ mod tests {
         let clock = crate::clock::MockClock(mock_time);
         let writer = LogWriter::create(storage.clone(), 1, &clock, 100, 1, VolumeKey::plaintext_arc()).unwrap();
 
-        writer.append_record(OpCode::Data, 1, b"first record payload").unwrap();
+        writer.append_data(1, b"first record payload").unwrap();
         writer
-            .append_record(OpCode::InodeDelta, 1, b"second record payload")
+            .append_raw_for_test(OpCode::InodeDelta, 1, b"second record payload")
             .unwrap();
         writer.emit_flush_commit(2, 20, clock.now()).unwrap();
         writer.flush().unwrap();
@@ -974,7 +1124,7 @@ mod tests {
         assert_eq!(writer.generation(), 1);
 
         // Write a user record so the log has committed data
-        writer.append_record(OpCode::Data, 10, b"some data").unwrap();
+        writer.append_data(10, b"some data").unwrap();
 
         // Aged out now: rolls, seals generation 1, and leaves generation 2 in lazy mode
         let rolled = writer.roll_if_needed(&clock).unwrap();
@@ -998,10 +1148,11 @@ mod tests {
         assert!(writer.roll_if_needed(&clock).unwrap().is_none());
         assert!(!writer.is_open());
         assert!(!storage.exists("000002.log"));
+
         assert!(!storage.exists("000003.log"));
 
         // First write into generation 2 lazily opens 000002.log
-        let (gen_num, offset, _) = writer.append_record(OpCode::Data, 10, b"generation 2 data").unwrap();
+        let (gen_num, offset, _) = writer.append_data(10, b"generation 2 data").unwrap();
         assert_eq!(gen_num, 2);
         assert_eq!(offset, FILE_HEADER_SIZE as u64);
         assert!(writer.is_open());
@@ -1017,7 +1168,7 @@ mod tests {
         // When nothing written, seal_active returns None
         assert!(writer.seal_active(&clock).unwrap().is_none());
 
-        writer.append_record(OpCode::Data, 1, b"active data").unwrap();
+        writer.append_data(1, b"active data").unwrap();
         let sealed = writer.seal_active(&clock).unwrap().unwrap();
         assert_eq!(sealed.generation, 1);
         assert_ne!(sealed.md5, [0u8; 16]);
@@ -1035,7 +1186,7 @@ mod tests {
         let checkpoint1 = writer.checkpoint();
 
         // Write some records and emit flush commit
-        writer.append_record(OpCode::Data, 1, b"batch data").unwrap();
+        writer.append_data(1, b"batch data").unwrap();
         let committed_id = writer.emit_flush_commit(1, 10, clock.now()).unwrap();
         writer.flush().unwrap();
         assert_eq!(committed_id, 1);
@@ -1049,7 +1200,7 @@ mod tests {
         let checkpoint2 = writer.checkpoint();
         assert_eq!(checkpoint2.offset, checkpoint1.offset);
         assert_eq!(checkpoint2.batch_id, 1);
-        writer.append_record(OpCode::Data, 1, b"batch data retry").unwrap();
+        writer.append_data(1, b"batch data retry").unwrap();
         let retried_id = writer.emit_flush_commit(1, 16, clock.now()).unwrap();
         writer.flush().unwrap();
         assert_eq!(retried_id, 1);
@@ -1065,7 +1216,7 @@ mod tests {
         // Checkpoint A (before batch 1)
         let cp_a = writer.checkpoint();
 
-        writer.append_record(OpCode::Data, 1, b"batch 1 data").unwrap();
+        writer.append_data(1, b"batch 1 data").unwrap();
         let b1 = writer.emit_flush_commit(1, 12, clock.now()).unwrap();
         assert_eq!(b1, 1);
 
@@ -1074,7 +1225,7 @@ mod tests {
         assert_eq!(cp_b.batch_id, 2);
         assert!(cp_b.offset > cp_a.offset);
 
-        writer.append_record(OpCode::Data, 2, b"batch 2 data").unwrap();
+        writer.append_data(2, b"batch 2 data").unwrap();
         let b2 = writer.emit_flush_commit(1, 12, clock.now()).unwrap();
         assert_eq!(b2, 2);
 
@@ -1083,7 +1234,7 @@ mod tests {
         assert_eq!(cp_c.batch_id, 3);
         assert!(cp_c.offset > cp_b.offset);
 
-        writer.append_record(OpCode::Data, 3, b"batch 3 partial").unwrap();
+        writer.append_data(3, b"batch 3 partial").unwrap();
 
         // Roll back to CP B: should restore to end of batch 1
         writer.rollback_to(&cp_b).unwrap();
@@ -1094,5 +1245,89 @@ mod tests {
         writer.rollback_to(&cp_a).unwrap();
         assert_eq!(writer.current_offset(), cp_a.offset);
         assert_eq!(writer.last_batch_id(), 0);
+    }
+
+    #[test]
+    fn test_append_serialized_direct() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = SystemClock;
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 10000, 1, VolumeKey::plaintext_arc()).unwrap();
+
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct TestMetadata {
+            name: String,
+            count: u64,
+            tags: Vec<String>,
+        }
+
+        let meta = TestMetadata {
+            name: "test_dir".to_string(),
+            count: 42,
+            tags: vec!["a".to_string(), "b".to_string()],
+        };
+
+        let (gen_num, _offset, size) = writer.append_serialized(OpCode::InodeDelta, 10, &meta).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(gen_num, 1);
+        assert!(size > 37);
+
+        let reader =
+            super::super::reader::LogReader::open(storage.as_ref(), "000001.log", VolumeKey::plaintext_arc()).unwrap();
+        let records: Vec<_> = reader.collect::<io::Result<Vec<_>>>().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].header.op_code, OpCode::InodeDelta);
+        assert_eq!(records[0].header.inode, 10);
+        let decoded: TestMetadata = crate::wire::deserialize(&records[0].payload).unwrap();
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn test_append_data_slices_optimistic_compression() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = SystemClock;
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 100000, 1, VolumeKey::plaintext_arc())
+            .unwrap()
+            .with_compression(crate::compress::Compression::Zstd);
+
+        // Highly compressible repetitive data
+        let chunk1 = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let chunk2 = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let full = [chunk1.as_slice(), chunk2.as_slice()].concat();
+
+        let (gen_num, _, _) = writer.append_data_slices(20, &[chunk1, chunk2], full.len()).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(gen_num, 1);
+
+        let reader =
+            super::super::reader::LogReader::open(storage.as_ref(), "000001.log", VolumeKey::plaintext_arc()).unwrap();
+        let records: Vec<_> = reader.collect::<io::Result<Vec<_>>>().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].header.op_code, OpCode::DataZstd);
+        assert_eq!(records[0].payload, full);
+
+        // Incompressible data should fall back to OpCode::Data
+        let mut incompressible = vec![0u8; 1000];
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        for b in incompressible.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+
+        let slice1 = &incompressible[..500];
+        let slice2 = &incompressible[500..];
+        let (gen2, _, _) = writer
+            .append_data_slices(21, &[slice1, slice2], incompressible.len())
+            .unwrap();
+        writer.flush().unwrap();
+        assert_eq!(gen2, 1);
+
+        let reader2 =
+            super::super::reader::LogReader::open(storage.as_ref(), "000001.log", VolumeKey::plaintext_arc()).unwrap();
+        let records2: Vec<_> = reader2.collect::<io::Result<Vec<_>>>().unwrap();
+        assert_eq!(records2.len(), 2);
+        assert_eq!(records2[1].header.op_code, OpCode::Data);
+        assert_eq!(records2[1].payload, incompressible);
     }
 }

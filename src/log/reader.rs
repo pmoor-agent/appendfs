@@ -206,8 +206,8 @@ mod tests {
         )
         .unwrap();
 
-        writer.append_record(OpCode::Data, 2, b"payload1").unwrap();
-        writer.append_record(OpCode::InodeDelta, 3, b"payload22").unwrap();
+        writer.append_data(2, b"payload1").unwrap();
+        writer.append_raw_for_test(OpCode::InodeDelta, 3, b"payload22").unwrap();
         writer.flush().unwrap();
 
         let mut reader = LogReader::open(&storage, &writer.filename(), VolumeKey::plaintext_arc()).unwrap();
@@ -241,7 +241,7 @@ mod tests {
         )
         .unwrap();
 
-        writer.append_record(OpCode::Data, 2, b"payload1").unwrap();
+        writer.append_data(2, b"payload1").unwrap();
         writer.flush().unwrap();
         let filename = writer.filename();
         drop(writer);
@@ -273,8 +273,8 @@ mod tests {
             VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        writer.append_record(OpCode::Data, 2, b"payload1").unwrap();
-        writer.append_record(OpCode::Data, 2, b"payload2").unwrap();
+        writer.append_data(2, b"payload1").unwrap();
+        writer.append_data(2, b"payload2").unwrap();
         writer.flush().unwrap();
         let filename = writer.filename();
         drop(writer);

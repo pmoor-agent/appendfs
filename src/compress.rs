@@ -66,40 +66,58 @@ thread_local! {
     static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { RefCell::new(None) };
 }
 
-fn decompress_zstd_buffered(compressed: &[u8], capacity: usize) -> io::Result<Vec<u8>> {
-    DECOMPRESSOR.with_borrow_mut(|slot| {
-        let decompressor = match slot {
-            Some(d) => d,
-            None => {
-                *slot = Some(zstd::bulk::Decompressor::new()?);
-                slot.as_mut().unwrap()
-            }
-        };
-        decompressor.decompress(compressed, capacity)
-    })
-}
-
-/// Compresses `payload` unconditionally using zstd.
-pub fn compress_zstd_unconditional(payload: &[u8]) -> io::Result<Vec<u8>> {
+fn with_compressor<R>(f: impl FnOnce(&mut zstd::bulk::Compressor<'static>) -> io::Result<R>) -> io::Result<R> {
     COMPRESSOR.with_borrow_mut(|slot| {
-        let compressor = match slot {
-            Some(c) => c,
+        let val = match slot {
+            Some(v) => v,
             None => {
                 *slot = Some(zstd::bulk::Compressor::new(ZSTD_LEVEL)?);
                 slot.as_mut().unwrap()
             }
         };
-        compressor.compress(payload)
+        f(val)
     })
+}
+
+fn with_decompressor<R>(f: impl FnOnce(&mut zstd::bulk::Decompressor<'static>) -> io::Result<R>) -> io::Result<R> {
+    DECOMPRESSOR.with_borrow_mut(|slot| {
+        let val = match slot {
+            Some(v) => v,
+            None => {
+                *slot = Some(zstd::bulk::Decompressor::new()?);
+                slot.as_mut().unwrap()
+            }
+        };
+        f(val)
+    })
+}
+
+fn decompress_zstd_buffered(compressed: &[u8], capacity: usize) -> io::Result<Vec<u8>> {
+    with_decompressor(|d| d.decompress(compressed, capacity))
+}
+
+/// Compresses `payload` unconditionally using zstd.
+pub fn compress_zstd_unconditional(payload: &[u8]) -> io::Result<Vec<u8>> {
+    with_compressor(|c| c.compress(payload))
+}
+
+/// Returns true if compression achieves at least the required space saving threshold.
+pub fn is_compression_beneficial(original_len: usize, compressed_len: usize) -> bool {
+    let saved = original_len.saturating_sub(compressed_len);
+    saved >= original_len / MIN_SAVING_DENOMINATOR * MIN_SAVING_NUMERATOR && compressed_len > 0
+}
+
+/// Compresses `payload` directly into `dst` using the thread-local compressor.
+pub fn compress_zstd_into(payload: &[u8], dst: &mut [u8]) -> io::Result<usize> {
+    with_compressor(|c| c.compress_to_buffer(payload, dst))
 }
 
 /// Compresses `payload` using zstd if compression is beneficial.
 pub fn compress_zstd(payload: &[u8]) -> Option<Vec<u8>> {
-    if let Ok(compressed) = compress_zstd_unconditional(payload) {
-        let saved = payload.len().saturating_sub(compressed.len());
-        if saved >= payload.len() / MIN_SAVING_DENOMINATOR * MIN_SAVING_NUMERATOR && !compressed.is_empty() {
-            return Some(compressed);
-        }
+    if let Ok(compressed) = compress_zstd_unconditional(payload)
+        && is_compression_beneficial(payload.len(), compressed.len())
+    {
+        return Some(compressed);
     }
     None
 }

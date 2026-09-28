@@ -561,9 +561,7 @@ mod tests {
             )
             .unwrap(),
         );
-        writer1
-            .append_record(crate::log::record::OpCode::Data, 1, b"batch1 data")
-            .unwrap();
+        writer1.append_data(1, b"batch1 data").unwrap();
         writer1
             .emit_flush_commit(1, b"batch1 data".len() as u64, clock.now())
             .unwrap();
@@ -584,9 +582,7 @@ mod tests {
             )
             .unwrap(),
         );
-        writer2
-            .append_record(crate::log::record::OpCode::Data, 1, b"batch3 data")
-            .unwrap();
+        writer2.append_data(1, b"batch3 data").unwrap();
         writer2
             .emit_flush_commit(1, b"batch3 data".len() as u64, clock.now())
             .unwrap();

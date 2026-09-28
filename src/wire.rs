@@ -29,6 +29,12 @@ pub fn serialize<T: ?Sized + Serialize>(value: &T) -> bincode::Result<Vec<u8>> {
     options().serialize(value)
 }
 
+/// Serializes `value` directly into `writer` in the on-disk encoding.
+pub fn serialize_into<W: std::io::Write, T: ?Sized + Serialize>(writer: W, value: &T) -> bincode::Result<()> {
+    use bincode::Options;
+    options().serialize_into(writer, value)
+}
+
 /// Deserializes `bytes` written by [`serialize`].
 pub fn deserialize<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> bincode::Result<T> {
     use bincode::Options;

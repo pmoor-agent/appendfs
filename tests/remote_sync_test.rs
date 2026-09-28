@@ -2134,7 +2134,7 @@ fn test_unsealed_manifest_logs_are_synced_and_pruned() {
     // 1. Write an unsealed log file (generation 1) without an OpCode::Seal record
     let writer = LogWriter::create(storage.clone(), 1, &*clock, 10_000_000, 1, volume_key.clone()).unwrap();
     writer
-        .append_record(appendfs::log::OpCode::InodeDelta, 1, b"unsealed record payload")
+        .append_raw_for_test(appendfs::log::OpCode::InodeDelta, 1, b"unsealed record payload")
         .unwrap();
     writer.emit_flush_commit(1, 23, clock.now()).unwrap();
     writer.flush().unwrap();

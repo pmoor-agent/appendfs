@@ -7,7 +7,7 @@
 
 use super::{FlushReason, FsInner, InMemoryFS, ShutdownState};
 use crate::error::FsError;
-use crate::extent_map::Extent;
+use crate::extent_map::{Extent, ExtentMap, StagedBuffer};
 use crate::log::{GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode};
 use crate::node::{EntryDelta, NodeDelta};
 use crate::operations::locks::LockManager;
@@ -28,6 +28,95 @@ struct PendingBatch {
     started_monotonic: Duration,
     serialize_duration: Duration,
     serialize_end: Duration,
+}
+
+struct StagedSlice {
+    data: StagedBuffer,
+    payload_offset: u32,
+    length: u32,
+}
+
+struct StagedRun {
+    file_offset: u64,
+    slices: Vec<StagedSlice>,
+    total_len: usize,
+}
+
+/// Collects staged extents from a file's range map into coalesced runs of at most
+/// `max_extent_size` bytes each. Contiguous extents are merged together and split across
+/// record boundaries so each returned `StagedRun` can be written as a single log record.
+fn collect_staged_runs(extents: &ExtentMap, max_extent_size: usize) -> Vec<StagedRun> {
+    let mut runs: Vec<StagedRun> = Vec::new();
+    let mut current_run: Option<StagedRun> = None;
+
+    for (&offset, entry) in extents.iter() {
+        if let Extent::Staged {
+            ref data,
+            payload_offset,
+            length,
+        } = entry.extent
+        {
+            let mut rem_len = length;
+            let mut off = payload_offset;
+            let mut file_off = offset;
+
+            while rem_len > 0 {
+                let can_append = match &current_run {
+                    Some(run) => run.file_offset + run.total_len as u64 == file_off && run.total_len < max_extent_size,
+                    None => false,
+                };
+
+                if can_append {
+                    let run = current_run.as_mut().unwrap();
+                    let take = std::cmp::min(rem_len as usize, max_extent_size - run.total_len) as u32;
+                    run.slices.push(StagedSlice {
+                        data: Arc::clone(data),
+                        payload_offset: off,
+                        length: take,
+                    });
+                    run.total_len += take as usize;
+                    off += take;
+                    rem_len -= take;
+                    file_off += take as u64;
+
+                    if run.total_len >= max_extent_size {
+                        runs.push(current_run.take().unwrap());
+                    }
+                } else {
+                    if let Some(run) = current_run.take() {
+                        runs.push(run);
+                    }
+                    let take = std::cmp::min(rem_len as usize, max_extent_size) as u32;
+                    let new_run = StagedRun {
+                        file_offset: file_off,
+                        slices: vec![StagedSlice {
+                            data: Arc::clone(data),
+                            payload_offset: off,
+                            length: take,
+                        }],
+                        total_len: take as usize,
+                    };
+                    off += take;
+                    rem_len -= take;
+                    file_off += take as u64;
+
+                    if new_run.total_len >= max_extent_size {
+                        runs.push(new_run);
+                    } else {
+                        current_run = Some(new_run);
+                    }
+                }
+            }
+        } else if let Some(run) = current_run.take() {
+            runs.push(run);
+        }
+    }
+
+    if let Some(run) = current_run {
+        runs.push(run);
+    }
+
+    runs
 }
 
 impl InMemoryFS {
@@ -209,8 +298,10 @@ impl InMemoryFS {
     /// followed by the `FlushCommit` trailer that makes the batch replayable.
     ///
     /// On any write error the entire batch is rolled back to its starting offset.
-    // TODO(too-many-lines): extract this into smaller units.
-    #[allow(clippy::too_many_lines)]
+    /// Writes pending data extents and serialized `LogEntryDelta` records for a frozen batch,
+    /// followed by the `FlushCommit` trailer that makes the batch replayable.
+    ///
+    /// On any write error the entire batch is rolled back to its starting offset.
     fn synthesize_and_write_flushing_layer(
         &self,
         frozen: &mut HashMap<u64, EntryDelta>,
@@ -232,66 +323,30 @@ impl InMemoryFS {
             inos.sort();
 
             // 1. Flush raw file data chunks
+            // Note: Sparse holes (`Extent::Zero`) carry no payload bytes and do not emit
+            // `OpCode::Data` records. They remain in `f.extents` and are serialized into the
+            // log in step 2 below within `OpCode::InodeDelta` records as `LogExtent` entries
+            // with `record_log_offset: 0` and `record_size: 0`.
             for &ino in &inos {
                 if let Some(EntryDelta::Node(NodeDelta::File(f))) = frozen.get_mut(&ino) {
-                    let staged_runs: Vec<(u64, u32, Vec<u8>)> = {
-                        let mut runs: Vec<(u64, u32, Vec<u8>)> = Vec::new();
-                        let mut current_run: Option<(u64, Vec<u8>)> = None;
+                    let staged_runs = collect_staged_runs(&f.extents, max_extent_size);
+                    for run in staged_runs {
+                        let guards: Vec<_> = run.slices.iter().map(|s| s.data.read().unwrap()).collect();
+                        let slice_refs: Vec<&[u8]> = run
+                            .slices
+                            .iter()
+                            .zip(&guards)
+                            .map(|(s, guard)| &guard[s.payload_offset as usize..(s.payload_offset + s.length) as usize])
+                            .collect();
 
-                        for (&offset, entry) in f.extents.iter() {
-                            if let Extent::Staged {
-                                data,
-                                payload_offset,
-                                length,
-                            } = &entry.extent
-                            {
-                                let guard = data.read().unwrap();
-                                let slice = &guard[*payload_offset as usize..(*payload_offset + *length) as usize];
-                                match current_run {
-                                    Some((start_off, ref mut bytes)) if start_off + bytes.len() as u64 == offset => {
-                                        bytes.extend_from_slice(slice);
-                                    }
-                                    Some((start_off, bytes)) => {
-                                        runs.push((start_off, bytes.len() as u32, bytes));
-                                        current_run = Some((offset, slice.to_vec()));
-                                    }
-                                    None => {
-                                        current_run = Some((offset, slice.to_vec()));
-                                    }
-                                }
-                            } else if let Some((start_off, bytes)) = current_run.take() {
-                                runs.push((start_off, bytes.len() as u32, bytes));
-                            }
-                        }
-                        if let Some((start_off, bytes)) = current_run {
-                            runs.push((start_off, bytes.len() as u32, bytes));
-                        }
-                        runs
-                    };
+                        let (generation, record_log_offset, record_size) =
+                            writer.append_data_slices(ino, &slice_refs, run.total_len)?;
+                        written_count += 1;
+                        flushed_data_bytes += run.total_len as u64;
 
-                    // Emit each run as one or more records of at most `max_extent_size`. A
-                    // record is the unit of decryption, so an uncapped run would make a read
-                    // of any byte within it decrypt the entire coalesced write.
-                    for (start_off, _length, data) in staged_runs {
-                        let mut chunk_start = 0usize;
-                        loop {
-                            let chunk_len = std::cmp::min(max_extent_size, data.len() - chunk_start);
-                            let chunk = &data[chunk_start..chunk_start + chunk_len];
-
-                            let (generation, record_log_offset, record_size) =
-                                writer.append_record(OpCode::Data, ino, chunk)?;
-                            written_count += 1;
-                            flushed_data_bytes += chunk_len as u64;
-
-                            let disk_extent =
-                                Extent::new_disk(generation, record_log_offset, record_size, 0, chunk_len as u32);
-                            f.extents.insert(start_off + chunk_start as u64, disk_extent);
-
-                            chunk_start += chunk_len;
-                            if chunk_start >= data.len() {
-                                break;
-                            }
-                        }
+                        let disk_extent =
+                            Extent::new_disk(generation, record_log_offset, record_size, 0, run.total_len as u32);
+                        f.extents.insert(run.file_offset, disk_extent);
                     }
                 }
             }
@@ -300,9 +355,7 @@ impl InMemoryFS {
             for &ino in &inos {
                 if let Some(entry_delta) = frozen.get(&ino) {
                     let log_entry = LogEntryDelta::from(entry_delta);
-                    let payload = crate::wire::serialize(&log_entry)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    writer.append_record(OpCode::InodeDelta, ino, &payload)?;
+                    writer.append_serialized(OpCode::InodeDelta, ino, &log_entry)?;
                     written_count += 1;
                 }
             }
@@ -906,6 +959,57 @@ mod tests {
         fs.init().unwrap();
         assert!(fs.flusher.stop(), "a successful init starts the flusher");
         fs.destroy();
+    }
+
+    #[test]
+    fn test_collect_staged_runs_merging_and_splitting() {
+        use std::sync::RwLock;
+
+        let mut map = ExtentMap::new();
+        let buf1 = Arc::new(RwLock::new(vec![1u8; 100]));
+        let buf2 = Arc::new(RwLock::new(vec![2u8; 100]));
+        let buf3 = Arc::new(RwLock::new(vec![3u8; 300]));
+
+        // Insert contiguous extents: 0..100, 100..200
+        map.insert(0, Extent::new_staged(buf1, 0, 100));
+        map.insert(100, Extent::new_staged(buf2, 0, 100));
+        // Insert a sparse hole from 200..300, and staged extent from 300..600
+        map.insert(300, Extent::new_staged(buf3, 0, 300));
+
+        // Test with max_extent_size = 150
+        // Expected runs:
+        // Run 1: offset 0, len 150 (slices: 0..100 from buf1, 0..50 from buf2)
+        // Run 2: offset 150, len 50 (slice: 50..100 from buf2)
+        // Run 3: offset 300, len 150 (slice: 0..150 from buf3)
+        // Run 4: offset 450, len 150 (slice: 150..300 from buf3)
+        let runs = collect_staged_runs(&map, 150);
+        assert_eq!(runs.len(), 4);
+
+        assert_eq!(runs[0].file_offset, 0);
+        assert_eq!(runs[0].total_len, 150);
+        assert_eq!(runs[0].slices.len(), 2);
+        assert_eq!(runs[0].slices[0].payload_offset, 0);
+        assert_eq!(runs[0].slices[0].length, 100);
+        assert_eq!(runs[0].slices[1].payload_offset, 0);
+        assert_eq!(runs[0].slices[1].length, 50);
+
+        assert_eq!(runs[1].file_offset, 150);
+        assert_eq!(runs[1].total_len, 50);
+        assert_eq!(runs[1].slices.len(), 1);
+        assert_eq!(runs[1].slices[0].payload_offset, 50);
+        assert_eq!(runs[1].slices[0].length, 50);
+
+        assert_eq!(runs[2].file_offset, 300);
+        assert_eq!(runs[2].total_len, 150);
+        assert_eq!(runs[2].slices.len(), 1);
+        assert_eq!(runs[2].slices[0].payload_offset, 0);
+        assert_eq!(runs[2].slices[0].length, 150);
+
+        assert_eq!(runs[3].file_offset, 450);
+        assert_eq!(runs[3].total_len, 150);
+        assert_eq!(runs[3].slices.len(), 1);
+        assert_eq!(runs[3].slices[0].payload_offset, 150);
+        assert_eq!(runs[3].slices[0].length, 150);
     }
 
     #[test]

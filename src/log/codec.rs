@@ -7,6 +7,7 @@
 //! reporting every payload shifted by a byte. Pairing them here removes the chance to perform
 //! half of the transformation.
 
+#[cfg(any(test, feature = "testing"))]
 use crate::compress::Compression;
 use crate::crypto::LogFileKey;
 use crate::log::record::OpCode;
@@ -25,6 +26,7 @@ pub struct RecordId {
 }
 
 /// Turns a payload into the bytes written to the log, returning `(actual_op, ciphertext, auth_tag)`.
+#[cfg(any(test, feature = "testing"))]
 pub fn encode(
     key: &LogFileKey,
     compression: Compression,
