@@ -1,4 +1,5 @@
 use crate::fs::InMemoryFS;
+use crate::log::summary::{SUMMARY_FOOTER_SIZE, SUMMARY_MAGIC, SummaryFooter};
 use crate::remote::config::{ConfiguredRemote, RemoteRegistry};
 use crate::remote::{RemoteObject, RemoteStore};
 use crate::storage::Storage;
@@ -47,58 +48,231 @@ pub fn upload_storage_file(
     remote.put_object(filename, &mut adapter, len, expected_md5)
 }
 
-/// Helper to cross-copy a file from one `RemoteStore` to another using streaming.
+struct StreamingMd5Writer<W: Write> {
+    inner: W,
+    hasher: md5::Context,
+    bytes_written: u64,
+}
+
+impl<W: Write> StreamingMd5Writer<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: md5::Context::new(),
+            bytes_written: 0,
+        }
+    }
+
+    fn finish(mut self) -> io::Result<(W, u64, [u8; 16])> {
+        self.inner.flush()?;
+        let digest = *self.hasher.compute();
+        Ok((self.inner, self.bytes_written, digest))
+    }
+}
+
+impl<W: Write> Write for StreamingMd5Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        let chunk = &buf[..n];
+        self.hasher.consume(chunk);
+        self.bytes_written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Helper to cross-copy a log file from one `RemoteStore` to another using streaming with inline MD5 verification.
 pub fn cross_copy_file(
     src_remote: &dyn RemoteStore,
     dst_remote: &dyn RemoteStore,
     filename: &str,
     expected_len: u64,
-    expected_md5: Option<&[u8; 16]>,
+    expected_md5: &[u8; 16],
 ) -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let tmp_file_path = dir.path().join(filename);
-    {
-        let mut tmp_file = std::fs::File::create(&tmp_file_path)?;
-        src_remote.get_object(filename, &mut tmp_file)?;
-        tmp_file.flush()?;
-    }
 
-    let meta = std::fs::metadata(&tmp_file_path)?;
-    if meta.len() != expected_len {
+    let (tmp_file, bytes_written, computed_md5) = {
+        let file = std::fs::File::create(&tmp_file_path)?;
+        let mut writer = StreamingMd5Writer::new(file);
+        src_remote.get_object(filename, &mut writer)?;
+        writer.finish()?
+    };
+
+    if bytes_written != expected_len {
+        let _ = std::fs::remove_file(&tmp_file_path);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "cross_copy_file {}: downloaded size {} does not match expected {}",
-                filename,
-                meta.len(),
-                expected_len
+                filename, bytes_written, expected_len
             ),
         ));
     }
 
-    if let Some(expected_digest) = expected_md5 {
-        use std::io::Read;
-        let mut f = std::fs::File::open(&tmp_file_path)?;
-        let mut ctx = md5::Context::new();
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = f.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            ctx.consume(&buf[..n]);
-        }
-        let computed = ctx.compute();
-        if &*computed != expected_digest {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("cross_copy_file {}: downloaded MD5 does not match expected", filename),
-            ));
+    if &computed_md5 != expected_md5 {
+        let _ = std::fs::remove_file(&tmp_file_path);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cross_copy_file {}: downloaded MD5 {} does not match expected {}",
+                filename,
+                hex::encode(computed_md5),
+                hex::encode(expected_md5)
+            ),
+        ));
+    }
+
+    drop(tmp_file);
+    let mut read_file = std::fs::File::open(&tmp_file_path)?;
+    dst_remote.put_object(filename, &mut read_file, expected_len, Some(expected_md5))?;
+    Ok(())
+}
+
+struct SummaryStreamingVerifier<W: Write> {
+    inner: W,
+    md5_hasher: md5::Context,
+    blake3_hasher: blake3::Hasher,
+    tail_buf: Vec<u8>,
+    total_bytes: u64,
+}
+
+impl<W: Write> SummaryStreamingVerifier<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            md5_hasher: md5::Context::new(),
+            blake3_hasher: blake3::Hasher::new(),
+            tail_buf: Vec::with_capacity(SUMMARY_FOOTER_SIZE),
+            total_bytes: 0,
         }
     }
 
-    let mut tmp_file = std::fs::File::open(&tmp_file_path)?;
-    dst_remote.put_object(filename, &mut tmp_file, expected_len, expected_md5)?;
+    fn finish(mut self, expected_len: u64, filename: &str) -> io::Result<(W, u64, [u8; 16])> {
+        self.inner.flush()?;
+
+        if self.total_bytes != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cross_copy_summary {}: downloaded size {} does not match expected {}",
+                    filename, self.total_bytes, expected_len
+                ),
+            ));
+        }
+
+        if self.total_bytes < SUMMARY_FOOTER_SIZE as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cross_copy_summary {}: file size {} is smaller than footer size {}",
+                    filename, self.total_bytes, SUMMARY_FOOTER_SIZE
+                ),
+            ));
+        }
+
+        if self.tail_buf.len() != SUMMARY_FOOTER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cross_copy_summary {}: tail buffer has {} bytes, expected {}",
+                    filename,
+                    self.tail_buf.len(),
+                    SUMMARY_FOOTER_SIZE
+                ),
+            ));
+        }
+
+        let footer = SummaryFooter::from_bytes(&self.tail_buf).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cross_copy_summary {}: failed to parse summary footer: {}", filename, e),
+            )
+        })?;
+
+        if footer.magic != *SUMMARY_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cross_copy_summary {}: invalid magic {:?}", filename, footer.magic),
+            ));
+        }
+
+        let computed_checksum: [u8; 32] = *self.blake3_hasher.finalize().as_bytes();
+        if computed_checksum != footer.checksum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cross_copy_summary {}: BLAKE3 checksum mismatch: expected {}, got {}",
+                    filename,
+                    hex::encode(footer.checksum),
+                    hex::encode(computed_checksum)
+                ),
+            ));
+        }
+
+        let computed_md5 = *self.md5_hasher.compute();
+        Ok((self.inner, self.total_bytes, computed_md5))
+    }
+}
+
+impl<W: Write> Write for SummaryStreamingVerifier<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        let chunk = &buf[..n];
+
+        self.md5_hasher.consume(chunk);
+        self.total_bytes += n as u64;
+
+        let total_avail = self.tail_buf.len() + n;
+        if total_avail <= SUMMARY_FOOTER_SIZE {
+            self.tail_buf.extend_from_slice(chunk);
+        } else {
+            let overflow = total_avail - SUMMARY_FOOTER_SIZE;
+            let tail_len = self.tail_buf.len();
+            if overflow <= tail_len {
+                self.blake3_hasher.update(&self.tail_buf[..overflow]);
+                self.tail_buf.drain(..overflow);
+                self.tail_buf.extend_from_slice(chunk);
+            } else {
+                self.blake3_hasher.update(&self.tail_buf);
+                self.tail_buf.clear();
+                let from_chunk = overflow - tail_len;
+                self.blake3_hasher.update(&chunk[..from_chunk]);
+                self.tail_buf.extend_from_slice(&chunk[from_chunk..]);
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Helper to cross-copy a `.summary` checkpoint file from one `RemoteStore` to another,
+/// verifying its internal BLAKE3 signature streaming locally, and computing its MD5 to pass on upload.
+pub fn cross_copy_summary(
+    src_remote: &dyn RemoteStore,
+    dst_remote: &dyn RemoteStore,
+    filename: &str,
+    expected_len: u64,
+) -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tmp_file_path = dir.path().join(filename);
+
+    let (tmp_file, bytes_written, computed_md5) = {
+        let file = std::fs::File::create(&tmp_file_path)?;
+        let mut writer = SummaryStreamingVerifier::new(file);
+        src_remote.get_object(filename, &mut writer)?;
+        writer.finish(expected_len, filename)?
+    };
+
+    drop(tmp_file);
+    let mut read_file = std::fs::File::open(&tmp_file_path)?;
+    dst_remote.put_object(filename, &mut read_file, bytes_written, Some(&computed_md5))?;
     Ok(())
 }
 
@@ -514,7 +688,7 @@ impl RemoteReplicationWorker {
             }
 
             let expected_len = log_entry.total_bytes;
-            let expected_md5 = Some(&log_entry.md5);
+            let expected_md5 = &log_entry.md5;
 
             for (r_idx, r) in stores.iter().enumerate() {
                 if r.read_only {
@@ -535,9 +709,7 @@ impl RemoteReplicationWorker {
                 };
 
                 let needs_upload = match map.get(filename) {
-                    Some(obj) => {
-                        obj.size != expected_len || expected_md5.is_some_and(|exp| obj.etag_md5() != Some(*exp))
-                    }
+                    Some(obj) => obj.size != expected_len || obj.etag_md5() != Some(*expected_md5),
                     None => true,
                 };
 
@@ -550,7 +722,7 @@ impl RemoteReplicationWorker {
                             expected_len,
                             r.name
                         );
-                        match upload_storage_file(storage.as_ref(), r.store.as_ref(), filename, expected_md5) {
+                        match upload_storage_file(storage.as_ref(), r.store.as_ref(), filename, Some(expected_md5)) {
                             Ok(()) => upload_succeeded = true,
                             Err(e) => {
                                 log::warn!("upload_storage_file {} to remote '{}' failed: {}", filename, r.name, e);
@@ -608,10 +780,7 @@ impl RemoteReplicationWorker {
                 let verified_on_remote = if needs_upload {
                     if upload_succeeded {
                         match r.store.head_object(filename) {
-                            Ok(Some(obj))
-                                if obj.size == expected_len
-                                    && expected_md5.is_none_or(|exp| obj.etag_md5() == Some(*exp)) =>
-                            {
+                            Ok(Some(obj)) if obj.size == expected_len && obj.etag_md5() == Some(*expected_md5) => {
                                 if let Some(Some(map)) = store_listings.get_mut(r_idx) {
                                     map.insert(filename.clone(), obj);
                                 }
@@ -619,11 +788,11 @@ impl RemoteReplicationWorker {
                             }
                             Ok(Some(obj)) => {
                                 log::warn!(
-                                    "Post-upload verification for {} on remote '{}' failed: expected size {}, MD5 {:?}, got size {}, ETag {:?}",
+                                    "Post-upload verification for {} on remote '{}' failed: expected size {}, MD5 {}, got size {}, ETag {:?}",
                                     filename,
                                     r.name,
                                     expected_len,
-                                    expected_md5.map(hex::encode),
+                                    hex::encode(expected_md5),
                                     obj.size,
                                     obj.etag
                                 );
@@ -750,7 +919,20 @@ impl RemoteReplicationWorker {
                 if needs_sync {
                     if local_exists {
                         log::info!("Syncing summary {} to remote '{}'...", sum_file, r.name);
-                        match upload_storage_file(storage.as_ref(), r.store.as_ref(), sum_file, None) {
+                        let sum_md5 = {
+                            let reader = storage.open_reader(sum_file)?;
+                            let mut ctx = md5::Context::new();
+                            let mut buf = [0u8; 64 * 1024];
+                            let mut offset = 0u64;
+                            while offset < local_len {
+                                let to_read = std::cmp::min((local_len - offset) as usize, buf.len());
+                                reader.read_exact_at(offset, &mut buf[..to_read])?;
+                                ctx.consume(&buf[..to_read]);
+                                offset += to_read as u64;
+                            }
+                            *ctx.compute()
+                        };
+                        match upload_storage_file(storage.as_ref(), r.store.as_ref(), sum_file, Some(&sum_md5)) {
                             Ok(()) => sync_succeeded = true,
                             Err(e) => {
                                 log::warn!("upload summary {} to '{}' failed: {}", sum_file, r.name, e);
@@ -776,13 +958,8 @@ impl RemoteReplicationWorker {
                                     src.name,
                                     r.name
                                 );
-                                match cross_copy_file(
-                                    src.store.as_ref(),
-                                    r.store.as_ref(),
-                                    sum_file,
-                                    src_head.size,
-                                    None,
-                                ) {
+                                match cross_copy_summary(src.store.as_ref(), r.store.as_ref(), sum_file, src_head.size)
+                                {
                                     Ok(()) => {
                                         sync_succeeded = true;
                                         break;
@@ -1034,18 +1211,105 @@ mod tests {
         assert_eq!(head.size, 28);
         assert_eq!(head.etag_md5(), Some(expected_md5));
 
-        // Cross-copy from remote 1 to remote 2
-        cross_copy_file(
-            remote1.as_ref(),
-            remote2.as_ref(),
-            "000001.log",
-            28,
-            Some(&expected_md5),
-        )
-        .unwrap();
+        // Cross-copy from remote 1 to remote 2 with streaming inline MD5 verification
+        cross_copy_file(remote1.as_ref(), remote2.as_ref(), "000001.log", 28, &expected_md5).unwrap();
 
         let head2 = remote2.head_object("000001.log").unwrap().unwrap();
         assert_eq!(head2.size, 28);
         assert_eq!(head2.etag_md5(), Some(expected_md5));
+    }
+
+    #[test]
+    fn test_cross_copy_file_md5_mismatch() {
+        let remote1 = Arc::new(MockRemoteStore::new());
+        let remote2 = Arc::new(MockRemoteStore::new());
+
+        let data = b"corrupted log payload";
+        remote1
+            .put_object("000001.log", &mut &data[..], data.len() as u64, None)
+            .unwrap();
+
+        let wrong_md5 = [0x55u8; 16];
+        let err = cross_copy_file(
+            remote1.as_ref(),
+            remote2.as_ref(),
+            "000001.log",
+            data.len() as u64,
+            &wrong_md5,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("downloaded MD5"));
+        assert!(remote2.head_object("000001.log").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cross_copy_summary_streaming_blake3_and_md5() {
+        let remote1 = Arc::new(MockRemoteStore::new());
+        let remote2 = Arc::new(MockRemoteStore::new());
+
+        let body = b"header_and_inode_snapshot_body_data_1234567890";
+        let checksum: [u8; 32] = *blake3::hash(body).as_bytes();
+        let footer = SummaryFooter::new(10, 1, checksum);
+        let mut full_summary = body.to_vec();
+        full_summary.extend_from_slice(&footer.to_bytes());
+
+        let total_len = full_summary.len() as u64;
+        let expected_md5: [u8; 16] = *md5::compute(&full_summary);
+
+        remote1
+            .put_object("000001.summary", &mut &full_summary[..], total_len, None)
+            .unwrap();
+
+        cross_copy_summary(remote1.as_ref(), remote2.as_ref(), "000001.summary", total_len).unwrap();
+
+        let head2 = remote2.head_object("000001.summary").unwrap().unwrap();
+        assert_eq!(head2.size, total_len);
+        assert_eq!(head2.etag_md5(), Some(expected_md5));
+    }
+
+    #[test]
+    fn test_cross_copy_summary_corrupted_blake3_rejected() {
+        let remote1 = Arc::new(MockRemoteStore::new());
+        let remote2 = Arc::new(MockRemoteStore::new());
+
+        let body = b"header_and_inode_snapshot_body_data_1234567890";
+        let checksum: [u8; 32] = *blake3::hash(body).as_bytes();
+        let footer = SummaryFooter::new(10, 1, checksum);
+        let mut full_summary = body.to_vec();
+        full_summary.extend_from_slice(&footer.to_bytes());
+
+        // Corrupt a byte in the summary body
+        full_summary[5] ^= 0xff;
+
+        let total_len = full_summary.len() as u64;
+        remote1
+            .put_object("000001.summary", &mut &full_summary[..], total_len, None)
+            .unwrap();
+
+        let err = cross_copy_summary(remote1.as_ref(), remote2.as_ref(), "000001.summary", total_len).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("BLAKE3 checksum mismatch"));
+        assert!(remote2.head_object("000001.summary").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cross_copy_summary_corrupted_magic_rejected() {
+        let remote1 = Arc::new(MockRemoteStore::new());
+        let remote2 = Arc::new(MockRemoteStore::new());
+
+        let data = [0u8; 100];
+        // Ensure invalid footer magic
+        let total_len = data.len() as u64;
+        remote1
+            .put_object("000001.summary", &mut &data[..], total_len, None)
+            .unwrap();
+
+        let err = cross_copy_summary(remote1.as_ref(), remote2.as_ref(), "000001.summary", total_len).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(remote2.head_object("000001.summary").unwrap().is_none());
     }
 }
