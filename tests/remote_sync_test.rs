@@ -2200,3 +2200,212 @@ fn test_unsealed_manifest_logs_are_synced_and_pruned() {
         "unsealed generation 1 log in manifest must be pruned locally when retention criteria met"
     );
 }
+
+#[test]
+fn test_post_upload_md5_verification_failure_and_recovery() {
+    use appendfs::remote::RemoteObject;
+    use std::io::{Read, Write};
+
+    #[derive(Debug)]
+    struct TamperedEtagStore {
+        inner: Arc<MockRemoteStore>,
+        tamper_head: std::sync::atomic::AtomicBool,
+    }
+
+    impl RemoteStore for TamperedEtagStore {
+        fn list_objects(&self, prefix: &str) -> std::io::Result<Vec<RemoteObject>> {
+            self.inner.list_objects(prefix)
+        }
+
+        fn head_object(&self, key: &str) -> std::io::Result<Option<RemoteObject>> {
+            let mut obj = self.inner.head_object(key)?;
+            if self.tamper_head.load(Ordering::SeqCst)
+                && key.ends_with(".log")
+                && let Some(ref mut o) = obj
+            {
+                // Inject a corrupted/mismatched MD5 digest in the ETag
+                o.etag = Some("\"0123456789abcdef0123456789abcdef\"".to_string());
+            }
+            Ok(obj)
+        }
+
+        fn put_object(
+            &self,
+            key: &str,
+            reader: &mut dyn Read,
+            len: u64,
+            content_md5: Option<&[u8; 16]>,
+        ) -> std::io::Result<()> {
+            self.inner.put_object(key, reader, len, content_md5)
+        }
+
+        fn get_object(&self, key: &str, writer: &mut dyn Write) -> std::io::Result<u64> {
+            self.inner.get_object(key, writer)
+        }
+
+        fn get_object_range(&self, key: &str, offset: u64, len: u64, writer: &mut dyn Write) -> std::io::Result<u64> {
+            self.inner.get_object_range(key, offset, len, writer)
+        }
+
+        fn delete_object(&self, key: &str) -> std::io::Result<()> {
+            self.inner.delete_object(key)
+        }
+    }
+
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
+
+    let raw_store = Arc::new(MockRemoteStore::new());
+    let tampered_store = Arc::new(TamperedEtagStore {
+        inner: raw_store.clone(),
+        tamper_head: std::sync::atomic::AtomicBool::new(true),
+    });
+
+    let mut registry = RemoteRegistry::new();
+    let mut cfg = RemoteTargetConfig::new("test-bucket");
+    cfg.upload_partial_logs = true;
+    registry.add_remote("backup", cfg);
+    registry.set_store_override("backup", tampered_store.clone());
+    registry.policy.min_synced_remotes = 1;
+    registry.policy.local_retention = "0s".to_string();
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    // 1. Write an active part in generation 1 and sync it
+    let root = 1u64;
+    let file_attr = create_core(&fs, root, "test_file.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, file_attr.ino, b"Active part data before seal", 0).unwrap();
+    fs.quiesce().unwrap();
+
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+    let mut last_audit = std::time::SystemTime::UNIX_EPOCH;
+    let mut confirmed_gens = std::collections::HashMap::new();
+    let mut confirmed_sums = std::collections::HashMap::new();
+
+    let fs_arc = Arc::new(fs);
+
+    // Sync active part: 000001.part0000.log is uploaded to remote
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        false,
+    )
+    .unwrap();
+
+    assert!(
+        raw_store.head_object("000001.part0000.log").unwrap().is_some(),
+        "Active part0000 must be uploaded to remote"
+    );
+
+    // 2. Force roll to generation 2 (seals generation 1)
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
+    fs_arc.export_summary(storage.as_ref()).unwrap();
+
+    // Reset part timer to run replication with tamper_head = true
+    last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+
+    // 3. Run replication cycle with tampered ETag in post-upload check
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        false,
+    )
+    .unwrap();
+
+    // 000001.log WAS uploaded to raw_store by upload_storage_file,
+    // but post-upload check failed due to ETag MD5 mismatch!
+    assert!(raw_store.head_object("000001.log").unwrap().is_some());
+
+    // Because post-upload MD5 verification failed:
+    // a. Transient active part was NOT cleaned up!
+    assert!(
+        raw_store.head_object("000001.part0000.log").unwrap().is_some(),
+        "Transient part must NOT be cleaned up when post-upload MD5 verification fails"
+    );
+    // b. Generation was NOT confirmed!
+    assert!(
+        !confirmed_gens.get("backup").is_some_and(|s| s.contains(&1)),
+        "Generation 1 must NOT be confirmed when post-upload MD5 check fails"
+    );
+    // c. Local log file was NOT pruned!
+    assert!(
+        storage.exists("000001.log"),
+        "Local 000001.log must NOT be pruned when post-upload MD5 verification fails"
+    );
+    // d. Telemetry recorded verification error!
+    assert!(
+        fs_arc
+            .replication_telemetry
+            .read()
+            .unwrap()
+            .remotes
+            .get("backup")
+            .unwrap()
+            .last_error
+            .is_some(),
+        "Telemetry must record the post-upload verification error"
+    );
+
+    // 4. Clear tampering: post-upload head_object will now return the real matching ETag MD5
+    tampered_store.tamper_head.store(false, Ordering::SeqCst);
+    last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        false,
+    )
+    .unwrap();
+
+    // Now post-upload verification succeeds:
+    // a. Transient active part is deleted!
+    assert!(
+        raw_store.head_object("000001.part0000.log").unwrap().is_none(),
+        "Transient part must be deleted once post-upload verification succeeds"
+    );
+    // b. Generation 1 is confirmed!
+    assert!(
+        confirmed_gens.get("backup").unwrap().contains(&1),
+        "Generation 1 must be confirmed on remote"
+    );
+    // c. Local log file is safely pruned!
+    assert!(
+        !storage.exists("000001.log"),
+        "Local 000001.log must be pruned once remote verification succeeds"
+    );
+}
