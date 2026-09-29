@@ -276,6 +276,25 @@ pub fn cross_copy_summary(
     Ok(())
 }
 
+/// Reads a `.summary` file from local storage, verifying its BLAKE3 signature and computing its MD5 in a single pass.
+pub fn verify_summary_storage_file(storage: &dyn Storage, filename: &str) -> io::Result<(u64, [u8; 16])> {
+    let reader = storage.open_reader(filename)?;
+    let len = reader.len()?;
+    // `io::sink()` is the standard library null sink (zero-sized `/dev/null` writer)
+    // that immediately discards written bytes without buffering or allocating memory.
+    let mut verifier = SummaryStreamingVerifier::new(io::sink());
+    let mut buf = [0u8; 64 * 1024];
+    let mut offset = 0u64;
+    while offset < len {
+        let to_read = std::cmp::min((len - offset) as usize, buf.len());
+        reader.read_exact_at(offset, &mut buf[..to_read])?;
+        verifier.write_all(&buf[..to_read])?;
+        offset += to_read as u64;
+    }
+    let (_, total_bytes, md5_digest) = verifier.finish(len, filename)?;
+    Ok((total_bytes, md5_digest))
+}
+
 /// Live operational telemetry for a single remote target.
 #[derive(Debug, Clone, Default)]
 pub struct RemoteSyncTelemetry {
@@ -891,6 +910,8 @@ impl RemoteReplicationWorker {
                 0
             };
 
+            let mut verified_local_md5: Option<Result<[u8; 16], String>> = None;
+
             for (r_idx, r) in stores.iter().enumerate() {
                 if r.read_only {
                     continue;
@@ -918,28 +939,34 @@ impl RemoteReplicationWorker {
                 let mut sync_succeeded = false;
                 if needs_sync {
                     if local_exists {
-                        log::info!("Syncing summary {} to remote '{}'...", sum_file, r.name);
-                        let sum_md5 = {
-                            let reader = storage.open_reader(sum_file)?;
-                            let mut ctx = md5::Context::new();
-                            let mut buf = [0u8; 64 * 1024];
-                            let mut offset = 0u64;
-                            while offset < local_len {
-                                let to_read = std::cmp::min((local_len - offset) as usize, buf.len());
-                                reader.read_exact_at(offset, &mut buf[..to_read])?;
-                                ctx.consume(&buf[..to_read]);
-                                offset += to_read as u64;
+                        let md5_res = verified_local_md5.get_or_insert_with(|| {
+                            verify_summary_storage_file(storage.as_ref(), sum_file)
+                                .map(|(_, md5)| md5)
+                                .map_err(|e| e.to_string())
+                        });
+
+                        match md5_res {
+                            Ok(sum_md5) => {
+                                log::info!("Syncing summary {} to remote '{}'...", sum_file, r.name);
+                                match upload_storage_file(storage.as_ref(), r.store.as_ref(), sum_file, Some(sum_md5)) {
+                                    Ok(()) => sync_succeeded = true,
+                                    Err(e) => {
+                                        log::warn!("upload summary {} to '{}' failed: {}", sum_file, r.name, e);
+                                        fs.replication_telemetry
+                                            .write()
+                                            .unwrap()
+                                            .record_error(&r.name, &e.to_string());
+                                    }
+                                }
                             }
-                            *ctx.compute()
-                        };
-                        match upload_storage_file(storage.as_ref(), r.store.as_ref(), sum_file, Some(&sum_md5)) {
-                            Ok(()) => sync_succeeded = true,
                             Err(e) => {
-                                log::warn!("upload summary {} to '{}' failed: {}", sum_file, r.name, e);
-                                fs.replication_telemetry
-                                    .write()
-                                    .unwrap()
-                                    .record_error(&r.name, &e.to_string());
+                                log::error!(
+                                    "Local summary {} verification failed (BLAKE3 mismatch or corruption): {}. Skipping upload to remote '{}'",
+                                    sum_file,
+                                    e,
+                                    r.name
+                                );
+                                fs.replication_telemetry.write().unwrap().record_error(&r.name, e);
                             }
                         }
                     } else {
@@ -1311,5 +1338,43 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(remote2.head_object("000001.summary").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_verify_summary_storage_file_valid_and_corrupt() {
+        let storage = Arc::new(MemoryStorage::new());
+
+        let body = b"header_and_inode_snapshot_body_data_1234567890";
+        let checksum: [u8; 32] = *blake3::hash(body).as_bytes();
+        let footer = SummaryFooter::new(10, 1, checksum);
+        let mut full_summary = body.to_vec();
+        full_summary.extend_from_slice(&footer.to_bytes());
+
+        let expected_len = full_summary.len() as u64;
+        let expected_md5: [u8; 16] = *md5::compute(&full_summary);
+
+        let mut writer = storage
+            .open_writer("000001.summary", crate::storage::WriteMode::CreateNew)
+            .unwrap();
+        writer.append(&full_summary).unwrap();
+        drop(writer);
+
+        // Valid verification in single pass
+        let (len, md5_digest) = verify_summary_storage_file(storage.as_ref(), "000001.summary").unwrap();
+        assert_eq!(len, expected_len);
+        assert_eq!(md5_digest, expected_md5);
+
+        // Corrupted body in storage
+        let mut corrupt_summary = full_summary.clone();
+        corrupt_summary[5] ^= 0xff;
+        let mut writer = storage
+            .open_writer("000002.summary", crate::storage::WriteMode::CreateNew)
+            .unwrap();
+        writer.append(&corrupt_summary).unwrap();
+        drop(writer);
+
+        let err = verify_summary_storage_file(storage.as_ref(), "000002.summary").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("BLAKE3 checksum mismatch"));
     }
 }
