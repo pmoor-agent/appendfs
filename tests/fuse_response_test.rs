@@ -185,7 +185,7 @@ fn test_all_fuse_response_handlers() {
 
     // 10. read
     let read_res = read_response(&fs, file_ino, file_fh, 0, 11);
-    assert_eq!(read_res, Ok(FuseResponse::buf(b"hello world".as_slice())));
+    assert_eq!(read_res.wait(), Ok(FuseResponse::buf(b"hello world".as_slice())));
 
     // 11. getlk
     let lock_query = ShimFlock {
@@ -412,9 +412,9 @@ fn test_filesystem_trait_all_methods() {
     let write_res = fs.write(file_ino, b"trait test", 0, file_fh);
     assert_eq!(write_res, Ok(FuseResponse::write(10)));
 
-    // 8. read via trait
+    // 8. read via trait (returns DeferredResult)
     let read_res = fs.read(file_ino, 10, 0, file_fh);
-    assert_eq!(read_res, Ok(FuseResponse::buf(b"trait test".as_slice())));
+    assert_eq!(read_res.wait(), Ok(FuseResponse::buf(b"trait test".as_slice())));
 
     // 9. open via trait
     let open_res = fs.open(file_ino, libc::O_RDONLY as u32);
@@ -580,4 +580,61 @@ fn test_open_cache_flags_and_timeout_delineation() {
     assert_eq!(FuseResponse::timeout_for_ino(1), 3600.0);
     assert_eq!(FuseResponse::timeout_for_ino(regular_ino), 3600.0);
     assert_eq!(FuseResponse::timeout_for_ino(status_ino), 0.0);
+}
+
+#[test]
+fn test_cold_read_deferred_threadpool_execution() {
+    use appendfs::crypto::{VolumeHeader, VolumeKey};
+    use appendfs::log::{LogWriter, RecoveryTarget};
+    use appendfs::operations::read_write::{create_core, open_core, write_core};
+    use appendfs::storage::MemoryStorage;
+
+    let storage = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(appendfs::clock::SystemClock);
+    let key = Arc::new(VolumeKey::plaintext());
+    appendfs::log::init_volume(storage.clone(), &key, VolumeHeader::plaintext()).unwrap();
+    let mut fs =
+        appendfs::log::recover_fs(storage.clone(), RecoveryTarget::Latest, clock.clone(), key.clone()).unwrap();
+
+    let writer = Arc::new(
+        LogWriter::create(
+            storage.clone(),
+            1,
+            clock.as_ref(),
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            key.clone(),
+        )
+        .unwrap(),
+    );
+    fs.attach_log_writer(writer);
+
+    let file = create_core(&fs, 1, "deferred_read.txt", 0o644, 0, 1000, 1000).unwrap();
+    let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
+    let payload = b"cold read deferred threadpool test".to_vec();
+    write_core(&fs, file.ino, &payload, 0).unwrap();
+
+    // 1. In-memory read before flush: must be 100% in-memory and immediately Ready
+    let in_mem_res = read_response(&fs, file.ino, fh, 0, payload.len());
+    assert!(in_mem_res.is_ready());
+    assert_eq!(in_mem_res.wait().unwrap().into_bytes().unwrap(), payload);
+
+    // 2. Flush to disk and clear in-memory decrypted record cache
+    fs.quiesce().unwrap();
+    fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
+
+    // 3. Cold read with absent pool (default): must execute synchronously and be immediately Ready
+    let cold_sync = read_response(&fs, file.ino, fh, 0, payload.len());
+    assert!(cold_sync.is_ready());
+    assert_eq!(cold_sync.wait().unwrap().into_bytes().unwrap(), payload);
+
+    // 4. Enable read pool, clear cache again, and execute cold read: must be Deferred and executed on ReadThreadPool
+    fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
+    fs.set_read_parallelism(4);
+    fs.enable_read_pool();
+    let cold_async = read_response(&fs, file.ino, fh, 0, payload.len());
+    assert!(cold_async.is_deferred());
+
+    let final_res = cold_async.wait().unwrap();
+    assert_eq!(final_res.into_bytes().unwrap(), payload);
 }

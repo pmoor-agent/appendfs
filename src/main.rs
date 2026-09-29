@@ -525,7 +525,7 @@ fn cmd_mount(args: MountArgs) {
     fs_instance.flush_interval.store(args.flush_interval, Ordering::SeqCst);
     fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
     fs_instance.track_atime = args.track_atime;
-    fs_instance.read_parallelism = args.read_parallelism;
+    fs_instance.set_read_parallelism(args.read_parallelism);
 
     fs_instance.log_cache = Some(build_log_cache(
         &args,
@@ -618,7 +618,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
     };
     fs_instance.set_storage(storage.clone());
     fs_instance.set_read_only();
-    fs_instance.read_parallelism = args.read_parallelism;
+    fs_instance.set_read_parallelism(args.read_parallelism);
 
     fs_instance.log_cache = Some(build_log_cache(&args, storage, remote_stores, &fs_instance.manifest));
 

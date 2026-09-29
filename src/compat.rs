@@ -3,14 +3,18 @@ use crate::error::FsError;
 use crate::fs::InMemoryFS;
 use crate::log::{LogWriter, init_volume_with_clock_and_uids};
 use crate::operations::dir::mkdir_core;
-use crate::operations::links::{link_core, readlink_core, symlink_core};
+#[cfg(any(test, feature = "testing"))]
+use crate::operations::links::readlink_core;
+use crate::operations::links::{link_core, symlink_core};
+#[cfg(any(test, feature = "testing"))]
+use crate::operations::read_write::read_core;
 use crate::operations::read_write::{
     FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_SIZE,
-    FUSE_SET_ATTR_UID, create_core, open_core, punch_hole_core, read_core, release_core, setattr_core,
-    write_handle_core,
+    FUSE_SET_ATTR_UID, create_core, open_core, punch_hole_core, release_core, setattr_core, write_handle_core,
 };
 use crate::operations::special::mknod_core;
 use crate::operations::xattr::setxattr_core;
+#[cfg(any(test, feature = "testing"))]
 use crate::shim::FileType;
 use crate::storage::{OsStorage, Storage};
 use crate::{VolumeHeader, VolumeKey};
@@ -822,6 +826,7 @@ pub fn lookup_path(fs: &InMemoryFS, path: &str) -> Option<u64> {
     Some(current)
 }
 
+#[cfg(any(test, feature = "testing"))]
 fn read_compat_file(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<u8> {
     let fh = open_core(fs, ino, libc::O_RDONLY as u32).expect("open compat file");
     let data = read_core(fs, ino, fh, offset, size)
@@ -837,6 +842,7 @@ fn read_compat_file(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<
 /// permissions (`mode`), ownership (`uid`/`gid`), timestamps (`mtime`/`atime`), and xattrs.
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
+#[cfg(any(test, feature = "testing"))]
 pub fn verify_compat_tree(fs: &InMemoryFS) {
     // 1. Root directory (Inode 1)
     let root_attr = fs.get_attr(1).expect("root directory must exist");

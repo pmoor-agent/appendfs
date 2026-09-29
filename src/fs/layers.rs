@@ -414,7 +414,7 @@ impl<'a> InodeLayerStack<'a> {
     /// Reads file data resolving extents across layers.
     pub fn read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<Vec<u8>, FsError> {
         let plan = self.plan_read_file_data(offset, size, fs.log_cache.as_deref())?;
-        fs.execute_read_plan_sync(plan)
+        execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key)
     }
 }
 
@@ -517,26 +517,15 @@ impl ReadPlan {
     }
 }
 
-impl InMemoryFS {
-    /// Executes a [`ReadPlan`] synchronously, reading any cold disk extents via [`LogFileCache`].
-    pub fn execute_read_plan_sync(&self, plan: ReadPlan) -> Result<Vec<u8>, FsError> {
-        execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key, self.read_parallelism)
-    }
-}
-
 /// Core execution helper for [`ReadPlan`] completely decoupled from [`InMemoryFS`].
 ///
 /// Phase 1: Copies all in-memory slices into `dst_buf` and drops their backing buffers
 /// immediately, allowing staged buffers to be freed before any disk I/O.
 /// Phase 2: Resolves cold disk slices from cache or disk directly into `dst_buf`.
-///
-/// `read_parallelism` controls concurrency for cold disk slice fetching: `0` auto-detects
-/// based on available CPU cores (capped at 16); values `> 0` specify explicit worker counts.
 pub fn execute_read_plan(
     mut plan: ReadPlan,
     log_cache: Option<&crate::log::LogFileCache>,
     volume_key: &crate::crypto::VolumeKey,
-    read_parallelism: usize,
 ) -> Result<Vec<u8>, FsError> {
     if plan.total_len == 0 || plan.slices.is_empty() {
         return Ok(Vec::new());
@@ -577,7 +566,7 @@ pub fn execute_read_plan(
     // disk or remote S3 reads below take significant time.
     if !cold_slices.is_empty() {
         let cache = log_cache.ok_or(FsError::EIO)?;
-        execute_cold_slices(cold_slices, &mut dst_buf, cache, volume_key, read_parallelism)?;
+        execute_cold_slices(cold_slices, &mut dst_buf, cache, volume_key)?;
     }
 
     Ok(dst_buf)
@@ -603,7 +592,6 @@ fn execute_cold_slices(
     dst_buf: &mut [u8],
     cache: &crate::log::LogFileCache,
     volume_key: &crate::crypto::VolumeKey,
-    read_parallelism: usize,
 ) -> Result<(), FsError> {
     if cold_slices.is_empty() {
         return Ok(());
@@ -628,7 +616,7 @@ fn execute_cold_slices(
     }
 
     // Sort jobs by (generation, record_log_offset) so that slices referencing the same
-    // record land in the same worker chunk to maximize decrypted_cache hits.
+    // record are decoded in sequence to maximize decrypted_cache hits.
     jobs.sort_by_key(|job| match &job.slice.source {
         ReadSliceSource::Disk {
             generation,
@@ -638,54 +626,32 @@ fn execute_cold_slices(
         _ => (0, 0),
     });
 
-    let max_workers = if read_parallelism > 0 {
-        read_parallelism
-    } else {
-        default_read_parallelism()
-    };
-    let num_workers = max_workers.min(jobs.len()).max(1);
-
-    let chunk_size = jobs.len().div_ceil(num_workers);
-
-    std::thread::scope(|s| -> Result<(), FsError> {
-        let mut handles = Vec::with_capacity(num_workers);
-
-        for chunk in jobs.chunks_mut(chunk_size) {
-            let handle = s.spawn(move || -> Result<(), FsError> {
-                for job in chunk {
-                    match &job.slice.source {
-                        ReadSliceSource::Disk {
-                            generation,
-                            record_log_offset,
-                            record_size,
-                            payload_offset,
-                            slice_inner_offset,
-                        } => {
-                            cache
-                                .read_extent_payload(
-                                    *generation,
-                                    *record_log_offset,
-                                    *record_size,
-                                    *payload_offset,
-                                    *slice_inner_offset,
-                                    &mut *job.target,
-                                    volume_key,
-                                )
-                                .map_err(|_| FsError::EIO)?;
-                        }
-                        _ => panic!("expected Disk slice in cold_slices"),
-                    }
-                }
-                Ok(())
-            });
-            handles.push(handle);
+    for job in jobs {
+        match &job.slice.source {
+            ReadSliceSource::Disk {
+                generation,
+                record_log_offset,
+                record_size,
+                payload_offset,
+                slice_inner_offset,
+            } => {
+                cache
+                    .read_extent_payload(
+                        *generation,
+                        *record_log_offset,
+                        *record_size,
+                        *payload_offset,
+                        *slice_inner_offset,
+                        &mut *job.target,
+                        volume_key,
+                    )
+                    .map_err(|_| FsError::EIO)?;
+            }
+            _ => panic!("expected Disk slice in cold_slices"),
         }
+    }
 
-        for h in handles {
-            h.join().map_err(|_| FsError::EIO)??;
-        }
-        Ok(())
-    })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -756,7 +722,7 @@ mod tests {
         assert_eq!(plan.slices[2].len, 40);
         assert!(matches!(plan.slices[2].source, ReadSliceSource::Memory { .. }));
 
-        let read_buf = fs.execute_read_plan_sync(plan).unwrap();
+        let read_buf = execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).unwrap();
         assert_eq!(&read_buf[0..40], &[0xAA; 40]);
         assert_eq!(&read_buf[40..60], &[0x00; 20]);
         assert_eq!(&read_buf[60..100], &[0xAA; 40]);
@@ -771,7 +737,7 @@ mod tests {
         assert!(!plan.has_cold_slices);
         assert!(plan.slices.is_empty());
 
-        let res = fs.execute_read_plan_sync(plan).unwrap();
+        let res = execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).unwrap();
         assert!(res.is_empty());
     }
 
@@ -944,12 +910,12 @@ mod tests {
         assert_eq!(plan.slices[0].len, 100);
         assert!(matches!(plan.slices[0].source, ReadSliceSource::Cache { .. }));
 
-        let buf = fs.execute_read_plan_sync(plan).unwrap();
+        let buf = execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).unwrap();
         assert_eq!(buf, vec![0xCC; 100]);
     }
 
     #[test]
-    fn test_execute_read_plan_multi_extent_parallel() {
+    fn test_execute_read_plan_multi_extent() {
         use crate::crypto::{VolumeHeader, VolumeKey};
         use crate::log::RecoveryTarget;
         use crate::storage::MemoryStorage;
@@ -995,7 +961,7 @@ mod tests {
         crate::operations::read_write::write_core(&fs, attr.ino, &data4, 600).unwrap();
         fs.quiesce().unwrap();
 
-        // Clear decrypted record cache to force actual cold disk decoding in parallel
+        // Clear decrypted record cache to force actual cold disk decoding
         fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
 
         let plan = fs.plan_read_file_data(attr.ino, 0, 800).unwrap();
@@ -1003,8 +969,7 @@ mod tests {
         assert!(plan.has_cold_slices);
         assert!(plan.slices.len() >= 4);
 
-        // Execute synchronously (which dispatches parallel worker threads under the hood)
-        let read_buf = fs.execute_read_plan_sync(plan.clone()).unwrap();
+        let read_buf = execute_read_plan(plan.clone(), fs.log_cache.as_deref(), &fs.volume_key).unwrap();
         assert_eq!(&read_buf[0..200], &data1[..]);
         assert_eq!(&read_buf[200..400], &data2[..]);
         assert_eq!(&read_buf[400..600], &data3[..]);
@@ -1015,7 +980,7 @@ mod tests {
         let log_cache_bg = fs.log_cache.clone();
         let volume_key_bg = fs.volume_key.clone();
         let thread_buf =
-            std::thread::spawn(move || execute_read_plan(plan_bg, log_cache_bg.as_deref(), &volume_key_bg, 0))
+            std::thread::spawn(move || execute_read_plan(plan_bg, log_cache_bg.as_deref(), &volume_key_bg))
                 .join()
                 .unwrap()
                 .unwrap();
@@ -1161,7 +1126,7 @@ mod tests {
         assert_eq!(plan.slices.len(), 1);
         assert!(plan.has_cold_slices);
 
-        let res = fs.execute_read_plan_sync(plan).unwrap();
+        let res = execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).unwrap();
         assert_eq!(res, payload);
     }
 
@@ -1177,16 +1142,25 @@ mod tests {
         let mut fs = InMemoryFS::new();
         // Default is 0 (auto-detect)
         assert_eq!(fs.read_parallelism, 0);
-        assert_eq!(fs.read_parallelism(), 0);
+        assert!(fs.read_pool.read().unwrap().is_none());
+        assert_eq!(fs.effective_read_parallelism(), default);
 
-        // Explicit configuration via direct field or setter
-        fs.read_parallelism = 8;
+        // Explicit configuration via setter
+        fs.set_read_parallelism(8);
         assert_eq!(fs.read_parallelism, 8);
         assert_eq!(fs.read_parallelism(), 8);
+        assert_eq!(fs.effective_read_parallelism(), 8);
 
         // Reset to 0 (auto-detect)
         fs.set_read_parallelism(0);
         assert_eq!(fs.read_parallelism, 0);
         assert_eq!(fs.read_parallelism(), 0);
+        assert_eq!(fs.effective_read_parallelism(), default);
+
+        // When pool is enabled:
+        fs.enable_read_pool();
+        assert_eq!(fs.read_pool.read().unwrap().as_ref().unwrap().num_workers(), default);
+        fs.set_read_parallelism(8);
+        assert_eq!(fs.read_pool.read().unwrap().as_ref().unwrap().num_workers(), 8);
     }
 }

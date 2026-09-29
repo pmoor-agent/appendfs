@@ -1,8 +1,10 @@
 use crate::error::FsError;
 use crate::extent_map::{Extent, ExtentMap};
-use crate::fs::{FileHandle, FlushReason, FsInner, InMemoryFS, is_virtual_ino};
+use crate::fs::{FileHandle, FlushReason, FsInner, InMemoryFS, execute_read_plan, is_virtual_ino};
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
-use crate::shim::{DeferredCompletion, DeferredResult, FileAttr, FileType, FuseResponse, RequestContext};
+use crate::shim::{
+    DeferredCompletion, DeferredResult, DeferredToken, FileAttr, FileType, FuseResponse, RequestContext,
+};
 use crate::sync::OpTag;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -26,6 +28,57 @@ pub fn getattr_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'stati
     getattr_core(fs, ino).map(FuseResponse::attr)
 }
 
+pub fn read_response(
+    fs: &InMemoryFS,
+    ino: u64,
+    fh: u64,
+    offset: i64,
+    size: usize,
+) -> DeferredResult<FuseResponse<'static>> {
+    log::trace!("read(ino={}, fh={}, size={}, offset={})", ino, fh, size, offset);
+    if offset < 0 {
+        return DeferredResult::err(FsError::EINVAL);
+    }
+
+    let plan = match fs.plan_read_handle(ino, fh, offset as u64, size) {
+        Ok(p) => p,
+        Err(e) => return DeferredResult::err(e),
+    };
+
+    if !plan.has_cold_slices {
+        // Fast path: 100% in-memory (zeros, staged buffers, or decrypted record cache hits)
+        return DeferredResult::ready(
+            execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).map(FuseResponse::buf),
+        );
+    }
+
+    let pool = fs.read_pool.read().unwrap().clone();
+    let Some(pool) = pool else {
+        // Without an active read threadpool (e.g. in unit tests or standalone tools),
+        // execute synchronously on the caller thread.
+        return DeferredResult::ready(
+            execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).map(FuseResponse::buf),
+        );
+    };
+
+    // Cold read offload: dispatch to the dedicated read threadpool
+    let (token, receiver) = DeferredToken::new();
+    let guard = fs.begin_async_op();
+    let log_cache = fs.log_cache.clone();
+    let volume_key = fs.volume_key.clone();
+
+    if let Err(e) = pool.spawn(move || {
+        let _guard = guard;
+        let res = execute_read_plan(plan, log_cache.as_deref(), &volume_key);
+        token.complete(res.map(FuseResponse::buf));
+    }) {
+        return DeferredResult::err(e);
+    }
+
+    DeferredResult::deferred(receiver)
+}
+
+#[cfg(any(test, feature = "testing"))]
 pub fn read_core(
     fs: &InMemoryFS,
     ino: u64,
@@ -33,14 +86,8 @@ pub fn read_core(
     offset: i64,
     size: usize,
 ) -> Result<FuseResponse<'static>, FsError> {
-    log::trace!("read(ino={}, fh={}, size={}, offset={})", ino, fh, size, offset);
-    if offset < 0 {
-        return Err(FsError::EINVAL);
-    }
-    fs.read_handle(ino, fh, offset as u64, size).map(FuseResponse::buf)
+    read_response(fs, ino, fh, offset, size).wait()
 }
-
-pub use read_core as read_response;
 
 pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> {
     let write_requested = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0;
