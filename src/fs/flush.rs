@@ -678,7 +678,7 @@ impl InMemoryFS {
             writer.record_lock_holder()?;
         }
         self.delayed_queue.start();
-        self.read_pool.start();
+        self.enable_read_pool(self.read_parallelism);
         if self.is_read_only() {
             return Ok(());
         }
@@ -757,7 +757,9 @@ impl InMemoryFS {
         // Drain the delayed response queue before drain_async_ops(): stalls have no timeout.
         self.delayed_queue.drain();
         self.drain_async_ops();
-        self.read_pool.shutdown();
+        if let Some(pool) = self.read_pool.write().unwrap().take() {
+            pool.shutdown();
+        }
 
         // Last, so the worker's final cycle replicates the summary exported above. Taking it
         // out of `self` also releases the worker's `Arc` back to this filesystem.

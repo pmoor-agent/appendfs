@@ -16,32 +16,16 @@ pub struct ReadThreadPool {
 }
 
 impl ReadThreadPool {
-    /// Creates a new [`ReadThreadPool`] configured for the specified number of worker threads.
+    /// Creates a new [`ReadThreadPool`] with the specified number of worker threads.
     ///
     /// The worker count is clamped to `1..=16`.
-    ///
-    /// Note: Worker threads are not started here, but on an explicit call to [`start`](Self::start)
-    /// during filesystem initialization.
     pub fn new(workers: usize) -> Self {
-        Self {
-            sender: Mutex::new(None),
-            workers: Mutex::new(Vec::new()),
-            num_workers: workers.clamp(1, 16),
-        }
-    }
-
-    /// Starts the worker threads. Idempotent.
-    pub fn start(&self) {
-        let mut sender_guard = self.sender.lock().unwrap();
-        if sender_guard.is_some() {
-            return;
-        }
-
+        let num_workers = workers.clamp(1, 16);
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
-        let mut workers = self.workers.lock().unwrap();
+        let mut handles = Vec::with_capacity(num_workers);
 
-        for i in 0..self.num_workers {
+        for i in 0..num_workers {
             let rx = Arc::clone(&rx);
             let handle = thread::Builder::new()
                 .name(format!("appendfs-read-{}", i))
@@ -51,15 +35,19 @@ impl ReadThreadPool {
                     }
                 })
                 .expect("failed to spawn read worker thread");
-            workers.push(handle);
+            handles.push(handle);
         }
 
-        *sender_guard = Some(tx);
+        Self {
+            sender: Mutex::new(Some(tx)),
+            workers: Mutex::new(handles),
+            num_workers,
+        }
     }
 
     /// Submits a task for asynchronous execution on the threadpool.
     ///
-    /// Returns [`FsError::EIO`] if the pool has not been started or has been shut down.
+    /// Returns [`FsError::EIO`] if the pool has been shut down.
     pub fn spawn(&self, f: impl FnOnce() + Send + 'static) -> Result<(), FsError> {
         let sender = self.sender.lock().unwrap();
         if let Some(ref tx) = *sender {
@@ -96,7 +84,7 @@ impl std::fmt::Debug for ReadThreadPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadThreadPool")
             .field("num_workers", &self.num_workers)
-            .field("is_started", &self.sender.lock().unwrap().is_some())
+            .field("is_active", &self.sender.lock().unwrap().is_some())
             .finish()
     }
 }
@@ -110,7 +98,6 @@ mod tests {
     fn test_read_thread_pool_execution() {
         let pool = ReadThreadPool::new(4);
         assert_eq!(pool.num_workers(), 4);
-        pool.start();
 
         let counter = Arc::new(AtomicUsize::new(0));
         let num_tasks = 20;
@@ -136,16 +123,8 @@ mod tests {
     }
 
     #[test]
-    fn test_read_thread_pool_unstarted_spawn_fails() {
-        let pool = ReadThreadPool::new(4);
-        let res = pool.spawn(|| {});
-        assert!(res.is_err());
-    }
-
-    #[test]
     fn test_read_thread_pool_shutdown_spawn_fails() {
         let pool = ReadThreadPool::new(4);
-        pool.start();
         pool.shutdown();
         let res = pool.spawn(|| {});
         assert!(res.is_err());

@@ -52,13 +52,22 @@ pub fn read_response(
         );
     }
 
+    let pool = fs.read_pool.read().unwrap().clone();
+    let Some(pool) = pool else {
+        // Without an active read threadpool (e.g. in unit tests or standalone tools),
+        // execute synchronously on the caller thread.
+        return DeferredResult::ready(
+            execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key).map(FuseResponse::buf),
+        );
+    };
+
     // Cold read offload: dispatch to the dedicated read threadpool
     let (token, receiver) = DeferredToken::new();
     let guard = fs.begin_async_op();
     let log_cache = fs.log_cache.clone();
     let volume_key = fs.volume_key.clone();
 
-    if let Err(e) = fs.read_pool.spawn(move || {
+    if let Err(e) = pool.spawn(move || {
         let _guard = guard;
         let res = execute_read_plan(plan, log_cache.as_deref(), &volume_key);
         token.complete(res.map(FuseResponse::buf));

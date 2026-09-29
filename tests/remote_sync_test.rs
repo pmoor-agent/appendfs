@@ -21,7 +21,6 @@ use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 
 fn read_test(fs: &InMemoryFS, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, FsError> {
-    fs.read_pool.start();
     let fh = open_core(fs, ino, libc::O_RDONLY as u32)?;
     let res = read_core(fs, ino, fh, offset as i64, size);
     let _ = release_core(fs, ino, fh);

@@ -623,16 +623,17 @@ fn test_cold_read_deferred_threadpool_execution() {
     fs.quiesce().unwrap();
     fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
 
-    // 3. Cold read with unstarted pool: must immediately fail with EIO
-    let cold_unstarted = read_response(&fs, file.ino, fh, 0, payload.len());
-    assert!(cold_unstarted.is_ready());
-    assert_eq!(cold_unstarted.wait().unwrap_err(), appendfs::error::FsError::EIO);
+    // 3. Cold read with absent pool (default): must execute synchronously and be immediately Ready
+    let cold_sync = read_response(&fs, file.ino, fh, 0, payload.len());
+    assert!(cold_sync.is_ready());
+    assert_eq!(cold_sync.wait().unwrap().into_bytes().unwrap(), payload);
 
-    // 4. Start read pool and execute cold read: must be Deferred and executed on ReadThreadPool
-    fs.read_pool.start();
-    let cold_res = read_response(&fs, file.ino, fh, 0, payload.len());
-    assert!(cold_res.is_deferred());
+    // 4. Enable read pool, clear cache again, and execute cold read: must be Deferred and executed on ReadThreadPool
+    fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
+    fs.enable_read_pool(4);
+    let cold_async = read_response(&fs, file.ino, fh, 0, payload.len());
+    assert!(cold_async.is_deferred());
 
-    let final_res = cold_res.wait().unwrap();
+    let final_res = cold_async.wait().unwrap();
     assert_eq!(final_res.into_bytes().unwrap(), payload);
 }

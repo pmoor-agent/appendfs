@@ -1142,19 +1142,25 @@ mod tests {
         let mut fs = InMemoryFS::new();
         // Default is 0 (auto-detect)
         assert_eq!(fs.read_parallelism, 0);
-        assert_eq!(fs.read_parallelism(), 0);
-        assert_eq!(fs.read_pool.num_workers(), default);
+        assert!(fs.read_pool.read().unwrap().is_none());
+        assert_eq!(fs.effective_read_parallelism(), default);
 
         // Explicit configuration via setter
         fs.set_read_parallelism(8);
         assert_eq!(fs.read_parallelism, 8);
         assert_eq!(fs.read_parallelism(), 8);
-        assert_eq!(fs.read_pool.num_workers(), 8);
+        assert_eq!(fs.effective_read_parallelism(), 8);
 
         // Reset to 0 (auto-detect)
         fs.set_read_parallelism(0);
         assert_eq!(fs.read_parallelism, 0);
         assert_eq!(fs.read_parallelism(), 0);
-        assert_eq!(fs.read_pool.num_workers(), default);
+        assert_eq!(fs.effective_read_parallelism(), default);
+
+        // When pool is enabled:
+        fs.enable_read_pool(0);
+        assert_eq!(fs.read_pool.read().unwrap().as_ref().unwrap().num_workers(), default);
+        fs.set_read_parallelism(8);
+        assert_eq!(fs.read_pool.read().unwrap().as_ref().unwrap().num_workers(), 8);
     }
 }

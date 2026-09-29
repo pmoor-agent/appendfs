@@ -844,7 +844,6 @@ fn read_compat_file(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<
 #[allow(clippy::too_many_lines)]
 #[cfg(any(test, feature = "testing"))]
 pub fn verify_compat_tree(fs: &InMemoryFS) {
-    fs.read_pool.start();
     // 1. Root directory (Inode 1)
     let root_attr = fs.get_attr(1).expect("root directory must exist");
     assert_eq!(root_attr.file_type, FileType::Directory);

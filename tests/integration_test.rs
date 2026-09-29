@@ -3034,7 +3034,6 @@ fn test_periodic_summary_generation_on_log_rolls() {
     assert!(names.contains(&"file3.bin".to_string()));
     assert!(names.contains(&"file4.bin".to_string()));
 
-    recovered_fs.read_pool.start();
     let f1_ino = recovered_fs.lookup_child(1, "file1.bin").unwrap();
     let fh1 = appendfs::operations::read_write::open_core(&recovered_fs, f1_ino, libc::O_RDONLY as u32).unwrap();
     let buf1 = appendfs::operations::read_write::read_core(&recovered_fs, f1_ino, fh1, 0, 1000)

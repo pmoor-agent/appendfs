@@ -855,7 +855,8 @@ pub struct InMemoryFS {
     /// Concurrency level for parallel cold disk reads (0 = auto-detect based on CPU cores, max 16).
     pub read_parallelism: usize,
     /// Dedicated threadpool for offloading cold disk and remote reads from the FUSE event loop.
-    pub read_pool: Arc<ReadThreadPool>,
+    /// `None` by default (cold reads run synchronously). Initialized in `init()` once FUSE is running.
+    pub read_pool: RwLock<Option<Arc<ReadThreadPool>>>,
     /// Optional fixed IV for exported summary files (used for deterministic golden fixture generation and testing).
     pub deterministic_summary_iv: Option<[u8; 12]>,
 }
@@ -966,7 +967,7 @@ impl InMemoryFS {
             op_metrics,
             delayed_queue,
             read_parallelism: 0,
-            read_pool: Arc::new(ReadThreadPool::new(default_read_parallelism())),
+            read_pool: RwLock::new(None),
             deterministic_summary_iv: None,
         };
         fs.register_runtime_status();
@@ -1193,7 +1194,23 @@ impl InMemoryFS {
     /// Sets the read parallelism for cold disk extent reads. Passing 0 enables auto-detection.
     pub fn set_read_parallelism(&mut self, workers: usize) {
         self.read_parallelism = workers;
-        self.read_pool = Arc::new(ReadThreadPool::new(self.effective_read_parallelism()));
+        if self.read_pool.read().unwrap().is_some() {
+            self.enable_read_pool(workers);
+        }
+    }
+
+    /// Enables the dedicated read threadpool with the given worker count (0 = auto-detect).
+    pub fn enable_read_pool(&self, workers: usize) {
+        let count = if workers > 0 {
+            workers
+        } else {
+            self.effective_read_parallelism()
+        };
+        let mut guard = self.read_pool.write().unwrap();
+        if let Some(old) = guard.take() {
+            old.shutdown();
+        }
+        *guard = Some(Arc::new(ReadThreadPool::new(count)));
     }
 
     /// Returns the effective read threadpool worker count.
