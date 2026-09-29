@@ -1158,7 +1158,7 @@ mod tests {
         assert_eq!(fs.effective_read_parallelism(), default);
 
         // When pool is enabled:
-        fs.enable_read_pool(0);
+        fs.enable_read_pool();
         assert_eq!(fs.read_pool.read().unwrap().as_ref().unwrap().num_workers(), default);
         fs.set_read_parallelism(8);
         assert_eq!(fs.read_pool.read().unwrap().as_ref().unwrap().num_workers(), 8);

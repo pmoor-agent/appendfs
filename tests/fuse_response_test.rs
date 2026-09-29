@@ -630,7 +630,8 @@ fn test_cold_read_deferred_threadpool_execution() {
 
     // 4. Enable read pool, clear cache again, and execute cold read: must be Deferred and executed on ReadThreadPool
     fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
-    fs.enable_read_pool(4);
+    fs.set_read_parallelism(4);
+    fs.enable_read_pool();
     let cold_async = read_response(&fs, file.ino, fh, 0, payload.len());
     assert!(cold_async.is_deferred());
 

@@ -1195,17 +1195,13 @@ impl InMemoryFS {
     pub fn set_read_parallelism(&mut self, workers: usize) {
         self.read_parallelism = workers;
         if self.read_pool.read().unwrap().is_some() {
-            self.enable_read_pool(workers);
+            self.enable_read_pool();
         }
     }
 
-    /// Enables the dedicated read threadpool with the given worker count (0 = auto-detect).
-    pub fn enable_read_pool(&self, workers: usize) {
-        let count = if workers > 0 {
-            workers
-        } else {
-            self.effective_read_parallelism()
-        };
+    /// Enables the dedicated read threadpool using the configured read parallelism.
+    pub fn enable_read_pool(&self) {
+        let count = self.effective_read_parallelism();
         let mut guard = self.read_pool.write().unwrap();
         if let Some(old) = guard.take() {
             old.shutdown();

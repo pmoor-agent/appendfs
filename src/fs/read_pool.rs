@@ -18,9 +18,9 @@ pub struct ReadThreadPool {
 impl ReadThreadPool {
     /// Creates a new [`ReadThreadPool`] with the specified number of worker threads.
     ///
-    /// The worker count is clamped to `1..=16`.
+    /// The worker count is guaranteed to be at least 1.
     pub fn new(workers: usize) -> Self {
-        let num_workers = workers.clamp(1, 16);
+        let num_workers = workers.max(1);
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let mut handles = Vec::with_capacity(num_workers);
@@ -128,5 +128,16 @@ mod tests {
         pool.shutdown();
         let res = pool.spawn(|| {});
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_read_thread_pool_worker_clamping() {
+        let pool_zero = ReadThreadPool::new(0);
+        assert_eq!(pool_zero.num_workers(), 1);
+        pool_zero.shutdown();
+
+        let pool_large = ReadThreadPool::new(32);
+        assert_eq!(pool_large.num_workers(), 32);
+        pool_large.shutdown();
     }
 }

@@ -678,7 +678,7 @@ impl InMemoryFS {
             writer.record_lock_holder()?;
         }
         self.delayed_queue.start();
-        self.enable_read_pool(self.read_parallelism);
+        self.enable_read_pool();
         if self.is_read_only() {
             return Ok(());
         }
