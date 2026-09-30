@@ -124,6 +124,16 @@ impl LogManifest {
         self.logs.iter().find(|l| l.generation == generation)
     }
 
+    /// Returns the latest sealed log entry recorded in the manifest, if any.
+    pub fn latest_log(&self) -> Option<&LogFileInfo> {
+        self.logs.last()
+    }
+
+    /// Returns the generation sequence number of the latest sealed log recorded in the manifest, if any.
+    pub fn latest_generation(&self) -> Option<u32> {
+        self.logs.last().map(|l| l.generation)
+    }
+
     /// Returns true if the volume was cleanly unmounted/sealed prior to summary export,
     /// or false if the last recorded log generation was unsealed (indicating an unclean crash recovery).
     pub fn last_shutdown_clean(&self) -> bool {
@@ -359,5 +369,44 @@ mod tests {
         };
         manifest.record_sealed_log(log2);
         manifest.record_sealed_log(log1);
+    }
+
+    #[test]
+    fn test_latest_log_and_generation() {
+        let mut manifest = LogManifest::new();
+        assert_eq!(manifest.latest_log(), None);
+        assert_eq!(manifest.latest_generation(), None);
+
+        let log1 = LogFileInfo {
+            version: 1,
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 5,
+            total_bytes: 1024,
+            total_data_bytes: 512,
+            md5: [1u8; 16],
+            sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+        };
+        manifest.record_sealed_log(log1.clone());
+        assert_eq!(manifest.latest_log(), Some(&log1));
+        assert_eq!(manifest.latest_generation(), Some(1));
+
+        let log2 = LogFileInfo {
+            version: 1,
+            generation: 3,
+            revision: 0,
+            filename: "000003.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 2,
+            total_bytes: 512,
+            total_data_bytes: 256,
+            md5: [2u8; 16],
+            sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+        };
+        manifest.record_sealed_log(log2.clone());
+        assert_eq!(manifest.latest_log(), Some(&log2));
+        assert_eq!(manifest.latest_generation(), Some(3));
     }
 }

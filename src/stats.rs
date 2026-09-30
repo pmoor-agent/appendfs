@@ -408,12 +408,7 @@ impl VolumeStats {
         let generations = calculate_generation_live_stats_from_nodes(inodes.values().map(|a| a.as_ref()), manifest);
         let extensions = calculate_extension_stats_from_nodes(inodes);
         let content_report = format_volume_content_report(inodes, manifest);
-        let next_generation = manifest
-            .logs
-            .iter()
-            .map(|l| l.generation)
-            .max()
-            .map_or(1, |max| max + 1);
+        let next_generation = manifest.latest_generation().map_or(1, |max| max + 1);
         Self::from_parts(next_generation, &counts, generations, extensions, content_report)
     }
 

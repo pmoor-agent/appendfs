@@ -11,6 +11,11 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
+#[inline]
+fn is_interrupted(running: Option<&AtomicBool>) -> bool {
+    running.is_some_and(|r| !r.load(Ordering::SeqCst))
+}
+
 /// Helper to stream a file from local `Storage` to a `RemoteStore`.
 pub fn upload_storage_file(
     storage: &dyn Storage,
@@ -362,7 +367,7 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
 
     let manifest = fs.manifest.read().unwrap().clone();
     let head_gen = fs.log_writer.as_ref().map(|w| w.generation());
-    let last_sealed_gen = manifest.logs.iter().map(|l| l.generation).max().unwrap_or(0);
+    let last_sealed_gen = manifest.latest_generation().unwrap_or(0);
 
     let head_gen_str = match head_gen {
         Some(head) => head.to_string(),
@@ -529,6 +534,8 @@ impl RemoteReplicationWorker {
                     &mut confirmed_generations,
                     &mut confirmed_summaries,
                     false,
+                    Some(&running_clone),
+                    None,
                 ) {
                     log::warn!("Remote replication worker cycle error: {}", e);
                 }
@@ -555,19 +562,11 @@ impl RemoteReplicationWorker {
                 }
             }
 
-            // Final drain cycle on unmount/shutdown
+            // Focused drain cycle on unmount/shutdown
             log::info!("Flushing remaining remote sync tasks before shutdown...");
-            let _ = Self::run_cycle_with_audit(
-                &fs_clone,
-                &registry_clone,
-                &log_dir_clone,
-                &mut last_part_sync,
-                &mut uploaded_part_offsets,
-                &mut last_audit,
-                &mut confirmed_generations,
-                &mut confirmed_summaries,
-                true,
-            );
+            if let Err(e) = Self::drain_on_shutdown(&fs_clone, &registry_clone) {
+                log::warn!("Remote replication shutdown drain error: {}", e);
+            }
         });
 
         Self {
@@ -609,6 +608,8 @@ impl RemoteReplicationWorker {
             &mut confirmed_generations,
             &mut confirmed_summaries,
             force_audit,
+            Some(&self.running),
+            None,
         )
     }
 
@@ -632,6 +633,8 @@ impl RemoteReplicationWorker {
             &mut confirmed_generations,
             &mut confirmed_summaries,
             true,
+            None,
+            None,
         )
     }
 
@@ -648,6 +651,8 @@ impl RemoteReplicationWorker {
         confirmed_generations: &mut std::collections::HashMap<String, std::collections::HashSet<u32>>,
         confirmed_summaries: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
         force_audit: bool,
+        running: Option<&AtomicBool>,
+        generations_to_sync: Option<&[u32]>,
     ) -> io::Result<()> {
         let (policy, stores) = {
             let reg = registry.read().unwrap();
@@ -676,6 +681,10 @@ impl RemoteReplicationWorker {
             *last_audit = now;
             confirmed_generations.clear();
             confirmed_summaries.clear();
+        }
+
+        if is_interrupted(running) {
+            return Ok(());
         }
 
         // Pre-fetch object listings from each remote store once per cycle: O(1) listing requests per remote.
@@ -707,12 +716,19 @@ impl RemoteReplicationWorker {
 
         // Sync sealed generations to all writable remotes
         let manifest = fs.manifest.read().unwrap().clone();
+
         for log_entry in &manifest.logs {
             let gen_num = log_entry.generation;
             let filename = &log_entry.filename;
 
             // Only completed manifest generations (skip active writer generation)
             if gen_num >= active_gen {
+                continue;
+            }
+
+            if let Some(target_gens) = generations_to_sync
+                && !target_gens.contains(&gen_num)
+            {
                 continue;
             }
 
@@ -744,6 +760,9 @@ impl RemoteReplicationWorker {
 
                 let mut upload_succeeded = false;
                 if needs_upload {
+                    if is_interrupted(running) {
+                        return Ok(());
+                    }
                     if storage.exists(filename) {
                         log::info!(
                             "Replicating sealed {} ({} bytes) to remote '{}'...",
@@ -948,6 +967,9 @@ impl RemoteReplicationWorker {
 
                 let mut sync_succeeded = false;
                 if needs_sync {
+                    if is_interrupted(running) {
+                        return Ok(());
+                    }
                     if local_exists {
                         let md5_res = verified_local_md5.get_or_insert_with(|| {
                             verify_summary_storage_file(storage.as_ref(), sum_file)
@@ -1040,94 +1062,102 @@ impl RemoteReplicationWorker {
         }
 
         // 4. Active generation part-chunk upload (every active_sync_interval_secs)
-        let time_since_last_part = now.duration_since(*last_part_sync).unwrap_or_default();
+        // Skip active part sync during targeted generation replication (e.g. shutdown drain)
+        if generations_to_sync.is_none() {
+            let time_since_last_part = now.duration_since(*last_part_sync).unwrap_or_default();
 
-        if time_since_last_part.as_secs() >= policy.active_sync_interval_secs {
-            let (last_offset, part_idx) = uploaded_parts
-                .entry(active_gen)
-                // From offset 0: the first part carries the file header, whose key salt a
-                // bootstrap needs to decrypt the records in the parts that follow.
-                .or_insert((0, 0));
-            // A file holding only its header has nothing worth shipping yet.
-            if active_offset > crate::log::record::FILE_HEADER_SIZE as u64 && active_offset > *last_offset {
-                let part_len = active_offset - *last_offset;
-                let part_filename = format!("{:06}.part{:04}.log", active_gen, *part_idx);
+            if time_since_last_part.as_secs() >= policy.active_sync_interval_secs {
+                if is_interrupted(running) {
+                    return Ok(());
+                }
+                let (last_offset, part_idx) = uploaded_parts
+                    .entry(active_gen)
+                    // From offset 0: the first part carries the file header, whose key salt a
+                    // bootstrap needs to decrypt the records in the parts that follow.
+                    .or_insert((0, 0));
+                // A file holding only its header has nothing worth shipping yet.
+                if active_offset > crate::log::record::FILE_HEADER_SIZE as u64 && active_offset > *last_offset {
+                    let part_len = active_offset - *last_offset;
+                    let part_filename = format!("{:06}.part{:04}.log", active_gen, *part_idx);
 
-                let wants_parts = stores
-                    .iter()
-                    .any(|r| r.mode == RemoteMode::ReadWrite && r.upload_partial_logs);
+                    let wants_parts = stores
+                        .iter()
+                        .any(|r| r.mode == RemoteMode::ReadWrite && r.upload_partial_logs);
 
-                if wants_parts {
-                    // Read slice from local active log
-                    let active_filename = crate::log::log_filename(active_gen);
-                    if let Ok(reader) = storage.open_reader(&active_filename) {
-                        let mut part_bytes = vec![0u8; part_len as usize];
-                        if reader.read_exact_at(*last_offset, &mut part_bytes).is_ok() {
-                            let part_md5: [u8; 16] = *md5::compute(&part_bytes);
-                            let mut any_part_success = false;
-                            for r in &stores {
-                                if r.mode != RemoteMode::ReadWrite || !r.upload_partial_logs {
-                                    continue;
-                                }
-                                log::info!(
-                                    "Uploading active incremental part {} ({} bytes) to remote '{}'...",
-                                    part_filename,
-                                    part_len,
-                                    r.name
-                                );
-                                match r.store.put_object(
-                                    &part_filename,
-                                    &mut &part_bytes[..],
-                                    part_len,
-                                    Some(&part_md5),
-                                ) {
-                                    Ok(()) => {
-                                        any_part_success = true;
-                                        fs.replication_telemetry
-                                            .write()
-                                            .unwrap()
-                                            .record_active_part(&r.name, active_gen, *part_idx, now);
+                    if wants_parts {
+                        // Read slice from local active log
+                        let active_filename = crate::log::log_filename(active_gen);
+                        if let Ok(reader) = storage.open_reader(&active_filename) {
+                            let mut part_bytes = vec![0u8; part_len as usize];
+                            if reader.read_exact_at(*last_offset, &mut part_bytes).is_ok() {
+                                let part_md5: [u8; 16] = *md5::compute(&part_bytes);
+                                let mut any_part_success = false;
+                                for r in &stores {
+                                    if r.mode != RemoteMode::ReadWrite || !r.upload_partial_logs {
+                                        continue;
                                     }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "put_object active part {} to '{}' failed: {}",
-                                            part_filename,
-                                            r.name,
-                                            e
-                                        );
-                                        fs.replication_telemetry
-                                            .write()
-                                            .unwrap()
-                                            .record_error(&r.name, &e.to_string());
+                                    log::info!(
+                                        "Uploading active incremental part {} ({} bytes) to remote '{}'...",
+                                        part_filename,
+                                        part_len,
+                                        r.name
+                                    );
+                                    match r.store.put_object(
+                                        &part_filename,
+                                        &mut &part_bytes[..],
+                                        part_len,
+                                        Some(&part_md5),
+                                    ) {
+                                        Ok(()) => {
+                                            any_part_success = true;
+                                            fs.replication_telemetry
+                                                .write()
+                                                .unwrap()
+                                                .record_active_part(&r.name, active_gen, *part_idx, now);
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "put_object active part {} to '{}' failed: {}",
+                                                part_filename,
+                                                r.name,
+                                                e
+                                            );
+                                            fs.replication_telemetry
+                                                .write()
+                                                .unwrap()
+                                                .record_error(&r.name, &e.to_string());
+                                        }
                                     }
                                 }
-                            }
-                            if any_part_success {
-                                *last_offset = active_offset;
-                                *part_idx += 1;
+                                if any_part_success {
+                                    *last_offset = active_offset;
+                                    *part_idx += 1;
+                                }
                             }
                         }
                     }
                 }
+                *last_part_sync = now;
             }
-            *last_part_sync = now;
         }
 
         // 5. Tiered storage local eviction / pruning
-        Self::prune_eligible_local_logs(fs, &storage, &manifest, active_gen, &policy, &stores, &store_listings);
+        Self::prune_eligible_local_logs(fs, &manifest, active_gen, &policy, &stores, &store_listings);
 
         Ok(())
     }
 
     fn prune_eligible_local_logs(
         fs: &InMemoryFS,
-        storage: &Arc<dyn Storage>,
         manifest: &crate::log::LogManifest,
         active_gen: u32,
         policy: &crate::remote::config::ReplicationPolicy,
         stores: &[ConfiguredRemote],
         store_listings: &[Option<HashMap<String, RemoteObject>>],
     ) {
+        let Some(storage) = fs.log_cache.as_ref().map(|c| c.storage().clone()) else {
+            return;
+        };
         let now = fs.clock.now();
         let last_summary_gen = fs.last_summary_generation.load(Ordering::SeqCst);
 
@@ -1208,6 +1238,36 @@ impl RemoteReplicationWorker {
                 }
             }
         }
+    }
+
+    /// Runs a focused replication drain during unmount / shutdown.
+    ///
+    /// Synchronizes the latest sealed log generation and missing summary checkpoint files
+    /// to writable remotes, and executes local log eviction / pruning.
+    pub fn drain_on_shutdown(fs: &InMemoryFS, registry: &Arc<RwLock<RemoteRegistry>>) -> io::Result<()> {
+        let latest_sealed_gen = fs.manifest.read().unwrap().latest_generation();
+
+        let target_gens: Vec<u32> = latest_sealed_gen.into_iter().collect();
+        let running_drain = AtomicBool::new(true);
+        let mut last_part_sync = SystemTime::UNIX_EPOCH;
+        let mut uploaded_parts = std::collections::HashMap::new();
+        let mut last_audit = SystemTime::UNIX_EPOCH;
+        let mut confirmed_generations = std::collections::HashMap::new();
+        let mut confirmed_summaries = std::collections::HashMap::new();
+
+        Self::run_cycle_with_audit(
+            fs,
+            registry,
+            Path::new(""),
+            &mut last_part_sync,
+            &mut uploaded_parts,
+            &mut last_audit,
+            &mut confirmed_generations,
+            &mut confirmed_summaries,
+            true,
+            Some(&running_drain),
+            Some(&target_gens),
+        )
     }
 
     /// Stops the background worker and joins its thread.

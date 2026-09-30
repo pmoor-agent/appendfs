@@ -804,7 +804,7 @@ impl InMemoryFS {
         let snapshot = self.inner.lock(OpTag::Flush).unwrap().snapshot_all();
         let manifest = self.manifest.read().unwrap().clone();
 
-        let generation = manifest.logs.last().map(|l| l.generation).unwrap_or(0);
+        let generation = manifest.latest_generation().unwrap_or(0);
         let last_batch_id = self
             .log_writer
             .as_ref()
