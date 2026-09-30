@@ -1059,7 +1059,7 @@ impl InMemoryFS {
 
     /// Returns the sequence number for the next log generation to be allocated from an already-locked manifest.
     pub fn next_generation_locked(&self, manifest: &crate::log::LogManifest) -> u32 {
-        let manifest_max = manifest.logs.iter().map(|l| l.generation).max().unwrap_or(0);
+        let manifest_max = manifest.latest_generation().unwrap_or(0);
         let summary_gen = self.last_summary_generation.load(Ordering::SeqCst);
         // Saturating rather than wrapping: at the end of the generation space the writer's
         // own roll reports it (see `next_generation`), which is a far better place to fail

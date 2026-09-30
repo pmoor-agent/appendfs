@@ -637,7 +637,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
     let effective_batch_id = fs_instance.last_batch_id.load(Ordering::SeqCst);
     let effective_gen = {
         let manifest = fs_instance.manifest.read().unwrap();
-        manifest.logs.last().map(|l| l.generation).unwrap_or(1)
+        manifest.latest_generation().unwrap_or(1)
     };
     let effective_time_str = fs_instance
         .recovered_time()

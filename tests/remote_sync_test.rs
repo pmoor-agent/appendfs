@@ -1311,6 +1311,8 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -1337,6 +1339,8 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -1358,6 +1362,8 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         true,
+        None,
+        None,
     )
     .unwrap();
 
@@ -1746,6 +1752,8 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         true,
+        None,
+        None,
     )
     .unwrap();
 
@@ -1820,6 +1828,8 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         false, // incremental, confirmed_gens avoids Step 2 probes
+        None,
+        None,
     )
     .unwrap();
 
@@ -1874,6 +1884,8 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -1901,6 +1913,8 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -1929,6 +1943,8 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -1961,6 +1977,8 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         false,
+        None,
+        None,
     )
     .unwrap();
     assert_eq!(failing_counting.lists(), 1, "1 batch listing for the cycle");
@@ -2266,7 +2284,6 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
     let volume_key = VolumeKey::plaintext_arc();
 
     init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-
     let mut fs = appendfs::recover_fs(
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
@@ -2318,6 +2335,8 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -2346,6 +2365,8 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -2397,6 +2418,8 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
         &mut confirmed_gens,
         &mut confirmed_sums,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -2685,5 +2708,233 @@ fn test_prune_rule_multi_tier_lifecycle_with_glacier() {
     assert!(
         !storage.exists("000001.log"),
         "000001.log must be pruned locally once both nfs and glacier confirmed it!"
+    );
+}
+
+#[test]
+fn test_shutdown_drain_syncs_latest_sealed_log_and_skips_earlier_backlog() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    // Gen 1:
+    let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f1.ino, b"data 1", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed1);
+
+    // Gen 2:
+    let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f2.ino, b"data 2", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed2);
+
+    // Gen 3:
+    let f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f3.ino, b"data 3", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed3 = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed3);
+
+    let summary = fs.export_summary(storage.as_ref()).unwrap();
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
+    let fs_arc = Arc::new(fs);
+
+    let mock_remote = Arc::new(MockRemoteStore::new());
+    let mut registry = RemoteRegistry::new();
+    registry.add_remote("mock", RemoteTargetConfig::new("test-bucket"));
+    registry.set_store_override("mock", mock_remote.clone());
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    // Remote has nothing (missing 000001.log, 000002.log, 000003.log)
+    appendfs::remote::RemoteReplicationWorker::drain_on_shutdown(&fs_arc, &registry_arc).unwrap();
+
+    // Verify remote received the latest sealed log (000003.log) and summary,
+    // while skipping earlier backlog logs (000001.log, 000002.log) to avoid wasting bandwidth.
+    assert!(mock_remote.head_object("000001.log").unwrap().is_none());
+    assert!(mock_remote.head_object("000002.log").unwrap().is_none());
+    assert!(mock_remote.head_object("000003.log").unwrap().is_some());
+    assert!(mock_remote.head_object(&summary).unwrap().is_some());
+}
+
+#[test]
+fn test_shutdown_drain_prunes_eligible_local_logs() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f1.ino, b"data 1", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed1);
+
+    let summary = fs.export_summary(storage.as_ref()).unwrap();
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
+    let fs_arc = Arc::new(fs);
+
+    let mock_remote = Arc::new(MockRemoteStore::new());
+    let mut registry = RemoteRegistry::new();
+    registry.add_remote("mock", RemoteTargetConfig::new("test-bucket"));
+    registry.set_store_override("mock", mock_remote.clone());
+    registry.policy.prune_rule = PruneExpr::parse("older_than(0s) && oneof(mock)").unwrap();
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    assert!(storage.exists("000001.log"));
+
+    appendfs::remote::RemoteReplicationWorker::drain_on_shutdown(&fs_arc, &registry_arc).unwrap();
+
+    // Verify 000001.log was replicated to mock remote AND pruned locally
+    assert!(mock_remote.head_object("000001.log").unwrap().is_some());
+    assert!(mock_remote.head_object(&summary).unwrap().is_some());
+    assert!(
+        !storage.exists("000001.log"),
+        "000001.log must be pruned locally during shutdown drain"
+    );
+}
+
+#[test]
+fn test_shutdown_drain_replicates_only_missing_latest_sealed_log_and_summary() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    // Gen 1:
+    let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f1.ino, b"data 1", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed1_md5 = sealed1.md5;
+    fs.manifest.write().unwrap().record_sealed_log(sealed1);
+
+    // Gen 2:
+    let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f2.ino, b"data 2", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed2);
+
+    let summary = fs.export_summary(storage.as_ref()).unwrap();
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
+    let fs_arc = Arc::new(fs);
+
+    let mock_remote = Arc::new(MockRemoteStore::new());
+    // Pre-populate remote with 000001.log: only 000002.log (the latest sealed log) is missing!
+    upload_storage_file(storage.as_ref(), mock_remote.as_ref(), "000001.log", Some(&sealed1_md5)).unwrap();
+
+    let mut registry = RemoteRegistry::new();
+    registry.add_remote("mock", RemoteTargetConfig::new("test-bucket"));
+    registry.set_store_override("mock", mock_remote.clone());
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    appendfs::remote::RemoteReplicationWorker::drain_on_shutdown(&fs_arc, &registry_arc).unwrap();
+
+    // Verify 000002.log and summary WERE replicated because ONLY the latest sealed log was missing
+    assert!(mock_remote.head_object("000002.log").unwrap().is_some());
+    assert!(mock_remote.head_object(&summary).unwrap().is_some());
+}
+
+#[test]
+fn test_replication_worker_active_round_interrupted_on_stop() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    // Create 3 sealed logs
+    for i in 1..=3 {
+        let file = create_core(&fs, 1, &format!("f{}.txt", i), 0o644, 0, 1000, 1000).unwrap();
+        write_core(&fs, file.ino, &[b'X'; 50000], 0).unwrap();
+        fs.quiesce().unwrap();
+        let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+        fs.manifest.write().unwrap().record_sealed_log(sealed);
+    }
+    fs.export_summary(storage.as_ref()).unwrap();
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
+    let fs_arc = Arc::new(fs);
+
+    // Setup a remote with LatencyRemoteStore so replication takes time
+    let raw_mock = Arc::new(MockRemoteStore::new());
+    let latency_remote = Arc::new(LatencyRemoteStore::new(raw_mock.clone()));
+    latency_remote.set_fixed_delay(std::time::Duration::from_millis(100));
+
+    let mut registry = RemoteRegistry::new();
+    registry.add_remote("latency", RemoteTargetConfig::new("test-bucket"));
+    registry.set_store_override("latency", latency_remote);
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    // Start background replication worker
+    let mut worker = appendfs::remote::RemoteReplicationWorker::start_with_interval(
+        fs_arc.clone(),
+        registry_arc.clone(),
+        Path::new("/unused").to_path_buf(),
+        std::time::Duration::from_secs(10),
+    );
+
+    // Immediately stop the worker while replication is in-flight
+    let start_stop = std::time::Instant::now();
+    worker.stop();
+    let stop_duration = start_stop.elapsed();
+
+    // worker.stop() should return promptly rather than hanging for seconds/minutes
+    assert!(
+        stop_duration < std::time::Duration::from_secs(3),
+        "worker.stop() must interrupt and return promptly"
+    );
+
+    // Since there was a backlog of 3 files, the shutdown drain also should not have transferred all 3 files
+    let remote_objs = raw_mock.list_objects("").unwrap();
+    assert!(
+        remote_objs.len() < 4,
+        "Active round must have been interrupted without completing the entire backlog"
     );
 }

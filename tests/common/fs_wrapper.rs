@@ -262,6 +262,8 @@ impl TestFS {
                 &mut confirmed_generations,
                 &mut confirmed_summaries,
                 false,
+                None,
+                None,
             );
         }
     }

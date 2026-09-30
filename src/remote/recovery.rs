@@ -218,7 +218,7 @@ pub fn prepare_remote_recovery_for_target(
     };
 
     let manifest = latest_reader.manifest;
-    let max_manifest_gen = manifest.logs.last().map(|l| l.generation).unwrap_or(0);
+    let max_manifest_gen = manifest.latest_generation().unwrap_or(0);
 
     let candidate_upper = match target {
         RecoveryTarget::Latest => max_manifest_gen,
