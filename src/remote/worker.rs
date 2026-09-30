@@ -913,9 +913,9 @@ impl RemoteReplicationWorker {
             }
         }
 
-        // 3. Sync .summary checkpoint files to writable remotes
+        // 3. Sync .summary checkpoint files to writable remotes: restrict transfer to just the latest summary
         let local_files = storage.list_files()?;
-        let mut summary_files: std::collections::BTreeSet<String> = local_files
+        let mut all_summaries: std::collections::BTreeSet<String> = local_files
             .iter()
             .filter(|f| f.ends_with(".summary"))
             .cloned()
@@ -925,11 +925,19 @@ impl RemoteReplicationWorker {
             for listing in store_listings.iter().flatten() {
                 for key in listing.keys() {
                     if key.ends_with(".summary") {
-                        summary_files.insert(key.clone());
+                        all_summaries.insert(key.clone());
                     }
                 }
             }
         }
+
+        let summary_files: Vec<String> = if generations_to_sync.is_some() {
+            crate::log::latest_summary_filename(all_summaries.iter().map(String::as_str))
+                .into_iter()
+                .collect()
+        } else {
+            all_summaries.into_iter().collect()
+        };
 
         for sum_file in &summary_files {
             let local_exists = storage.exists(sum_file);
@@ -1242,7 +1250,7 @@ impl RemoteReplicationWorker {
 
     /// Runs a focused replication drain during unmount / shutdown.
     ///
-    /// Synchronizes the latest sealed log generation and missing summary checkpoint files
+    /// Synchronizes the latest sealed log generation and latest summary checkpoint file
     /// to writable remotes, and executes local log eviction / pruning.
     pub fn drain_on_shutdown(fs: &InMemoryFS, registry: &Arc<RwLock<RemoteRegistry>>) -> io::Result<()> {
         let latest_sealed_gen = fs.manifest.read().unwrap().latest_generation();

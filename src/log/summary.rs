@@ -168,6 +168,31 @@ pub fn summary_filename_with_revision(generation: u32, revision: u16) -> String 
     }
 }
 
+/// Finds the latest summary filename from an iterator of filenames or object keys.
+///
+/// Filenames are parsed via `parse_summary_filename`, comparing `(generation, revision)`
+/// to return the filename with the highest generation and revision.
+pub fn latest_summary_filename<'a, I>(files: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut latest: Option<((u32, u16), &str)> = None;
+    for file in files {
+        if let Some((generation, rev)) = crate::log::manifest::parse_summary_filename(file)
+            && latest.as_ref().is_none_or(|(gr, _)| (generation, rev) > *gr)
+        {
+            latest = Some(((generation, rev), file));
+        }
+    }
+    latest.map(|(_, f)| f.to_string())
+}
+
+/// Finds the newest `.summary` file in a storage volume.
+pub fn latest_summary_file(storage: &dyn Storage) -> io::Result<Option<String>> {
+    let files = storage.list_files()?;
+    Ok(latest_summary_filename(files.iter().map(String::as_str)))
+}
+
 /// Everything that goes into one summary snapshot.
 ///
 /// Grouped into a struct rather than passed positionally: the eight-argument version needed
@@ -1219,5 +1244,39 @@ mod tests {
         storage.insert_file("bad_magic.summary", bad_magic_bytes);
         let err = SummaryReader::read_summary_header(storage.as_ref(), "bad_magic.summary").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_latest_summary_filename_and_file() {
+        assert_eq!(latest_summary_filename(Vec::<&str>::new()), None);
+        assert_eq!(latest_summary_filename(["not_a_summary.txt", "000001.log"]), None);
+
+        let files = ["000000.summary", "000001.summary", "000003.summary", "000002.summary"];
+        assert_eq!(latest_summary_filename(files), Some("000003.summary".to_string()));
+
+        let files_with_rev = [
+            "000003.summary",
+            "000003_r1.summary",
+            "000003_r3.summary",
+            "000003_r2.summary",
+        ];
+        assert_eq!(
+            latest_summary_filename(files_with_rev),
+            Some("000003_r3.summary".to_string())
+        );
+
+        let mixed = ["prefix/000001.summary", "000004.summary", "000002_r5.summary"];
+        assert_eq!(latest_summary_filename(mixed), Some("000004.summary".to_string()));
+
+        let storage = Arc::new(MemoryStorage::new());
+        assert_eq!(latest_summary_file(storage.as_ref()).unwrap(), None);
+
+        storage.insert_file("000000.summary", vec![]);
+        storage.insert_file("000005.summary", vec![]);
+        storage.insert_file("000002.summary", vec![]);
+        assert_eq!(
+            latest_summary_file(storage.as_ref()).unwrap(),
+            Some("000005.summary".to_string())
+        );
     }
 }

@@ -9,29 +9,13 @@ use appendfs::crypto::{
 };
 use appendfs::log::{LogWriter, SummaryReader};
 use appendfs::storage::{OsStorage, Storage};
-use appendfs::{VolumeStats, check_volume, dump_file, init_volume, recover_fs};
+use appendfs::{VolumeStats, check_volume, dump_file, init_volume, latest_summary_file, recover_fs};
 
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use zeroize::Zeroizing;
-
-/// Finds the newest `{:06}.summary` in a volume directory.
-///
-/// The volume header lives in summary files, so this is the entry point for anything that
-/// needs to identify a volume or verify a key.
-fn latest_summary_file(storage: &dyn Storage) -> std::io::Result<Option<String>> {
-    let mut latest: Option<((u32, u16), String)> = None;
-    for file in storage.list_files()? {
-        if let Some((generation, rev)) = appendfs::log::parse_summary_filename(&file)
-            && latest.as_ref().is_none_or(|(gr, _)| (generation, rev) > *gr)
-        {
-            latest = Some(((generation, rev), file));
-        }
-    }
-    Ok(latest.map(|(_, f)| f))
-}
 
 fn load_remote_registry(storage: &dyn Storage) -> appendfs::remote::RemoteRegistry {
     match appendfs::remote::RemoteRegistry::load_from_storage(storage) {

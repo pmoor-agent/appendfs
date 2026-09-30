@@ -2764,10 +2764,11 @@ fn test_shutdown_drain_syncs_latest_sealed_log_and_skips_earlier_backlog() {
     appendfs::remote::RemoteReplicationWorker::drain_on_shutdown(&fs_arc, &registry_arc).unwrap();
 
     // Verify remote received the latest sealed log (000003.log) and summary,
-    // while skipping earlier backlog logs (000001.log, 000002.log) to avoid wasting bandwidth.
+    // while skipping earlier backlog logs (000001.log, 000002.log) and older summaries to avoid wasting bandwidth.
     assert!(mock_remote.head_object("000001.log").unwrap().is_none());
     assert!(mock_remote.head_object("000002.log").unwrap().is_none());
     assert!(mock_remote.head_object("000003.log").unwrap().is_some());
+    assert!(mock_remote.head_object("000000.summary").unwrap().is_none());
     assert!(mock_remote.head_object(&summary).unwrap().is_some());
 }
 
@@ -2870,6 +2871,141 @@ fn test_shutdown_drain_replicates_only_missing_latest_sealed_log_and_summary() {
     // Verify 000002.log and summary WERE replicated because ONLY the latest sealed log was missing
     assert!(mock_remote.head_object("000002.log").unwrap().is_some());
     assert!(mock_remote.head_object(&summary).unwrap().is_some());
+}
+
+#[test]
+fn test_shutdown_drain_syncs_latest_summary_and_skips_earlier_summaries() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    // Gen 1:
+    let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f1.ino, b"data 1", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed1);
+    let sum1 = fs.export_summary(storage.as_ref()).unwrap();
+    assert_eq!(sum1, "000001.summary");
+
+    // Gen 2:
+    let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f2.ino, b"data 2", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed2);
+    let sum2 = fs.export_summary(storage.as_ref()).unwrap();
+    assert_eq!(sum2, "000002.summary");
+
+    // Gen 3:
+    let f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f3.ino, b"data 3", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed3 = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed3);
+    let sum3 = fs.export_summary(storage.as_ref()).unwrap();
+    assert_eq!(sum3, "000003.summary");
+
+    // Storage now has 000000.summary, 000001.summary, 000002.summary, and 000003.summary
+    assert!(storage.exists("000000.summary"));
+    assert!(storage.exists("000001.summary"));
+    assert!(storage.exists("000002.summary"));
+    assert!(storage.exists("000003.summary"));
+
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
+    let fs_arc = Arc::new(fs);
+
+    let mock_remote = Arc::new(MockRemoteStore::new());
+    let mut registry = RemoteRegistry::new();
+    registry.add_remote("mock", RemoteTargetConfig::new("test-bucket"));
+    registry.set_store_override("mock", mock_remote.clone());
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    appendfs::remote::RemoteReplicationWorker::drain_on_shutdown(&fs_arc, &registry_arc).unwrap();
+
+    // Verify remote received ONLY the latest summary (000003.summary) and latest log (000003.log)
+    assert!(mock_remote.head_object("000000.summary").unwrap().is_none());
+    assert!(mock_remote.head_object("000001.summary").unwrap().is_none());
+    assert!(mock_remote.head_object("000002.summary").unwrap().is_none());
+    assert!(mock_remote.head_object("000003.summary").unwrap().is_some());
+    assert!(mock_remote.head_object("000001.log").unwrap().is_none());
+    assert!(mock_remote.head_object("000002.log").unwrap().is_none());
+    assert!(mock_remote.head_object("000003.log").unwrap().is_some());
+}
+
+#[test]
+fn test_worker_syncs_only_latest_summary_cross_copy() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f1.ino, b"data 1", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed1);
+    let sum1 = fs.export_summary(storage.as_ref()).unwrap();
+
+    let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, f2.ino, b"data 2", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed2);
+    let sum2 = fs.export_summary(storage.as_ref()).unwrap();
+
+    // Populate remote1 with 000001.summary and 000002.summary
+    let remote1 = Arc::new(MockRemoteStore::new());
+    let remote2 = Arc::new(MockRemoteStore::new());
+
+    upload_storage_file(storage.as_ref(), remote1.as_ref(), &sum1, None).unwrap();
+    upload_storage_file(storage.as_ref(), remote1.as_ref(), &sum2, None).unwrap();
+
+    // Remove summaries from local storage so remote2 must cross-copy from remote1
+    storage.remove_file(&sum1).unwrap();
+    storage.remove_file(&sum2).unwrap();
+    assert!(!storage.exists(&sum1));
+    assert!(!storage.exists(&sum2));
+
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
+    let fs_arc = Arc::new(fs);
+
+    let mut registry = RemoteRegistry::new();
+    registry.add_remote("r1", RemoteTargetConfig::new("bucket-1"));
+    registry.set_store_override("r1", remote1.clone());
+    registry.add_remote("r2", RemoteTargetConfig::new("bucket-2"));
+    registry.set_store_override("r2", remote2.clone());
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    // Drain on shutdown: should cross-copy ONLY the latest summary (000002.summary), skipping older 000001.summary
+    appendfs::remote::RemoteReplicationWorker::drain_on_shutdown(&fs_arc, &registry_arc).unwrap();
+
+    // Remote 2 must cross-copy ONLY the latest summary (000002.summary), skipping older 000001.summary
+    assert!(remote2.head_object(&sum1).unwrap().is_none());
+    assert!(remote2.head_object(&sum2).unwrap().is_some());
 }
 
 #[test]

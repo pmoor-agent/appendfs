@@ -2,7 +2,6 @@ use crate::crypto::VolumeKey;
 use crate::log::{RecoveryTarget, SummaryReader};
 use crate::remote::RemoteReadTarget;
 use crate::storage::{Storage, StorageWriter, WriteMode};
-use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -165,18 +164,19 @@ pub fn prepare_remote_recovery_for_target(
 
     // If local storage has no summaries at all, search remotes for the newest checkpoint
     if local_summaries.is_empty() {
-        let mut remote_summary_gens = BTreeSet::new();
+        let mut remote_summary_keys = Vec::new();
         for target_remote in remote_stores {
             if let Ok(objs) = target_remote.store.list_objects("") {
                 for obj in objs {
-                    if let Some((gen_num, rev_num)) = crate::log::parse_summary_filename(&obj.key) {
-                        remote_summary_gens.insert((gen_num, rev_num));
+                    if obj.key.ends_with(".summary") {
+                        remote_summary_keys.push(obj.key);
                     }
                 }
             }
         }
 
-        if let Some(&(latest_remote_gen, latest_remote_rev)) = remote_summary_gens.last()
+        if let Some(latest_key) = crate::log::latest_summary_filename(remote_summary_keys.iter().map(String::as_str))
+            && let Some((latest_remote_gen, latest_remote_rev)) = crate::log::parse_summary_filename(&latest_key)
             && let Ok(Some(reader)) = fetch_and_verify_summary(
                 remote_stores,
                 storage,

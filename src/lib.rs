@@ -47,7 +47,8 @@ pub use fs::{
 };
 pub use log::{
     ExtentState, LogFileCache, LogReader, LogRecord, LogWriter, RecoveryTarget, SharedExtentState, SummaryFooter,
-    SummaryHeader, SummaryReader, export_summary, init_volume, init_volume_with_clock, recover_fs,
+    SummaryHeader, SummaryReader, export_summary, init_volume, init_volume_with_clock, latest_summary_file,
+    latest_summary_filename, recover_fs,
 };
 pub use node::{InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta};
 pub use operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics};
