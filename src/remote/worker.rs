@@ -535,7 +535,9 @@ impl RemoteReplicationWorker {
                 };
 
                 let needs_upload = match map.get(filename) {
-                    Some(obj) => obj.size != expected_len,
+                    Some(obj) => {
+                        obj.size != expected_len || expected_md5.is_some_and(|exp| obj.etag_md5() != Some(*exp))
+                    }
                     None => true,
                 };
 
@@ -606,13 +608,56 @@ impl RemoteReplicationWorker {
                 let verified_on_remote = if needs_upload {
                     if upload_succeeded {
                         match r.store.head_object(filename) {
-                            Ok(Some(obj)) if obj.size == expected_len => {
+                            Ok(Some(obj))
+                                if obj.size == expected_len
+                                    && expected_md5.is_none_or(|exp| obj.etag_md5() == Some(*exp)) =>
+                            {
                                 if let Some(Some(map)) = store_listings.get_mut(r_idx) {
                                     map.insert(filename.clone(), obj);
                                 }
                                 true
                             }
-                            _ => false,
+                            Ok(Some(obj)) => {
+                                log::warn!(
+                                    "Post-upload verification for {} on remote '{}' failed: expected size {}, MD5 {:?}, got size {}, ETag {:?}",
+                                    filename,
+                                    r.name,
+                                    expected_len,
+                                    expected_md5.map(hex::encode),
+                                    obj.size,
+                                    obj.etag
+                                );
+                                fs.replication_telemetry
+                                    .write()
+                                    .unwrap()
+                                    .record_error(&r.name, "post-upload verification failed (size or MD5 mismatch)");
+                                false
+                            }
+                            Ok(None) => {
+                                log::warn!(
+                                    "Post-upload verification for {} on remote '{}' failed: object not found",
+                                    filename,
+                                    r.name
+                                );
+                                fs.replication_telemetry
+                                    .write()
+                                    .unwrap()
+                                    .record_error(&r.name, "post-upload verification failed (object not found)");
+                                false
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Post-upload head_object for {} on remote '{}' failed: {}",
+                                    filename,
+                                    r.name,
+                                    e
+                                );
+                                fs.replication_telemetry
+                                    .write()
+                                    .unwrap()
+                                    .record_error(&r.name, &e.to_string());
+                                false
+                            }
                         }
                     } else {
                         false
