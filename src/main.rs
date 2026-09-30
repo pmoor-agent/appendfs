@@ -555,6 +555,7 @@ fn cmd_mount(args: MountArgs) {
         eprintln!("Failed to mount appendfs FUSE filesystem: {}", err);
         std::process::exit(1);
     }
+    log::info!("Orderly shutdown complete");
 }
 
 fn cmd_mount_ro(args: MountRoArgs) {
@@ -644,6 +645,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
         eprintln!("Failed to mount read-only appendfs FUSE filesystem: {}", err);
         std::process::exit(1);
     }
+    log::info!("Orderly shutdown complete");
 }
 
 fn cmd_stats(args: StatsArgs) {

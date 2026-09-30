@@ -715,6 +715,26 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
         "the mount must leave exactly one log file of its own"
     );
 
+    // The mount log must indicate an orderly shutdown close to process exit.
+    assert!(
+        appendfs::wait_until(
+            || {
+                std::fs::read_dir(&logs_dir)
+                    .map(|entries| {
+                        entries.flatten().any(|e| {
+                            e.file_name().to_string_lossy().starts_with("appendfs-")
+                                && std::fs::read_to_string(e.path())
+                                    .map(|c| c.contains("mount") && c.contains("Orderly shutdown complete"))
+                                    .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(5)
+        ),
+        "a backgrounded mount must log an orderly shutdown on unmount"
+    );
+
     // The volume itself is unaffected: the log lives in a subdirectory, so nothing that
     // scans the log directory for generations or summaries can see it.
     let fsck = Command::new(env!("CARGO_BIN_EXE_appendfs"))
@@ -725,6 +745,80 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
         fsck.status.success(),
         "fsck must not be confused by the log directory: {}",
         String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+#[test]
+fn test_cli_backgrounded_mount_ro_writes_orderly_shutdown_log() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::thread;
+    use std::time::Duration;
+
+    let log_dir = TempDir::new().unwrap();
+    let mount_dir = TempDir::new().unwrap();
+    std::fs::set_permissions(mount_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["init", log_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to init volume");
+    assert!(init_out.status.success());
+
+    let initial_dev = std::fs::metadata(mount_dir.path()).unwrap().dev();
+
+    let parent = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "mount-ro",
+            log_dir.path().to_str().unwrap(),
+            mount_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn appendfs mount-ro");
+    assert!(
+        parent.status.success(),
+        "mount-ro failed: {}",
+        String::from_utf8_lossy(&parent.stderr)
+    );
+
+    let mut mounted = false;
+    for _ in 0..200 {
+        if let Ok(meta) = std::fs::metadata(mount_dir.path())
+            && meta.dev() != initial_dev
+        {
+            mounted = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(mounted, "timed out waiting for read-only FUSE filesystem to mount");
+
+    let unmounted = appendfs::wait_until(
+        || {
+            matches!(Command::new("fusermount3").arg("-u").arg(mount_dir.path()).status(),
+                     Ok(s) if s.success())
+        },
+        Duration::from_secs(5),
+    );
+    assert!(unmounted, "failed to unmount read-only filesystem");
+
+    let logs_dir = log_dir.path().join("logs");
+    assert!(
+        appendfs::wait_until(
+            || {
+                std::fs::read_dir(&logs_dir)
+                    .map(|entries| {
+                        entries.flatten().any(|e| {
+                            e.file_name().to_string_lossy().starts_with("appendfs-")
+                                && std::fs::read_to_string(e.path())
+                                    .map(|c| c.contains("mount-ro") && c.contains("Orderly shutdown complete"))
+                                    .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(5)
+        ),
+        "a backgrounded read-only mount must log an orderly shutdown on unmount"
     );
 }
 
