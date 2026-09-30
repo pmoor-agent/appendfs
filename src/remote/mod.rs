@@ -40,7 +40,7 @@ pub use recovery::prepare_remote_recovery_for_target;
 pub use s3::S3RemoteStore;
 pub use sigv4::SigV4Signer;
 pub use tiered_reader::TieredStorageReader;
-pub use worker::RemoteReplicationWorker;
+pub use worker::{DEFAULT_POLL_INTERVAL, RemoteReplicationWorker};
 
 use std::io;
 use std::sync::Arc;

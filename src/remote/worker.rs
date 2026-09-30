@@ -476,10 +476,13 @@ pub struct RemoteReplicationWorker {
     log_dir: PathBuf,
 }
 
+/// Default background poll interval when no roll/summary events trigger replication (60 seconds).
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
 impl RemoteReplicationWorker {
-    /// Starts the background replication worker thread with default 5-second interval.
+    /// Starts the background replication worker thread with default 60-second interval.
     pub fn start(fs: Arc<InMemoryFS>, registry: Arc<RwLock<RemoteRegistry>>, log_dir: PathBuf) -> Self {
-        Self::start_with_interval(fs, registry, log_dir, Duration::from_secs(5))
+        Self::start_with_interval(fs, registry, log_dir, DEFAULT_POLL_INTERVAL)
     }
 
     /// Starts the background replication worker thread with a configurable maintenance poll interval.
@@ -1376,5 +1379,10 @@ mod tests {
         let err = verify_summary_storage_file(storage.as_ref(), "000002.summary").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("BLAKE3 checksum mismatch"));
+    }
+
+    #[test]
+    fn test_default_poll_interval() {
+        assert_eq!(DEFAULT_POLL_INTERVAL, Duration::from_secs(60));
     }
 }
