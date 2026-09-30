@@ -7,7 +7,7 @@ use appendfs::crypto::{VolumeHeader, VolumeKey};
 use appendfs::log::{LogFileCache, LogWriter, init_volume, init_volume_with_clock};
 use appendfs::operations::read_write::{create_core, open_core, read_core, release_core, write_core};
 use appendfs::remote::bootstrap_from_remote;
-use appendfs::remote::worker::{cross_copy_file, upload_storage_file};
+use appendfs::remote::worker::{cross_copy_file, cross_copy_summary, upload_storage_file};
 use appendfs::remote::{
     BlockCache, CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, LocalDirRemoteStore, MemoryBlockCache,
     MockRemoteStore, RemoteRegistry, RemoteStore, RemoteTargetConfig, check_remote_integrity,
@@ -101,7 +101,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
         remote_b2.as_ref(),
         "000001.log",
         gen1_info.total_bytes,
-        Some(&gen1_md5),
+        &gen1_md5,
     )
     .unwrap();
     cross_copy_file(
@@ -109,12 +109,19 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
         remote_b2.as_ref(),
         "000002.log",
         gen2_info.total_bytes,
-        Some(&gen2_md5),
+        &gen2_md5,
     )
     .unwrap();
     let b2_head = remote_b2.head_object("000001.log").unwrap().unwrap();
     assert_eq!(b2_head.size, gen1_info.total_bytes);
     assert_eq!(b2_head.etag_md5(), Some(gen1_md5));
+
+    // Cross-copy summary from aws to b2 with BLAKE3 validation and inline MD5 computation
+    let sum2_len = storage.file_len("000002.summary").unwrap();
+    cross_copy_summary(remote_aws.as_ref(), remote_b2.as_ref(), "000002.summary", sum2_len).unwrap();
+    let b2_sum_head = remote_b2.head_object("000002.summary").unwrap().unwrap();
+    assert_eq!(b2_sum_head.size, sum2_len);
+    assert!(b2_sum_head.etag_md5().is_some());
 
     // 4. Run integrity check on remote_aws against manifest
     let report = check_remote_integrity(remote_aws.as_ref(), "aws", &manifest);
