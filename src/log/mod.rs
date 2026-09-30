@@ -26,6 +26,7 @@ pub use record::{
 pub use recovery::{RecoveryTarget, recover_fs};
 pub use summary::{
     SummaryFooter, SummaryHeader, SummaryReader, SummarySnapshot, export_summary, init_volume, init_volume_with_clock,
-    init_volume_with_clock_and_uids, summary_filename, summary_filename_with_revision,
+    init_volume_with_clock_and_uids, latest_summary_file, latest_summary_filename, summary_filename,
+    summary_filename_with_revision,
 };
 pub use writer::{LogCheckpoint, LogWriter};

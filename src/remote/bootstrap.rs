@@ -37,21 +37,13 @@ pub fn bootstrap_from_remote(
     }
 
     // 2. Find newest .summary file
-    let mut latest_summary: Option<((u32, u16), String)> = None;
-    for obj in &objects {
-        if let Some((generation, rev)) = crate::log::parse_summary_filename(&obj.key)
-            && latest_summary.as_ref().is_none_or(|(gr, _)| (generation, rev) > *gr)
-        {
-            latest_summary = Some(((generation, rev), obj.key.clone()));
-        }
-    }
-
-    let ((summary_gen, summary_rev), summary_key) = latest_summary.ok_or_else(|| {
+    let summary_key = crate::log::latest_summary_filename(objects.iter().map(|o| o.key.as_str())).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "No valid .summary checkpoint files found in remote store",
         )
     })?;
+    let (summary_gen, summary_rev) = crate::log::parse_summary_filename(&summary_key).unwrap();
 
     let local_summary_name = crate::log::summary_filename_with_revision(summary_gen, summary_rev);
     let tmp_summary_name = format!("{}.tmp", local_summary_name);
