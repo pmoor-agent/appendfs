@@ -320,18 +320,27 @@ fn cmd_init(args: InitArgs) {
         let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
         let registry = load_remote_registry(storage.as_ref());
 
+        if args.remote_mode == appendfs::remote::RemoteMode::WriteOnly {
+            eprintln!("Error: Cannot bootstrap an initial filesystem from a write-only remote.");
+            std::process::exit(1);
+        }
+
         let remote_cfg = if let Some(cfg) = registry.get_remote(remote_name) {
+            if cfg.mode == appendfs::remote::RemoteMode::WriteOnly {
+                eprintln!("Error: Cannot bootstrap an initial filesystem from a write-only remote.");
+                std::process::exit(1);
+            }
             cfg.clone()
         } else if let Some(ref path) = args.remote_path {
             let mut cfg = appendfs::remote::RemoteTargetConfig::new_path(path);
-            cfg.read_only = args.remote_read_only;
+            cfg.mode = args.remote_mode;
             cfg
         } else if let Some(ref bucket) = args.remote_bucket {
             let mut cfg = appendfs::remote::RemoteTargetConfig::new(bucket);
             cfg.endpoint = args.remote_endpoint.clone();
             cfg.region = args.remote_region.clone();
             cfg.prefix = args.remote_prefix.clone();
-            cfg.read_only = args.remote_read_only;
+            cfg.mode = args.remote_mode;
             cfg.access_key_id = args.remote_access_key_id.clone();
             cfg.secret_access_key = args.remote_secret_access_key.clone();
             cfg
@@ -821,7 +830,7 @@ fn cmd_remote_add(add_args: RemoteAddArgs) {
     cfg.endpoint = add_args.endpoint;
     cfg.region = add_args.region;
     cfg.prefix = add_args.prefix;
-    cfg.read_only = add_args.read_only;
+    cfg.mode = add_args.mode;
     cfg.replicate_ancestors = add_args.replicate_ancestors;
     if let Some(prio) = add_args.read_priority {
         cfg.read_priority = prio;
@@ -838,9 +847,14 @@ fn cmd_remote_add(add_args: RemoteAddArgs) {
         std::process::exit(1);
     }
     if add_args.no_upload_partial_logs {
-        cfg.upload_partial_logs = false;
+        cfg.upload_partial_logs = Some(false);
     } else if let Some(upl) = add_args.upload_partial_logs {
-        cfg.upload_partial_logs = upl;
+        cfg.upload_partial_logs = Some(upl);
+    }
+
+    if let Err(e) = cfg.validate(&add_args.name) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
 
     registry.add_remote(&add_args.name, cfg);
@@ -886,8 +900,12 @@ fn cmd_remote_list(list_args: RemoteListArgs) {
                     name,
                     p.display(),
                     cfg.read_priority,
-                    if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
-                    if cfg.upload_partial_logs { "Enabled" } else { "Disabled" },
+                    cfg.mode,
+                    if cfg.upload_partial_logs() {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    },
                 );
             } else {
                 let sc_str = cfg
@@ -901,8 +919,12 @@ fn cmd_remote_list(list_args: RemoteListArgs) {
                     cfg.bucket.as_deref().unwrap_or(""),
                     cfg.read_priority,
                     cfg.region,
-                    if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
-                    if cfg.upload_partial_logs { "Enabled" } else { "Disabled" },
+                    cfg.mode,
+                    if cfg.upload_partial_logs() {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    },
                     cfg.endpoint,
                     cfg.prefix,
                     sc_str

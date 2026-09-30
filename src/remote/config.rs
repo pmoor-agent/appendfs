@@ -11,21 +11,59 @@ use std::sync::Arc;
 
 pub const DEFAULT_REMOTES_FILENAME: &str = "remotes.toml";
 
+/// Operating mode of a remote target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+pub enum RemoteMode {
+    /// Remote is actively read from and written to during normal operations.
+    #[default]
+    ReadWrite,
+    /// Remote is read-only upstream (used for upstream volumes and zero-cost cloud forking); no writes are uploaded.
+    ReadOnly,
+    /// Remote is write-only archive (e.g. Amazon Glacier Deep Archive); used for disaster recovery, never queried for live reads.
+    WriteOnly,
+}
+
+impl RemoteMode {
+    /// Returns true if the remote can be read from during normal operations.
+    pub fn is_readable(&self) -> bool {
+        matches!(self, Self::ReadWrite | Self::ReadOnly)
+    }
+
+    /// Returns true if changes can be replicated/written to the remote.
+    pub fn is_writable(&self) -> bool {
+        matches!(self, Self::ReadWrite | Self::WriteOnly)
+    }
+}
+
+impl std::fmt::Display for RemoteMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadWrite => write!(f, "Read-Write"),
+            Self::ReadOnly => write!(f, "Read-Only"),
+            Self::WriteOnly => write!(f, "Write-Only"),
+        }
+    }
+}
+
 /// Configuration for a single remote target (e.g. AWS S3, Cloudflare R2, MinIO, or a local/NFS filesystem directory).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteTargetConfig {
     /// Local filesystem path for local directory or NFS NAS share remotes
+    #[serde(default)]
     pub path: Option<PathBuf>,
     /// S3 bucket name (for S3-compatible cloud object stores)
     #[serde(default)]
     pub bucket: Option<String>,
     #[serde(default = "default_region")]
     pub region: String,
+    #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]
     pub prefix: String,
     #[serde(default)]
-    pub read_only: bool,
+    pub mode: RemoteMode,
     #[serde(default)]
     pub replicate_ancestors: bool,
     /// Read priority (lower numerical values are queried first during remote reads; default 10 for path/NFS, 100 for S3)
@@ -34,16 +72,22 @@ pub struct RemoteTargetConfig {
     /// Maximum concurrent read requests to this remote (0 or None = unlimited)
     #[serde(default)]
     pub max_concurrent_reads: Option<usize>,
+    #[serde(default)]
     pub access_key_id: Option<String>,
+    #[serde(default)]
     pub secret_access_key: Option<String>,
+    #[serde(default)]
     pub access_key_id_env: Option<String>,
+    #[serde(default)]
     pub secret_access_key_env: Option<String>,
+    #[serde(default)]
     pub credentials_file: Option<PathBuf>,
+    #[serde(default)]
     pub force_path_style: Option<bool>,
-    /// Whether to upload incremental active log parts to this remote before generation seals (default: true).
-    #[serde(default = "default_upload_partial_logs")]
-    pub upload_partial_logs: bool,
-    /// S3 storage class for uploaded objects (e.g. "INTELLIGENT_TIERING", "STANDARD_IA", "GLACIER_IR").
+    /// Whether to upload incremental active log parts to this remote before generation seals (None = default based on mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_partial_logs: Option<bool>,
+    /// S3 storage class for uploaded objects (e.g. "INTELLIGENT_TIERING", "STANDARD_IA", "GLACIER_IR", "DEEP_ARCHIVE").
     #[serde(default)]
     pub storage_class: Option<String>,
 }
@@ -56,10 +100,6 @@ fn default_read_priority() -> u32 {
     100
 }
 
-fn default_upload_partial_logs() -> bool {
-    true
-}
-
 impl RemoteTargetConfig {
     pub fn new(bucket: impl Into<String>) -> Self {
         Self {
@@ -68,7 +108,7 @@ impl RemoteTargetConfig {
             region: default_region(),
             endpoint: None,
             prefix: String::new(),
-            read_only: false,
+            mode: RemoteMode::ReadWrite,
             replicate_ancestors: false,
             read_priority: default_read_priority(),
             max_concurrent_reads: None,
@@ -78,7 +118,7 @@ impl RemoteTargetConfig {
             secret_access_key_env: None,
             credentials_file: None,
             force_path_style: None,
-            upload_partial_logs: default_upload_partial_logs(),
+            upload_partial_logs: None,
             storage_class: None,
         }
     }
@@ -90,7 +130,7 @@ impl RemoteTargetConfig {
             region: default_region(),
             endpoint: None,
             prefix: String::new(),
-            read_only: false,
+            mode: RemoteMode::ReadWrite,
             replicate_ancestors: false,
             read_priority: 10,
             max_concurrent_reads: None,
@@ -100,9 +140,21 @@ impl RemoteTargetConfig {
             secret_access_key_env: None,
             credentials_file: None,
             force_path_style: None,
-            upload_partial_logs: default_upload_partial_logs(),
+            upload_partial_logs: None,
             storage_class: None,
         }
+    }
+
+    pub fn with_mode(mut self, mode: RemoteMode) -> Self {
+        self.mode = mode;
+        if self.mode != RemoteMode::ReadWrite {
+            self.upload_partial_logs = Some(false);
+        }
+        self
+    }
+
+    pub fn upload_partial_logs(&self) -> bool {
+        self.upload_partial_logs.unwrap_or(self.mode == RemoteMode::ReadWrite)
     }
 
     pub fn with_storage_class(mut self, storage_class: impl Into<String>) -> Self {
@@ -121,8 +173,21 @@ impl RemoteTargetConfig {
     }
 
     pub fn with_upload_partial_logs(mut self, enabled: bool) -> Self {
-        self.upload_partial_logs = enabled;
+        self.upload_partial_logs = Some(enabled);
         self
+    }
+
+    pub fn validate(&self, name: &str) -> io::Result<()> {
+        if self.upload_partial_logs == Some(true) && self.mode != RemoteMode::ReadWrite {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "remote '{}': upload_partial_logs can only be true for read-write mode (found mode: {})",
+                    name, self.mode
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolves AWS credentials according to precedence:
@@ -210,12 +275,10 @@ impl RemoteTargetConfig {
 /// Global volume replication and tiered retention policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicationPolicy {
-    /// Number of remotes $k$ that must confirm an immutable log generation before local eviction is permitted.
-    #[serde(default = "default_min_synced")]
-    pub min_synced_remotes: usize,
-    /// Keep sealed log files locally for at least this duration before eviction (e.g. "30d", "24h", "3600s", default: "30d").
-    #[serde(default = "default_local_retention")]
-    pub local_retention: String,
+    /// Pruning rule expression that must be satisfied before local log files are evicted.
+    /// Default: "older_than(30d) && readable(1)".
+    #[serde(default)]
+    pub prune_rule: crate::remote::policy::PruneExpr,
     /// Maximum time an active log can stay open before rolling (default: 86400s / 24 hours).
     #[serde(default = "default_max_log_age")]
     pub max_log_age_secs: u64,
@@ -227,20 +290,6 @@ pub struct ReplicationPolicy {
     pub audit_interval_secs: u64,
 }
 
-impl ReplicationPolicy {
-    /// Returns the parsed local retention duration.
-    pub fn local_retention_duration(&self) -> std::time::Duration {
-        crate::clock::parse_duration(&self.local_retention)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(30 * 86400))
-    }
-}
-
-fn default_min_synced() -> usize {
-    1
-}
-fn default_local_retention() -> String {
-    "30d".to_string()
-}
 fn default_max_log_age() -> u64 {
     86400 // 24 hours
 }
@@ -254,8 +303,7 @@ fn default_audit_interval() -> u64 {
 impl Default for ReplicationPolicy {
     fn default() -> Self {
         Self {
-            min_synced_remotes: default_min_synced(),
-            local_retention: default_local_retention(),
+            prune_rule: crate::remote::policy::PruneExpr::default(),
             max_log_age_secs: default_max_log_age(),
             active_sync_interval_secs: default_active_sync_interval(),
             audit_interval_secs: default_audit_interval(),
@@ -268,7 +316,7 @@ impl Default for ReplicationPolicy {
 pub struct ConfiguredRemote {
     pub name: String,
     pub store: Arc<dyn RemoteStore>,
-    pub read_only: bool,
+    pub mode: RemoteMode,
     pub replicate_ancestors: bool,
     pub upload_partial_logs: bool,
 }
@@ -319,11 +367,27 @@ impl RemoteRegistry {
         let len = reader.len()?;
         let bytes = reader.read_vec(0, len as usize)?;
         let content = String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        toml::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let registry: Self = toml::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        registry.validate()?;
+        Ok(registry)
+    }
+
+    /// Validates all remote configurations in the registry.
+    pub fn validate(&self) -> io::Result<()> {
+        for (name, cfg) in &self.remotes {
+            cfg.validate(name)?;
+        }
+        let stores = self.build_all_stores();
+        self.policy
+            .prune_rule
+            .validate_safety(&stores)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        Ok(())
     }
 
     /// Persists configuration to `remotes.toml` in the given `Storage`.
     pub fn save_to_storage(&self, storage: &dyn Storage) -> io::Result<()> {
+        self.validate()?;
         let content = toml::to_string_pretty(self).map_err(io::Error::other)?;
         let mut writer = storage.open_writer(DEFAULT_REMOTES_FILENAME, WriteMode::Overwrite)?;
         writer.append(content.as_bytes())?;
@@ -375,19 +439,19 @@ impl RemoteRegistry {
                     cfg.read_priority,
                     name.clone(),
                     store,
-                    cfg.read_only,
+                    cfg.mode,
                     cfg.replicate_ancestors,
-                    cfg.upload_partial_logs,
+                    cfg.upload_partial_logs(),
                 )
             })
             .collect();
         entries.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
         entries
             .into_iter()
-            .map(|(_, name, store, ro, ra, upl)| ConfiguredRemote {
+            .map(|(_, name, store, mode, ra, upl)| ConfiguredRemote {
                 name,
                 store,
-                read_only: ro,
+                mode,
                 replicate_ancestors: ra,
                 upload_partial_logs: upl,
             })
@@ -395,10 +459,12 @@ impl RemoteRegistry {
     }
 
     /// Returns configured stores sorted by `read_priority` (ascending), breaking ties by name.
+    /// Only remotes whose mode is readable (`ReadWrite` or `ReadOnly`) are included.
     pub fn build_read_stores(&self) -> Vec<crate::remote::RemoteReadTarget> {
         let mut entries: Vec<_> = self
             .remotes
             .iter()
+            .filter(|(_, cfg)| cfg.mode.is_readable())
             .map(|(name, cfg)| {
                 let store = self
                     .store_overrides
@@ -429,8 +495,7 @@ mod tests {
     fn test_remote_registry_toml_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = RemoteRegistry::new();
-        registry.policy.min_synced_remotes = 2;
-        registry.policy.local_retention = "60d".to_string();
+        registry.policy.prune_rule = crate::remote::policy::PruneExpr::parse("older_than(60d) && readable(2)").unwrap();
 
         let mut r1 = RemoteTargetConfig::new("my-aws-bucket");
         r1.region = "us-west-2".to_string();
@@ -440,9 +505,8 @@ mod tests {
         r1.storage_class = Some("INTELLIGENT_TIERING".to_string());
         registry.add_remote("aws", r1);
 
-        let mut r2 = RemoteTargetConfig::new("my-b2-bucket");
+        let mut r2 = RemoteTargetConfig::new("my-b2-bucket").with_mode(RemoteMode::ReadOnly);
         r2.endpoint = Some("https://s3.us-west-002.backblazeb2.com".to_string());
-        r2.read_only = true;
         r2.read_priority = 200;
         r2.access_key_id_env = Some("B2_KEY_ID".to_string());
         r2.secret_access_key_env = Some("B2_APP_KEY".to_string());
@@ -451,19 +515,25 @@ mod tests {
         let r3 = RemoteTargetConfig::new_path("/mnt/nfs_backup/appendfs_logs");
         registry.add_remote("nas", r3);
 
+        let r4 = RemoteTargetConfig::new("my-glacier-bucket")
+            .with_mode(RemoteMode::WriteOnly)
+            .with_storage_class("DEEP_ARCHIVE");
+        registry.add_remote("glacier", r4);
+
         registry.save_to_dir(dir.path()).unwrap();
         let loaded = RemoteRegistry::load_from_dir(dir.path()).unwrap();
         assert_eq!(registry, loaded);
 
-        assert_eq!(loaded.remotes.len(), 3);
+        assert_eq!(loaded.remotes.len(), 4);
         assert_eq!(loaded.remotes["aws"].bucket.as_deref(), Some("my-aws-bucket"));
         assert_eq!(
             loaded.remotes["aws"].storage_class.as_deref(),
             Some("INTELLIGENT_TIERING")
         );
         assert_eq!(loaded.remotes["b2"].storage_class, None);
-        assert!(!loaded.remotes["aws"].read_only);
-        assert!(loaded.remotes["b2"].read_only);
+        assert_eq!(loaded.remotes["aws"].mode, RemoteMode::ReadWrite);
+        assert_eq!(loaded.remotes["b2"].mode, RemoteMode::ReadOnly);
+        assert_eq!(loaded.remotes["glacier"].mode, RemoteMode::WriteOnly);
         assert_eq!(loaded.remotes["nas"].read_priority, 10);
         assert_eq!(loaded.remotes["aws"].read_priority, 100);
         assert_eq!(loaded.remotes["b2"].read_priority, 200);
@@ -472,23 +542,50 @@ mod tests {
             Some(Path::new("/mnt/nfs_backup/appendfs_logs"))
         );
 
-        // Verify build_read_stores sorts by read_priority (10 -> 100 -> 200)
+        // Verify build_read_stores sorts by read_priority (10 -> 100 -> 200) and EXCLUDES WriteOnly glacier remote!
         let stores = loaded.build_read_stores();
         let names: Vec<_> = stores.into_iter().map(|t| t.name).collect();
         assert_eq!(names, vec!["nas", "aws", "b2"]);
 
-        // Verify default upload_partial_logs is true for all remotes
-        for cfg in loaded.remotes.values() {
-            assert!(cfg.upload_partial_logs);
-        }
+        // Verify upload_partial_logs defaults: true for ReadWrite, false for ReadOnly and WriteOnly
+        assert!(loaded.remotes["aws"].upload_partial_logs());
+        assert!(loaded.remotes["nas"].upload_partial_logs());
+        assert!(!loaded.remotes["b2"].upload_partial_logs());
+        assert!(!loaded.remotes["glacier"].upload_partial_logs());
+    }
+
+    #[test]
+    fn test_upload_partial_logs_startup_validation_errors() {
+        // Attempting to set upload_partial_logs = true on a write-only remote must fail validation
+        let invalid_toml = r#"
+[remotes.glacier]
+bucket = "glacier-bucket"
+mode = "write-only"
+upload_partial_logs = true
+"#;
+        let reg: RemoteRegistry = toml::from_str(invalid_toml).unwrap();
+        let res = reg.validate();
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("upload_partial_logs can only be true for read-write mode"));
+
+        // Attempting to set upload_partial_logs = true on a read-only remote must also fail validation
+        let invalid_toml_ro = r#"
+[remotes.upstream]
+bucket = "upstream-bucket"
+mode = "read-only"
+upload_partial_logs = true
+"#;
+        let reg_ro: RemoteRegistry = toml::from_str(invalid_toml_ro).unwrap();
+        let res_ro = reg_ro.validate();
+        assert!(res_ro.is_err());
+        let err_msg_ro = res_ro.unwrap_err().to_string();
+        assert!(err_msg_ro.contains("upload_partial_logs can only be true for read-write mode"));
     }
 
     #[test]
     fn test_upload_partial_logs_config_toggle_and_toml_omission() {
         let toml_data = r#"
-[policy]
-min_synced_remotes = 1
-
 [remotes.s3]
 bucket = "backup-bucket"
 upload_partial_logs = false
@@ -502,10 +599,10 @@ bucket = "legacy-bucket"
 "#;
         let registry: RemoteRegistry = toml::from_str(toml_data).unwrap();
         assert_eq!(registry.remotes.len(), 3);
-        assert!(!registry.remotes["s3"].upload_partial_logs);
-        assert!(registry.remotes["nfs"].upload_partial_logs);
+        assert!(!registry.remotes["s3"].upload_partial_logs());
+        assert!(registry.remotes["nfs"].upload_partial_logs());
         assert!(
-            registry.remotes["legacy"].upload_partial_logs,
+            registry.remotes["legacy"].upload_partial_logs(),
             "omitted field should default to true"
         );
 
@@ -524,11 +621,7 @@ bucket = "legacy-bucket"
         assert_eq!(policy.max_log_age_secs, 86400);
         assert_eq!(policy.active_sync_interval_secs, 3600);
         assert_eq!(policy.audit_interval_secs, 21600);
-        assert_eq!(policy.min_synced_remotes, 1);
-        assert_eq!(policy.local_retention, "30d");
-        assert_eq!(
-            policy.local_retention_duration(),
-            std::time::Duration::from_secs(30 * 86400)
-        );
+        assert_eq!(policy.prune_rule, crate::remote::policy::PruneExpr::default());
+        assert_eq!(policy.prune_rule.to_string(), "older_than(30d) && readable(1)");
     }
 }

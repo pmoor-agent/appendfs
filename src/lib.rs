@@ -54,9 +54,9 @@ pub use operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics};
 pub use remote::{
     BLOCK_TOUCH_THROTTLE, BatchLeaderGuard, BlockCache, ConcurrencyLimiter, ConcurrencyPermit, ConfiguredRemote,
     DEFAULT_DECRYPTED_CACHE_SIZE, DEFAULT_POLL_INTERVAL, DecryptedRecordCache, FollowerBlock, MemoryBlockCache,
-    OnDiskBlockCache, RemoteObject, RemoteReadCoalescer, RemoteReadTarget, RemoteRegistry, RemoteReplicationWorker,
-    RemoteStore, RemoteTargetConfig, ReplicationPolicy, S3RemoteStore, TMP_FILE_MAX_AGE, TieredCache,
-    TieredStorageReader, prepare_remote_recovery_for_target,
+    OnDiskBlockCache, PruneContext, PruneExpr, RemoteMode, RemoteObject, RemoteReadCoalescer, RemoteReadTarget,
+    RemoteRegistry, RemoteReplicationWorker, RemoteStore, RemoteTargetConfig, ReplicationPolicy, S3RemoteStore,
+    TMP_FILE_MAX_AGE, TieredCache, TieredStorageReader, prepare_remote_recovery_for_target,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use remote::{CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, MockRemoteStore, RemoteStoreMetrics};

@@ -201,9 +201,9 @@ fn test_cli_remote_add_and_list_upload_partial_logs() {
     // 4. Verify remotes.toml was written correctly
     let storage = appendfs::storage::OsStorage::new(temp_dir.path());
     let registry = appendfs::remote::RemoteRegistry::load_from_storage(&storage).unwrap();
-    assert!(registry.remotes["nfs"].upload_partial_logs);
+    assert!(registry.remotes["nfs"].upload_partial_logs());
     assert_eq!(registry.remotes["nfs"].storage_class, None);
-    assert!(!registry.remotes["s3_backup"].upload_partial_logs);
+    assert!(!registry.remotes["s3_backup"].upload_partial_logs());
     assert_eq!(
         registry.remotes["s3_backup"].storage_class.as_deref(),
         Some("INTELLIGENT_TIERING")
@@ -228,6 +228,110 @@ fn test_cli_remote_add_and_list_upload_partial_logs() {
     assert!(
         stderr.contains("cannot be used with") || stderr.contains("Cannot specify both"),
         "expected conflict error, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_cli_remote_add_mode_and_glacier_validation() {
+    let temp_dir = TempDir::new().unwrap();
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .arg("init")
+        .arg(temp_dir.path())
+        .output()
+        .expect("failed to run appendfs init");
+    assert!(init_out.status.success());
+
+    // 1. Add write-only Glacier remote without specifying upload_partial_logs (should default to false)
+    let glacier_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remote",
+            "add",
+            temp_dir.path().to_str().unwrap(),
+            "glacier",
+            "--bucket",
+            "my-glacier-bucket",
+            "--mode",
+            "write-only",
+            "--storage-class",
+            "DEEP_ARCHIVE",
+        ])
+        .output()
+        .expect("failed to run remote add glacier");
+    assert!(
+        glacier_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&glacier_out.stderr)
+    );
+
+    // 2. Verify `remote list` shows mode='Write-Only' and partial_logs=Disabled
+    let list_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["remote", "list", temp_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run remote list");
+    assert!(list_out.status.success());
+    let stdout = String::from_utf8_lossy(&list_out.stdout);
+    assert!(stdout.contains("glacier: type='s3'"));
+    assert!(stdout.contains("mode='Write-Only'"));
+    assert!(stdout.contains("partial_logs=Disabled"));
+    assert!(stdout.contains("storage_class='DEEP_ARCHIVE'"));
+
+    // 3. Verify remotes.toml was written with mode = "write-only" and upload_partial_logs = false
+    let storage = appendfs::storage::OsStorage::new(temp_dir.path());
+    let registry = appendfs::remote::RemoteRegistry::load_from_storage(&storage).unwrap();
+    assert_eq!(
+        registry.remotes["glacier"].mode,
+        appendfs::remote::RemoteMode::WriteOnly
+    );
+    assert!(!registry.remotes["glacier"].upload_partial_logs());
+    assert_eq!(
+        registry.remotes["glacier"].storage_class.as_deref(),
+        Some("DEEP_ARCHIVE")
+    );
+
+    // 4. Verify adding a write-only remote with --upload-partial-logs fails validation
+    let bad_glacier_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remote",
+            "add",
+            temp_dir.path().to_str().unwrap(),
+            "bad_glacier",
+            "--bucket",
+            "bad-glacier-bucket",
+            "--mode",
+            "write-only",
+            "--upload-partial-logs",
+        ])
+        .output()
+        .expect("failed to run remote add bad_glacier");
+    assert!(!bad_glacier_out.status.success());
+    let stderr = String::from_utf8_lossy(&bad_glacier_out.stderr);
+    assert!(
+        stderr.contains("upload_partial_logs can only be true for read-write mode"),
+        "expected validation error, got: {}",
+        stderr
+    );
+
+    // 5. Verify adding a read-only remote with --upload-partial-logs also fails validation
+    let bad_ro_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remote",
+            "add",
+            temp_dir.path().to_str().unwrap(),
+            "bad_ro",
+            "--bucket",
+            "bad-ro-bucket",
+            "--mode",
+            "read-only",
+            "--upload-partial-logs",
+        ])
+        .output()
+        .expect("failed to run remote add bad_ro");
+    assert!(!bad_ro_out.status.success());
+    let stderr = String::from_utf8_lossy(&bad_ro_out.stderr);
+    assert!(
+        stderr.contains("upload_partial_logs can only be true for read-write mode"),
+        "expected validation error, got: {}",
         stderr
     );
 }

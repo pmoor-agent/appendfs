@@ -1,3 +1,4 @@
+use crate::remote::RemoteMode;
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -140,9 +141,9 @@ pub struct RemoteAddArgs {
     #[arg(long = "prefix", default_value = "")]
     pub prefix: String,
 
-    /// Mark this remote as read-only (used for upstream volumes and zero-cost cloud forking)
-    #[arg(long = "read-only", default_value_t = false)]
-    pub read_only: bool,
+    /// Remote operating mode: "read-write", "read-only", or "write-only" (default: "read-write")
+    #[arg(long = "mode", default_value = "read-write", value_enum)]
+    pub mode: RemoteMode,
 
     /// When forking from a read-only remote, replicate ancestor logs to this remote (default: false)
     #[arg(long = "replicate-ancestors", default_value_t = false)]
@@ -293,9 +294,9 @@ pub struct InitArgs {
     #[arg(long = "remote-prefix", default_value = "")]
     pub remote_prefix: String,
 
-    /// Mark bootstrap remote as read-only (for zero-cost CoW cloud forking)
-    #[arg(long = "remote-read-only", default_value_t = false)]
-    pub remote_read_only: bool,
+    /// Remote operating mode: "read-write", "read-only", or "write-only" (default: "read-write")
+    #[arg(long = "remote-mode", default_value = "read-write", value_enum)]
+    pub remote_mode: RemoteMode,
 
     /// Access key ID for bootstrap remote credentials
     #[arg(long = "remote-access-key-id")]

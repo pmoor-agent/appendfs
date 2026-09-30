@@ -10,7 +10,8 @@ use appendfs::remote::bootstrap_from_remote;
 use appendfs::remote::worker::{cross_copy_file, cross_copy_summary, upload_storage_file};
 use appendfs::remote::{
     BlockCache, CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, LocalDirRemoteStore, MemoryBlockCache,
-    MockRemoteStore, RemoteRegistry, RemoteStore, RemoteTargetConfig, check_remote_integrity,
+    MockRemoteStore, PruneContext, PruneExpr, RemoteMode, RemoteRegistry, RemoteStore, RemoteTargetConfig,
+    check_remote_integrity,
 };
 use appendfs::storage::MemoryStorage;
 use appendfs::wait_until;
@@ -18,6 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn read_test(fs: &InMemoryFS, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, FsError> {
@@ -311,8 +313,7 @@ fn test_read_only_remote_and_cloud_forking() {
     let _downstream_remote = Arc::new(MockRemoteStore::new());
 
     let mut registry = RemoteRegistry::new();
-    let mut upstream_cfg = RemoteTargetConfig::new("upstream-bucket");
-    upstream_cfg.read_only = true;
+    let upstream_cfg = RemoteTargetConfig::new("upstream-bucket").with_mode(RemoteMode::ReadOnly);
     registry.add_remote("upstream", upstream_cfg);
 
     let downstream_cfg = RemoteTargetConfig::new("downstream-bucket");
@@ -323,11 +324,15 @@ fn test_read_only_remote_and_cloud_forking() {
     assert_eq!(stores.len(), 2);
 
     let up = stores.iter().find(|r| r.name == "upstream").unwrap();
-    assert!(up.read_only, "Upstream remote must be marked read-only");
-    assert!(up.upload_partial_logs);
+    assert_eq!(
+        up.mode,
+        RemoteMode::ReadOnly,
+        "Upstream remote must be marked read-only"
+    );
+    assert!(!up.upload_partial_logs);
 
     let down = stores.iter().find(|r| r.name == "downstream").unwrap();
-    assert!(!down.read_only, "Downstream remote must be writable");
+    assert_eq!(down.mode, RemoteMode::ReadWrite, "Downstream remote must be writable");
     assert!(down.upload_partial_logs);
 }
 
@@ -366,7 +371,7 @@ fn test_bootstrap_rebuilds_encrypted_active_log_from_parts() {
 
     let mut registry = RemoteRegistry::new();
     registry.policy.active_sync_interval_secs = 0;
-    registry.policy.min_synced_remotes = 1;
+    registry.policy.prune_rule = PruneExpr::immediate_readable(1);
     registry.add_remote("primary", RemoteTargetConfig::new("my-bucket"));
     registry.set_store_override("primary", remote.clone());
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
@@ -450,7 +455,7 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     // Setup registry with active_sync_interval = 0 (sync on every tick)
     let mut registry = RemoteRegistry::new();
     registry.policy.active_sync_interval_secs = 0;
-    registry.policy.min_synced_remotes = 1;
+    registry.policy.prune_rule = PruneExpr::immediate_readable(1);
     let target = RemoteTargetConfig::new("my-bucket");
     registry.add_remote("primary", target);
     registry.set_store_override("primary", remote.clone());
@@ -607,7 +612,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     let mut registry = RemoteRegistry::new();
     let nas_cfg = RemoteTargetConfig::new_path(nfs_dir.path());
     registry.add_remote("nas", nas_cfg);
-    registry.policy.min_synced_remotes = 1;
+    registry.policy.prune_rule = PruneExpr::immediate_readable(1);
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
 
     // 1. Write file in generation 1
@@ -1429,8 +1434,7 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     let mut registry = RemoteRegistry::new();
     let nas_cfg = RemoteTargetConfig::new_path(nfs_dir.path());
     registry.add_remote("nas", nas_cfg);
-    registry.policy.min_synced_remotes = 1;
-    registry.policy.local_retention = "0s".to_string();
+    registry.policy.prune_rule = PruneExpr::immediate_readable(1);
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
 
     let fs_arc = Arc::new(recovered_fs);
@@ -1721,9 +1725,8 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     let mut registry = RemoteRegistry::new();
     registry.add_remote("counting", RemoteTargetConfig::new("test-bucket"));
     registry.set_store_override("counting", counting_store.clone());
-    registry.policy.min_synced_remotes = 1;
     // Set high retention so first cycle only replicates, does not prune
-    registry.policy.local_retention = "1h".to_string();
+    registry.policy.prune_rule = PruneExpr::parse("older_than(1h) && readable(1)").unwrap();
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
 
     let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
@@ -1796,7 +1799,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     // Configure 0 retention so all sealed generations 1, 2, 3 are eligible for local pruning
     {
         let mut reg = registry_arc.write().unwrap();
-        reg.policy.local_retention = "0s".to_string();
+        reg.policy.prune_rule = PruneExpr::immediate_readable(1);
     }
 
     // Ensure all 3 local log files exist before pruning
@@ -1993,18 +1996,18 @@ fn test_per_remote_upload_partial_logs_behavior() {
     // Setup registry: nfs has upload_partial_logs = true, s3 has upload_partial_logs = false
     let mut registry = RemoteRegistry::new();
     registry.policy.active_sync_interval_secs = 0; // trigger on every tick
-    registry.policy.min_synced_remotes = 1;
+    registry.policy.prune_rule = PruneExpr::immediate_readable(1);
 
     let nfs_cfg = RemoteTargetConfig::new_path("/mnt/nfs/appendfs");
     assert!(
-        nfs_cfg.upload_partial_logs,
+        nfs_cfg.upload_partial_logs(),
         "new_path must default upload_partial_logs to true"
     );
     registry.add_remote("nfs", nfs_cfg);
     registry.set_store_override("nfs", nfs_mock.clone());
 
     let s3_cfg = RemoteTargetConfig::new("my-s3-bucket").with_upload_partial_logs(false);
-    assert!(!s3_cfg.upload_partial_logs);
+    assert!(!s3_cfg.upload_partial_logs());
     registry.add_remote("s3", s3_cfg.clone());
     registry.set_store_override("s3", s3_counting.clone());
 
@@ -2178,8 +2181,7 @@ fn test_unsealed_manifest_logs_are_synced_and_pruned() {
     let mut registry = RemoteRegistry::new();
     registry.add_remote("remote1", RemoteTargetConfig::new("test-bucket"));
     registry.set_store_override("remote1", mock_remote.clone());
-    registry.policy.min_synced_remotes = 1;
-    registry.policy.local_retention = "0s".to_string();
+    registry.policy.prune_rule = PruneExpr::immediate_readable(1);
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
 
     let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
@@ -2285,11 +2287,10 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
 
     let mut registry = RemoteRegistry::new();
     let mut cfg = RemoteTargetConfig::new("test-bucket");
-    cfg.upload_partial_logs = true;
+    cfg.upload_partial_logs = Some(true);
     registry.add_remote("backup", cfg);
     registry.set_store_override("backup", tampered_store.clone());
-    registry.policy.min_synced_remotes = 1;
-    registry.policy.local_retention = "0s".to_string();
+    registry.policy.prune_rule = PruneExpr::immediate_readable(1);
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
 
     // 1. Write an active part in generation 1 and sync it
@@ -2414,5 +2415,275 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
     assert!(
         !storage.exists("000001.log"),
         "Local 000001.log must be pruned once remote verification succeeds"
+    );
+}
+
+#[test]
+fn test_write_only_glacier_remote_replication_and_prune_safety() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    let live_remote = Arc::new(MockRemoteStore::new());
+    let glacier_remote = Arc::new(MockRemoteStore::new());
+
+    let mut registry = RemoteRegistry::new();
+    let s3_live_cfg = RemoteTargetConfig::new("s3-live-bucket").with_mode(RemoteMode::ReadWrite);
+    let glacier_cfg = RemoteTargetConfig::new("glacier-bucket")
+        .with_mode(RemoteMode::WriteOnly)
+        .with_storage_class("DEEP_ARCHIVE");
+
+    // upload_partial_logs should default to true for live, false for glacier
+    assert!(s3_live_cfg.upload_partial_logs());
+    assert!(!glacier_cfg.upload_partial_logs());
+
+    registry.add_remote("s3_live", s3_live_cfg);
+    registry.add_remote("glacier", glacier_cfg);
+    registry.set_store_override("s3_live", live_remote.clone());
+    registry.set_store_override("glacier", glacier_remote.clone());
+    registry.policy.prune_rule = PruneExpr::immediate_readable(1);
+    registry.policy.active_sync_interval_secs = 0; // immediate partial sync
+
+    // 1. Verify build_read_stores EXCLUDES write-only glacier remote
+    let read_stores = registry.build_read_stores();
+    assert_eq!(read_stores.len(), 1);
+    assert_eq!(read_stores[0].name, "s3_live");
+
+    let fs_arc = Arc::new(fs);
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+    fs_arc.set_remote_registry(registry_arc.clone());
+
+    // 2. Perform write in active generation 1
+    let file1_attr = create_core(&fs_arc, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+    let ino = file1_attr.ino;
+    write_core(&fs_arc, ino, b"data-for-active-part", 0).unwrap();
+    fs_arc.quiesce().unwrap();
+
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+
+    // 3. Run worker cycle: live remote gets active part, glacier remote does NOT
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+
+    assert!(
+        live_remote.head_object("000001.part0000.log").unwrap().is_some(),
+        "live remote must receive active part"
+    );
+    assert!(
+        glacier_remote.head_object("000001.part0000.log").unwrap().is_none(),
+        "glacier write-only remote must NOT receive active parts"
+    );
+
+    // 4. Seal generation 1 and roll to generation 2
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(sealed.generation, 1);
+    fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
+    let summary_file = fs_arc.export_summary(storage.as_ref()).unwrap();
+
+    // 5. Run worker cycle: both remotes receive sealed 000001.log and summary
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+
+    assert!(
+        live_remote.head_object("000001.log").unwrap().is_some(),
+        "live remote must receive sealed 000001.log"
+    );
+    assert!(
+        glacier_remote.head_object("000001.log").unwrap().is_some(),
+        "glacier remote must receive sealed 000001.log"
+    );
+    assert!(
+        glacier_remote.head_object(&summary_file).unwrap().is_some(),
+        "glacier remote must receive summary"
+    );
+
+    // 6. Test eviction quorum safety:
+    // Create a standalone scenario where ONLY glacier has confirmed a sealed file.
+    // Since glacier is write-only, prune_local_cache must NOT prune the local file!
+    let isolated_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    init_volume(isolated_storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut iso_fs = appendfs::recover_fs(
+        isolated_storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let iso_writer =
+        Arc::new(LogWriter::create_lazy(isolated_storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    iso_fs.log_writer = Some(iso_writer.clone());
+    iso_fs.set_storage(isolated_storage.clone());
+
+    let iso_fs_arc = Arc::new(iso_fs);
+    let iso_file_attr = create_core(&iso_fs_arc, 1, "important.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&iso_fs_arc, iso_file_attr.ino, b"crucial data", 0).unwrap();
+    iso_fs_arc.quiesce().unwrap();
+    let iso_sealed = iso_writer.force_roll(&*clock).unwrap().unwrap();
+    iso_fs_arc.manifest.write().unwrap().record_sealed_log(iso_sealed);
+    let _ = iso_fs_arc.export_summary(isolated_storage.as_ref()).unwrap();
+
+    assert!(isolated_storage.exists("000001.log"));
+
+    // Upload 000001.log ONLY to a write-only glacier remote
+    let lone_glacier = Arc::new(MockRemoteStore::new());
+    let gen1_md5 = iso_fs_arc.manifest.read().unwrap().get_by_generation(1).unwrap().md5;
+    upload_storage_file(
+        isolated_storage.as_ref(),
+        lone_glacier.as_ref(),
+        "000001.log",
+        Some(&gen1_md5),
+    )
+    .unwrap();
+
+    let mut lone_registry = RemoteRegistry::new();
+    let lone_glacier_cfg = RemoteTargetConfig::new("lone-glacier")
+        .with_mode(RemoteMode::WriteOnly)
+        .with_storage_class("DEEP_ARCHIVE");
+    lone_registry.add_remote("glacier", lone_glacier_cfg);
+    lone_registry.set_store_override("glacier", lone_glacier.clone());
+    lone_registry.policy.prune_rule = PruneExpr::immediate_readable(1);
+
+    let lone_reg_arc = Arc::new(std::sync::RwLock::new(lone_registry));
+    let mut lone_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut lone_parts = std::collections::HashMap::new();
+
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &iso_fs_arc,
+        &lone_reg_arc,
+        Path::new("/unused"),
+        &mut lone_part_sync,
+        &mut lone_parts,
+    )
+    .unwrap();
+
+    // CRITICAL INVARIANT: 000001.log must NOT be pruned locally because the only remote that confirmed it is write-only!
+    assert!(
+        isolated_storage.exists("000001.log"),
+        "local file must NOT be pruned when only confirmed on write-only remotes!"
+    );
+}
+
+#[test]
+fn test_prune_rule_multi_tier_lifecycle_with_glacier() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    let nfs_remote = Arc::new(MockRemoteStore::new());
+    let glacier_remote = Arc::new(MockRemoteStore::new());
+
+    let mut registry = RemoteRegistry::new();
+    let nfs_cfg = RemoteTargetConfig::new_path("/tmp/nfs").with_mode(RemoteMode::ReadWrite);
+    let glacier_cfg = RemoteTargetConfig::new("glacier-bucket")
+        .with_mode(RemoteMode::WriteOnly)
+        .with_storage_class("DEEP_ARCHIVE");
+
+    registry.add_remote("nfs", nfs_cfg);
+    registry.add_remote("glacier", glacier_cfg);
+    registry.set_store_override("nfs", nfs_remote.clone());
+    registry.set_store_override("glacier", glacier_remote.clone());
+
+    // 1. Verify safety validation rejects an unsafe prune_rule that allows solely glacier
+    registry.policy.prune_rule = PruneExpr::parse("older_than(0s) && glacier").unwrap();
+    assert!(
+        registry.validate().is_err(),
+        "Prune rule satisfied solely by write-only glacier remote must fail validation"
+    );
+
+    // 2. Set multi-tier rule requiring BOTH nfs (readable) AND glacier (write-only archive)
+    registry.policy.prune_rule = PruneExpr::parse("older_than(0s) && oneof(nfs) && oneof(glacier)").unwrap();
+    assert!(registry.validate().is_ok());
+
+    let fs_arc = Arc::new(fs);
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+    fs_arc.set_remote_registry(registry_arc.clone());
+
+    // Create file and seal generation 1
+    let file1_attr = create_core(&fs_arc, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs_arc, file1_attr.ino, b"multi-tier prune data", 0).unwrap();
+    fs_arc.quiesce().unwrap();
+    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
+    let _ = fs_arc.export_summary(storage.as_ref()).unwrap();
+
+    assert!(storage.exists("000001.log"));
+
+    // Scenario: Test evaluation with partial confirmations
+    let stores = registry_arc.read().unwrap().build_all_stores();
+    let mut confirmed = std::collections::HashSet::from(["glacier"]);
+    let ctx_partial = PruneContext::new(Duration::from_secs(10), &confirmed, &stores);
+    assert!(
+        !registry_arc.read().unwrap().policy.prune_rule.evaluate(&ctx_partial),
+        "Prune rule requiring nfs && glacier must not be satisfied when only glacier confirmed"
+    );
+
+    confirmed.insert("nfs");
+    let ctx_full = PruneContext::new(Duration::from_secs(10), &confirmed, &stores);
+    assert!(
+        registry_arc.read().unwrap().policy.prune_rule.evaluate(&ctx_full),
+        "Prune rule must be satisfied when both nfs and glacier are confirmed"
+    );
+
+    // Run worker cycle: replicates to both remotes, confirms both, and prunes local log!
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+
+    assert!(
+        glacier_remote.head_object("000001.log").unwrap().is_some(),
+        "glacier remote must have received 000001.log"
+    );
+    assert!(
+        nfs_remote.head_object("000001.log").unwrap().is_some(),
+        "nfs remote must have received 000001.log"
+    );
+    assert!(
+        !storage.exists("000001.log"),
+        "000001.log must be pruned locally once both nfs and glacier confirmed it!"
     );
 }
