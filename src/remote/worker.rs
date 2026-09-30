@@ -931,9 +931,13 @@ impl RemoteReplicationWorker {
             }
         }
 
-        let summary_files: Vec<String> = if generations_to_sync.is_some() {
-            crate::log::latest_summary_filename(all_summaries.iter().map(String::as_str))
+        let summary_files: Vec<String> = if let Some(target_gens) = generations_to_sync {
+            all_summaries
                 .into_iter()
+                .filter(|f| {
+                    crate::log::manifest::parse_summary_filename(f)
+                        .is_some_and(|(gen_num, _)| target_gens.contains(&gen_num))
+                })
                 .collect()
         } else {
             all_summaries.into_iter().collect()
@@ -1255,7 +1259,10 @@ impl RemoteReplicationWorker {
     pub fn drain_on_shutdown(fs: &InMemoryFS, registry: &Arc<RwLock<RemoteRegistry>>) -> io::Result<()> {
         let latest_sealed_gen = fs.manifest.read().unwrap().latest_generation();
 
-        let target_gens: Vec<u32> = latest_sealed_gen.into_iter().collect();
+        let target_gens: Vec<u32> = match latest_sealed_gen {
+            Some(g) => vec![g],
+            None => vec![fs.last_summary_generation.load(Ordering::SeqCst)],
+        };
         let running_drain = AtomicBool::new(true);
         let mut last_part_sync = SystemTime::UNIX_EPOCH;
         let mut uploaded_parts = std::collections::HashMap::new();
