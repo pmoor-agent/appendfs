@@ -1,6 +1,6 @@
 use crate::fs::InMemoryFS;
 use crate::log::summary::{SUMMARY_FOOTER_SIZE, SUMMARY_MAGIC, SummaryFooter};
-use crate::remote::config::{ConfiguredRemote, RemoteRegistry};
+use crate::remote::config::{ConfiguredRemote, RemoteMode, RemoteRegistry};
 use crate::remote::{RemoteObject, RemoteStore};
 use crate::storage::Storage;
 use std::collections::HashMap;
@@ -405,13 +405,10 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
         };
         out.push_str(&format!("  Target:             {}\n", target_str));
         out.push_str(&format!("  Read Priority:      {}\n", config.read_priority));
-        out.push_str(&format!(
-            "  Mode:               {}\n",
-            if config.read_only { "Read-Only" } else { "Read-Write" }
-        ));
+        out.push_str(&format!("  Mode:               {}\n", config.mode));
         out.push_str(&format!(
             "  Partial Logs:       {}\n",
-            if config.upload_partial_logs {
+            if config.upload_partial_logs() {
                 "Enabled"
             } else {
                 "Disabled"
@@ -422,12 +419,22 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
         let synced_gen = telem.map_or(0, |t| t.synced_generation);
         let lag = last_sealed_gen.saturating_sub(synced_gen);
 
-        let status_str = if config.read_only {
-            "Read-Only Upstream"
-        } else if lag == 0 {
-            "Up to date"
-        } else {
-            "Syncing"
+        let status_str = match config.mode {
+            RemoteMode::ReadOnly => "Read-Only Upstream",
+            RemoteMode::WriteOnly => {
+                if lag == 0 {
+                    "Up to date (Archive)"
+                } else {
+                    "Syncing (Archive)"
+                }
+            }
+            RemoteMode::ReadWrite => {
+                if lag == 0 {
+                    "Up to date"
+                } else {
+                    "Syncing"
+                }
+            }
         };
         out.push_str(&format!("  Status:             {}\n", status_str));
         out.push_str(&format!("  Synced Generation:  {} / {}\n", synced_gen, last_sealed_gen));
@@ -713,7 +720,7 @@ impl RemoteReplicationWorker {
             let expected_md5 = &log_entry.md5;
 
             for (r_idx, r) in stores.iter().enumerate() {
-                if r.read_only {
+                if !r.mode.is_writable() {
                     continue;
                 }
 
@@ -916,7 +923,7 @@ impl RemoteReplicationWorker {
             let mut verified_local_md5: Option<Result<[u8; 16], String>> = None;
 
             for (r_idx, r) in stores.iter().enumerate() {
-                if r.read_only {
+                if !r.mode.is_writable() {
                     continue;
                 }
 
@@ -1046,7 +1053,9 @@ impl RemoteReplicationWorker {
                 let part_len = active_offset - *last_offset;
                 let part_filename = format!("{:06}.part{:04}.log", active_gen, *part_idx);
 
-                let wants_parts = stores.iter().any(|r| !r.read_only && r.upload_partial_logs);
+                let wants_parts = stores
+                    .iter()
+                    .any(|r| r.mode == RemoteMode::ReadWrite && r.upload_partial_logs);
 
                 if wants_parts {
                     // Read slice from local active log
@@ -1057,7 +1066,7 @@ impl RemoteReplicationWorker {
                             let part_md5: [u8; 16] = *md5::compute(&part_bytes);
                             let mut any_part_success = false;
                             for r in &stores {
-                                if r.read_only || !r.upload_partial_logs {
+                                if r.mode != RemoteMode::ReadWrite || !r.upload_partial_logs {
                                     continue;
                                 }
                                 log::info!(
@@ -1120,22 +1129,25 @@ impl RemoteReplicationWorker {
         store_listings: &[Option<HashMap<String, RemoteObject>>],
     ) {
         let now = fs.clock.now();
-        let retention_dur = policy.local_retention_duration();
-
         let last_summary_gen = fs.last_summary_generation.load(Ordering::SeqCst);
 
-        // Pre-filter candidate logs eligible for local pruning before dispatching remote queries
+        // Pre-filter candidate logs eligible for local pruning before dispatching remote queries.
+        // Core Guardrails (strictly engine-enforced, cannot be overridden by user prune rules):
+        // 1. Summaries, and especially the latest summary snapshot, are strictly pinned and never pruned locally.
+        // 2. Active log writer generation cannot be pruned.
+        // 3. Uncovered logs (generation > last_summary_gen) cannot be pruned.
+        // 4. Local summary covering the log generation must exist on disk.
         let mut candidates = Vec::new();
         for log_entry in &manifest.logs {
             let gen_num = log_entry.generation;
             let filename = &log_entry.filename;
 
-            // Cannot prune active generation
+            // Invariant 1: Cannot prune active generation
             if gen_num >= active_gen {
                 continue;
             }
 
-            // Finding 1: Cannot prune local log if no local summary covers it
+            // Invariant 2: Cannot prune local log if no local summary covers it
             if gen_num > last_summary_gen {
                 continue;
             }
@@ -1150,9 +1162,6 @@ impl RemoteReplicationWorker {
 
             let sealed_time = log_entry.sealed_at.unwrap_or(log_entry.created_at);
             let age = now.duration_since(sealed_time).unwrap_or_default();
-            if age < retention_dur {
-                continue;
-            }
 
             candidates.push((log_entry, age));
         }
@@ -1161,15 +1170,16 @@ impl RemoteReplicationWorker {
             return;
         }
 
+        let prune_expr = &policy.prune_rule;
+
         for (log_entry, age) in candidates {
             let gen_num = log_entry.generation;
             let filename = &log_entry.filename;
 
-            // Verify quorum k of N stores have matching size and ETag
-            let mut verified_copies = 0;
-            for (i, _) in stores.iter().enumerate() {
+            // Collect set of confirmed remote stores with matching size and ETag/MD5
+            let mut confirmed_remotes = std::collections::HashSet::new();
+            for (i, r) in stores.iter().enumerate() {
                 let Some(map) = &store_listings[i] else {
-                    // Remote listing failed; skip this remote for now rather than issuing expensive head_object requests
                     continue;
                 };
 
@@ -1177,16 +1187,18 @@ impl RemoteReplicationWorker {
                     && remote_obj.size == log_entry.total_bytes
                     && remote_obj.etag_md5() == Some(log_entry.md5)
                 {
-                    verified_copies += 1;
+                    confirmed_remotes.insert(r.name.as_str());
                 }
             }
 
-            if verified_copies >= policy.min_synced_remotes {
+            let ctx = crate::remote::policy::PruneContext::new(age, &confirmed_remotes, stores);
+
+            if prune_expr.evaluate(&ctx) {
                 log::info!(
-                    "Pruning local sealed {} ({} days old, verified on {} remotes)...",
+                    "Pruning local sealed {} ({} days old, verified on remotes: {:?})...",
                     filename,
                     age.as_secs() / 86400,
-                    verified_copies
+                    confirmed_remotes
                 );
                 if storage.remove_file(filename).is_ok() {
                     // Finding 8: invalidate cached reader so unlinked fd is dropped and disk space is freed!

@@ -12,6 +12,7 @@ pub mod latency;
 pub mod limiter;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
+pub mod policy;
 pub mod recovery;
 pub mod s3;
 pub mod sigv4;
@@ -25,7 +26,7 @@ pub use block_cache::{
 };
 pub use bootstrap::bootstrap_from_remote;
 pub use coalesce::{BatchLeaderGuard, CoalesceError, FollowerBlock, RemoteReadCoalescer};
-pub use config::{ConfiguredRemote, RemoteRegistry, RemoteTargetConfig, ReplicationPolicy};
+pub use config::{ConfiguredRemote, RemoteMode, RemoteRegistry, RemoteTargetConfig, ReplicationPolicy};
 #[cfg(any(test, feature = "testing"))]
 pub use counting::{CountingRemoteStore, RemoteStoreMetrics};
 #[cfg(any(test, feature = "testing"))]
@@ -36,6 +37,7 @@ pub use latency::LatencyRemoteStore;
 pub use limiter::{ConcurrencyLimiter, ConcurrencyPermit};
 #[cfg(any(test, feature = "testing"))]
 pub use mock::MockRemoteStore;
+pub use policy::{PruneContext, PruneExpr};
 pub use recovery::prepare_remote_recovery_for_target;
 pub use s3::S3RemoteStore;
 pub use sigv4::SigV4Signer;

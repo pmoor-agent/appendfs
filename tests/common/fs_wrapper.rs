@@ -182,8 +182,7 @@ impl TestFS {
         let mut remote_read_targets = Vec::new();
 
         let mut registry = appendfs::RemoteRegistry::new();
-        registry.policy.min_synced_remotes = 1;
-        registry.policy.local_retention = "0s".to_string(); // aggressive local eviction once verified
+        registry.policy.prune_rule = appendfs::remote::PruneExpr::immediate_readable(1);
         registry.policy.max_log_age_secs = 3600;
         registry.policy.active_sync_interval_secs = 0;
 
