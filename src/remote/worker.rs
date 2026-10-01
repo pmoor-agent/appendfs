@@ -329,11 +329,9 @@ impl ReplicationTelemetry {
                 name: remote_name.to_string(),
                 ..Default::default()
             });
-        if generation_num >= entry.synced_generation {
-            entry.synced_generation = generation_num;
-            entry.last_sync_time = Some(now);
-            entry.last_error = None;
-        }
+        entry.synced_generation = generation_num;
+        entry.last_sync_time = Some(now);
+        entry.last_error = None;
     }
 
     pub fn record_active_part(&mut self, remote_name: &str, generation_num: u32, part_idx: u32, now: SystemTime) {
@@ -359,6 +357,31 @@ impl ReplicationTelemetry {
             });
         entry.last_error = Some(error.to_string());
     }
+}
+
+/// Computes the highest contiguous sealed generation confirmed present on a remote.
+pub fn compute_contiguous_synced_gen(
+    manifest_logs: &[crate::log::LogFileInfo],
+    active_gen: u32,
+    confirmed: &std::collections::HashSet<u32>,
+) -> u32 {
+    let mut gens: Vec<u32> = manifest_logs
+        .iter()
+        .map(|l| l.generation)
+        .filter(|&g| g < active_gen)
+        .collect();
+    gens.sort_unstable();
+    gens.dedup();
+
+    let mut contiguous = 0;
+    for g in gens {
+        if confirmed.contains(&g) {
+            contiguous = g;
+        } else {
+            break;
+        }
+    }
+    contiguous
 }
 
 /// Formats a complete human-readable report of replication status across all remotes.
@@ -717,37 +740,117 @@ impl RemoteReplicationWorker {
         // Sync sealed generations to all writable remotes
         let manifest = fs.manifest.read().unwrap().clone();
 
-        for log_entry in &manifest.logs {
-            let gen_num = log_entry.generation;
-            let filename = &log_entry.filename;
+        // Reconcile each remote's synced status from the fetched object listings upfront.
+        // This ensures remotes that are already up-to-date (or partially synced from prior runs)
+        // immediately reflect their true synced generation and lag in telemetry, without waiting
+        // for generation-by-generation uploads to complete on other remotes.
+        let mut missing_counts: HashMap<String, usize> = HashMap::with_capacity(stores.len());
 
-            // Only completed manifest generations (skip active writer generation)
-            if gen_num >= active_gen {
+        for (r_idx, r) in stores.iter().enumerate() {
+            let Some(ref mut map) = store_listings[r_idx] else {
+                continue;
+            };
+
+            let confirmed = confirmed_generations.entry(r.name.clone()).or_default();
+            let mut missing_count = 0;
+
+            for log_entry in manifest.logs.iter().filter(|l| l.generation < active_gen) {
+                let gen_num = log_entry.generation;
+                let expected_len = log_entry.total_bytes;
+                let expected_md5 = &log_entry.md5;
+
+                let already_confirmed = !is_audit && confirmed.contains(&gen_num);
+                let is_present = already_confirmed
+                    || match map.get(&log_entry.filename) {
+                        Some(obj) => obj.size == expected_len && obj.etag_md5() == Some(*expected_md5),
+                        None => false,
+                    };
+
+                if is_present {
+                    confirmed.insert(gen_num);
+
+                    // Clean up any obsolete transient parts on this remote once consolidated log is verified,
+                    // but ONLY if partial logs were enabled for this remote (avoiding unnecessary DELETE calls
+                    // for append-only / write-only remotes).
+                    if r.upload_partial_logs {
+                        let prefix = format!("{:06}.part", gen_num);
+                        let part_keys: Vec<String> = map.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+                        for part_key in part_keys {
+                            if r.store.delete_object(&part_key).is_ok() {
+                                map.remove(&part_key);
+                            }
+                        }
+                    }
+                } else {
+                    missing_count += 1;
+                    if is_audit {
+                        confirmed.remove(&gen_num);
+                    }
+                }
+            }
+
+            let synced_gen = compute_contiguous_synced_gen(&manifest.logs, active_gen, confirmed);
+            fs.replication_telemetry
+                .write()
+                .unwrap()
+                .record_synced_gen(&r.name, synced_gen, now);
+
+            missing_counts.insert(r.name.clone(), missing_count);
+        }
+
+        // Build prioritized replication order:
+        // 1. ReadWrite remotes before WriteOnly remotes (primary operational path before archive)
+        // 2. Remotes with fewer missing generations first (lowest replication lag)
+        // 3. Stable tie-breaker by remote name
+        let mut store_order: Vec<usize> = (0..stores.len()).collect();
+        store_order.sort_by(|&a, &b| {
+            let sa = &stores[a];
+            let sb = &stores[b];
+            let rw_a = if sa.mode == RemoteMode::ReadWrite { 0 } else { 1 };
+            let rw_b = if sb.mode == RemoteMode::ReadWrite { 0 } else { 1 };
+            if rw_a != rw_b {
+                return rw_a.cmp(&rw_b);
+            }
+            let missing_a = missing_counts.get(&sa.name).copied().unwrap_or(0);
+            let missing_b = missing_counts.get(&sb.name).copied().unwrap_or(0);
+            if missing_a != missing_b {
+                return missing_a.cmp(&missing_b);
+            }
+            sa.name.cmp(&sb.name)
+        });
+
+        // 2. Sync sealed generations to writable remotes in prioritized order
+        for &r_idx in &store_order {
+            let r = &stores[r_idx];
+            if !r.mode.is_writable() {
                 continue;
             }
 
-            if let Some(target_gens) = generations_to_sync
-                && !target_gens.contains(&gen_num)
-            {
-                continue;
-            }
+            for log_entry in &manifest.logs {
+                let gen_num = log_entry.generation;
+                let filename = &log_entry.filename;
 
-            let expected_len = log_entry.total_bytes;
-            let expected_md5 = &log_entry.md5;
-
-            for (r_idx, r) in stores.iter().enumerate() {
-                if !r.mode.is_writable() {
+                // Only completed manifest generations (skip active writer generation)
+                if gen_num >= active_gen {
                     continue;
                 }
 
-                // If not in a full audit cycle, skip if this remote already confirmed this generation
-                if !is_audit
-                    && confirmed_generations
-                        .get(&r.name)
-                        .is_some_and(|set| set.contains(&gen_num))
+                if let Some(target_gens) = generations_to_sync
+                    && !target_gens.contains(&gen_num)
                 {
                     continue;
                 }
+
+                // Skip if this remote already confirmed this generation (from listing audit or prior sync)
+                if confirmed_generations
+                    .get(&r.name)
+                    .is_some_and(|set| set.contains(&gen_num))
+                {
+                    continue;
+                }
+
+                let expected_len = log_entry.total_bytes;
+                let expected_md5 = &log_entry.md5;
 
                 let Some(ref map) = store_listings[r_idx] else {
                     continue;
@@ -905,10 +1008,12 @@ impl RemoteReplicationWorker {
 
                     confirmed_generations.entry(r.name.clone()).or_default().insert(gen_num);
 
+                    let synced_gen =
+                        compute_contiguous_synced_gen(&manifest.logs, active_gen, &confirmed_generations[&r.name]);
                     fs.replication_telemetry
                         .write()
                         .unwrap()
-                        .record_synced_gen(&r.name, gen_num, now);
+                        .record_synced_gen(&r.name, synced_gen, now);
                 }
             }
         }
@@ -943,26 +1048,53 @@ impl RemoteReplicationWorker {
             all_summaries.into_iter().collect()
         };
 
-        for sum_file in &summary_files {
-            let local_exists = storage.exists(sum_file);
-            let local_len = if local_exists {
-                storage.file_len(sum_file).unwrap_or(0)
-            } else {
-                0
+        // Upfront reconcile confirmed summary files
+        for (r_idx, r) in stores.iter().enumerate() {
+            let Some(ref map) = store_listings[r_idx] else {
+                continue;
             };
-
-            let mut verified_local_md5: Option<Result<[u8; 16], String>> = None;
-
-            for (r_idx, r) in stores.iter().enumerate() {
-                if !r.mode.is_writable() {
-                    continue;
+            let confirmed_sum = confirmed_summaries.entry(r.name.clone()).or_default();
+            for sum_file in &summary_files {
+                let local_exists = storage.exists(sum_file);
+                let local_len = if local_exists {
+                    storage.file_len(sum_file).unwrap_or(0)
+                } else {
+                    0
+                };
+                let already_confirmed = !is_audit && confirmed_sum.contains(sum_file);
+                let is_present = already_confirmed
+                    || match map.get(sum_file) {
+                        Some(h) => !local_exists || h.size == local_len,
+                        None => false,
+                    };
+                if is_present {
+                    confirmed_sum.insert(sum_file.clone());
+                } else if is_audit {
+                    confirmed_sum.remove(sum_file);
                 }
+            }
+        }
 
-                // If not in a full audit cycle, skip if this remote already confirmed this summary
-                if !is_audit
-                    && confirmed_summaries
-                        .get(&r.name)
-                        .is_some_and(|set| set.contains(sum_file))
+        let mut verified_summary_md5s: HashMap<String, Result<[u8; 16], String>> = HashMap::new();
+
+        for &r_idx in &store_order {
+            let r = &stores[r_idx];
+            if !r.mode.is_writable() {
+                continue;
+            }
+
+            for sum_file in &summary_files {
+                let local_exists = storage.exists(sum_file);
+                let local_len = if local_exists {
+                    storage.file_len(sum_file).unwrap_or(0)
+                } else {
+                    0
+                };
+
+                // If already confirmed, skip sync
+                if confirmed_summaries
+                    .get(&r.name)
+                    .is_some_and(|set| set.contains(sum_file))
                 {
                     continue;
                 }
@@ -983,7 +1115,7 @@ impl RemoteReplicationWorker {
                         return Ok(());
                     }
                     if local_exists {
-                        let md5_res = verified_local_md5.get_or_insert_with(|| {
+                        let md5_res = verified_summary_md5s.entry(sum_file.clone()).or_insert_with(|| {
                             verify_summary_storage_file(storage.as_ref(), sum_file)
                                 .map(|(_, md5)| md5)
                                 .map_err(|e| e.to_string())

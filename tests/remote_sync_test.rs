@@ -3074,3 +3074,323 @@ fn test_replication_worker_active_round_interrupted_on_stop() {
         "Active round must have been interrupted without completing the entire backlog"
     );
 }
+
+fn read_storage_file(storage: &dyn Storage, name: &str) -> Vec<u8> {
+    let r = storage.open_reader(name).unwrap();
+    let mut b = vec![0u8; r.len().unwrap() as usize];
+    r.read_exact_at(0, &mut b).unwrap();
+    b
+}
+
+#[test]
+fn test_pre_synced_remote_reflects_up_to_date_status_without_lockstep_lag() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let mock_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let clock = Arc::new(appendfs::clock::MockClock(mock_time));
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+
+    // Create 5 sealed log generations (1..=5) and active generation 6
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    let root = 1u64;
+    for g in 1..=5 {
+        let file_attr = create_core(&fs, root, &format!("file_{}.txt", g), 0o644, 0, 1000, 1000).unwrap();
+        write_core(&fs, file_attr.ino, format!("Content for gen {}", g).as_bytes(), 0).unwrap();
+        fs.quiesce().unwrap();
+
+        let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+        assert_eq!(sealed.generation, g);
+        fs.manifest.write().unwrap().record_sealed_log(sealed);
+        fs.export_summary(storage.as_ref()).unwrap();
+    }
+
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
+    let fs_arc = Arc::new(fs);
+
+    // Setup two remotes:
+    // 1. aws-glacier: Write-Only archive, only holds generations 1 and 2
+    // 2. gcs-netherlands: Read-Write, holds all generations 1..5 (synced in previous run)
+    let glacier_raw = Arc::new(MockRemoteStore::new());
+    let gcs_raw = Arc::new(MockRemoteStore::new());
+
+    // Pre-populate gcs-netherlands with all 5 generations and summaries
+    for g in 1..=5 {
+        let log_file = format!("{:06}.log", g);
+        let bytes = read_storage_file(storage.as_ref(), &log_file);
+        let md5: [u8; 16] = *md5::compute(&bytes);
+        gcs_raw
+            .put_object(
+                &log_file,
+                &mut std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                Some(&md5),
+            )
+            .unwrap();
+
+        let sum_file = format!("{:06}.summary", g);
+        if storage.exists(&sum_file) {
+            let sum_bytes = read_storage_file(storage.as_ref(), &sum_file);
+            let sum_md5: [u8; 16] = *md5::compute(&sum_bytes);
+            gcs_raw
+                .put_object(
+                    &sum_file,
+                    &mut std::io::Cursor::new(&sum_bytes),
+                    sum_bytes.len() as u64,
+                    Some(&sum_md5),
+                )
+                .unwrap();
+        }
+    }
+    if storage.exists("000000.summary") {
+        let b = read_storage_file(storage.as_ref(), "000000.summary");
+        let m: [u8; 16] = *md5::compute(&b);
+        gcs_raw
+            .put_object(
+                "000000.summary",
+                &mut std::io::Cursor::new(&b),
+                b.len() as u64,
+                Some(&m),
+            )
+            .unwrap();
+    }
+
+    // Pre-populate aws-glacier with only generations 1 and 2
+    for g in 1..=2 {
+        let log_file = format!("{:06}.log", g);
+        let bytes = read_storage_file(storage.as_ref(), &log_file);
+        let md5: [u8; 16] = *md5::compute(&bytes);
+        glacier_raw
+            .put_object(
+                &log_file,
+                &mut std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                Some(&md5),
+            )
+            .unwrap();
+    }
+
+    // Inject failure on aws-glacier so it fails all uploads and remains stuck at gen 2 during replication
+    let glacier_failing = Arc::new(FailingRemoteStore::new(glacier_raw.clone()));
+    glacier_failing.fail_method("put_object");
+
+    let mut registry = RemoteRegistry::new();
+    let mut glacier_cfg = RemoteTargetConfig::new("appendfs-glacier-bucket");
+    glacier_cfg.mode = RemoteMode::WriteOnly;
+    registry.add_remote("aws-glacier", glacier_cfg);
+    registry.set_store_override("aws-glacier", glacier_failing);
+
+    let mut gcs_cfg = RemoteTargetConfig::new("appendfs-remote");
+    gcs_cfg.mode = RemoteMode::ReadWrite;
+    registry.add_remote("gcs-netherlands", gcs_cfg);
+    registry.set_store_override("gcs-netherlands", gcs_raw);
+
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+    fs_arc.set_remote_registry(registry_arc.clone());
+
+    // Run replication cycle
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+
+    let status = appendfs::remote::worker::format_remotes_status(&fs_arc);
+
+    // Verify gcs-netherlands is NOT held back at generation 2:
+    // It must report Up to date, 5 / 5 synced generations, and 0 lag!
+    assert!(status.contains("[Remote: gcs-netherlands]"));
+    assert!(status.contains(
+        "Status:             Up to date\n  Synced Generation:  5 / 5\n  Replication Lag:    0 sealed generation(s)"
+    ));
+
+    // Verify aws-glacier accurately reports its lag and error without corrupting gcs-netherlands:
+    assert!(status.contains("[Remote: aws-glacier]"));
+    assert!(status.contains("Status:             Syncing (Archive)\n  Synced Generation:  2 / 5\n  Replication Lag:    3 sealed generation(s)"));
+    assert!(status.contains("Last Error:"));
+}
+
+#[test]
+fn test_prioritized_replication_rw_and_low_lag_replicates_before_archive_backlog() {
+    use appendfs::remote::RemoteObject;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct OrderTrackingStore {
+        inner: Arc<MockRemoteStore>,
+        name: String,
+        ops: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RemoteStore for OrderTrackingStore {
+        fn list_objects(&self, prefix: &str) -> std::io::Result<Vec<RemoteObject>> {
+            self.inner.list_objects(prefix)
+        }
+        fn head_object(&self, key: &str) -> std::io::Result<Option<RemoteObject>> {
+            self.inner.head_object(key)
+        }
+        fn put_object(
+            &self,
+            key: &str,
+            reader: &mut dyn std::io::Read,
+            len: u64,
+            content_md5: Option<&[u8; 16]>,
+        ) -> std::io::Result<()> {
+            self.ops.lock().unwrap().push(format!("{}: {}", self.name, key));
+            self.inner.put_object(key, reader, len, content_md5)
+        }
+        fn get_object(&self, key: &str, writer: &mut dyn std::io::Write) -> std::io::Result<u64> {
+            self.inner.get_object(key, writer)
+        }
+        fn get_object_range(
+            &self,
+            key: &str,
+            offset: u64,
+            len: u64,
+            writer: &mut dyn std::io::Write,
+        ) -> std::io::Result<u64> {
+            self.inner.get_object_range(key, offset, len, writer)
+        }
+        fn delete_object(&self, key: &str) -> std::io::Result<()> {
+            self.inner.delete_object(key)
+        }
+    }
+
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let mock_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let clock = Arc::new(appendfs::clock::MockClock(mock_time));
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+
+    // Create 4 sealed log generations (1..=4) and active generation 5
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    let root = 1u64;
+    for g in 1..=4 {
+        let file_attr = create_core(&fs, root, &format!("f_{}.txt", g), 0o644, 0, 1000, 1000).unwrap();
+        write_core(&fs, file_attr.ino, format!("Content {}", g).as_bytes(), 0).unwrap();
+        fs.quiesce().unwrap();
+
+        let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+        assert_eq!(sealed.generation, g);
+        fs.manifest.write().unwrap().record_sealed_log(sealed);
+        fs.export_summary(storage.as_ref()).unwrap();
+    }
+
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
+    let fs_arc = Arc::new(fs);
+
+    // Setup:
+    // gcs-netherlands (ReadWrite): missing ONLY generation 4 (lag 1)
+    // aws-glacier (WriteOnly): missing generations 2, 3, 4 (lag 3)
+    let gcs_raw = Arc::new(MockRemoteStore::new());
+    for g in 1..=3 {
+        let log_file = format!("{:06}.log", g);
+        let bytes = read_storage_file(storage.as_ref(), &log_file);
+        let md5: [u8; 16] = *md5::compute(&bytes);
+        gcs_raw
+            .put_object(
+                &log_file,
+                &mut std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                Some(&md5),
+            )
+            .unwrap();
+    }
+
+    let glacier_raw = Arc::new(MockRemoteStore::new());
+    let log_file = format!("{:06}.log", 1);
+    let bytes = read_storage_file(storage.as_ref(), &log_file);
+    let md5: [u8; 16] = *md5::compute(&bytes);
+    glacier_raw
+        .put_object(
+            &log_file,
+            &mut std::io::Cursor::new(&bytes),
+            bytes.len() as u64,
+            Some(&md5),
+        )
+        .unwrap();
+
+    let ops = Arc::new(Mutex::new(Vec::new()));
+    let gcs_tracking = Arc::new(OrderTrackingStore {
+        inner: gcs_raw.clone(),
+        name: "gcs".to_string(),
+        ops: ops.clone(),
+    });
+    let glacier_tracking = Arc::new(OrderTrackingStore {
+        inner: glacier_raw.clone(),
+        name: "glacier".to_string(),
+        ops: ops.clone(),
+    });
+
+    let mut registry = RemoteRegistry::new();
+    let mut glacier_cfg = RemoteTargetConfig::new("glacier-bucket");
+    glacier_cfg.mode = RemoteMode::WriteOnly;
+    registry.add_remote("aws-glacier", glacier_cfg);
+    registry.set_store_override("aws-glacier", glacier_tracking);
+
+    let mut gcs_cfg = RemoteTargetConfig::new("gcs-bucket");
+    gcs_cfg.mode = RemoteMode::ReadWrite;
+    registry.add_remote("gcs-netherlands", gcs_cfg);
+    registry.set_store_override("gcs-netherlands", gcs_tracking);
+
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+    fs_arc.set_remote_registry(registry_arc.clone());
+
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        Path::new("/unused"),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+
+    let recorded = ops.lock().unwrap().clone();
+    // gcs (ReadWrite, lag 1) must sync 000004.log BEFORE glacier (WriteOnly, lag 3) syncs 000002.log
+    let gcs_first_log = recorded
+        .iter()
+        .position(|op| op == "gcs: 000004.log")
+        .expect("gcs must upload 000004.log");
+    let glacier_first_log = recorded
+        .iter()
+        .position(|op| op == "glacier: 000002.log")
+        .expect("glacier must upload 000002.log");
+    assert!(
+        gcs_first_log < glacier_first_log,
+        "ReadWrite remote with lowest lag must replicate before WriteOnly archive remote backlog: {:?}",
+        recorded
+    );
+
+    // Both remotes should now be fully up-to-date!
+    let status = appendfs::remote::worker::format_remotes_status(&fs_arc);
+    assert!(status.contains("[Remote: gcs-netherlands]\n  Target:             s3 (bucket: gcs-bucket, prefix: )\n  Read Priority:      100\n  Mode:               Read-Write\n  Partial Logs:       Enabled\n  Status:             Up to date\n  Synced Generation:  4 / 4\n  Replication Lag:    0 sealed generation(s)"));
+    assert!(status.contains("[Remote: aws-glacier]\n  Target:             s3 (bucket: glacier-bucket, prefix: )\n  Read Priority:      100\n  Mode:               Write-Only\n  Partial Logs:       Disabled\n  Status:             Up to date (Archive)\n  Synced Generation:  4 / 4\n  Replication Lag:    0 sealed generation(s)"));
+}
