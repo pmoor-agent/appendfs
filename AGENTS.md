@@ -24,7 +24,7 @@ All code contributions follow a standard fork-and-pull-request workflow:
 ### Step-by-Step Lifecycle
 
 1. **Develop on a local feature branch**:
-   - Always branch off an up-to-date `main` (synchronized with `upstream/main`).
+   - Always update the repository first (`git fetch upstream`) and base feature branches off `upstream/main`.
    - Keep changes focused and atomic.
 2. **Push feature branch to `pmoor-agent/appendfs` (`origin`)**:
    - Push to `origin`: `git push -u origin <branch-name>`.
