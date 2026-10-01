@@ -488,14 +488,17 @@ impl VerificationPlan {
 }
 
 /// Builds a deterministic verification plan covering approximately `options.sample_percent`% of
-/// data records for each active log generation. Records crossing 1 MiB block boundaries automatically
-/// expand the required fetch set to include the full span of blocks needed for complete decryption.
+/// 1 MiB blocks containing live data for each active log generation. Records crossing 1 MiB block boundaries
+/// automatically expand the required fetch set to include the full span of blocks needed for complete decryption,
+/// and all live extents completely covered by the resulting block set are verified.
 #[allow(clippy::too_many_lines)]
 pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> VerificationPlan {
     let manifest = fs.manifest.read().unwrap();
     let base_map = fs.inner.lock(OpTag::Stats).unwrap().base.clone();
-    let mut unique_records: BTreeMap<(u32, u64), LiveRecord> = BTreeMap::new();
+    const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
 
+    // 1. Collect all unique live records from the inode tree
+    let mut unique_records: BTreeMap<(u32, u64), LiveRecord> = BTreeMap::new();
     for (&ino, node_arc) in &base_map {
         if let NodeKind::File { extent_map, .. } = &node_arc.as_ref().kind {
             for (_offset, entry) in extent_map.iter() {
@@ -519,14 +522,33 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
         }
     }
 
+    let total_live_records = unique_records.len();
+    let total_live_bytes: u64 = unique_records.values().map(|r| r.record_size as u64).sum();
+
+    // 2. Index live records by generation and by (generation, block_index)
     let mut records_by_gen: BTreeMap<u32, Vec<LiveRecord>> = BTreeMap::new();
+    let mut records_by_gen_block: BTreeMap<(u32, u64), Vec<LiveRecord>> = BTreeMap::new();
+    let mut live_blocks_by_gen: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
+
     for rec in unique_records.into_values() {
+        let start_blk = rec.record_log_offset / BLOCK_SIZE;
+        let end_blk = (rec.record_log_offset + rec.record_size as u64 - 1) / BLOCK_SIZE;
+
+        for blk in start_blk..=end_blk {
+            live_blocks_by_gen.entry(rec.generation).or_default().insert(blk);
+            records_by_gen_block
+                .entry((rec.generation, blk))
+                .or_default()
+                .push(rec.clone());
+        }
         records_by_gen.entry(rec.generation).or_default().push(rec);
     }
+
     for records in records_by_gen.values_mut() {
         records.sort_by_key(|r| r.record_log_offset);
     }
 
+    // 3. Derive deterministic seed
     let seed = options.seed.unwrap_or_else(|| {
         let mut hasher = blake3::Hasher::new();
         for log in &manifest.logs {
@@ -540,6 +562,7 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
+    // 4. Resolve target remotes
     let mut target_remotes = Vec::new();
     if !options.remotes.is_empty() {
         let reg_opt = fs.remote_registry.read().unwrap().clone();
@@ -559,72 +582,117 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
         }
     }
 
-    let mut sampled_records = Vec::new();
-    let mut sampled_record_bytes = 0u64;
-    let mut total_live_records = 0usize;
-    let mut total_live_bytes = 0u64;
+    // 5. Sample blocks per generation and expand straddling records
+    let mut local_blocks: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
+    let mut remote_blocks: BTreeMap<String, BTreeMap<u32, BTreeSet<u64>>> = BTreeMap::new();
+    let mut target_idx = 0usize;
 
-    for (_gen, mut records) in records_by_gen {
-        total_live_records += records.len();
-        let gen_live_bytes: u64 = records.iter().map(|r| r.record_size as u64).sum();
-        total_live_bytes += gen_live_bytes;
+    for (&generation, gen_blocks) in &live_blocks_by_gen {
+        let mut block_vec: Vec<u64> = gen_blocks.iter().copied().collect();
+        let total_gen_blocks = block_vec.len();
 
-        if options.sample_percent >= 100.0 {
-            for r in records {
-                sampled_record_bytes += r.record_size as u64;
-                sampled_records.push(r);
-            }
+        let sample_count = if options.sample_percent >= 100.0 {
+            total_gen_blocks
         } else {
-            records.shuffle(&mut rng);
-            let target = ((gen_live_bytes as f64) * (options.sample_percent / 100.0)).ceil() as u64;
-            let target = target.max(1).min(gen_live_bytes);
-            let mut accumulated = 0u64;
-            for r in records {
-                accumulated += r.record_size as u64;
-                sampled_record_bytes += r.record_size as u64;
-                sampled_records.push(r);
-                if accumulated >= target {
-                    break;
+            let count = ((total_gen_blocks as f64) * (options.sample_percent / 100.0)).ceil() as usize;
+            count.max(1).min(total_gen_blocks)
+        };
+
+        if options.sample_percent < 100.0 {
+            block_vec.shuffle(&mut rng);
+            block_vec.truncate(sample_count);
+        }
+        block_vec.sort_unstable();
+
+        for &seed_blk in &block_vec {
+            let target_remote = if target_remotes.is_empty() {
+                None
+            } else {
+                let remote = target_remotes[target_idx % target_remotes.len()].clone();
+                target_idx += 1;
+                Some(remote)
+            };
+
+            // Seed block itself is required
+            match &target_remote {
+                None => {
+                    local_blocks.entry(generation).or_default().insert(seed_blk);
+                }
+                Some(remote_name) => {
+                    remote_blocks
+                        .entry(remote_name.clone())
+                        .or_default()
+                        .entry(generation)
+                        .or_default()
+                        .insert(seed_blk);
+                }
+            }
+
+            // Expand straddling records crossing this seed block
+            if let Some(straddling_records) = records_by_gen_block.get(&(generation, seed_blk)) {
+                for rec in straddling_records {
+                    let start_blk = rec.record_log_offset / BLOCK_SIZE;
+                    let end_blk = (rec.record_log_offset + rec.record_size as u64 - 1) / BLOCK_SIZE;
+                    for blk in start_blk..=end_blk {
+                        match &target_remote {
+                            None => {
+                                local_blocks.entry(generation).or_default().insert(blk);
+                            }
+                            Some(remote_name) => {
+                                remote_blocks
+                                    .entry(remote_name.clone())
+                                    .or_default()
+                                    .entry(generation)
+                                    .or_default()
+                                    .insert(blk);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Find all records whose required blocks are completely covered by fetched blocks
+    let mut sampled_records = Vec::new();
+    let mut record_targets = Vec::new();
+    let mut verified_records: HashSet<(u32, u64)> = HashSet::new();
+
+    if target_remotes.is_empty() {
+        for (&generation, gen_records) in &records_by_gen {
+            if let Some(fetched) = local_blocks.get(&generation) {
+                for rec in gen_records {
+                    let start_blk = rec.record_log_offset / BLOCK_SIZE;
+                    let end_blk = (rec.record_log_offset + rec.record_size as u64 - 1) / BLOCK_SIZE;
+                    let fully_covered = (start_blk..=end_blk).all(|b| fetched.contains(&b));
+                    if fully_covered && verified_records.insert((rec.generation, rec.record_log_offset)) {
+                        sampled_records.push(rec.clone());
+                        record_targets.push((rec.clone(), None));
+                    }
+                }
+            }
+        }
+    } else {
+        for (remote_name, gen_map) in &remote_blocks {
+            for (&generation, fetched) in gen_map {
+                if let Some(gen_records) = records_by_gen.get(&generation) {
+                    for rec in gen_records {
+                        let start_blk = rec.record_log_offset / BLOCK_SIZE;
+                        let end_blk = (rec.record_log_offset + rec.record_size as u64 - 1) / BLOCK_SIZE;
+                        let fully_covered = (start_blk..=end_blk).all(|b| fetched.contains(&b));
+                        if fully_covered && verified_records.insert((rec.generation, rec.record_log_offset)) {
+                            sampled_records.push(rec.clone());
+                            record_targets.push((rec.clone(), Some(remote_name.clone())));
+                        }
+                    }
                 }
             }
         }
     }
 
     sampled_records.sort_by_key(|r| (r.generation, r.record_log_offset));
-
-    const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
-    let mut local_blocks: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
-    let mut remote_blocks: BTreeMap<String, BTreeMap<u32, BTreeSet<u64>>> = BTreeMap::new();
-    let mut record_targets = Vec::new();
-
-    for (idx, record) in sampled_records.iter().enumerate() {
-        let target_remote = if target_remotes.is_empty() {
-            None
-        } else {
-            Some(target_remotes[idx % target_remotes.len()].clone())
-        };
-
-        let start_blk = record.record_log_offset / BLOCK_SIZE;
-        let end_blk = (record.record_log_offset + record.record_size as u64 - 1) / BLOCK_SIZE;
-
-        match &target_remote {
-            None => {
-                let set = local_blocks.entry(record.generation).or_default();
-                for blk in start_blk..=end_blk {
-                    set.insert(blk);
-                }
-            }
-            Some(remote_name) => {
-                let gen_map = remote_blocks.entry(remote_name.clone()).or_default();
-                let set = gen_map.entry(record.generation).or_default();
-                for blk in start_blk..=end_blk {
-                    set.insert(blk);
-                }
-            }
-        }
-
-        record_targets.push((record.clone(), target_remote));
-    }
+    record_targets.sort_by_key(|(r, _)| (r.generation, r.record_log_offset));
+    let sampled_record_bytes: u64 = sampled_records.iter().map(|r| r.record_size as u64).sum();
 
     VerificationPlan {
         sample_percent: options.sample_percent,
@@ -2097,27 +2165,101 @@ mod tests {
             .unwrap(),
         );
         fs.log_writer = Some(writer);
-        fs.set_storage(storage);
+        fs.set_storage(storage.clone());
 
-        // Create 20 files with distinct payloads
-        for i in 0..20 {
+        // Create 8 files of ~300 KiB each so data spans across ~3 distinct 1 MiB blocks
+        for i in 0..8 {
             let name = format!("file_{}.txt", i);
             let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
-            let payload = format!("Payload data for file index {}", i).repeat(100);
-            crate::operations::read_write::write_core(&fs, f.ino, payload.as_bytes(), 0).unwrap();
+            let payload = vec![(i as u8) + 1; 300_000];
+            crate::operations::read_write::write_core(&fs, f.ino, &payload, 0).unwrap();
         }
         fs.quiesce().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
 
-        // 1. Sample at fractional percentage 0.05% with fixed seed
+        // 1. Sample at fractional percentage 0.05% with fixed seed (selects 1 block out of 3)
         let opts = CheckOptions::sampled(0.05, Some(42));
         let plan = plan_sampled_verification(&fs, &opts);
-        assert!(!plan.sampled_records.is_empty(), "Should sample at least 1 record");
-        assert!(plan.sampled_records.len() < 20, "Should sample subset of records");
+        let blocks = plan.local_blocks.get(&1).unwrap();
+        assert!(!blocks.is_empty(), "Should sample at least 1 block");
+        assert!(blocks.len() < 3, "Should sample a subset of blocks");
 
         let report = check_fs_integrity(&fs, None, &opts);
         assert!(report.is_clean(), "Report must be clean: {:?}", report.issues);
         assert_eq!(report.sampled_records, plan.sampled_records.len());
         assert_eq!(report.sample_percent, Some(0.05));
+    }
+
+    #[test]
+    fn test_all_extents_in_fetched_block_are_verified() {
+        let storage = Arc::new(crate::storage::MemoryStorage::new());
+        crate::log::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage.clone());
+
+        // In Block 0, create 4 small files (~10 KiB each)
+        for i in 0..4 {
+            let name = format!("blk0_file_{}.txt", i);
+            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, f.ino, &vec![b'A' + i; 10_000], 0).unwrap();
+        }
+        // Write a 1.5 MiB file to advance into block 1 and block 2
+        let filler = crate::operations::read_write::create_core(&fs, 1, "filler.bin", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, filler.ino, &vec![b'X'; 1_500_000], 0).unwrap();
+
+        // In block 2, create 3 small files
+        for i in 0..3 {
+            let name = format!("blk2_file_{}.txt", i);
+            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, f.ino, &vec![b'B' + i; 10_000], 0).unwrap();
+        }
+        fs.quiesce().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
+
+        // Sample 1 block (30% of 3 blocks = 1 block). With seed 42, find which block was sampled.
+        let opts = CheckOptions::sampled(30.0, Some(42));
+        let plan = plan_sampled_verification(&fs, &opts);
+        let blocks = plan.local_blocks.get(&1).unwrap();
+        assert!(!blocks.is_empty());
+
+        // All live records whose required blocks were fetched must be in plan.sampled_records!
+        assert!(!plan.sampled_records.is_empty());
+        for rec in &plan.sampled_records {
+            let start = rec.record_log_offset / crate::remote::block_cache::BLOCK_SIZE;
+            let end = (rec.record_log_offset + rec.record_size as u64 - 1) / crate::remote::block_cache::BLOCK_SIZE;
+            for b in start..=end {
+                assert!(blocks.contains(&b), "Record block {} must be in fetched blocks", b);
+            }
+        }
+
+        let report = check_fs_integrity(&fs, None, &opts);
+        assert!(report.is_clean());
+        assert_eq!(report.sampled_records, plan.sampled_records.len());
     }
 
     #[test]
