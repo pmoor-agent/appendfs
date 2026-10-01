@@ -1,4 +1,3 @@
-use crate::crypto::LogFileKey;
 use crate::fs::InMemoryFS;
 use crate::log::LogFileCache;
 use crate::log::extent::ExtentState;
@@ -735,9 +734,9 @@ pub fn execute_sampled_verification(
     let manifest = fs.manifest.read().unwrap();
     const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
 
-    // 1. Fetch remote blocks if needed
-    let mut fetched_remote_blocks: HashMap<(String, u32, u64), Vec<u8>> = HashMap::new();
-    let mut remote_file_keys: HashMap<(String, u32), Arc<LogFileKey>> = HashMap::new();
+    // 1. Verify remote records by streaming contiguous runs of blocks
+    let mut verified_count = 0usize;
+    let mut verified_bytes = 0u64;
 
     if !plan.remote_blocks.is_empty() {
         let reg_opt = fs.remote_registry.read().unwrap().clone();
@@ -806,9 +805,7 @@ pub fn execute_sampled_verification(
                     }
                 };
                 let file_key = Arc::new(fs.volume_key.log_file_key(&file_header.key_salt));
-                remote_file_keys.insert((remote_name.clone(), generation), file_key);
 
-                // Fetch each block
                 let manifest_len = manifest
                     .get_by_generation(generation)
                     .map(|l| l.total_bytes)
@@ -819,203 +816,99 @@ pub fn execute_sampled_verification(
                             .map(|w| w.current_offset())
                     })
                     .unwrap_or(0);
+
+                // Group contiguous blocks into runs
+                let mut runs: Vec<Vec<u64>> = Vec::new();
+                let mut cur_run: Vec<u64> = Vec::new();
                 for &b in blocks {
-                    let start_offset = b * BLOCK_SIZE;
-                    if start_offset < manifest_len {
-                        let len = (manifest_len - start_offset).min(BLOCK_SIZE);
-                        let mut block_buf = Vec::with_capacity(len as usize);
-                        if let Err(e) = store.get_object_range(&filename, start_offset, len, &mut block_buf) {
-                            report.issues.push(IntegrityIssue::error(
-                                "REMOTE_READ_FAILED",
-                                None,
-                                format!(
-                                    "Failed to fetch block {} of {} from remote '{}': {}",
-                                    b, filename, remote_name, e
-                                ),
-                            ));
+                    if let Some(&last) = cur_run.last() {
+                        if b == last + 1 {
+                            cur_run.push(b);
                         } else {
-                            fetched_remote_blocks.insert((remote_name.clone(), generation, b), block_buf);
+                            runs.push(std::mem::take(&mut cur_run));
+                            cur_run.push(b);
                         }
+                    } else {
+                        cur_run.push(b);
                     }
                 }
-            }
-        }
-    }
+                if !cur_run.is_empty() {
+                    runs.push(cur_run);
+                }
 
-    // 2. Open local cache if local blocks exist
-    let local_cache = fs
-        .log_cache
-        .clone()
-        .or_else(|| log_dir.map(|d| Arc::new(LogFileCache::new(d))));
+                // Stream verification run-by-run: load only run blocks, verify records, drop run blocks
+                for run in runs {
+                    let run_min = *run.first().unwrap();
+                    let run_max = *run.last().unwrap();
+                    let mut run_blocks: HashMap<u64, Vec<u8>> = HashMap::with_capacity(run.len());
 
-    // 3. Verify each record
-    let mut verified_count = 0usize;
-    let mut verified_bytes = 0u64;
-
-    for (record, target) in &plan.record_targets {
-        match target {
-            Some(remote_name) => {
-                let file_key = match remote_file_keys.get(&(remote_name.clone(), record.generation)) {
-                    Some(k) => k,
-                    None => continue,
-                };
-                let mut raw_record = Vec::with_capacity(record.record_size as usize);
-                let mut cur_offset = record.record_log_offset;
-                let end_offset = record.record_log_offset + record.record_size as u64;
-                let mut failed = false;
-
-                while cur_offset < end_offset {
-                    let blk = cur_offset / BLOCK_SIZE;
-                    let blk_start = blk * BLOCK_SIZE;
-                    let offset_in_blk = (cur_offset - blk_start) as usize;
-                    match fetched_remote_blocks.get(&(remote_name.clone(), record.generation, blk)) {
-                        Some(blk_bytes) => {
-                            let avail = blk_bytes.len().saturating_sub(offset_in_blk);
-                            let remaining = (end_offset - cur_offset) as usize;
-                            let take = avail.min(remaining);
-                            if take == 0 {
-                                failed = true;
-                                break;
+                    for &b in &run {
+                        let start_offset = b * BLOCK_SIZE;
+                        if start_offset < manifest_len {
+                            let len = (manifest_len - start_offset).min(BLOCK_SIZE);
+                            let mut block_buf = Vec::with_capacity(len as usize);
+                            if let Err(e) = store.get_object_range(&filename, start_offset, len, &mut block_buf) {
+                                report.issues.push(IntegrityIssue::error(
+                                    "REMOTE_READ_FAILED",
+                                    None,
+                                    format!(
+                                        "Failed to fetch block {} of {} from remote '{}': {}",
+                                        b, filename, remote_name, e
+                                    ),
+                                ));
+                            } else {
+                                run_blocks.insert(b, block_buf);
                             }
-                            raw_record.extend_from_slice(&blk_bytes[offset_in_blk..offset_in_blk + take]);
-                            cur_offset += take as u64;
-                        }
-                        None => {
-                            failed = true;
-                            break;
                         }
                     }
-                }
 
-                if failed || raw_record.len() != record.record_size as usize {
-                    report.issues.push(IntegrityIssue::error(
-                        "CORRUPT_LOG_RECORD",
-                        Some(record.inode),
-                        format!(
-                            "Record at offset 0x{:x} in generation {} could not be assembled from remote '{}'",
-                            record.record_log_offset, record.generation, remote_name
-                        ),
-                    ));
-                    continue;
-                }
+                    // Verify records covered by this run
+                    for (record, target) in &plan.record_targets {
+                        if target.as_deref() == Some(remote_name.as_str()) && record.generation == generation {
+                            let start_blk = record.record_log_offset / BLOCK_SIZE;
+                            let end_blk = (record.record_log_offset + record.record_size as u64 - 1) / BLOCK_SIZE;
+                            if start_blk >= run_min && end_blk <= run_max {
+                                let mut raw_record = Vec::with_capacity(record.record_size as usize);
+                                let mut cur_offset = record.record_log_offset;
+                                let end_offset = record.record_log_offset + record.record_size as u64;
+                                let mut failed = false;
 
-                let mut hdr_buf = [0u8; RECORD_HEADER_SIZE];
-                hdr_buf.copy_from_slice(&raw_record[..RECORD_HEADER_SIZE]);
-                match RecordHeader::from_bytes(&hdr_buf) {
-                    Err(e) => {
-                        report.issues.push(IntegrityIssue::error(
-                            "CORRUPT_LOG_RECORD",
-                            Some(record.inode),
-                            format!(
-                                "Invalid record header at offset 0x{:x} in gen {} (remote '{}'): {}",
-                                record.record_log_offset, record.generation, remote_name, e
-                            ),
-                        ));
-                    }
-                    Ok(rec_header) => {
-                        let opcode = rec_header.op_code as u8;
-                        if opcode != OpCode::Data as u8 && opcode != OpCode::DataZstd as u8 {
-                            report.issues.push(IntegrityIssue::error(
-                                "CORRUPT_LOG_RECORD",
-                                Some(record.inode),
-                                format!(
-                                    "Record at offset 0x{:x} in gen {} has unexpected OpCode {}",
-                                    record.record_log_offset, record.generation, opcode
-                                ),
-                            ));
-                        } else if rec_header.inode != record.inode {
-                            report.issues.push(IntegrityIssue::error(
-                                "CORRUPT_LOG_RECORD",
-                                Some(record.inode),
-                                format!(
-                                    "Record at offset 0x{:x} belongs to inode {}, expected {}",
-                                    record.record_log_offset, rec_header.inode, record.inode
-                                ),
-                            ));
-                        } else {
-                            let payload = &raw_record[RECORD_HEADER_SIZE..];
-                            match file_key.decrypt_record(
-                                rec_header.sequence,
-                                rec_header.op_code as u8,
-                                rec_header.inode,
-                                payload,
-                                &rec_header.auth_tag,
-                            ) {
-                                Ok(_) => {
-                                    verified_count += 1;
-                                    verified_bytes += record.record_size as u64;
+                                while cur_offset < end_offset {
+                                    let blk = cur_offset / BLOCK_SIZE;
+                                    let blk_start = blk * BLOCK_SIZE;
+                                    let offset_in_blk = (cur_offset - blk_start) as usize;
+                                    match run_blocks.get(&blk) {
+                                        Some(blk_bytes) => {
+                                            let avail = blk_bytes.len().saturating_sub(offset_in_blk);
+                                            let remaining = (end_offset - cur_offset) as usize;
+                                            let take = avail.min(remaining);
+                                            if take == 0 {
+                                                failed = true;
+                                                break;
+                                            }
+                                            raw_record
+                                                .extend_from_slice(&blk_bytes[offset_in_blk..offset_in_blk + take]);
+                                            cur_offset += take as u64;
+                                        }
+                                        None => {
+                                            failed = true;
+                                            break;
+                                        }
+                                    }
                                 }
-                                Err(e) => {
+
+                                if failed || raw_record.len() != record.record_size as usize {
                                     report.issues.push(IntegrityIssue::error(
                                         "CORRUPT_LOG_RECORD",
                                         Some(record.inode),
                                         format!(
-                                            "Authentication tag mismatch for record at offset 0x{:x} in gen {} (remote '{}'): {}",
-                                            record.record_log_offset, record.generation, remote_name, e
+                                            "Record at offset 0x{:x} in generation {} could not be assembled from remote '{}'",
+                                            record.record_log_offset, record.generation, remote_name
                                         ),
                                     ));
+                                    continue;
                                 }
-                            }
-                        }
-                    }
-                }
-            }
-            None => {
-                // Local verification
-                if let Some(ref c) = local_cache {
-                    let log_filename = manifest
-                        .get_by_generation(record.generation)
-                        .map(|l| l.filename.clone())
-                        .unwrap_or_else(|| crate::log::log_filename(record.generation));
-                    if !c.storage().exists(&log_filename) {
-                        report.issues.push(IntegrityIssue::error(
-                            "MISSING_LOG_FILE",
-                            Some(record.inode),
-                            format!(
-                                "File inode {} extent references generation {} ('{}'), which does not exist in storage",
-                                record.inode, record.generation, log_filename
-                            ),
-                        ));
-                        continue;
-                    }
 
-                    match c.storage().file_len(&log_filename) {
-                        Ok(file_len) => {
-                            if file_len < record.record_log_offset + record.record_size as u64 {
-                                report.issues.push(IntegrityIssue::error(
-                                    "EXTENT_PAST_LOG_EOF",
-                                    Some(record.inode),
-                                    format!(
-                                        "File inode {} record at offset 0x{:x} in {} declares {} bytes, which runs past {} byte file",
-                                        record.inode, record.record_log_offset, log_filename, record.record_size, file_len
-                                    ),
-                                ));
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            report.issues.push(IntegrityIssue::error(
-                                "LOG_FILE_READ_ERROR",
-                                Some(record.inode),
-                                format!("Failed to read file size for {}: {}", log_filename, e),
-                            ));
-                            continue;
-                        }
-                    }
-
-                    match c.get_or_open(record.generation, &fs.volume_key) {
-                        Ok(open) => {
-                            let mut raw_record = vec![0u8; record.record_size as usize];
-                            if let Err(e) = open.reader.read_exact_at(record.record_log_offset, &mut raw_record) {
-                                report.issues.push(IntegrityIssue::error(
-                                    "CORRUPT_LOG_RECORD",
-                                    Some(record.inode),
-                                    format!(
-                                        "Failed to read record at offset 0x{:x} in {}: {}",
-                                        record.record_log_offset, log_filename, e
-                                    ),
-                                ));
-                            } else {
                                 let mut hdr_buf = [0u8; RECORD_HEADER_SIZE];
                                 hdr_buf.copy_from_slice(&raw_record[..RECORD_HEADER_SIZE]);
                                 match RecordHeader::from_bytes(&hdr_buf) {
@@ -1024,8 +917,8 @@ pub fn execute_sampled_verification(
                                             "CORRUPT_LOG_RECORD",
                                             Some(record.inode),
                                             format!(
-                                                "Invalid record header at offset 0x{:x} in {}: {}",
-                                                record.record_log_offset, log_filename, e
+                                                "Invalid record header at offset 0x{:x} in gen {} (remote '{}'): {}",
+                                                record.record_log_offset, record.generation, remote_name, e
                                             ),
                                         ));
                                     }
@@ -1036,8 +929,8 @@ pub fn execute_sampled_verification(
                                                 "CORRUPT_LOG_RECORD",
                                                 Some(record.inode),
                                                 format!(
-                                                    "Record at offset 0x{:x} in {} has OpCode {} instead of OpCode::Data / OpCode::DataZstd",
-                                                    record.record_log_offset, log_filename, opcode
+                                                    "Record at offset 0x{:x} in gen {} has unexpected OpCode {}",
+                                                    record.record_log_offset, record.generation, opcode
                                                 ),
                                             ));
                                         } else if rec_header.inode != record.inode {
@@ -1045,13 +938,13 @@ pub fn execute_sampled_verification(
                                                 "CORRUPT_LOG_RECORD",
                                                 Some(record.inode),
                                                 format!(
-                                                    "Record at offset 0x{:x} in {} belongs to inode {}, expected inode {}",
-                                                    record.record_log_offset, log_filename, rec_header.inode, record.inode
+                                                    "Record at offset 0x{:x} belongs to inode {}, expected {}",
+                                                    record.record_log_offset, rec_header.inode, record.inode
                                                 ),
                                             ));
                                         } else {
                                             let payload = &raw_record[RECORD_HEADER_SIZE..];
-                                            match open.file_key.decrypt_record(
+                                            match file_key.decrypt_record(
                                                 rec_header.sequence,
                                                 rec_header.op_code as u8,
                                                 rec_header.inode,
@@ -1067,8 +960,8 @@ pub fn execute_sampled_verification(
                                                         "CORRUPT_LOG_RECORD",
                                                         Some(record.inode),
                                                         format!(
-                                                            "Authentication tag mismatch for record at offset 0x{:x} in {}: {}",
-                                                            record.record_log_offset, log_filename, e
+                                                            "Authentication tag mismatch for record at offset 0x{:x} in gen {} (remote '{}'): {}",
+                                                            record.record_log_offset, record.generation, remote_name, e
                                                         ),
                                                     ));
                                                 }
@@ -1078,13 +971,143 @@ pub fn execute_sampled_verification(
                                 }
                             }
                         }
-                        Err(e) => {
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Verify local records one by one
+    let local_cache = fs
+        .log_cache
+        .clone()
+        .or_else(|| log_dir.map(|d| Arc::new(LogFileCache::new(d))));
+
+    for (record, target) in &plan.record_targets {
+        if target.is_none() {
+            // Local verification
+            if let Some(ref c) = local_cache {
+                let log_filename = manifest
+                    .get_by_generation(record.generation)
+                    .map(|l| l.filename.clone())
+                    .unwrap_or_else(|| crate::log::log_filename(record.generation));
+                if !c.storage().exists(&log_filename) {
+                    report.issues.push(IntegrityIssue::error(
+                        "MISSING_LOG_FILE",
+                        Some(record.inode),
+                        format!(
+                            "File inode {} extent references generation {} ('{}'), which does not exist in storage",
+                            record.inode, record.generation, log_filename
+                        ),
+                    ));
+                    continue;
+                }
+
+                match c.storage().file_len(&log_filename) {
+                    Ok(file_len) => {
+                        if file_len < record.record_log_offset + record.record_size as u64 {
                             report.issues.push(IntegrityIssue::error(
-                                "LOG_FILE_READ_ERROR",
-                                Some(record.inode),
-                                format!("Failed to open log file {}: {}", log_filename, e),
-                            ));
+                                    "EXTENT_PAST_LOG_EOF",
+                                    Some(record.inode),
+                                    format!(
+                                        "File inode {} record at offset 0x{:x} in {} declares {} bytes, which runs past {} byte file",
+                                        record.inode, record.record_log_offset, log_filename, record.record_size, file_len
+                                    ),
+                                ));
+                            continue;
                         }
+                    }
+                    Err(e) => {
+                        report.issues.push(IntegrityIssue::error(
+                            "LOG_FILE_READ_ERROR",
+                            Some(record.inode),
+                            format!("Failed to read file size for {}: {}", log_filename, e),
+                        ));
+                        continue;
+                    }
+                }
+
+                match c.get_or_open(record.generation, &fs.volume_key) {
+                    Ok(open) => {
+                        let mut raw_record = vec![0u8; record.record_size as usize];
+                        if let Err(e) = open.reader.read_exact_at(record.record_log_offset, &mut raw_record) {
+                            report.issues.push(IntegrityIssue::error(
+                                "CORRUPT_LOG_RECORD",
+                                Some(record.inode),
+                                format!(
+                                    "Failed to read record at offset 0x{:x} in {}: {}",
+                                    record.record_log_offset, log_filename, e
+                                ),
+                            ));
+                        } else {
+                            let mut hdr_buf = [0u8; RECORD_HEADER_SIZE];
+                            hdr_buf.copy_from_slice(&raw_record[..RECORD_HEADER_SIZE]);
+                            match RecordHeader::from_bytes(&hdr_buf) {
+                                Err(e) => {
+                                    report.issues.push(IntegrityIssue::error(
+                                        "CORRUPT_LOG_RECORD",
+                                        Some(record.inode),
+                                        format!(
+                                            "Invalid record header at offset 0x{:x} in {}: {}",
+                                            record.record_log_offset, log_filename, e
+                                        ),
+                                    ));
+                                }
+                                Ok(rec_header) => {
+                                    let opcode = rec_header.op_code as u8;
+                                    if opcode != OpCode::Data as u8 && opcode != OpCode::DataZstd as u8 {
+                                        report.issues.push(IntegrityIssue::error(
+                                                "CORRUPT_LOG_RECORD",
+                                                Some(record.inode),
+                                                format!(
+                                                    "Record at offset 0x{:x} in {} has OpCode {} instead of OpCode::Data / OpCode::DataZstd",
+                                                    record.record_log_offset, log_filename, opcode
+                                                ),
+                                            ));
+                                    } else if rec_header.inode != record.inode {
+                                        report.issues.push(IntegrityIssue::error(
+                                            "CORRUPT_LOG_RECORD",
+                                            Some(record.inode),
+                                            format!(
+                                                "Record at offset 0x{:x} in {} belongs to inode {}, expected inode {}",
+                                                record.record_log_offset, log_filename, rec_header.inode, record.inode
+                                            ),
+                                        ));
+                                    } else {
+                                        let payload = &raw_record[RECORD_HEADER_SIZE..];
+                                        match open.file_key.decrypt_record(
+                                            rec_header.sequence,
+                                            rec_header.op_code as u8,
+                                            rec_header.inode,
+                                            payload,
+                                            &rec_header.auth_tag,
+                                        ) {
+                                            Ok(_) => {
+                                                verified_count += 1;
+                                                verified_bytes += record.record_size as u64;
+                                            }
+                                            Err(e) => {
+                                                report.issues.push(IntegrityIssue::error(
+                                                        "CORRUPT_LOG_RECORD",
+                                                        Some(record.inode),
+                                                        format!(
+                                                            "Authentication tag mismatch for record at offset 0x{:x} in {}: {}",
+                                                            record.record_log_offset, log_filename, e
+                                                        ),
+                                                    ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        report.issues.push(IntegrityIssue::error(
+                            "LOG_FILE_READ_ERROR",
+                            Some(record.inode),
+                            format!("Failed to open log file {}: {}", log_filename, e),
+                        ));
                     }
                 }
             }
