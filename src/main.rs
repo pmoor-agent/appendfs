@@ -552,9 +552,11 @@ fn cmd_mount(args: MountArgs) {
 
     let fuse_args = args.to_fuse_args();
     if let Err(err) = appendfs::mount_arc(fuse_args, fs_instance) {
+        log::error!("Failed to mount appendfs FUSE filesystem: {}", err);
         eprintln!("Failed to mount appendfs FUSE filesystem: {}", err);
         std::process::exit(1);
     }
+    log::info!("Orderly shutdown complete");
 }
 
 fn cmd_mount_ro(args: MountRoArgs) {
@@ -641,9 +643,11 @@ fn cmd_mount_ro(args: MountRoArgs) {
     let fs_instance = Arc::new(fs_instance);
     let fuse_args = args.to_fuse_args();
     if let Err(err) = appendfs::mount_ro_arc(fuse_args, fs_instance) {
+        log::error!("Failed to mount read-only appendfs FUSE filesystem: {}", err);
         eprintln!("Failed to mount read-only appendfs FUSE filesystem: {}", err);
         std::process::exit(1);
     }
+    log::info!("Orderly shutdown complete");
 }
 
 fn cmd_stats(args: StatsArgs) {
