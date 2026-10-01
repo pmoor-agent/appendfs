@@ -572,7 +572,7 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
                 target_remotes = reg.remotes.keys().cloned().collect();
             } else {
                 for r in &options.remotes {
-                    if reg.remotes.contains_key(r) {
+                    if r == "local" || reg.remotes.contains_key(r) {
                         target_remotes.push(r.clone());
                     }
                 }
@@ -585,7 +585,18 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
     // 5. Sample blocks per generation and expand straddling records
     let mut local_blocks: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
     let mut remote_blocks: BTreeMap<String, BTreeMap<u32, BTreeSet<u64>>> = BTreeMap::new();
-    let mut target_idx = 0usize;
+    let mut target_counts: HashMap<Option<String>, usize> = HashMap::new();
+    if target_remotes.is_empty() {
+        target_counts.insert(None, 0);
+    } else {
+        for r in &target_remotes {
+            if r == "local" {
+                target_counts.insert(None, 0);
+            } else {
+                target_counts.insert(Some(r.clone()), 0);
+            }
+        }
+    }
 
     for (&generation, gen_blocks) in &live_blocks_by_gen {
         let mut block_vec: Vec<u64> = gen_blocks.iter().copied().collect();
@@ -600,56 +611,57 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
 
         if options.sample_percent < 100.0 {
             block_vec.shuffle(&mut rng);
-            block_vec.truncate(sample_count);
+        } else {
+            block_vec.sort_unstable();
         }
-        block_vec.sort_unstable();
+
+        let mut gen_fetched_blocks: HashSet<u64> = HashSet::new();
 
         for &seed_blk in &block_vec {
-            let target_remote = if target_remotes.is_empty() {
-                None
-            } else {
-                let remote = target_remotes[target_idx % target_remotes.len()].clone();
-                target_idx += 1;
-                Some(remote)
-            };
-
-            // Seed block itself is required
-            match &target_remote {
-                None => {
-                    local_blocks.entry(generation).or_default().insert(seed_blk);
-                }
-                Some(remote_name) => {
-                    remote_blocks
-                        .entry(remote_name.clone())
-                        .or_default()
-                        .entry(generation)
-                        .or_default()
-                        .insert(seed_blk);
-                }
+            if gen_fetched_blocks.contains(&seed_blk) {
+                continue;
+            }
+            if gen_fetched_blocks.len() >= sample_count {
+                break;
             }
 
-            // Expand straddling records crossing this seed block
+            // Pick the target with the minimum assigned blocks so far
+            let target_remote = target_counts
+                .iter()
+                .min_by_key(|(t, count)| (**count, t.as_deref().unwrap_or("")))
+                .map(|(t, _)| t.clone())
+                .unwrap_or(None);
+
+            let mut blocks_to_add = vec![seed_blk];
             if let Some(straddling_records) = records_by_gen_block.get(&(generation, seed_blk)) {
                 for rec in straddling_records {
                     let start_blk = rec.record_log_offset / BLOCK_SIZE;
                     let end_blk = (rec.record_log_offset + rec.record_size as u64 - 1) / BLOCK_SIZE;
                     for blk in start_blk..=end_blk {
-                        match &target_remote {
-                            None => {
-                                local_blocks.entry(generation).or_default().insert(blk);
-                            }
-                            Some(remote_name) => {
-                                remote_blocks
-                                    .entry(remote_name.clone())
-                                    .or_default()
-                                    .entry(generation)
-                                    .or_default()
-                                    .insert(blk);
-                            }
+                        if !gen_fetched_blocks.contains(&blk) && !blocks_to_add.contains(&blk) {
+                            blocks_to_add.push(blk);
                         }
                     }
                 }
             }
+
+            for &blk in &blocks_to_add {
+                gen_fetched_blocks.insert(blk);
+                match &target_remote {
+                    None => {
+                        local_blocks.entry(generation).or_default().insert(blk);
+                    }
+                    Some(remote_name) => {
+                        remote_blocks
+                            .entry(remote_name.clone())
+                            .or_default()
+                            .entry(generation)
+                            .or_default()
+                            .insert(blk);
+                    }
+                }
+            }
+            *target_counts.entry(target_remote).or_default() += blocks_to_add.len();
         }
     }
 
@@ -658,7 +670,7 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
     let mut record_targets = Vec::new();
     let mut verified_records: HashSet<(u32, u64)> = HashSet::new();
 
-    if target_remotes.is_empty() {
+    if !local_blocks.is_empty() {
         for (&generation, gen_records) in &records_by_gen {
             if let Some(fetched) = local_blocks.get(&generation) {
                 for rec in gen_records {
@@ -672,18 +684,18 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
                 }
             }
         }
-    } else {
-        for (remote_name, gen_map) in &remote_blocks {
-            for (&generation, fetched) in gen_map {
-                if let Some(gen_records) = records_by_gen.get(&generation) {
-                    for rec in gen_records {
-                        let start_blk = rec.record_log_offset / BLOCK_SIZE;
-                        let end_blk = (rec.record_log_offset + rec.record_size as u64 - 1) / BLOCK_SIZE;
-                        let fully_covered = (start_blk..=end_blk).all(|b| fetched.contains(&b));
-                        if fully_covered && verified_records.insert((rec.generation, rec.record_log_offset)) {
-                            sampled_records.push(rec.clone());
-                            record_targets.push((rec.clone(), Some(remote_name.clone())));
-                        }
+    }
+
+    for (remote_name, gen_map) in &remote_blocks {
+        for (&generation, fetched) in gen_map {
+            if let Some(gen_records) = records_by_gen.get(&generation) {
+                for rec in gen_records {
+                    let start_blk = rec.record_log_offset / BLOCK_SIZE;
+                    let end_blk = (rec.record_log_offset + rec.record_size as u64 - 1) / BLOCK_SIZE;
+                    let fully_covered = (start_blk..=end_blk).all(|b| fetched.contains(&b));
+                    if fully_covered && verified_records.insert((rec.generation, rec.record_log_offset)) {
+                        sampled_records.push(rec.clone());
+                        record_targets.push((rec.clone(), Some(remote_name.clone())));
                     }
                 }
             }
@@ -2429,5 +2441,103 @@ mod tests {
             "Issue message must mention corrupted remote: {}",
             issue.message
         );
+    }
+
+    #[test]
+    fn test_sampled_verification_distributes_evenly_across_remotes_and_local() {
+        use crate::remote::mock::MockRemoteStore;
+        use crate::remote::{RemoteRegistry, RemoteTargetConfig};
+
+        let storage = Arc::new(crate::storage::MemoryStorage::new());
+        crate::log::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage.clone());
+
+        // Create 10 files of 300 KiB each spanning ~3 blocks (blocks 0, 1, 2)
+        for i in 0..10 {
+            let f =
+                crate::operations::read_write::create_core(&fs, 1, &format!("dist_{}.txt", i), 0o644, 0, 1000, 1000)
+                    .unwrap();
+            crate::operations::read_write::write_core(&fs, f.ino, &vec![0xAA; 300_000], 0).unwrap();
+        }
+        fs.quiesce().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
+
+        let mut registry = RemoteRegistry::default();
+        let r1 = Arc::new(MockRemoteStore::new());
+        let r2 = Arc::new(MockRemoteStore::new());
+        registry.add_remote("r1", RemoteTargetConfig::new("r1"));
+        registry.add_remote("r2", RemoteTargetConfig::new("r2"));
+        registry.set_store_override("r1", r1);
+        registry.set_store_override("r2", r2);
+        fs.set_remote_registry(Arc::new(std::sync::RwLock::new(registry)));
+
+        // Case 1: --remotes r1,r2 with 100% of blocks
+        // Total blocks = 3. Round robin: blk 0 -> r1, blk 1 -> r2, blk 2 -> r1.
+        // Total sampled blocks is 3 (100% in total, NOT 3 on r1 and 3 on r2).
+        let opts_two_remotes = CheckOptions {
+            verify_data: true,
+            sample_percent: 100.0,
+            remotes: vec!["r1".to_string(), "r2".to_string()],
+            seed: Some(42),
+        };
+        let plan_two = plan_sampled_verification(&fs, &opts_two_remotes);
+        let r1_blocks = plan_two.remote_blocks.get("r1").unwrap().get(&1).unwrap().len();
+        let r2_blocks = plan_two.remote_blocks.get("r2").unwrap().get(&1).unwrap().len();
+        assert_eq!(
+            r1_blocks + r2_blocks,
+            3,
+            "Total blocks across all remotes must equal total volume blocks"
+        );
+        assert_eq!(r1_blocks, 2);
+        assert_eq!(r2_blocks, 1);
+        assert!(
+            plan_two.local_blocks.is_empty(),
+            "Local blocks must be empty when only r1 and r2 requested"
+        );
+
+        // Case 2: --remotes local,r1 with 100% of blocks
+        // Round robin: blk 0 -> local, blk 1 -> r1, blk 2 -> local.
+        let opts_local_remote = CheckOptions {
+            verify_data: true,
+            sample_percent: 100.0,
+            remotes: vec!["local".to_string(), "r1".to_string()],
+            seed: Some(42),
+        };
+        let plan_lr = plan_sampled_verification(&fs, &opts_local_remote);
+        let loc_count = plan_lr.local_blocks.get(&1).unwrap().len();
+        let rem_count = plan_lr.remote_blocks.get("r1").unwrap().get(&1).unwrap().len();
+        assert_eq!(
+            loc_count + rem_count,
+            3,
+            "Total blocks across local + remote must equal total volume blocks"
+        );
+        assert_eq!(loc_count, 2);
+        assert_eq!(rem_count, 1);
     }
 }

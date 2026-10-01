@@ -545,7 +545,7 @@ pub struct FsckArgs {
     #[arg(long = "sample-percent")]
     pub sample_percent: Option<f64>,
 
-    /// Target remotes to verify: "all" or specific remote name(s) (comma-separated or multiple flags)
+    /// Target remotes to verify: "all", "local", or specific remote name(s) (comma-separated or multiple flags)
     #[arg(long = "remotes", value_delimiter = ',')]
     pub remotes: Vec<String>,
 

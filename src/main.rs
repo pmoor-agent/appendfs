@@ -773,7 +773,7 @@ fn cmd_fsck(args: FsckArgs) {
             }
         } else {
             for r in &args.remotes {
-                if registry.get_remote(r).is_none() {
+                if r != "local" && registry.get_remote(r).is_none() {
                     eprintln!("Error: Remote '{}' is not configured in remotes.toml.", r);
                     std::process::exit(1);
                 }
@@ -810,6 +810,9 @@ fn cmd_fsck(args: FsckArgs) {
     // 1. If remotes were specified, check each remote's objects against manifest
     if !target_remotes.is_empty() {
         for remote_name in &target_remotes {
+            if remote_name == "local" {
+                continue;
+            }
             if let Some(remote_cfg) = registry.get_remote(remote_name) {
                 let store = registry
                     .store_overrides
