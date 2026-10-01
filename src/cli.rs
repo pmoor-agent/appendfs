@@ -540,6 +540,23 @@ pub struct FsckArgs {
     #[arg(long = "verify-data", default_value_t = false)]
     pub verify_data: bool,
 
+    /// Percentage of live data to sample and verify (0.0 < percent <= 100.0, e.g. 0.01 for 0.01%).
+    /// Automatically implies --verify-data.
+    #[arg(long = "sample-percent")]
+    pub sample_percent: Option<f64>,
+
+    /// Target remotes to verify: "all" or specific remote name(s) (comma-separated or multiple flags)
+    #[arg(long = "remotes", value_delimiter = ',')]
+    pub remotes: Vec<String>,
+
+    /// Reproducible seed for sampled block selection (default: derived from manifest)
+    #[arg(long = "seed")]
+    pub seed: Option<u64>,
+
+    /// Automatically confirm cloud egress prompt without interactive confirmation
+    #[arg(short = 'y', long = "yes", default_value_t = false)]
+    pub yes: bool,
+
     /// Verbosity level (-v for detailed integrity check report)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -551,10 +568,24 @@ pub struct FsckArgs {
     /// Prompt for the volume's passphrase in order to unlock volume
     #[arg(long = "passphrase", default_value_t = false)]
     pub passphrase: bool,
+}
 
-    /// Verify remote objects on specified remote against summary manifest authenticated MD5s
-    #[arg(long = "remote")]
-    pub remote: Option<String>,
+impl FsckArgs {
+    /// Returns true if data verification is enabled (either via --verify-data or --sample-percent).
+    pub fn is_verify_data(&self) -> bool {
+        self.verify_data || self.sample_percent.is_some()
+    }
+
+    /// Returns the effective sampling percentage (defaulting to 100.0 if --verify-data is set without --sample-percent).
+    pub fn effective_sample_percent(&self) -> Option<f64> {
+        if let Some(pct) = self.sample_percent {
+            Some(pct)
+        } else if self.verify_data {
+            Some(100.0)
+        } else {
+            None
+        }
+    }
 }
 
 /// Helper scanning `storage` for existing `.log` files to find the highest generation number.
@@ -647,11 +678,39 @@ mod tests {
             panic!("expected Fsck command");
         };
         assert!(!args_default.verify_data);
+        assert!(!args_default.is_verify_data());
+        assert_eq!(args_default.effective_sample_percent(), None);
+        assert!(args_default.remotes.is_empty());
+        assert!(!args_default.yes);
 
         let cli_verified = Cli::parse_from(["appendfs", "fsck", "--verify-data", "/path/to/log"]);
         let Commands::Fsck(args_verified) = cli_verified.command else {
             panic!("expected Fsck command");
         };
         assert!(args_verified.verify_data);
+        assert!(args_verified.is_verify_data());
+        assert_eq!(args_verified.effective_sample_percent(), Some(100.0));
+
+        let cli_sampled = Cli::parse_from([
+            "appendfs",
+            "fsck",
+            "--sample-percent",
+            "0.05",
+            "--remotes",
+            "aws,wasabi",
+            "--seed",
+            "12345",
+            "-y",
+            "/path/to/log",
+        ]);
+        let Commands::Fsck(args_sampled) = cli_sampled.command else {
+            panic!("expected Fsck command");
+        };
+        assert!(!args_sampled.verify_data);
+        assert!(args_sampled.is_verify_data());
+        assert_eq!(args_sampled.effective_sample_percent(), Some(0.05));
+        assert_eq!(args_sampled.remotes, vec!["aws".to_string(), "wasabi".to_string()]);
+        assert_eq!(args_sampled.seed, Some(12345));
+        assert!(args_sampled.yes);
     }
 }

@@ -27,7 +27,8 @@ pub mod wire;
 pub use crypto::{VolumeHeader, VolumeKey};
 
 pub use check::{
-    IntegrityIssue, IntegrityReport, IssueLevel, check_fs_integrity, check_remote_integrity, check_volume,
+    CheckOptions, IntegrityIssue, IntegrityReport, IssueLevel, LiveRecord, VerificationPlan, check_fs_integrity,
+    check_remote_integrity, check_volume, plan_sampled_verification,
 };
 pub use cli::{
     Cli, Commands, DumpArgs, FsckArgs, InitArgs, MountArgs, MountRoArgs, StatsArgs, find_latest_generation,

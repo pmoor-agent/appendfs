@@ -1,14 +1,68 @@
+use crate::crypto::LogFileKey;
 use crate::fs::InMemoryFS;
 use crate::log::LogFileCache;
 use crate::log::extent::ExtentState;
-use crate::log::record::{OpCode, RECORD_HEADER_SIZE, RecordHeader};
+use crate::log::record::{FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader};
 use crate::node::NodeKind;
 use crate::sync::OpTag;
+use rand::SeedableRng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Options controlling filesystem integrity verification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckOptions {
+    /// Deep verify physical extent payloads and cryptographic checksums in `.log` files.
+    pub verify_data: bool,
+    /// Percentage of live data to sample and verify (0.0 < percent <= 100.0, default: 100.0).
+    pub sample_percent: f64,
+    /// Target remotes to verify (empty for local-only, "all", or specific remote names).
+    pub remotes: Vec<String>,
+    /// Deterministic seed for sampled block selection (if None, derived from manifest).
+    pub seed: Option<u64>,
+}
+
+impl Default for CheckOptions {
+    fn default() -> Self {
+        Self {
+            verify_data: false,
+            sample_percent: 100.0,
+            remotes: Vec::new(),
+            seed: None,
+        }
+    }
+}
+
+impl CheckOptions {
+    /// Creates a metadata-only verification option set (default).
+    pub fn metadata_only() -> Self {
+        Self::default()
+    }
+
+    /// Creates a full data verification option set (100% of live data).
+    pub fn full_data() -> Self {
+        Self {
+            verify_data: true,
+            sample_percent: 100.0,
+            remotes: Vec::new(),
+            seed: None,
+        }
+    }
+
+    /// Creates a sampled data verification option set with a given percentage (0.0 < percent <= 100.0).
+    pub fn sampled(sample_percent: f64, seed: Option<u64>) -> Self {
+        Self {
+            verify_data: true,
+            sample_percent,
+            remotes: Vec::new(),
+            seed,
+        }
+    }
+}
 
 /// Severity level of an integrity issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -66,7 +120,6 @@ impl IntegrityIssue {
     }
 }
 
-/// Aggregated report produced by the filesystem integrity check.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IntegrityReport {
     pub total_inodes: usize,
@@ -77,6 +130,11 @@ pub struct IntegrityReport {
     pub total_data_bytes: u64,
     pub orphaned_inodes: Vec<u64>,
     pub issues: Vec<IntegrityIssue>,
+    pub sampled_records: usize,
+    pub sampled_data_bytes: u64,
+    pub sampled_blocks: usize,
+    pub sample_percent: Option<f64>,
+    pub remotes_checked: Vec<String>,
 }
 
 impl IntegrityReport {
@@ -93,6 +151,31 @@ impl IntegrityReport {
     /// Returns the number of Warning-level issues.
     pub fn warning_count(&self) -> usize {
         self.issues.iter().filter(|i| i.level == IssueLevel::Warning).count()
+    }
+
+    /// Merges another integrity report into this one.
+    pub fn merge(&mut self, other: IntegrityReport) {
+        if self.total_inodes == 0 {
+            self.total_inodes = other.total_inodes;
+            self.directories = other.directories;
+            self.regular_files = other.regular_files;
+            self.symlinks = other.symlinks;
+            self.total_extents = other.total_extents;
+            self.total_data_bytes = other.total_data_bytes;
+        }
+        self.orphaned_inodes.extend(other.orphaned_inodes);
+        self.issues.extend(other.issues);
+        self.sampled_records += other.sampled_records;
+        self.sampled_data_bytes += other.sampled_data_bytes;
+        self.sampled_blocks += other.sampled_blocks;
+        if self.sample_percent.is_none() {
+            self.sample_percent = other.sample_percent;
+        }
+        for r in other.remotes_checked {
+            if !self.remotes_checked.contains(&r) {
+                self.remotes_checked.push(r);
+            }
+        }
     }
 
     /// Formats the report as a clean, human-readable terminal output.
@@ -176,7 +259,17 @@ impl IntegrityReport {
             })
             .count();
         if extent_issues == 0 {
-            out.push_str("  [PASS] File Extents & Log Record Consistency\n");
+            if let Some(pct) = self.sample_percent {
+                out.push_str(&format!(
+                    "  [PASS] File Extents & Log Record Consistency ({:.3}% sample, {} records, {:.2} MiB across {} blocks)\n",
+                    pct,
+                    self.sampled_records,
+                    self.sampled_data_bytes as f64 / (1024.0 * 1024.0),
+                    self.sampled_blocks
+                ));
+            } else {
+                out.push_str("  [PASS] File Extents & Log Record Consistency\n");
+            }
         } else {
             out.push_str(&format!(
                 "  [FAIL] File Extents ({} extent/data inconsistencies)\n",
@@ -196,6 +289,22 @@ impl IntegrityReport {
                 "  [FAIL] Log Manifest ({} manifest issues)\n",
                 manifest_issues
             ));
+        }
+
+        if !self.remotes_checked.is_empty() {
+            let remote_issues = self.issues.iter().filter(|i| i.code.starts_with("REMOTE_")).count();
+            if remote_issues == 0 {
+                out.push_str(&format!(
+                    "  [PASS] Remote Stores & Manifest Consistency ({})\n",
+                    self.remotes_checked.join(", ")
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  [FAIL] Remote Stores ({} remote integrity issues across {})\n",
+                    remote_issues,
+                    self.remotes_checked.join(", ")
+                ));
+            }
         }
 
         out.push('\n');
@@ -240,10 +349,683 @@ impl IntegrityReport {
     }
 }
 
+/// A candidate record from a live file extent for verification.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LiveRecord {
+    pub inode: u64,
+    pub generation: u32,
+    pub record_log_offset: u64,
+    pub record_size: u32,
+}
+
+/// Pre-flight plan for sampled data verification.
+#[derive(Debug, Clone)]
+pub struct VerificationPlan {
+    pub sample_percent: f64,
+    pub seed: u64,
+    pub total_live_records: usize,
+    pub total_live_bytes: u64,
+    pub sampled_records: Vec<LiveRecord>,
+    pub sampled_record_bytes: u64,
+    /// 1 MiB blocks to fetch locally per generation: generation -> set of block indices.
+    pub local_blocks: BTreeMap<u32, BTreeSet<u64>>,
+    /// 1 MiB blocks to fetch per remote: remote_name -> (generation -> set of block indices).
+    pub remote_blocks: BTreeMap<String, BTreeMap<u32, BTreeSet<u64>>>,
+    /// Which target (None = local, Some(remote_name) = remote) is assigned to verify each sampled record.
+    pub record_targets: Vec<(LiveRecord, Option<String>)>,
+}
+
+impl VerificationPlan {
+    pub fn total_remote_egress_bytes(&self, manifest: &crate::log::LogManifest) -> u64 {
+        let mut total = 0u64;
+        for gen_map in self.remote_blocks.values() {
+            for (&generation, blocks) in gen_map {
+                let file_len = manifest
+                    .get_by_generation(generation)
+                    .map(|l| l.total_bytes)
+                    .unwrap_or(0);
+                for &b in blocks {
+                    let start = b * crate::remote::block_cache::BLOCK_SIZE;
+                    if start < file_len {
+                        total += (file_len - start).min(crate::remote::block_cache::BLOCK_SIZE);
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    pub fn total_remote_requests(&self) -> usize {
+        self.remote_blocks
+            .values()
+            .map(|gen_map| gen_map.values().map(|b| b.len()).sum::<usize>())
+            .sum()
+    }
+
+    pub fn display_summary(&self, manifest: &crate::log::LogManifest) -> String {
+        let mut out = String::new();
+        out.push_str("=================================================================\n");
+        out.push_str("             AppendFS Sampled Data Verification Plan             \n");
+        out.push_str("=================================================================\n");
+        out.push_str(&format!(
+            "  Sample Rate:         {:.3}% (Seed: 0x{:016x})\n",
+            self.sample_percent, self.seed
+        ));
+        out.push_str(&format!(
+            "  Live Records:        {} sampled out of {} (totaling {:.2} MiB)\n",
+            self.sampled_records.len(),
+            self.total_live_records,
+            self.sampled_record_bytes as f64 / (1024.0 * 1024.0)
+        ));
+        out.push('\n');
+        out.push_str("  Planned Read Traffic:\n");
+
+        let mut local_bytes = 0u64;
+        let mut local_blocks_count = 0usize;
+        for (&generation, blocks) in &self.local_blocks {
+            local_blocks_count += blocks.len();
+            let file_len = manifest
+                .get_by_generation(generation)
+                .map(|l| l.total_bytes)
+                .unwrap_or(0);
+            for &b in blocks {
+                let start = b * crate::remote::block_cache::BLOCK_SIZE;
+                if start < file_len {
+                    local_bytes += (file_len - start).min(crate::remote::block_cache::BLOCK_SIZE);
+                }
+            }
+        }
+
+        if local_blocks_count > 0 || self.remote_blocks.is_empty() {
+            out.push_str(&format!(
+                "    Local Storage:     {:.2} MiB ({} 1 MiB blocks)\n",
+                local_bytes as f64 / (1024.0 * 1024.0),
+                local_blocks_count
+            ));
+        }
+
+        let mut total_remote_bytes = 0u64;
+        let mut total_remote_reqs = 0usize;
+
+        for (remote_name, gen_map) in &self.remote_blocks {
+            let mut rem_bytes = 0u64;
+            let mut rem_reqs = 0usize;
+            for (&generation, blocks) in gen_map {
+                rem_reqs += blocks.len();
+                let file_len = manifest
+                    .get_by_generation(generation)
+                    .map(|l| l.total_bytes)
+                    .unwrap_or(0);
+                for &b in blocks {
+                    let start = b * crate::remote::block_cache::BLOCK_SIZE;
+                    if start < file_len {
+                        rem_bytes += (file_len - start).min(crate::remote::block_cache::BLOCK_SIZE);
+                    }
+                }
+            }
+            total_remote_bytes += rem_bytes;
+            total_remote_reqs += rem_reqs;
+            out.push_str(&format!(
+                "    Remote '{}':       {:.2} MiB ({} blocks / {} GET requests)\n",
+                remote_name,
+                rem_bytes as f64 / (1024.0 * 1024.0),
+                rem_reqs,
+                rem_reqs
+            ));
+        }
+
+        if !self.remote_blocks.is_empty() {
+            out.push_str("    -------------------------------------------------------------\n");
+            out.push_str(&format!(
+                "    Total Remote Egress: {:.2} MiB across {} GET range requests\n",
+                total_remote_bytes as f64 / (1024.0 * 1024.0),
+                total_remote_reqs
+            ));
+        }
+        out.push_str("=================================================================\n");
+        out
+    }
+}
+
+/// Builds a deterministic verification plan covering approximately `options.sample_percent`% of
+/// data records for each active log generation. Records crossing 1 MiB block boundaries automatically
+/// expand the required fetch set to include the full span of blocks needed for complete decryption.
+#[allow(clippy::too_many_lines)]
+pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> VerificationPlan {
+    let manifest = fs.manifest.read().unwrap();
+    let base_map = fs.inner.lock(OpTag::Stats).unwrap().base.clone();
+    let mut unique_records: BTreeMap<(u32, u64), LiveRecord> = BTreeMap::new();
+
+    for (&ino, node_arc) in &base_map {
+        if let NodeKind::File { extent_map, .. } = &node_arc.as_ref().kind {
+            for (_offset, entry) in extent_map.iter() {
+                if let ExtentState::Disk {
+                    generation,
+                    record_log_offset,
+                    record_size,
+                    ..
+                } = &entry.extent
+                {
+                    unique_records
+                        .entry((*generation, *record_log_offset))
+                        .or_insert(LiveRecord {
+                            inode: ino,
+                            generation: *generation,
+                            record_log_offset: *record_log_offset,
+                            record_size: *record_size,
+                        });
+                }
+            }
+        }
+    }
+
+    let mut records_by_gen: BTreeMap<u32, Vec<LiveRecord>> = BTreeMap::new();
+    for rec in unique_records.into_values() {
+        records_by_gen.entry(rec.generation).or_default().push(rec);
+    }
+    for records in records_by_gen.values_mut() {
+        records.sort_by_key(|r| r.record_log_offset);
+    }
+
+    let seed = options.seed.unwrap_or_else(|| {
+        let mut hasher = blake3::Hasher::new();
+        for log in &manifest.logs {
+            hasher.update(&log.generation.to_le_bytes());
+            hasher.update(&log.total_bytes.to_le_bytes());
+            hasher.update(&log.md5);
+        }
+        let hash = hasher.finalize();
+        u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+    });
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    let mut target_remotes = Vec::new();
+    if !options.remotes.is_empty() {
+        let reg_opt = fs.remote_registry.read().unwrap().clone();
+        if let Some(reg_arc) = reg_opt {
+            let reg = reg_arc.read().unwrap();
+            if options.remotes.iter().any(|r| r == "all") {
+                target_remotes = reg.remotes.keys().cloned().collect();
+            } else {
+                for r in &options.remotes {
+                    if reg.remotes.contains_key(r) {
+                        target_remotes.push(r.clone());
+                    }
+                }
+            }
+        } else {
+            target_remotes = options.remotes.clone();
+        }
+    }
+
+    let mut sampled_records = Vec::new();
+    let mut sampled_record_bytes = 0u64;
+    let mut total_live_records = 0usize;
+    let mut total_live_bytes = 0u64;
+
+    for (_gen, mut records) in records_by_gen {
+        total_live_records += records.len();
+        let gen_live_bytes: u64 = records.iter().map(|r| r.record_size as u64).sum();
+        total_live_bytes += gen_live_bytes;
+
+        if options.sample_percent >= 100.0 {
+            for r in records {
+                sampled_record_bytes += r.record_size as u64;
+                sampled_records.push(r);
+            }
+        } else {
+            records.shuffle(&mut rng);
+            let target = ((gen_live_bytes as f64) * (options.sample_percent / 100.0)).ceil() as u64;
+            let target = target.max(1).min(gen_live_bytes);
+            let mut accumulated = 0u64;
+            for r in records {
+                accumulated += r.record_size as u64;
+                sampled_record_bytes += r.record_size as u64;
+                sampled_records.push(r);
+                if accumulated >= target {
+                    break;
+                }
+            }
+        }
+    }
+
+    sampled_records.sort_by_key(|r| (r.generation, r.record_log_offset));
+
+    const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
+    let mut local_blocks: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
+    let mut remote_blocks: BTreeMap<String, BTreeMap<u32, BTreeSet<u64>>> = BTreeMap::new();
+    let mut record_targets = Vec::new();
+
+    for (idx, record) in sampled_records.iter().enumerate() {
+        let target_remote = if target_remotes.is_empty() {
+            None
+        } else {
+            Some(target_remotes[idx % target_remotes.len()].clone())
+        };
+
+        let start_blk = record.record_log_offset / BLOCK_SIZE;
+        let end_blk = (record.record_log_offset + record.record_size as u64 - 1) / BLOCK_SIZE;
+
+        match &target_remote {
+            None => {
+                let set = local_blocks.entry(record.generation).or_default();
+                for blk in start_blk..=end_blk {
+                    set.insert(blk);
+                }
+            }
+            Some(remote_name) => {
+                let gen_map = remote_blocks.entry(remote_name.clone()).or_default();
+                let set = gen_map.entry(record.generation).or_default();
+                for blk in start_blk..=end_blk {
+                    set.insert(blk);
+                }
+            }
+        }
+
+        record_targets.push((record.clone(), target_remote));
+    }
+
+    VerificationPlan {
+        sample_percent: options.sample_percent,
+        seed,
+        total_live_records,
+        total_live_bytes,
+        sampled_records,
+        sampled_record_bytes,
+        local_blocks,
+        remote_blocks,
+        record_targets,
+    }
+}
+
+/// Executes data verification for the sampled records in `plan`.
+#[allow(clippy::too_many_lines)]
+pub fn execute_sampled_verification(
+    fs: &InMemoryFS,
+    plan: &VerificationPlan,
+    log_dir: Option<&Path>,
+    report: &mut IntegrityReport,
+) {
+    if plan.sampled_records.is_empty() {
+        report.sample_percent = Some(plan.sample_percent);
+        return;
+    }
+
+    let manifest = fs.manifest.read().unwrap();
+    const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
+
+    // 1. Fetch remote blocks if needed
+    let mut fetched_remote_blocks: HashMap<(String, u32, u64), Vec<u8>> = HashMap::new();
+    let mut remote_file_keys: HashMap<(String, u32), Arc<LogFileKey>> = HashMap::new();
+
+    if !plan.remote_blocks.is_empty() {
+        let reg_opt = fs.remote_registry.read().unwrap().clone();
+        let registry = if let Some(reg_arc) = reg_opt {
+            reg_arc.read().unwrap().clone()
+        } else if let Some(dir) = log_dir {
+            crate::remote::RemoteRegistry::load_from_storage(&crate::storage::OsStorage::new(dir)).unwrap_or_default()
+        } else if let Some(ref cache) = fs.log_cache {
+            crate::remote::RemoteRegistry::load_from_storage(cache.storage().as_ref()).unwrap_or_default()
+        } else {
+            crate::remote::RemoteRegistry::default()
+        };
+
+        for (remote_name, gen_map) in &plan.remote_blocks {
+            let store = match registry.store_overrides.get(remote_name) {
+                Some(s) => s.clone(),
+                None => match registry.get_remote(remote_name) {
+                    Some(cfg) => cfg.build_store(),
+                    None => {
+                        report.issues.push(IntegrityIssue::error(
+                            "REMOTE_UNKNOWN",
+                            None,
+                            format!("Remote '{}' is not configured in remotes.toml", remote_name),
+                        ));
+                        continue;
+                    }
+                },
+            };
+
+            for (&generation, blocks) in gen_map {
+                let filename = manifest
+                    .get_by_generation(generation)
+                    .map(|l| l.filename.clone())
+                    .unwrap_or_else(|| crate::log::log_filename(generation));
+
+                // Fetch 42-byte FileHeader to derive LogFileKey
+                let mut hdr_bytes = Vec::with_capacity(FILE_HEADER_SIZE);
+                if let Err(e) = store.get_object_range(&filename, 0, FILE_HEADER_SIZE as u64, &mut hdr_bytes) {
+                    report.issues.push(IntegrityIssue::error(
+                        "REMOTE_READ_FAILED",
+                        None,
+                        format!(
+                            "Failed to read header from remote '{}' for {}: {}",
+                            remote_name, filename, e
+                        ),
+                    ));
+                    continue;
+                }
+                let Ok(hdr_array): Result<[u8; FILE_HEADER_SIZE], _> = hdr_bytes.try_into() else {
+                    report.issues.push(IntegrityIssue::error(
+                        "REMOTE_CORRUPT_HEADER",
+                        None,
+                        format!("Invalid header length in {} on remote '{}'", filename, remote_name),
+                    ));
+                    continue;
+                };
+                let file_header = match FileHeader::from_bytes(&hdr_array) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        report.issues.push(IntegrityIssue::error(
+                            "REMOTE_CORRUPT_HEADER",
+                            None,
+                            format!("Invalid header in {} on remote '{}': {}", filename, remote_name, e),
+                        ));
+                        continue;
+                    }
+                };
+                let file_key = Arc::new(fs.volume_key.log_file_key(&file_header.key_salt));
+                remote_file_keys.insert((remote_name.clone(), generation), file_key);
+
+                // Fetch each block
+                let manifest_len = manifest
+                    .get_by_generation(generation)
+                    .map(|l| l.total_bytes)
+                    .or_else(|| {
+                        fs.log_writer
+                            .as_ref()
+                            .filter(|w| w.generation() == generation)
+                            .map(|w| w.current_offset())
+                    })
+                    .unwrap_or(0);
+                for &b in blocks {
+                    let start_offset = b * BLOCK_SIZE;
+                    if start_offset < manifest_len {
+                        let len = (manifest_len - start_offset).min(BLOCK_SIZE);
+                        let mut block_buf = Vec::with_capacity(len as usize);
+                        if let Err(e) = store.get_object_range(&filename, start_offset, len, &mut block_buf) {
+                            report.issues.push(IntegrityIssue::error(
+                                "REMOTE_READ_FAILED",
+                                None,
+                                format!(
+                                    "Failed to fetch block {} of {} from remote '{}': {}",
+                                    b, filename, remote_name, e
+                                ),
+                            ));
+                        } else {
+                            fetched_remote_blocks.insert((remote_name.clone(), generation, b), block_buf);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Open local cache if local blocks exist
+    let local_cache = fs
+        .log_cache
+        .clone()
+        .or_else(|| log_dir.map(|d| Arc::new(LogFileCache::new(d))));
+
+    // 3. Verify each record
+    let mut verified_count = 0usize;
+    let mut verified_bytes = 0u64;
+
+    for (record, target) in &plan.record_targets {
+        match target {
+            Some(remote_name) => {
+                let file_key = match remote_file_keys.get(&(remote_name.clone(), record.generation)) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let mut raw_record = Vec::with_capacity(record.record_size as usize);
+                let mut cur_offset = record.record_log_offset;
+                let end_offset = record.record_log_offset + record.record_size as u64;
+                let mut failed = false;
+
+                while cur_offset < end_offset {
+                    let blk = cur_offset / BLOCK_SIZE;
+                    let blk_start = blk * BLOCK_SIZE;
+                    let offset_in_blk = (cur_offset - blk_start) as usize;
+                    match fetched_remote_blocks.get(&(remote_name.clone(), record.generation, blk)) {
+                        Some(blk_bytes) => {
+                            let avail = blk_bytes.len().saturating_sub(offset_in_blk);
+                            let remaining = (end_offset - cur_offset) as usize;
+                            let take = avail.min(remaining);
+                            if take == 0 {
+                                failed = true;
+                                break;
+                            }
+                            raw_record.extend_from_slice(&blk_bytes[offset_in_blk..offset_in_blk + take]);
+                            cur_offset += take as u64;
+                        }
+                        None => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if failed || raw_record.len() != record.record_size as usize {
+                    report.issues.push(IntegrityIssue::error(
+                        "CORRUPT_LOG_RECORD",
+                        Some(record.inode),
+                        format!(
+                            "Record at offset 0x{:x} in generation {} could not be assembled from remote '{}'",
+                            record.record_log_offset, record.generation, remote_name
+                        ),
+                    ));
+                    continue;
+                }
+
+                let mut hdr_buf = [0u8; RECORD_HEADER_SIZE];
+                hdr_buf.copy_from_slice(&raw_record[..RECORD_HEADER_SIZE]);
+                match RecordHeader::from_bytes(&hdr_buf) {
+                    Err(e) => {
+                        report.issues.push(IntegrityIssue::error(
+                            "CORRUPT_LOG_RECORD",
+                            Some(record.inode),
+                            format!(
+                                "Invalid record header at offset 0x{:x} in gen {} (remote '{}'): {}",
+                                record.record_log_offset, record.generation, remote_name, e
+                            ),
+                        ));
+                    }
+                    Ok(rec_header) => {
+                        let opcode = rec_header.op_code as u8;
+                        if opcode != OpCode::Data as u8 && opcode != OpCode::DataZstd as u8 {
+                            report.issues.push(IntegrityIssue::error(
+                                "CORRUPT_LOG_RECORD",
+                                Some(record.inode),
+                                format!(
+                                    "Record at offset 0x{:x} in gen {} has unexpected OpCode {}",
+                                    record.record_log_offset, record.generation, opcode
+                                ),
+                            ));
+                        } else if rec_header.inode != record.inode {
+                            report.issues.push(IntegrityIssue::error(
+                                "CORRUPT_LOG_RECORD",
+                                Some(record.inode),
+                                format!(
+                                    "Record at offset 0x{:x} belongs to inode {}, expected {}",
+                                    record.record_log_offset, rec_header.inode, record.inode
+                                ),
+                            ));
+                        } else {
+                            let payload = &raw_record[RECORD_HEADER_SIZE..];
+                            match file_key.decrypt_record(
+                                rec_header.sequence,
+                                rec_header.op_code as u8,
+                                rec_header.inode,
+                                payload,
+                                &rec_header.auth_tag,
+                            ) {
+                                Ok(_) => {
+                                    verified_count += 1;
+                                    verified_bytes += record.record_size as u64;
+                                }
+                                Err(e) => {
+                                    report.issues.push(IntegrityIssue::error(
+                                        "CORRUPT_LOG_RECORD",
+                                        Some(record.inode),
+                                        format!(
+                                            "Authentication tag mismatch for record at offset 0x{:x} in gen {} (remote '{}'): {}",
+                                            record.record_log_offset, record.generation, remote_name, e
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                // Local verification
+                if let Some(ref c) = local_cache {
+                    let log_filename = manifest
+                        .get_by_generation(record.generation)
+                        .map(|l| l.filename.clone())
+                        .unwrap_or_else(|| crate::log::log_filename(record.generation));
+                    if !c.storage().exists(&log_filename) {
+                        report.issues.push(IntegrityIssue::error(
+                            "MISSING_LOG_FILE",
+                            Some(record.inode),
+                            format!(
+                                "File inode {} extent references generation {} ('{}'), which does not exist in storage",
+                                record.inode, record.generation, log_filename
+                            ),
+                        ));
+                        continue;
+                    }
+
+                    match c.storage().file_len(&log_filename) {
+                        Ok(file_len) => {
+                            if file_len < record.record_log_offset + record.record_size as u64 {
+                                report.issues.push(IntegrityIssue::error(
+                                    "EXTENT_PAST_LOG_EOF",
+                                    Some(record.inode),
+                                    format!(
+                                        "File inode {} record at offset 0x{:x} in {} declares {} bytes, which runs past {} byte file",
+                                        record.inode, record.record_log_offset, log_filename, record.record_size, file_len
+                                    ),
+                                ));
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            report.issues.push(IntegrityIssue::error(
+                                "LOG_FILE_READ_ERROR",
+                                Some(record.inode),
+                                format!("Failed to read file size for {}: {}", log_filename, e),
+                            ));
+                            continue;
+                        }
+                    }
+
+                    match c.get_or_open(record.generation, &fs.volume_key) {
+                        Ok(open) => {
+                            let mut raw_record = vec![0u8; record.record_size as usize];
+                            if let Err(e) = open.reader.read_exact_at(record.record_log_offset, &mut raw_record) {
+                                report.issues.push(IntegrityIssue::error(
+                                    "CORRUPT_LOG_RECORD",
+                                    Some(record.inode),
+                                    format!(
+                                        "Failed to read record at offset 0x{:x} in {}: {}",
+                                        record.record_log_offset, log_filename, e
+                                    ),
+                                ));
+                            } else {
+                                let mut hdr_buf = [0u8; RECORD_HEADER_SIZE];
+                                hdr_buf.copy_from_slice(&raw_record[..RECORD_HEADER_SIZE]);
+                                match RecordHeader::from_bytes(&hdr_buf) {
+                                    Err(e) => {
+                                        report.issues.push(IntegrityIssue::error(
+                                            "CORRUPT_LOG_RECORD",
+                                            Some(record.inode),
+                                            format!(
+                                                "Invalid record header at offset 0x{:x} in {}: {}",
+                                                record.record_log_offset, log_filename, e
+                                            ),
+                                        ));
+                                    }
+                                    Ok(rec_header) => {
+                                        let opcode = rec_header.op_code as u8;
+                                        if opcode != OpCode::Data as u8 && opcode != OpCode::DataZstd as u8 {
+                                            report.issues.push(IntegrityIssue::error(
+                                                "CORRUPT_LOG_RECORD",
+                                                Some(record.inode),
+                                                format!(
+                                                    "Record at offset 0x{:x} in {} has OpCode {} instead of OpCode::Data / OpCode::DataZstd",
+                                                    record.record_log_offset, log_filename, opcode
+                                                ),
+                                            ));
+                                        } else if rec_header.inode != record.inode {
+                                            report.issues.push(IntegrityIssue::error(
+                                                "CORRUPT_LOG_RECORD",
+                                                Some(record.inode),
+                                                format!(
+                                                    "Record at offset 0x{:x} in {} belongs to inode {}, expected inode {}",
+                                                    record.record_log_offset, log_filename, rec_header.inode, record.inode
+                                                ),
+                                            ));
+                                        } else {
+                                            let payload = &raw_record[RECORD_HEADER_SIZE..];
+                                            match open.file_key.decrypt_record(
+                                                rec_header.sequence,
+                                                rec_header.op_code as u8,
+                                                rec_header.inode,
+                                                payload,
+                                                &rec_header.auth_tag,
+                                            ) {
+                                                Ok(_) => {
+                                                    verified_count += 1;
+                                                    verified_bytes += record.record_size as u64;
+                                                }
+                                                Err(e) => {
+                                                    report.issues.push(IntegrityIssue::error(
+                                                        "CORRUPT_LOG_RECORD",
+                                                        Some(record.inode),
+                                                        format!(
+                                                            "Authentication tag mismatch for record at offset 0x{:x} in {}: {}",
+                                                            record.record_log_offset, log_filename, e
+                                                        ),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            report.issues.push(IntegrityIssue::error(
+                                "LOG_FILE_READ_ERROR",
+                                Some(record.inode),
+                                format!("Failed to open log file {}: {}", log_filename, e),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    report.sampled_records += verified_count;
+    report.sampled_data_bytes += verified_bytes;
+    report.sampled_blocks += plan.local_blocks.values().map(|b| b.len()).sum::<usize>()
+        + plan
+            .remote_blocks
+            .values()
+            .map(|m| m.values().map(|b| b.len()).sum::<usize>())
+            .sum::<usize>();
+    report.sample_percent = Some(plan.sample_percent);
+}
+
 /// Runs a read-only filesystem integrity check on the provided `InMemoryFS`.
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
-pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: bool) -> IntegrityReport {
+pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, options: &CheckOptions) -> IntegrityReport {
     let mut report = IntegrityReport::default();
 
     // 0. Extract manifest and base snapshot
@@ -554,13 +1336,14 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                 if let ExtentState::Disk {
                     generation,
                     record_log_offset,
-                    record_size: _,
+                    record_size,
                     payload_offset: _,
                     length: _,
                 } = &entry.extent
                 {
                     let generation = *generation;
                     let record_log_offset = *record_log_offset;
+                    let record_size = *record_size;
                     if !active_generations.contains(&generation) {
                         report.issues.push(IntegrityIssue::error(
                             "EXTENT_UNKNOWN_GENERATION",
@@ -575,145 +1358,52 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                         ));
                     }
 
-                    if verify_data && let Some(ref c) = cache {
-                        let log_filename = fs
-                            .manifest
-                            .read()
-                            .ok()
-                            .and_then(|m| m.get_by_generation(generation).map(|l| l.filename.clone()))
-                            .unwrap_or_else(|| crate::log::log_filename(generation));
-                        if !c.storage().exists(&log_filename) {
-                            report.issues.push(IntegrityIssue::error(
-                                    "MISSING_LOG_FILE",
-                                    Some(ino),
-                                    format!(
-                                        "File inode {} extent references generation {} ('{}'), which does not exist in storage",
-                                        ino, generation, log_filename
-                                    ),
-                                ));
-                        } else if let Ok(file_len) = c.storage().file_len(&log_filename) {
-                            // Only the header's position can be judged from the extent alone.
-                            // `length` is the extent's *logical* size, which bears no fixed
-                            // relation to the bytes on disk: encryption adds a tag, and
-                            // compression can shrink a multi-megabyte extent to a few hundred
-                            // bytes. Comparing `record_log_offset + length` against the file
-                            // size therefore called every healthy compressed volume corrupt,
-                            // and - because it gated the branch below - skipped the header and
-                            // checksum verification that would have shown otherwise. The
-                            // record's real extent is checked once `payload_len` is known.
-                            if file_len < record_log_offset + RECORD_HEADER_SIZE as u64 {
-                                report.issues.push(IntegrityIssue::error(
-                                        "EXTENT_PAST_LOG_EOF",
-                                        Some(ino),
-                                        format!(
-                                            "File inode {} extent references log generation {} at offset 0x{:x}, but file size is only {} bytes",
-                                            ino, generation, record_log_offset, file_len
-                                        ),
-                                    ));
-                            } else {
-                                // Deep verification: Check record header & BLAKE3 checksum
-                                match c.get_or_open(generation, &fs.volume_key) {
-                                    Ok(open) => {
-                                        let reader = &open.reader;
-                                        let mut hdr_buf = [0u8; RECORD_HEADER_SIZE];
-                                        if let Err(e) = reader.read_exact_at(record_log_offset, &mut hdr_buf) {
-                                            report.issues.push(IntegrityIssue::error(
-                                                "CORRUPT_LOG_RECORD",
-                                                Some(ino),
-                                                format!(
-                                                    "Failed to read record header at offset 0x{:x} in {}: {}",
-                                                    record_log_offset, log_filename, e
-                                                ),
-                                            ));
-                                        } else {
-                                            match RecordHeader::from_bytes(&hdr_buf) {
-                                                Err(e) => {
-                                                    report.issues.push(IntegrityIssue::error(
-                                                        "CORRUPT_LOG_RECORD",
-                                                        Some(ino),
-                                                        format!(
-                                                            "Invalid record header at offset 0x{:x} in {}: {}",
-                                                            record_log_offset, log_filename, e
-                                                        ),
-                                                    ));
-                                                }
-                                                Ok(rec_header) => {
-                                                    let opcode = rec_header.op_code as u8;
-                                                    let rec_ino = rec_header.inode;
-                                                    let payload_len = rec_header.payload_len as usize;
+                    if (record_size as usize) < RECORD_HEADER_SIZE {
+                        report.issues.push(IntegrityIssue::error(
+                            "EXTENT_INVALID_RECORD_SIZE",
+                            Some(ino),
+                            format!(
+                                "File inode {} extent record at offset 0x{:x} declares record_size {} bytes, smaller than header size {}",
+                                ino, record_log_offset, record_size, RECORD_HEADER_SIZE
+                            ),
+                        ));
+                    }
 
-                                                    if opcode != OpCode::Data as u8 && opcode != OpCode::DataZstd as u8
-                                                    {
-                                                        report.issues.push(IntegrityIssue::error(
-                                                            "CORRUPT_LOG_RECORD",
-                                                            Some(ino),
-                                                            format!("Record at offset 0x{:x} in {} has OpCode {} instead of OpCode::Data / OpCode::DataZstd", record_log_offset, log_filename, opcode),
-                                                        ));
-                                                    } else if rec_ino != ino {
-                                                        report.issues.push(IntegrityIssue::error(
-                                                            "CORRUPT_LOG_RECORD",
-                                                            Some(ino),
-                                                            format!("Record at offset 0x{:x} in {} belongs to inode {}, expected inode {}", record_log_offset, log_filename, rec_ino, ino),
-                                                        ));
-                                                    } else if file_len
-                                                        < record_log_offset
-                                                            + RECORD_HEADER_SIZE as u64
-                                                            + payload_len as u64
-                                                    {
-                                                        report.issues.push(IntegrityIssue::error(
-                                                            "EXTENT_PAST_LOG_EOF",
-                                                            Some(ino),
-                                                            format!(
-                                                                "File inode {} record at offset 0x{:x} in {} declares a {} byte payload, which runs past the {} byte file",
-                                                                ino, record_log_offset, log_filename, payload_len, file_len
-                                                            ),
-                                                        ));
-                                                    } else {
-                                                        let mut payload = vec![0u8; payload_len];
-                                                        if let Err(e) = reader.read_exact_at(
-                                                            record_log_offset + RECORD_HEADER_SIZE as u64,
-                                                            &mut payload,
-                                                        ) {
-                                                            report.issues.push(IntegrityIssue::error(
-                                                                "CORRUPT_LOG_RECORD",
-                                                                Some(ino),
-                                                                format!(
-                                                                    "Failed to read payload at offset 0x{:x} in {}: {}",
-                                                                    record_log_offset, log_filename, e
-                                                                ),
-                                                            ));
-                                                        } else if let Err(e) = open.file_key.decrypt_record(
-                                                            rec_header.sequence,
-                                                            rec_header.op_code as u8,
-                                                            rec_ino,
-                                                            &payload,
-                                                            &rec_header.auth_tag,
-                                                        ) {
-                                                            report.issues.push(IntegrityIssue::error(
-                                                                "CORRUPT_LOG_RECORD",
-                                                                Some(ino),
-                                                                format!("Authentication tag mismatch for record at offset 0x{:x} in {}: {}", record_log_offset, log_filename, e),
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        report.issues.push(IntegrityIssue::error(
-                                            "LOG_FILE_READ_ERROR",
-                                            Some(ino),
-                                            format!("Failed to open log file {}: {}", log_filename, e),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
+                    let max_allowed_bytes =
+                        manifest
+                            .get_by_generation(generation)
+                            .map(|l| l.total_bytes)
+                            .or_else(|| {
+                                fs.log_writer
+                                    .as_ref()
+                                    .filter(|w| w.generation() == generation)
+                                    .map(|w| w.current_offset())
+                            });
+
+                    if let Some(max_bytes) = max_allowed_bytes
+                        && record_log_offset + record_size as u64 > max_bytes
+                    {
+                        report.issues.push(IntegrityIssue::error(
+                            "EXTENT_PAST_MANIFEST_EOF",
+                            Some(ino),
+                            format!(
+                                "File inode {} extent record [0x{:x}..0x{:x}) in generation {} exceeds total bytes {}",
+                                ino,
+                                record_log_offset,
+                                record_log_offset + record_size as u64,
+                                generation,
+                                max_bytes
+                            ),
+                        ));
                     }
                 }
             }
         }
+    }
+
+    if options.verify_data {
+        let plan = plan_sampled_verification(fs, options);
+        execute_sampled_verification(fs, &plan, log_dir, &mut report);
     }
 
     // Pass 4: Manifest & Physical File Consistency
@@ -759,7 +1449,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
 /// Helper function to recover a volume using Storage in read-only mode and run integrity checks.
 pub fn check_volume(
     storage: Arc<dyn crate::storage::Storage>,
-    verify_data: bool,
+    options: &CheckOptions,
     volume_key: Arc<crate::crypto::VolumeKey>,
 ) -> std::io::Result<IntegrityReport> {
     let fs = crate::log::recover_fs(
@@ -768,7 +1458,7 @@ pub fn check_volume(
         std::sync::Arc::new(crate::clock::SystemClock),
         volume_key,
     )?;
-    Ok(check_fs_integrity(&fs, None, verify_data))
+    Ok(check_fs_integrity(&fs, None, options))
 }
 
 /// Verifies that objects on a remote store match the authenticated sizes and MD5 digests in the summary manifest.
@@ -845,6 +1535,7 @@ pub fn check_remote_integrity(
             }
         }
     }
+    report.remotes_checked.push(remote_name.to_string());
     report
 }
 
@@ -899,13 +1590,14 @@ mod tests {
 
         fs.quiesce().unwrap();
 
-        let report = check_volume(storage, true, VolumeKey::plaintext_arc()).unwrap();
+        let report = check_volume(storage, &CheckOptions::full_data(), VolumeKey::plaintext_arc()).unwrap();
         assert!(report.is_clean(), "Report must be clean: {:?}", report.issues);
         assert_eq!(report.error_count(), 0);
         assert_eq!(report.orphaned_inodes.len(), 0);
         assert_eq!(report.directories, 2); // root + mydir
         assert_eq!(report.regular_files, 1);
         assert_eq!(report.symlinks, 1);
+        assert_eq!(report.sampled_records, 1);
     }
 
     #[test]
@@ -940,7 +1632,7 @@ mod tests {
             .base
             .insert(orphan_ino, Arc::new(orphan_node));
 
-        let report = check_fs_integrity(&fs, None, false);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only());
         assert!(!report.is_clean());
         assert_eq!(report.orphaned_inodes, vec![999]);
         let orphan_issue = report.issues.iter().find(|i| i.code == "ORPHAN_INODE").unwrap();
@@ -991,7 +1683,7 @@ mod tests {
             *node_arc = Arc::new(node);
         }
 
-        let report = check_fs_integrity(&fs, None, false);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only());
         assert!(!report.is_clean());
         let issue = report.issues.iter().find(|i| i.code == "NLINK_MISMATCH").unwrap();
         assert_eq!(issue.inode, Some(f.ino));
@@ -1037,10 +1729,137 @@ mod tests {
             *root_arc = Arc::new(root);
         }
 
-        let report = check_fs_integrity(&fs, None, false);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only());
         assert!(!report.is_clean());
         let issue = report.issues.iter().find(|i| i.code == "EXTENT_PAST_EOF").unwrap();
         assert_eq!(issue.inode, Some(2));
+    }
+
+    #[test]
+    fn test_extent_past_manifest_eof_zero_io_detection() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = crate::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage.clone());
+
+        let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f.ino, b"small payload", 0).unwrap();
+        fs.quiesce().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
+
+        // Inject extent pointing past manifest total_bytes in log generation 1
+        {
+            let mut inner = fs.inner.lock_for_tests().unwrap();
+            let node_arc = inner.base.get_mut(&f.ino).unwrap();
+            let mut node = (**node_arc).clone();
+            if let NodeKind::File { extent_map, size } = &mut node.kind {
+                *size = 50_000_000;
+                extent_map.insert(
+                    0,
+                    crate::extent_map::Extent::new_disk(
+                        1,
+                        999_999_999, // way past manifest total_bytes!
+                        4096,
+                        0,
+                        4096,
+                    ),
+                );
+            }
+            *node_arc = Arc::new(node);
+        }
+
+        // Even with verify_data = false (pure metadata check), must catch EXTENT_PAST_MANIFEST_EOF
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only());
+        assert!(!report.is_clean());
+        let issue = report.issues.iter().find(|i| i.code == "EXTENT_PAST_MANIFEST_EOF");
+        assert!(
+            issue.is_some(),
+            "Must report EXTENT_PAST_MANIFEST_EOF: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn test_extent_invalid_record_size_detection() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = crate::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage);
+
+        let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f.ino, b"small payload", 0).unwrap();
+        fs.quiesce().unwrap();
+
+        // Inject extent with record_size smaller than RECORD_HEADER_SIZE (32 bytes)
+        {
+            let mut inner = fs.inner.lock_for_tests().unwrap();
+            let node_arc = inner.base.get_mut(&f.ino).unwrap();
+            let mut node = (**node_arc).clone();
+            if let NodeKind::File { extent_map, .. } = &mut node.kind {
+                extent_map.insert(
+                    0,
+                    crate::extent_map::Extent::new_disk(
+                        1, 128, 10, // record_size 10 < RECORD_HEADER_SIZE 32!
+                        0, 10,
+                    ),
+                );
+            }
+            *node_arc = Arc::new(node);
+        }
+
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only());
+        assert!(!report.is_clean());
+        assert!(report.issues.iter().any(|i| i.code == "EXTENT_INVALID_RECORD_SIZE"));
     }
 
     #[test]
@@ -1089,7 +1908,7 @@ mod tests {
             *root_arc = Arc::new(root);
         }
 
-        let report = check_fs_integrity(&fs, None, false);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only());
         assert!(!report.is_clean());
         let cycle_issue = report.issues.iter().find(|i| i.code == "DIR_CYCLE");
         assert!(cycle_issue.is_some(), "Must report DIR_CYCLE: {:?}", report.issues);
@@ -1135,7 +1954,7 @@ mod tests {
             *root_arc = Arc::new(root);
         }
 
-        let report = check_fs_integrity(&fs, None, false);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only());
         assert!(!report.is_clean());
         assert!(report.issues.iter().any(|i| i.code == "DANGLING_ENTRY"));
         assert!(report.issues.iter().any(|i| i.code == "INVALID_PARENT"));
@@ -1200,7 +2019,7 @@ mod tests {
         storage.insert_file("000001.log", bytes);
 
         // 3. Re-check: must catch CORRUPT_LOG_RECORD
-        let corrupt_report = check_fs_integrity(&fs, None, true);
+        let corrupt_report = check_fs_integrity(&fs, None, &CheckOptions::full_data());
         assert!(!corrupt_report.is_clean());
         assert!(corrupt_report.issues.iter().any(|i| i.code == "CORRUPT_LOG_RECORD"));
     }
@@ -1243,8 +2062,230 @@ mod tests {
         inner.base.insert(2, Arc::new(child_node));
         drop(inner);
 
-        let report = check_fs_integrity(&fs, None, false);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only());
         assert!(!report.is_clean());
         assert!(report.issues.iter().any(|i| i.code == "NAME_TOO_LONG"));
+    }
+
+    #[test]
+    fn test_sampled_verification_fractional_percentage() {
+        let storage = Arc::new(crate::storage::MemoryStorage::new());
+        crate::log::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage);
+
+        // Create 20 files with distinct payloads
+        for i in 0..20 {
+            let name = format!("file_{}.txt", i);
+            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
+            let payload = format!("Payload data for file index {}", i).repeat(100);
+            crate::operations::read_write::write_core(&fs, f.ino, payload.as_bytes(), 0).unwrap();
+        }
+        fs.quiesce().unwrap();
+
+        // 1. Sample at fractional percentage 0.05% with fixed seed
+        let opts = CheckOptions::sampled(0.05, Some(42));
+        let plan = plan_sampled_verification(&fs, &opts);
+        assert!(!plan.sampled_records.is_empty(), "Should sample at least 1 record");
+        assert!(plan.sampled_records.len() < 20, "Should sample subset of records");
+
+        let report = check_fs_integrity(&fs, None, &opts);
+        assert!(report.is_clean(), "Report must be clean: {:?}", report.issues);
+        assert_eq!(report.sampled_records, plan.sampled_records.len());
+        assert_eq!(report.sample_percent, Some(0.05));
+    }
+
+    #[test]
+    fn test_multi_block_boundary_expansion() {
+        let storage = Arc::new(crate::storage::MemoryStorage::new());
+        crate::log::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let fs = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        // Manually inject a file whose extent record crosses from block 0 into block 1:
+        // offset 1_048_500, record_size = 200 => end_offset = 1_048_699 (crosses 1_048_576)
+        let f_ino = 2;
+        let mut extent_map = ExtentMap::new();
+        extent_map.insert(0, crate::extent_map::Extent::new_disk(1, 1_048_500, 200, 0, 100));
+        let file_node = Node {
+            meta: InodeMeta::new(0o644, 1, 1000, 1000, std::time::SystemTime::UNIX_EPOCH),
+            kind: NodeKind::File { extent_map, size: 100 },
+        };
+
+        {
+            let mut inner = fs.inner.lock_for_tests().unwrap();
+            inner.base.insert(f_ino, Arc::new(file_node));
+            let root_arc = inner.base.get_mut(&1).unwrap();
+            let mut root = (**root_arc).clone();
+            if let NodeKind::Directory { entries, .. } = &mut root.kind {
+                entries.push(("spanning.bin".to_string(), f_ino));
+            }
+            *root_arc = Arc::new(root);
+        }
+
+        let opts = CheckOptions::full_data();
+        let plan = plan_sampled_verification(&fs, &opts);
+        assert_eq!(plan.sampled_records.len(), 1);
+        let blocks = plan.local_blocks.get(&1).unwrap();
+        // Record at 1_048_500 spanning 200 bytes must require both block 0 and block 1!
+        assert!(blocks.contains(&0), "Must require block 0");
+        assert!(blocks.contains(&1), "Must require block 1 (boundary expansion)");
+    }
+
+    #[test]
+    fn test_sampled_verification_remote_stores_and_corruption() {
+        use crate::remote::mock::MockRemoteStore;
+        use crate::remote::{RemoteMode, RemoteRegistry, RemoteStore, RemoteTargetConfig};
+
+        let storage = Arc::new(crate::storage::MemoryStorage::new());
+        crate::log::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage.clone());
+
+        let f = crate::operations::read_write::create_core(&fs, 1, "cloud_file.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f.ino, b"cloud data content verification", 0).unwrap();
+        fs.quiesce().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
+
+        // Set up two mock remotes: "backup1" and "backup2"
+        let remote1 = Arc::new(MockRemoteStore::new());
+        let remote2 = Arc::new(MockRemoteStore::new());
+
+        // Replicate 000001.log and summary to remotes
+        let log_bytes = storage.get_file_bytes("000001.log").unwrap();
+        remote1
+            .put_object(
+                "000001.log",
+                &mut std::io::Cursor::new(log_bytes.clone()),
+                log_bytes.len() as u64,
+                None,
+            )
+            .unwrap();
+        remote2
+            .put_object(
+                "000001.log",
+                &mut std::io::Cursor::new(log_bytes.clone()),
+                log_bytes.len() as u64,
+                None,
+            )
+            .unwrap();
+
+        let mut registry = RemoteRegistry::default();
+        let mut cfg1 = RemoteTargetConfig::new("backup1");
+        cfg1.mode = RemoteMode::ReadWrite;
+        registry.add_remote("backup1", cfg1);
+        registry.set_store_override("backup1", remote1.clone());
+
+        let mut cfg2 = RemoteTargetConfig::new("backup2");
+        cfg2.mode = RemoteMode::ReadWrite;
+        registry.add_remote("backup2", cfg2);
+        registry.set_store_override("backup2", remote2.clone());
+
+        fs.set_remote_registry(Arc::new(std::sync::RwLock::new(registry)));
+
+        // 1. Verification across remotes must pass initially
+        let opts = CheckOptions {
+            verify_data: true,
+            sample_percent: 100.0,
+            remotes: vec!["backup1".to_string(), "backup2".to_string()],
+            seed: Some(123),
+        };
+        let clean_report = check_fs_integrity(&fs, None, &opts);
+        assert!(clean_report.is_clean(), "Must be clean: {:?}", clean_report.issues);
+        assert!(clean_report.sampled_records > 0);
+
+        // 2. Corrupt a byte in 000001.log on backup1
+        let mut corrupted_log = log_bytes.clone();
+        let rec_offset = FILE_HEADER_SIZE + RECORD_HEADER_SIZE + 2;
+        corrupted_log[rec_offset] ^= 0xFF;
+        remote1
+            .put_object(
+                "000001.log",
+                &mut std::io::Cursor::new(corrupted_log),
+                log_bytes.len() as u64,
+                None,
+            )
+            .unwrap();
+
+        // 3. Verifying against backup1 must detect corruption with remote name
+        let opts1 = CheckOptions {
+            verify_data: true,
+            sample_percent: 100.0,
+            remotes: vec!["backup1".to_string()],
+            seed: Some(123),
+        };
+        let corrupt_report = check_fs_integrity(&fs, None, &opts1);
+        assert!(!corrupt_report.is_clean());
+        let issue = corrupt_report
+            .issues
+            .iter()
+            .find(|i| i.code == "CORRUPT_LOG_RECORD")
+            .unwrap();
+        assert!(
+            issue.message.contains("backup1"),
+            "Issue message must mention corrupted remote: {}",
+            issue.message
+        );
     }
 }
