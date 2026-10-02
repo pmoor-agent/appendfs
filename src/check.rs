@@ -255,6 +255,7 @@ impl IntegrityReport {
                     || i.code == "ZERO_LEN_EXTENT"
                     || i.code == "MISSING_LOG_FILE"
                     || i.code == "CORRUPT_LOG_RECORD"
+                    || i.code == "REMOTE_WRITE_ONLY"
             })
             .count();
         if extent_issues == 0 {
@@ -558,10 +559,19 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
         if let Some(reg_arc) = reg_opt {
             let reg = reg_arc.read().unwrap();
             if options.remotes.iter().any(|r| r == "all") {
-                target_remotes = reg.remotes.keys().cloned().collect();
+                target_remotes = reg
+                    .remotes
+                    .iter()
+                    .filter(|(_, cfg)| cfg.mode.is_readable())
+                    .map(|(name, _)| name.clone())
+                    .collect();
             } else {
                 for r in &options.remotes {
-                    if r == "local" || reg.remotes.contains_key(r) {
+                    if r == "local" {
+                        target_remotes.push(r.clone());
+                    } else if let Some(cfg) = reg.get_remote(r)
+                        && cfg.mode.is_readable()
+                    {
                         target_remotes.push(r.clone());
                     }
                 }
@@ -741,6 +751,20 @@ pub fn execute_sampled_verification(
         };
 
         for (remote_name, gen_map) in &plan.remote_blocks {
+            if let Some(cfg) = registry.get_remote(remote_name)
+                && !cfg.mode.is_readable()
+            {
+                report.issues.push(IntegrityIssue::error(
+                    "REMOTE_WRITE_ONLY",
+                    None,
+                    format!(
+                        "Remote '{}' is configured as write-only and cannot be data verified",
+                        remote_name
+                    ),
+                ));
+                continue;
+            }
+
             let store = match registry.store_overrides.get(remote_name) {
                 Some(s) => s.clone(),
                 None => match registry.get_remote(remote_name) {
@@ -1495,8 +1519,42 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, options: &Che
     }
 
     if options.verify_data {
-        let plan = plan_sampled_verification(fs, options);
-        execute_sampled_verification(fs, &plan, log_dir, &mut report);
+        let mut has_write_only_error = false;
+        let reg_opt = fs.remote_registry.read().unwrap().clone();
+        if let Some(reg_arc) = reg_opt {
+            let reg = reg_arc.read().unwrap();
+            for r in &options.remotes {
+                if r != "local"
+                    && r != "all"
+                    && let Some(cfg) = reg.get_remote(r)
+                    && !cfg.mode.is_readable()
+                {
+                    report.issues.push(IntegrityIssue::error(
+                        "REMOTE_WRITE_ONLY",
+                        None,
+                        format!("Remote '{}' is configured as write-only and cannot be data verified", r),
+                    ));
+                    has_write_only_error = true;
+                }
+            }
+            if options.remotes.iter().any(|r| r == "all")
+                && !options.remotes.iter().any(|r| r == "local")
+                && !reg.remotes.is_empty()
+                && !reg.remotes.values().any(|c| c.mode.is_readable())
+            {
+                report.issues.push(IntegrityIssue::error(
+                    "REMOTE_WRITE_ONLY",
+                    None,
+                    "All configured remotes in 'all' are write-only and cannot be data verified".to_string(),
+                ));
+                has_write_only_error = true;
+            }
+        }
+
+        if !has_write_only_error {
+            let plan = plan_sampled_verification(fs, options);
+            execute_sampled_verification(fs, &plan, log_dir, &mut report);
+        }
     }
 
     // Pass 4: Manifest & Physical File Consistency
@@ -2612,6 +2670,112 @@ mod tests {
             cumulative_blocks.len() >= 5,
             "Multiple runs with default random seed must accumulate coverage (found {} blocks)",
             cumulative_blocks.len()
+        );
+    }
+
+    #[test]
+    fn test_write_only_remote_rejected_for_data_verification() {
+        use crate::remote::{RemoteMode, RemoteRegistry, RemoteTargetConfig};
+
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::log::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = crate::log::recover_fs(
+            storage.clone(),
+            crate::log::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage.clone());
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file.ino, b"hello world data", 0).unwrap();
+        fs.quiesce().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
+
+        let glacier_store = Arc::new(crate::remote::MockRemoteStore::new());
+        let mut registry = RemoteRegistry::new();
+        let mut glacier_cfg = RemoteTargetConfig::new("glacier-bucket");
+        glacier_cfg.mode = RemoteMode::WriteOnly;
+        registry.add_remote("glacier", glacier_cfg);
+        registry.set_store_override("glacier", glacier_store);
+        fs.set_remote_registry(Arc::new(std::sync::RwLock::new(registry)));
+
+        // 1. Explicitly requesting write-only remote for data verification must fail
+        let opts = CheckOptions {
+            verify_data: true,
+            sample_percent: 100.0,
+            remotes: vec!["glacier".to_string()],
+            seed: Some(42),
+        };
+        let report = check_fs_integrity(&fs, None, &opts);
+        assert!(
+            !report.is_clean(),
+            "Report must fail for write-only remote data verification"
+        );
+        assert!(
+            report.issues.iter().any(|i| i.code == "REMOTE_WRITE_ONLY"),
+            "Must contain REMOTE_WRITE_ONLY error, found: {:?}",
+            report.issues
+        );
+
+        // 2. Metadata-only verification of write-only remote succeeds (checking manifest against bucket)
+        let opts_meta = CheckOptions {
+            verify_data: false,
+            sample_percent: 100.0,
+            remotes: vec!["glacier".to_string()],
+            seed: None,
+        };
+        let report_meta = check_fs_integrity(&fs, None, &opts_meta);
+        assert!(
+            !report_meta.issues.iter().any(|i| i.code == "REMOTE_WRITE_ONLY"),
+            "Metadata-only check must not produce REMOTE_WRITE_ONLY error"
+        );
+
+        // 3. --remotes all with verify_data filters out write-only remotes from sampling targets
+        let s3_store = Arc::new(crate::remote::MockRemoteStore::new());
+        let mut s3_cfg = RemoteTargetConfig::new("s3-bucket");
+        s3_cfg.mode = RemoteMode::ReadWrite;
+        {
+            let reg_opt = fs.remote_registry.read().unwrap();
+            let mut reg = reg_opt.as_ref().unwrap().write().unwrap();
+            reg.add_remote("s3", s3_cfg);
+            reg.set_store_override("s3", s3_store);
+        }
+
+        let opts_all = CheckOptions {
+            verify_data: true,
+            sample_percent: 100.0,
+            remotes: vec!["all".to_string()],
+            seed: Some(42),
+        };
+        let plan_all = plan_sampled_verification(&fs, &opts_all);
+        assert!(
+            plan_all.remote_blocks.contains_key("s3"),
+            "Readable remote 's3' must be sampled"
+        );
+        assert!(
+            !plan_all.remote_blocks.contains_key("glacier"),
+            "Write-only remote 'glacier' must NOT be sampled"
         );
     }
 }

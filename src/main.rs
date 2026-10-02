@@ -740,6 +740,47 @@ fn confirm_remote_egress(plan: &appendfs::VerificationPlan, manifest: &appendfs:
     }
 }
 
+fn resolve_fsck_target_remotes(args: &FsckArgs, registry: &appendfs::remote::RemoteRegistry) -> Vec<String> {
+    let mut target_remotes = Vec::new();
+    if args.remotes.is_empty() {
+        return target_remotes;
+    }
+
+    if args.remotes.iter().any(|r| r == "all") {
+        target_remotes = registry.remotes.keys().cloned().collect();
+        if target_remotes.is_empty() {
+            eprintln!("Warning: --remotes all specified, but no remotes configured in remotes.toml.");
+        } else if args.is_verify_data()
+            && !registry.remotes.values().any(|c| c.mode.is_readable())
+            && !args.remotes.iter().any(|r| r == "local")
+        {
+            eprintln!("Error: All configured remotes in 'all' are write-only and cannot be data verified.");
+            std::process::exit(1);
+        }
+    } else {
+        for r in &args.remotes {
+            if r != "local" {
+                match registry.get_remote(r) {
+                    None => {
+                        eprintln!("Error: Remote '{}' is not configured in remotes.toml.", r);
+                        std::process::exit(1);
+                    }
+                    Some(cfg) if args.is_verify_data() && !cfg.mode.is_readable() => {
+                        eprintln!(
+                            "Error: Remote '{}' is configured as write-only and cannot be data verified.",
+                            r
+                        );
+                        std::process::exit(1);
+                    }
+                    _ => {}
+                }
+            }
+            target_remotes.push(r.clone());
+        }
+    }
+    target_remotes
+}
+
 fn cmd_fsck(args: FsckArgs) {
     let log_dir = &args.log_dir;
 
@@ -764,23 +805,7 @@ fn cmd_fsck(args: FsckArgs) {
     };
 
     let registry = load_remote_registry(storage.as_ref());
-    let mut target_remotes = Vec::new();
-    if !args.remotes.is_empty() {
-        if args.remotes.iter().any(|r| r == "all") {
-            target_remotes = registry.remotes.keys().cloned().collect();
-            if target_remotes.is_empty() {
-                eprintln!("Warning: --remotes all specified, but no remotes configured in remotes.toml.");
-            }
-        } else {
-            for r in &args.remotes {
-                if r != "local" && registry.get_remote(r).is_none() {
-                    eprintln!("Error: Remote '{}' is not configured in remotes.toml.", r);
-                    std::process::exit(1);
-                }
-                target_remotes.push(r.clone());
-            }
-        }
-    }
+    let target_remotes = resolve_fsck_target_remotes(&args, &registry);
 
     let mut check_options = CheckOptions {
         verify_data: args.is_verify_data(),
