@@ -133,18 +133,11 @@ timeout 5m cargo test --test compat_test
 ```
 `tests/compat_test.rs` automatically discovers and runs full recovery checks against all `tests/fixtures/v*` directories.
 
-### Generating or Updating Golden Fixtures
+### Generating Golden Fixtures
 Golden fixtures are produced deterministically via the `generate_compat_fixture` binary:
 
-- **Regenerate existing v1 fixtures**:
-  ```bash
-  cargo run --bin generate_compat_fixture
-  # Or individually:
-  cargo run --bin generate_compat_fixture tests/fixtures/v1
-  cargo run --bin generate_compat_fixture tests/fixtures/v1_passphrase_compressed
-  cargo run --bin generate_compat_fixture tests/fixtures/v1_secret_key_passphrase_compressed
-  ```
-
+- **Immutable v1 fixtures**:
+  Existing `v1` fixtures represent the live on-disk format and must **never** be regenerated.
 - **Generate fixtures for a new format version (e.g. v2)**:
   ```bash
   cargo run --bin generate_compat_fixture tests/fixtures/v2
@@ -155,18 +148,23 @@ The generator produces:
 - `000001.log`: 3 flushed commit batches covering directories, files, symlinks, special files, and xattrs.
 - `000001.summary`: Exported snapshot of all populated inodes.
 
-## Pre-Release vs. Post-Release Compatibility Policy
+## Storage Versioning & Production Compatibility Policy
 
-- **Pre-Release (v0 development)**:
-  - While AppendFS has no real-life production deployments, keep format versioning fresh at version 1.
-  - Do not add legacy deserializers, compatibility shims, or migration fallbacks for unreleased schema adjustments.
-  - When modifying persisted structs or headers, cleanly regenerate `tests/fixtures/v1`:
+AppendFS now has a live production deployment. Format changes can **no longer be made willy-nilly**:
+
+- **No v1 Fixture Regeneration**:
+  - Golden files for `v1` (`tests/fixtures/v1*`) are frozen and must **never** be regenerated or modified.
+- **Explicit Version Increments**:
+  - Any breaking change to on-disk structures (log record formats, record headers, summary formats, or volume layout) requires introducing a new storage version by bumping `CURRENT_VERSION` and/or `CURRENT_SUMMARY_VERSION`.
+- **Backward Compatibility & Recovery**:
+  - New versions of AppendFS must maintain backward compatibility, continuing to cleanly recover and mount volumes created by older format versions (including `v1`).
+- **Fixture Retention**:
+  - Golden fixtures for each format version must be permanently retained under `tests/fixtures/` (e.g. `tests/fixtures/v1`, `tests/fixtures/v2`) so `tests/compat_test.rs` continuously validates backward compatibility across all supported versions.
+- **Generating Fixtures for New Versions**:
+  - When introducing a new storage version (e.g. `v2`), generate a new fixture directory rather than modifying existing ones:
     ```bash
-    cargo run --bin generate_compat_fixture tests/fixtures/v1
+    cargo run --bin generate_compat_fixture tests/fixtures/v2
     ```
-- **Post-Release (Production)**:
-  - Any breaking format modification requires bumping `CURRENT_VERSION` / `CURRENT_SUMMARY_VERSION`.
-  - Introduce a new fixture directory (`tests/fixtures/v2/`) and retain `tests/fixtures/v1/` to verify forward/backward compatibility.
 
 ## Architectural & Recovery Invariants
 
