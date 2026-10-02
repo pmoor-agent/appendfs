@@ -549,7 +549,7 @@ pub struct FsckArgs {
     #[arg(long = "remotes", value_delimiter = ',')]
     pub remotes: Vec<String>,
 
-    /// Reproducible seed for sampled block selection (default: derived from manifest)
+    /// Reproducible seed for sampled block selection (default: random)
     #[arg(long = "seed")]
     pub seed: Option<u64>,
 

@@ -21,7 +21,7 @@ pub struct CheckOptions {
     pub sample_percent: f64,
     /// Target remotes to verify (empty for local-only, "all", or specific remote names).
     pub remotes: Vec<String>,
-    /// Deterministic seed for sampled block selection (if None, derived from manifest).
+    /// Seed for sampled block selection (if None, a random seed is generated).
     pub seed: Option<u64>,
 }
 
@@ -492,7 +492,6 @@ impl VerificationPlan {
 /// and all live extents completely covered by the resulting block set are verified.
 #[allow(clippy::too_many_lines)]
 pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> VerificationPlan {
-    let manifest = fs.manifest.read().unwrap();
     let base_map = fs.inner.lock(OpTag::Stats).unwrap().base.clone();
     const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
 
@@ -547,17 +546,8 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
         records.sort_by_key(|r| r.record_log_offset);
     }
 
-    // 3. Derive deterministic seed
-    let seed = options.seed.unwrap_or_else(|| {
-        let mut hasher = blake3::Hasher::new();
-        for log in &manifest.logs {
-            hasher.update(&log.generation.to_le_bytes());
-            hasher.update(&log.total_bytes.to_le_bytes());
-            hasher.update(&log.md5);
-        }
-        let hash = hasher.finalize();
-        u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
-    });
+    // 3. Derive seed: random by default if None, or explicit if specified
+    let seed = options.seed.unwrap_or_else(rand::random);
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
@@ -2562,5 +2552,66 @@ mod tests {
         );
         assert_eq!(loc_count, 2);
         assert_eq!(rem_count, 1);
+    }
+
+    #[test]
+    fn test_sampled_verification_random_seed_coverage_accumulation() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::log::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = crate::log::recover_fs(
+            storage.clone(),
+            crate::log::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage.clone());
+
+        // Create 20 files of 1 MiB each across 20 distinct blocks
+        let chunk = vec![0x42u8; 1024 * 1024];
+        for i in 1..=20 {
+            let file =
+                crate::operations::read_write::create_core(&fs, 1, &format!("file_{}.dat", i), 0o644, 0, 1000, 1000)
+                    .unwrap();
+            crate::operations::read_write::write_core(&fs, file.ino, &chunk, 0).unwrap();
+        }
+        fs.quiesce().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
+
+        // Sample with 5% (1 block out of 20) with random seed (seed: None)
+        let mut cumulative_blocks: HashSet<u64> = HashSet::new();
+        for _ in 0..30 {
+            let opts = CheckOptions::sampled(5.0, None);
+            let plan = plan_sampled_verification(&fs, &opts);
+            if let Some(blocks) = plan.local_blocks.get(&1) {
+                cumulative_blocks.extend(blocks);
+            }
+        }
+        // With 30 trials picking 1 block out of 20 uniformly at random,
+        // the probability of picking >= 5 distinct blocks is overwhelmingly high (> 1 - 10^-10).
+        assert!(
+            cumulative_blocks.len() >= 5,
+            "Multiple runs with default random seed must accumulate coverage (found {} blocks)",
+            cumulative_blocks.len()
+        );
     }
 }

@@ -782,12 +782,15 @@ fn cmd_fsck(args: FsckArgs) {
         }
     }
 
-    let check_options = CheckOptions {
+    let mut check_options = CheckOptions {
         verify_data: args.is_verify_data(),
         sample_percent: args.effective_sample_percent().unwrap_or(100.0),
         remotes: target_remotes.clone(),
         seed: args.seed,
     };
+    if check_options.verify_data && check_options.seed.is_none() {
+        check_options.seed = Some(rand::random());
+    }
 
     let mut fs = match recover_fs(
         storage.clone(),
