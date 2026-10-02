@@ -17,9 +17,12 @@ Features:
 Usage:
     python3 scripts/restore.py <volume_dir_or_log_file> <target_restore_dir>
     python3 scripts/restore.py tests/fixtures/v1 /tmp/restored
+    python3 scripts/restore.py tests/fixtures/v1_passphrase_compressed /tmp/restored
+    python3 scripts/restore.py tests/fixtures/v1_passphrase_compressed /tmp/restored --passphrase
 """
 
 import argparse
+import getpass
 import io
 import os
 import re
@@ -42,6 +45,21 @@ FILE_HEADER_SIZE = 42
 RECORD_HEADER_SIZE = 37
 SUMMARY_HEADER_SIZE = 66
 VOLUME_HEADER_SIZE = 72
+
+CIPHER_NONE = 0
+CIPHER_CHACHA20_POLY1305 = 1
+
+KEY_SOURCE_NONE = 0
+KEY_SOURCE_PASSPHRASE = 1
+KEY_SOURCE_KEY_FILE = 2
+KEY_SOURCE_KEY_FILE_AND_PASSPHRASE = 3
+
+KEY_SOURCE_NAMES = {
+    KEY_SOURCE_NONE: "None (unencrypted)",
+    KEY_SOURCE_PASSPHRASE: "Passphrase",
+    KEY_SOURCE_KEY_FILE: "Key file",
+    KEY_SOURCE_KEY_FILE_AND_PASSPHRASE: "Key file + passphrase",
+}
 
 OP_DATA = 1
 OP_DATA_ZSTD = 2
@@ -315,12 +333,39 @@ class VolumeDecryptor:
         return data
 
 
-DATA_KEY_CONTEXT = "appendfs volume data key v1"
-KCV_KEY_CONTEXT = "appendfs key check value v1"
+class VolumeHeaderInfo:
+    """Parsed volume header metadata from an AppendFS summary file."""
+
+    def __init__(
+        self,
+        cipher: int,
+        key_source: int,
+        compression: int,
+        volume_id: bytes,
+        kdf_salt: bytes,
+        kcv_iv: bytes,
+        kcv_tag: bytes,
+    ):
+        self.cipher = cipher
+        self.key_source = key_source
+        self.compression = compression
+        self.volume_id = volume_id
+        self.kdf_salt = kdf_salt
+        self.kcv_iv = kcv_iv
+        self.kcv_tag = kcv_tag
+
+    def needs_passphrase(self) -> bool:
+        return self.key_source in (KEY_SOURCE_PASSPHRASE, KEY_SOURCE_KEY_FILE_AND_PASSPHRASE)
+
+    def needs_key_file(self) -> bool:
+        return self.key_source in (KEY_SOURCE_KEY_FILE, KEY_SOURCE_KEY_FILE_AND_PASSPHRASE)
+
+    def is_encrypted(self) -> bool:
+        return self.cipher != CIPHER_NONE
 
 
-def read_volume_header_from_summary(summary_path: Path) -> Tuple[bytes, bytes, bytes, bytes]:
-    """Reads (volume_id, kdf_salt, kcv_iv, kcv_tag) from an AppendFS summary file."""
+def read_volume_header_from_summary(summary_path: Path) -> VolumeHeaderInfo:
+    """Reads volume header metadata from an AppendFS summary file."""
     if not summary_path.is_file():
         raise FileNotFoundError(f"Summary file not found: '{summary_path}'")
     with open(summary_path, "rb") as f:
@@ -330,17 +375,25 @@ def read_volume_header_from_summary(summary_path: Path) -> Tuple[bytes, bytes, b
         magic, ver, gen, rev, tx, next_ino, sec, nsec, iv, vh_len, uncompressed_len = struct.unpack(
             ">4sIIHQQqI12sIQ", hdr
         )
-        if magic != b"APPS":
+        if magic != SUMMARY_MAGIC:
             raise ValueError(f"Invalid magic {magic} in '{summary_path}'")
         if vh_len < VOLUME_HEADER_SIZE:
-            raise ValueError(f"Summary '{summary_path}' does not contain an encrypted VolumeHeader")
+            raise ValueError(f"Summary '{summary_path}' does not contain a valid VolumeHeader")
         vh_bytes = f.read(VOLUME_HEADER_SIZE)
         if len(vh_bytes) < VOLUME_HEADER_SIZE:
             raise ValueError(f"Truncated VolumeHeader in '{summary_path}'")
         cipher, key_source, compression, volume_id, kdf_salt, kcv_iv, kcv_tag = struct.unpack(
             ">III16s16s12s16s", vh_bytes
         )
-        return (volume_id, kdf_salt, kcv_iv, kcv_tag)
+        return VolumeHeaderInfo(
+            cipher=cipher,
+            key_source=key_source,
+            compression=compression,
+            volume_id=volume_id,
+            kdf_salt=kdf_salt,
+            kcv_iv=kcv_iv,
+            kcv_tag=kcv_tag,
+        )
 
 
 def derive_key_from_passphrase_or_file(
@@ -352,7 +405,7 @@ def derive_key_from_passphrase_or_file(
     kcv_tag: Optional[bytes] = None,
 ) -> bytes:
     """Derives the 32-byte data encryption key matching AppendFS's MasterKey and VolumeHeader."""
-    if key_file and passphrase:
+    if key_file and passphrase is not None:
         with open(key_file, "r") as f:
             hex_str = f.read().strip()
         if len(hex_str) != 64:
@@ -374,7 +427,7 @@ def derive_key_from_passphrase_or_file(
         if len(hex_str) != 64:
             raise ValueError(f"Expected 64 hex characters in key file '{key_file}', found {len(hex_str)}")
         master_key = bytes.fromhex(hex_str)
-    elif passphrase:
+    elif passphrase is not None:
         master_key = argon2.low_level.hash_secret_raw(
             secret=passphrase.encode("utf-8"),
             salt=salt,
@@ -385,7 +438,7 @@ def derive_key_from_passphrase_or_file(
             type=argon2.low_level.Type.ID,
         )
     else:
-        raise ValueError("Either --passphrase, --key-file, or both must be provided for encrypted volumes")
+        raise ValueError("Either passphrase, key_file, or both must be provided for encrypted volumes")
 
     # Optional key-check value verification
     if volume_id is not None and kcv_iv is not None and kcv_tag is not None:
@@ -398,6 +451,23 @@ def derive_key_from_passphrase_or_file(
 
     # Derivation matching derive_subkey(DATA_KEY_CONTEXT, &master.key)
     return blake3.blake3(master_key, derive_key_context=DATA_KEY_CONTEXT).digest()
+
+
+def prompt_passphrase(prompt: str = "Enter passphrase: ") -> str:
+    """Prompts for a passphrase without echoing input if interactive, or reads from stdin if piped."""
+    if sys.stdin.isatty():
+        try:
+            return getpass.getpass(prompt)
+        except EOFError:
+            raise ValueError("End of input encountered while reading passphrase")
+        except KeyboardInterrupt:
+            print(file=sys.stderr)
+            sys.exit(130)
+    else:
+        line = sys.stdin.readline()
+        if not line:
+            raise ValueError("End of input encountered while reading passphrase from stdin")
+        return line.rstrip("\r\n")
 
 
 class Restorer:
@@ -979,7 +1049,12 @@ def main():
     )
     parser.add_argument("volume", type=Path, help="Path to an AppendFS volume directory or a specific .log file")
     parser.add_argument("dest", type=Path, help="Target destination directory where files will be restored")
-    parser.add_argument("--passphrase", type=str, help="Passphrase for encrypted volume")
+    parser.add_argument(
+        "-p",
+        "--passphrase",
+        action="store_true",
+        help="Prompt for the volume's passphrase to unlock an encrypted volume",
+    )
     parser.add_argument("--key-file", type=str, help="Path to 32-byte hex key file for encrypted volume")
     parser.add_argument("--salt", type=str, help="Hex-encoded 16-byte KDF salt (if no .summary file exists)")
     parser.add_argument("--no-verify", action="store_true", help="Skip BLAKE3 authentication checksum verification")
@@ -1000,16 +1075,55 @@ def main():
 
     # Determine encryption key if needed
     key_bytes = None
-    if args.passphrase or args.key_file:
-        summary_0 = volume_path / "000000.summary" if volume_path.is_dir() else volume_path.parent / "000000.summary"
-        if not summary_0.is_file():
+    summary_0 = volume_path / "000000.summary" if volume_path.is_dir() else volume_path.parent / "000000.summary"
+
+    if summary_0.is_file():
+        header = read_volume_header_from_summary(summary_0)
+        if not header.is_encrypted():
+            if args.key_file is not None:
+                raise ValueError("Volume is not encrypted; --key-file does not apply to it")
+            if args.passphrase:
+                raise ValueError("Volume is not encrypted; --passphrase does not apply to it")
+        else:
+            source = header.key_source
+            source_name = KEY_SOURCE_NAMES.get(source, f"Unknown ({source})")
+            if args.key_file is not None and not header.needs_key_file():
+                raise ValueError(
+                    f"Volume is unlocked by: {source_name}. It does not use a key file, so --key-file does not apply."
+                )
+            if header.needs_key_file() and args.key_file is None:
+                raise ValueError(
+                    f"Volume is unlocked by: {source_name}. Pass --key-file to unlock it."
+                )
+            if args.passphrase and not header.needs_passphrase():
+                raise ValueError(
+                    f"Volume is unlocked by: {source_name}. It does not use a passphrase, so --passphrase does not apply."
+                )
+
+            passphrase = None
+            if header.needs_passphrase():
+                passphrase = prompt_passphrase(f"Enter passphrase for volume '{volume_path}': ")
+
+            key_bytes = derive_key_from_passphrase_or_file(
+                passphrase, args.key_file, header.kdf_salt, header.volume_id, header.kcv_iv, header.kcv_tag
+            )
+    elif args.passphrase or args.key_file is not None:
+        if args.salt:
+            kdf_salt = bytes.fromhex(args.salt)
+            if len(kdf_salt) != 16:
+                raise ValueError(f"Expected 16 bytes (32 hex characters) for --salt, found {len(kdf_salt)} bytes")
+        else:
             raise FileNotFoundError(
                 f"Required initial summary '000000.summary' not found in '{volume_path}'. "
-                "The initial summary is required to obtain volume metadata and KDF salt."
+                "The initial summary or --salt is required to obtain volume metadata and KDF salt."
             )
-        volume_id, kdf_salt, kcv_iv, kcv_tag = read_volume_header_from_summary(summary_0)
+
+        passphrase = None
+        if args.passphrase:
+            passphrase = prompt_passphrase(f"Enter passphrase for volume '{volume_path}': ")
+
         key_bytes = derive_key_from_passphrase_or_file(
-            args.passphrase, args.key_file, kdf_salt, volume_id, kcv_iv, kcv_tag
+            passphrase, args.key_file, kdf_salt
         )
 
     decryptor = VolumeDecryptor(key_bytes=key_bytes, no_verify=args.no_verify)
