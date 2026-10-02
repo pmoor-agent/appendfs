@@ -8,17 +8,23 @@ This directory contains checked-in golden on-disk storage fixtures used by `test
   - `000000.summary`: Initial volume summary snapshot.
   - `000001.log`: 3 flushed commit batches covering directories, files, symlinks, special files, and extended attributes.
   - `000001.summary`: Exported snapshot of all populated inodes.
+  - `*-dump.txt`: Golden dump inspection outputs for summary and log files.
+  - `fsck-report.txt`: Golden filesystem integrity check report under 100% data verification.
 
 - `v1_passphrase_compressed/`: ChaCha20-Poly1305 encrypted golden files derived with Argon2id from canonical passphrase `"passphrase"` with Zstd record compression.
   - `000000.summary`: Initial volume summary snapshot (encrypted with explicit deterministic IV).
   - `000001.log`: 3 flushed encrypted and compressed commit batches.
   - `000001.summary`: Exported snapshot of all populated inodes (encrypted with explicit deterministic IV).
+  - `*-dump.txt`: Golden decrypted dump inspection outputs.
+  - `fsck-report.txt`: Golden filesystem integrity check report under 100% data verification.
 
 - `v1_secret_key_passphrase_compressed/`: ChaCha20-Poly1305 encrypted golden files derived with Argon2id from canonical secret key file (`key.hex`) and passphrase `"passphrase"` with Zstd record compression.
   - `key.hex`: Canonical 32-byte hex key file.
   - `000000.summary`: Initial volume summary snapshot (encrypted with explicit deterministic IV).
   - `000001.log`: 3 flushed encrypted and compressed commit batches.
   - `000001.summary`: Exported snapshot of all populated inodes (encrypted with explicit deterministic IV).
+  - `*-dump.txt`: Golden decrypted dump inspection outputs.
+  - `fsck-report.txt`: Golden filesystem integrity check report under 100% data verification.
 
 ## Generating or Updating Fixtures
 

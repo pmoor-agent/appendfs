@@ -16,8 +16,8 @@
 //! ```
 
 use appendfs::compat::{
-    COMPAT_ENCRYPTED_PASSPHRASE, COMPAT_FIXTURE_DUMP_FILES, COMPAT_FIXTURE_FILES, COMPAT_KEY_FILENAME,
-    CompatFixtureConfig, create_canonical_compat_volume,
+    COMPAT_ENCRYPTED_PASSPHRASE, COMPAT_FIXTURE_DUMP_FILES, COMPAT_FIXTURE_FILES, COMPAT_FSCK_REPORT_FILENAME,
+    COMPAT_KEY_FILENAME, CompatFixtureConfig, create_canonical_compat_volume,
 };
 use std::path::{Path, PathBuf};
 
@@ -36,7 +36,11 @@ fn generate_one(out_dir: &Path, config: CompatFixtureConfig) {
         std::process::exit(1);
     }
     println!("Successfully generated fixtures:");
-    for name in COMPAT_FIXTURE_FILES.iter().chain(COMPAT_FIXTURE_DUMP_FILES.iter()) {
+    for name in COMPAT_FIXTURE_FILES
+        .iter()
+        .chain(COMPAT_FIXTURE_DUMP_FILES.iter())
+        .chain([COMPAT_FSCK_REPORT_FILENAME].iter())
+    {
         println!("  - {}", out_dir.join(name).display());
     }
     if config == CompatFixtureConfig::SecretKeyPassphraseCompressed {
