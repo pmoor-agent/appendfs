@@ -527,20 +527,35 @@ pub fn verify_python_restore_script(fixture_dir: &Path) {
 
     let mut cmd = std::process::Command::new("python3");
     cmd.arg(&script_path).arg(fixture_dir).arg(dest_path);
+    let mut passphrase_input = None;
     if is_encrypted {
         let h = volume_header.as_ref().expect("encrypted volume must have header");
         if h.key_source.needs_passphrase() {
-            cmd.arg("--passphrase")
-                .arg(appendfs::compat::COMPAT_ENCRYPTED_PASSPHRASE);
+            cmd.arg("--passphrase");
+            passphrase_input = Some(appendfs::compat::COMPAT_ENCRYPTED_PASSPHRASE);
         }
         if h.key_source.needs_key_file() {
             let key_file = fixture_dir.join(appendfs::compat::COMPAT_KEY_FILENAME);
             cmd.arg("--key-file").arg(&key_file);
         }
     }
-    let output = cmd
-        .output()
+    if passphrase_input.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    }
+    let mut child = cmd
+        .spawn()
         .expect("failed to execute python3; python3 must be installed and in PATH");
+
+    if let Some(pass) = passphrase_input {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("open stdin");
+        writeln!(stdin, "{}", pass).expect("write passphrase to stdin");
+        drop(stdin);
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait on python3 child process");
 
     assert!(
         output.status.success(),
