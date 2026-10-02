@@ -1,3 +1,4 @@
+use crate::clock::format_duration;
 use crate::extent_map::Extent;
 use crate::fs::{InMemoryFS, InodeCounts};
 use crate::log::LogManifest;
@@ -709,8 +710,8 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Formats a duration into a human-readable string (ns, µs, ms, s).
-pub fn format_duration(d: std::time::Duration) -> String {
+/// Formats a latency or timing duration into a human-readable string (ns, µs, ms, s).
+pub fn format_latency(d: std::time::Duration) -> String {
     let nanos = d.as_nanos();
     if nanos < 1_000 {
         format!("{} ns", nanos)
@@ -755,7 +756,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     let rec_time_str = match snap.recovered_time {
         Some(t) => {
             let elapsed = fs.clock.now().duration_since(t).unwrap_or_default().as_secs();
-            format!("{}s ago", elapsed)
+            format!("{} ago", format_duration(std::time::Duration::from_secs(elapsed)))
         }
         None => "N/A (fresh session)".to_string(),
     };
@@ -894,11 +895,11 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     ));
     out.push_str(&format!(
         "  Time Flushing:      {} queued, {} serialize, {} wait, {} flush, {} folding into base\n",
-        format_duration(flush.total_queued),
-        format_duration(flush.total_serialize),
-        format_duration(flush.total_wait),
-        format_duration(flush.total_flush),
-        format_duration(flush.total_fold)
+        format_latency(flush.total_queued),
+        format_latency(flush.total_serialize),
+        format_latency(flush.total_wait),
+        format_latency(flush.total_flush),
+        format_latency(flush.total_fold)
     ));
     let reasons: Vec<String> = crate::fs::FlushReason::ALL
         .iter()
@@ -935,20 +936,21 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         let now = fs.clock.now();
         for record in flush.recent.iter().rev() {
             let age = now.duration_since(record.started_at).unwrap_or_default().as_secs();
+            let age_str = format!("{} ago", format_duration(std::time::Duration::from_secs(age)));
             out.push_str(&format!(
-                "    #{:<6} {:<11} {:>10} {:>10} {:>7}  {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}  {}s ago\n",
+                "    #{:<6} {:<11} {:>10} {:>10} {:>7}  {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}  {}\n",
                 record.id,
                 record.reason,
                 format_bytes(record.bytes as u64),
                 format_bytes(record.disk_bytes),
                 record.ops,
-                format_duration(record.queued),
-                format_duration(record.serialize),
-                format_duration(record.wait),
-                format_duration(record.flush),
-                format_duration(record.fold),
-                format_duration(record.duration),
-                age
+                format_latency(record.queued),
+                format_latency(record.serialize),
+                format_latency(record.wait),
+                format_latency(record.flush),
+                format_latency(record.fold),
+                format_latency(record.duration),
+                age_str
             ));
         }
     }
@@ -1007,10 +1009,10 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push_str(&format!("  Mutex Lock Count:   {}\n", mutex_lock_count));
     out.push_str(&format!(
         "  Mutex Busy Time:    {} (avg: {} / lock)\n",
-        format_duration(mutex_busy_time),
-        format_duration(avg_hold)
+        format_latency(mutex_busy_time),
+        format_latency(avg_hold)
     ));
-    out.push_str(&format!("  Mutex Wait Time:    {}\n", format_duration(mutex_wait_time)));
+    out.push_str(&format!("  Mutex Wait Time:    {}\n", format_latency(mutex_wait_time)));
 
     let mut op_stats: Vec<_> = fs.inner.op_stats().into_iter().filter(|s| s.count > 0).collect();
     if !op_stats.is_empty() {
@@ -1030,10 +1032,10 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
                 "  {:<12} {:>8} {:>12} {:>12} {:>12} {:>12}\n",
                 s.tag.name(),
                 s.count,
-                format_duration(s.busy_time),
-                format_duration(s.avg_hold_time()),
-                format_duration(s.max_hold_time),
-                format_duration(s.wait_time),
+                format_latency(s.busy_time),
+                format_latency(s.avg_hold_time()),
+                format_latency(s.max_hold_time),
+                format_latency(s.wait_time),
             ));
         }
     }
@@ -1050,11 +1052,11 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         out.push_str(&format!("  Hard Stalled:       {}\n", total_stalled));
         out.push_str(&format!(
             "  Total Delay Time:   {}\n",
-            format_duration(fs.op_metrics.total_delay_duration())
+            format_latency(fs.op_metrics.total_delay_duration())
         ));
         out.push_str(&format!(
             "  Avg Delay / Waiter: {}\n",
-            format_duration(fs.op_metrics.avg_delay_duration())
+            format_latency(fs.op_metrics.avg_delay_duration())
         ));
     }
 
@@ -1080,10 +1082,10 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
                     fs.op_metrics.active(*op),
                     calls,
                     fs.op_metrics.throttled(*op),
-                    format_duration(fs.op_metrics.avg_throttled_duration(*op)),
+                    format_latency(fs.op_metrics.avg_throttled_duration(*op)),
                     fs.op_metrics.stalled(*op),
-                    format_duration(fs.op_metrics.avg_latency(*op)),
-                    format_duration(fs.op_metrics.max_latency(*op)),
+                    format_latency(fs.op_metrics.avg_latency(*op)),
+                    format_latency(fs.op_metrics.max_latency(*op)),
                 ));
             }
         }
@@ -1918,5 +1920,63 @@ mod tests {
         assert!(report.contains("/backups/backup.tar"));
         // Since avg extent is 4 MiB, no files qualify as < 1 MiB avg extent
         assert!(!report.contains("--- Top Fragmented Files (< 1 MiB Avg Extent) ---"));
+    }
+
+    #[test]
+    fn test_format_latency() {
+        assert_eq!(format_latency(std::time::Duration::from_nanos(500)), "500 ns");
+        assert_eq!(format_latency(std::time::Duration::from_micros(150)), "150.00 µs");
+        assert_eq!(format_latency(std::time::Duration::from_millis(25)), "25.00 ms");
+        assert_eq!(format_latency(std::time::Duration::from_millis(1500)), "1.50 s");
+    }
+
+    #[test]
+    fn test_format_runtime_status_batch_and_recovery_duration() {
+        use crate::clock::{AdvancingClock, Clock};
+        use crate::operations::read_write::create_core;
+        use crate::storage::MemoryStorage;
+
+        let start_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let clock = Arc::new(AdvancingClock::new(start_time));
+        let storage = Arc::new(MemoryStorage::new());
+        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage.clone());
+
+        let writer = Arc::new(
+            crate::log::LogWriter::create(
+                storage,
+                1,
+                clock.as_ref(),
+                1024 * 1024,
+                1,
+                Arc::new(crate::crypto::VolumeKey::plaintext()),
+            )
+            .unwrap(),
+        );
+        fs.attach_log_writer(writer);
+        fs.set_recovered_time(Some(clock.now()));
+
+        // Flush a batch
+        create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        // Immediately after flush: age is 0s
+        let status_0s = format_runtime_status(&fs);
+        assert!(status_0s.contains("Last Recovery:      0s ago"));
+        assert!(status_0s.contains("0s ago\n"));
+
+        // Advance by 106041 seconds (1d 5h 27m 21s)
+        clock.advance(std::time::Duration::from_secs(106041));
+
+        let status = format_runtime_status(&fs);
+        assert!(
+            status.contains("Last Recovery:      1d5h27m21s ago"),
+            "Last Recovery must format broken up duration: {}",
+            status
+        );
+        assert!(
+            status.contains("1d5h27m21s ago\n"),
+            "Recent Flushes age column must show 1d5h27m21s ago: {}",
+            status
+        );
     }
 }
