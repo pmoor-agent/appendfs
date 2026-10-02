@@ -69,7 +69,8 @@ pub use stats::{
     ExtensionStats, ExtentsBucket, FRAGMENTED_AVG_EXTENT_THRESHOLD, FRAGMENTED_MIN_EXTENTS, FileFragInfo,
     HistogramBucket, TOP_EXTENSIONS_LIMIT, VolumeStats, build_path_map, calculate_extension_stats_from_nodes,
     calculate_generation_live_stats_from_nodes, extract_extension, format_extension_stats_table,
-    format_generation_status, format_generations_table, format_runtime_status, format_volume_content_report,
+    format_generation_status, format_generations_table, format_latency, format_runtime_status,
+    format_volume_content_report,
 };
 pub use storage::{
     BufferedStorageWriter, DEFAULT_STORAGE_BUFFER_CAPACITY, FaultStorage, MemoryStorage, OsStorage, OsStorageReader,

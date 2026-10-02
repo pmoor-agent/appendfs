@@ -385,6 +385,7 @@ pub fn compute_contiguous_synced_gen(
 }
 
 /// Formats a complete human-readable report of replication status across all remotes.
+#[allow(clippy::too_many_lines)]
 pub fn format_remotes_status(fs: &InMemoryFS) -> String {
     let mut out = String::new();
 
@@ -474,7 +475,10 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
             }
             if let Some(t_time) = t.last_sync_time {
                 let elapsed = now.duration_since(t_time).unwrap_or_default().as_secs();
-                out.push_str(&format!("  Last Sync:          {}s ago\n", elapsed));
+                out.push_str(&format!(
+                    "  Last Sync:          {} ago\n",
+                    crate::clock::format_duration(Duration::from_secs(elapsed))
+                ));
             }
             if let Some(ref err) = t.last_error {
                 out.push_str(&format!("  Last Error:         {}\n", err));
@@ -1603,5 +1607,38 @@ mod tests {
     #[test]
     fn test_default_poll_interval() {
         assert_eq!(DEFAULT_POLL_INTERVAL, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_format_remote_status_last_sync_duration() {
+        use crate::clock::{AdvancingClock, Clock};
+        use crate::remote::RemoteTargetConfig;
+
+        let start_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let clock = Arc::new(AdvancingClock::new(start_time));
+        let storage = Arc::new(MemoryStorage::new());
+        let fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage);
+
+        let mut registry = RemoteRegistry::new();
+        let target_cfg = RemoteTargetConfig::new("backup-bucket");
+        registry.add_remote("backup", target_cfg);
+        let registry = Arc::new(RwLock::new(registry));
+        fs.set_remote_registry(registry);
+
+        {
+            let mut telem = fs.replication_telemetry.write().unwrap();
+            let entry = telem.remotes.entry("backup".to_string()).or_default();
+            entry.last_sync_time = Some(clock.now());
+        }
+
+        // Advance clock by 106041 seconds
+        clock.advance(Duration::from_secs(106041));
+
+        let status = format_remotes_status(&fs);
+        assert!(
+            status.contains("Last Sync:          1d5h27m21s ago"),
+            "Last Sync must format broken up duration: {}",
+            status
+        );
     }
 }

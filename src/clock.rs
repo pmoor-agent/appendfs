@@ -191,7 +191,9 @@ pub fn format_duration(d: Duration) -> String {
         .largest(jiff::Unit::Day)
         .relative(jiff::SpanRelativeTo::days_are_24_hours());
     match span.round(round_config) {
-        Ok(rounded) => jiff::fmt::friendly::SpanPrinter::new().span_to_string(&rounded),
+        Ok(rounded) => jiff::fmt::friendly::SpanPrinter::new()
+            .spacing(jiff::fmt::friendly::Spacing::None)
+            .span_to_string(&rounded),
         Err(_) => format!("{}s", d.as_secs()),
     }
 }
@@ -513,12 +515,13 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(42)), "42s");
         assert_eq!(format_duration(Duration::from_secs(120)), "2m");
         assert_eq!(format_duration(Duration::from_secs(3600)), "1h");
-        assert_eq!(format_duration(Duration::from_secs(3665)), "1h 1m 5s");
+        assert_eq!(format_duration(Duration::from_secs(3665)), "1h1m5s");
         assert_eq!(format_duration(Duration::from_secs(86400)), "1d");
+        assert_eq!(format_duration(Duration::from_secs(106041)), "1d5h27m21s");
         assert_eq!(format_duration(Duration::from_secs(30 * 86400)), "30d");
 
         // Roundtrip checks
-        for secs in [0, 42, 120, 3600, 3665, 86400, 30 * 86400] {
+        for secs in [0, 42, 120, 3600, 3665, 86400, 106041, 30 * 86400] {
             let dur = Duration::from_secs(secs);
             let formatted = format_duration(dur);
             assert_eq!(parse_duration(&formatted).unwrap(), dur);
