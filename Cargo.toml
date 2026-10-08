@@ -29,6 +29,11 @@ base64 = "0.22"
 tempfile = "3.8"
 jiff = "0.2"
 
+[lints.rust]
+# `unsafe` belongs in the FFI layer (src/shim.rs), which opts back in. Anything else that
+# needs it should grow a safe wrapper there instead.
+unsafe_code = "deny"
+
 [features]
 default = []
 testing = []

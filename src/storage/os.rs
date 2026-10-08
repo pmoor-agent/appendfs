@@ -129,7 +129,6 @@ impl Storage for OsStorage {
 
     fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn crate::storage::StorageLock>> {
         use std::io::Read;
-        use std::os::unix::io::AsRawFd;
 
         create_dir_all(&self.base_dir)?;
         let lock_path = self.full_path(".lock");
@@ -140,10 +139,9 @@ impl Storage for OsStorage {
             .truncate(false)
             .open(&lock_path)?;
 
-        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if ret != 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
                 let mut pid_buf = String::new();
                 let _ = file.read_to_string(&mut pid_buf);
                 let pid_str = pid_buf.trim();
@@ -161,7 +159,7 @@ impl Storage for OsStorage {
                 };
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, msg));
             }
-            return Err(err);
+            Err(std::fs::TryLockError::Error(err)) => return Err(err),
         }
 
         // A failure drops `lock`, releasing the volume again rather than holding it anonymously.

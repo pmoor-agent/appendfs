@@ -14,6 +14,7 @@ pub mod logging;
 pub mod node;
 pub mod operations;
 pub mod remote;
+#[allow(unsafe_code)]
 pub mod shim;
 pub mod stats;
 pub mod storage;

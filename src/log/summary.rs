@@ -335,8 +335,7 @@ pub fn init_volume_with_clock(
     volume_header: crate::crypto::VolumeHeader,
     clock: Arc<dyn crate::clock::Clock>,
 ) -> io::Result<String> {
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    let (uid, gid) = crate::shim::current_uid_gid();
     init_volume_with_clock_and_uids(storage, volume_key, volume_header, clock, uid, gid)
 }
 

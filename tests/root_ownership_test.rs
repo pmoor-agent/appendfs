@@ -6,6 +6,7 @@
 //! followed by `appendfs mount` produced a volume that mounted successfully and then
 //! refused every write to its own root with EACCES. It went unnoticed because the first
 //! user on a typical Linux install, and every developer who had run this, is uid 1000.
+#![allow(unsafe_code)] // getuid/getgid, to check the root owner independently of the crate.
 
 use appendfs::crypto::{VolumeHeader, VolumeKey};
 use appendfs::storage::OsStorage;
