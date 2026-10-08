@@ -459,6 +459,8 @@ pub struct FsInner {
     /// it is frozen. Lets a waiter register before the batch it will belong to exists.
     pub live_completion: BatchCompletion,
     /// Monotonic timestamp when mutations were first staged into the current `live` layer.
+    /// `None` exactly when `live` is empty: set by the first `record_mutation`, cleared by
+    /// the freeze that takes `live`.
     pub live_staged_at: Option<Duration>,
     /// Set when someone needs `live` flushed regardless of how little is staged, recording
     /// why. Taken by the freeze that honors it, which stamps the reason onto the batch.
@@ -730,9 +732,7 @@ impl<'a> FsInnerGuard<'a> {
         let first = self.guard.live_staged_at.is_none();
         self.guard.record_mutation(additional_bytes, self.fs.clock.monotonic());
         self.mutation_occurred = true;
-        if first {
-            self.first_staged = true;
-        }
+        self.first_staged |= first;
     }
 
     /// Parks a task to be executed immediately after the mutex lock is released.
