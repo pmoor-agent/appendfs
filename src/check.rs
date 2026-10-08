@@ -4,8 +4,8 @@ use crate::log::extent::ExtentState;
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader};
 use crate::node::NodeKind;
 use crate::sync::OpTag;
-use rand::SeedableRng;
 use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -134,6 +134,10 @@ pub struct IntegrityReport {
     pub sampled_blocks: usize,
     pub sample_percent: Option<f64>,
     pub remotes_checked: Vec<String>,
+    #[serde(default)]
+    pub remote_files_verified: usize,
+    #[serde(default)]
+    pub remote_bytes_verified: u64,
 }
 
 impl IntegrityReport {
@@ -175,6 +179,8 @@ impl IntegrityReport {
                 self.remotes_checked.push(r);
             }
         }
+        self.remote_files_verified += other.remote_files_verified;
+        self.remote_bytes_verified += other.remote_bytes_verified;
     }
 
     /// Formats the report as a clean, human-readable terminal output.
@@ -294,10 +300,19 @@ impl IntegrityReport {
         if !self.remotes_checked.is_empty() {
             let remote_issues = self.issues.iter().filter(|i| i.code.starts_with("REMOTE_")).count();
             if remote_issues == 0 {
-                out.push_str(&format!(
-                    "  [PASS] Remote Stores & Manifest Consistency ({})\n",
-                    self.remotes_checked.join(", ")
-                ));
+                if self.remote_files_verified > 0 {
+                    out.push_str(&format!(
+                        "  [PASS] Remote Stores & Manifest Consistency ({}) (verified on-disk MD5 for {} files, {:.2} MiB)\n",
+                        self.remotes_checked.join(", "),
+                        self.remote_files_verified,
+                        self.remote_bytes_verified as f64 / (1024.0 * 1024.0)
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  [PASS] Remote Stores & Manifest Consistency ({})\n",
+                        self.remotes_checked.join(", ")
+                    ));
+                }
             } else {
                 out.push_str(&format!(
                     "  [FAIL] Remote Stores ({} remote integrity issues across {})\n",
@@ -1612,13 +1627,127 @@ pub fn check_volume(
     Ok(check_fs_integrity(&fs, None, options))
 }
 
+#[derive(Debug, Clone)]
+struct RemoteFileCandidate {
+    filename: String,
+    total_bytes: u64,
+    expected_md5: [u8; 16],
+    sidecar_md5: Option<[u8; 16]>,
+}
+
+fn verify_remote_sidecar_files_md5(
+    remote: &dyn crate::remote::RemoteStore,
+    remote_name: &str,
+    candidates: &[RemoteFileCandidate],
+    options: &CheckOptions,
+    report: &mut IntegrityReport,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+
+    let total_bytes: u64 = candidates.iter().map(|c| c.total_bytes).sum();
+    let sample_pct = options.sample_percent.clamp(0.0, 100.0);
+    let target_bytes = if sample_pct >= 100.0 {
+        total_bytes
+    } else {
+        let tb = ((total_bytes as f64) * (sample_pct / 100.0)).ceil() as u64;
+        if sample_pct > 0.0 { tb.max(1) } else { 0 }
+    };
+
+    if target_bytes == 0 {
+        return;
+    }
+
+    let selected: Vec<&RemoteFileCandidate> = if sample_pct >= 100.0 {
+        candidates.iter().collect()
+    } else {
+        let seed = options.seed.unwrap_or_else(rand::random::<u64>);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+        let mut scored: Vec<(f64, &RemoteFileCandidate)> = candidates
+            .iter()
+            .map(|c| {
+                let weight = (c.total_bytes as f64).max(1.0);
+                let u: f64 = rng.gen_range(0.0f64..1.0f64).max(1e-12);
+                let score = -u.ln() / weight;
+                (score, c)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut picked = Vec::new();
+        let mut accumulated = 0u64;
+        for (_score, candidate) in scored {
+            picked.push(candidate);
+            accumulated += candidate.total_bytes;
+            if accumulated >= target_bytes {
+                break;
+            }
+        }
+        picked
+    };
+
+    for candidate in selected {
+        match remote.compute_object_md5(&candidate.filename) {
+            Ok(computed_md5) => {
+                if computed_md5 != candidate.expected_md5 {
+                    report.issues.push(IntegrityIssue::error(
+                        "REMOTE_FILE_MD5_MISMATCH",
+                        None,
+                        format!(
+                            "Remote '{}' object {} on-disk data MD5 mismatch: expected manifest MD5 {}, computed {}",
+                            remote_name,
+                            candidate.filename,
+                            hex::encode(candidate.expected_md5),
+                            hex::encode(computed_md5)
+                        ),
+                    ));
+                } else if let Some(sidecar_md5) = candidate.sidecar_md5
+                    && sidecar_md5 != computed_md5
+                {
+                    report.issues.push(IntegrityIssue::error(
+                        "REMOTE_SIDECAR_CORRUPT",
+                        None,
+                        format!(
+                            "Remote '{}' object {} sidecar .md5 mismatch: on-disk data MD5 is {}, but sidecar specifies {}",
+                            remote_name,
+                            candidate.filename,
+                            hex::encode(computed_md5),
+                            hex::encode(sidecar_md5)
+                        ),
+                    ));
+                } else {
+                    report.remote_files_verified += 1;
+                    report.remote_bytes_verified += candidate.total_bytes;
+                }
+            }
+            Err(e) => {
+                report.issues.push(IntegrityIssue::error(
+                    "REMOTE_FILE_READ_FAILED",
+                    None,
+                    format!(
+                        "Remote '{}' failed to read object {} for on-disk MD5 verification: {}",
+                        remote_name, candidate.filename, e
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 /// Verifies that objects on a remote store match the authenticated sizes and MD5 digests in the summary manifest.
+///
+/// When `options.verify_data` is true and the store uses sidecar checksum files (`has_sidecar_checksums`),
+/// also verifies that actual on-disk file bytes match the expected MD5 on a sampled percentage of files.
 pub fn check_remote_integrity(
     remote: &dyn crate::remote::RemoteStore,
     remote_name: &str,
     manifest: &crate::log::LogManifest,
+    options: &CheckOptions,
 ) -> IntegrityReport {
     let mut report = IntegrityReport::default();
+    report.remotes_checked.push(remote_name.to_string());
 
     // Batch-list all objects from the remote store to compare sizes and ETags (MD5)
     // in O(1) listing requests rather than dispatching individual head_object requests per log.
@@ -1633,6 +1762,8 @@ pub fn check_remote_integrity(
             return report;
         }
     };
+
+    let mut candidates: Vec<RemoteFileCandidate> = Vec::new();
 
     for log_entry in &manifest.logs {
         let expected_md5 = log_entry.md5;
@@ -1649,7 +1780,8 @@ pub fn check_remote_integrity(
                         ),
                     ));
                 }
-                match remote_obj.etag_md5() {
+                let sidecar_md5 = remote_obj.etag_md5();
+                match sidecar_md5 {
                     Some(remote_md5) => {
                         if remote_md5 != expected_md5 {
                             report.issues.push(IntegrityIssue::error(
@@ -1676,6 +1808,13 @@ pub fn check_remote_integrity(
                         ));
                     }
                 }
+
+                candidates.push(RemoteFileCandidate {
+                    filename: log_entry.filename.clone(),
+                    total_bytes: remote_obj.size,
+                    expected_md5,
+                    sidecar_md5,
+                });
             }
             None => {
                 report.issues.push(IntegrityIssue::error(
@@ -1686,7 +1825,26 @@ pub fn check_remote_integrity(
             }
         }
     }
-    report.remotes_checked.push(remote_name.to_string());
+
+    // Also include any summary files discovered on the remote if they have valid sidecar MD5s
+    for (name, obj) in &listed_objects {
+        if name.ends_with(".summary")
+            && !candidates.iter().any(|c| &c.filename == name)
+            && let Some(md5) = obj.etag_md5()
+        {
+            candidates.push(RemoteFileCandidate {
+                filename: name.clone(),
+                total_bytes: obj.size,
+                expected_md5: md5,
+                sidecar_md5: Some(md5),
+            });
+        }
+    }
+
+    if options.verify_data && remote.has_sidecar_checksums() {
+        verify_remote_sidecar_files_md5(remote, remote_name, &candidates, options, &mut report);
+    }
+
     report
 }
 
@@ -2776,6 +2934,175 @@ mod tests {
         assert!(
             !plan_all.remote_blocks.contains_key("glacier"),
             "Write-only remote 'glacier' must NOT be sampled"
+        );
+    }
+
+    #[test]
+    fn test_local_dir_remote_md5_verification_catches_bitrot() {
+        use crate::remote::{LocalDirRemoteStore, RemoteStore};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let local_remote = Arc::new(LocalDirRemoteStore::new(temp_dir.path()));
+
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::log::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = crate::log::recover_fs(
+            storage.clone(),
+            crate::log::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage.clone());
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file.ino, b"crucial data that must not rot", 0).unwrap();
+        fs.quiesce().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
+
+        let manifest = fs.manifest.read().unwrap().clone();
+        assert!(!manifest.logs.is_empty(), "Manifest should have sealed 000001.log");
+
+        // Replicate 000001.log to the local remote
+        let reader = storage.open_reader("000001.log").unwrap();
+        let log_data = reader.read_vec(0, reader.len().unwrap() as usize).unwrap();
+        local_remote
+            .put_object(
+                "000001.log",
+                &mut &log_data[..],
+                log_data.len() as u64,
+                Some(&manifest.logs[0].md5),
+            )
+            .unwrap();
+
+        // 1. Clean verification: both metadata-only and verify_data pass
+        let meta_report =
+            check_remote_integrity(local_remote.as_ref(), "nas", &manifest, &CheckOptions::metadata_only());
+        assert!(meta_report.is_clean(), "Metadata check must pass on clean replica");
+
+        let data_report = check_remote_integrity(local_remote.as_ref(), "nas", &manifest, &CheckOptions::full_data());
+        assert!(
+            data_report.is_clean(),
+            "Data check must pass on clean replica: {:?}",
+            data_report.issues
+        );
+        assert_eq!(data_report.remote_files_verified, 1);
+        assert_eq!(data_report.remote_bytes_verified, log_data.len() as u64);
+
+        // 2. Simulate bit rot: corrupt a byte in 000001.log on disk, but leave 000001.log.md5 intact
+        let file_path = temp_dir.path().join("000001.log");
+        let mut on_disk_bytes = std::fs::read(&file_path).unwrap();
+        on_disk_bytes[50] ^= 0xFF; // Flip bits in payload
+        std::fs::write(&file_path, &on_disk_bytes).unwrap();
+
+        // Metadata check reads .md5 sidecar, so it PASSES (the blind spot)
+        let blind_spot_report =
+            check_remote_integrity(local_remote.as_ref(), "nas", &manifest, &CheckOptions::metadata_only());
+        assert!(
+            blind_spot_report.is_clean(),
+            "Metadata-only check misses on-disk bit rot because .md5 sidecar matches manifest"
+        );
+
+        // Data verification hashes the actual file on disk, so it FAILS with REMOTE_FILE_MD5_MISMATCH
+        let detected_report =
+            check_remote_integrity(local_remote.as_ref(), "nas", &manifest, &CheckOptions::full_data());
+        assert!(
+            !detected_report.is_clean(),
+            "Data verification must detect on-disk bit rot"
+        );
+        assert!(
+            detected_report
+                .issues
+                .iter()
+                .any(|i| i.code == "REMOTE_FILE_MD5_MISMATCH"),
+            "Expected REMOTE_FILE_MD5_MISMATCH, found: {:?}",
+            detected_report.issues
+        );
+
+        // Formatted report reflects failure under Remote Stores
+        let formatted = detected_report.format_report(None, false);
+        assert!(formatted.contains("[FAIL] Remote Stores"));
+    }
+
+    #[test]
+    fn test_local_dir_remote_md5_sampling_percentages() {
+        use crate::remote::{LocalDirRemoteStore, RemoteStore};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let local_remote = Arc::new(LocalDirRemoteStore::new(temp_dir.path()));
+
+        // Create 4 log files with different sizes
+        let mut manifest = crate::log::LogManifest::new();
+        let mut total_bytes = 0u64;
+
+        for i in 1..=4 {
+            let filename = format!("{:06}.log", i);
+            let size = i as u64 * 10_000;
+            total_bytes += size;
+            let data = vec![(i as u8) + 64; size as usize];
+            let mut hasher = md5::Context::new();
+            hasher.consume(&data);
+            let md5 = hasher.compute().0;
+
+            local_remote
+                .put_object(&filename, &mut &data[..], size, Some(&md5))
+                .unwrap();
+
+            let log_info = crate::log::LogFileInfo {
+                version: 1,
+                generation: i,
+                revision: 0,
+                filename,
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                record_count: 10,
+                total_bytes: size,
+                total_data_bytes: size,
+                md5,
+                sealed_at: Some(std::time::SystemTime::UNIX_EPOCH),
+            };
+            manifest.record_sealed_log(log_info);
+        }
+
+        // 1. 100% data verification samples all 4 files
+        let opts_100 = CheckOptions::full_data();
+        let report_100 = check_remote_integrity(local_remote.as_ref(), "local-dir", &manifest, &opts_100);
+        assert!(report_100.is_clean());
+        assert_eq!(report_100.remote_files_verified, 4);
+        assert_eq!(report_100.remote_bytes_verified, total_bytes);
+
+        // 2. 25% data verification with seed samples a subset
+        let opts_25 = CheckOptions::sampled(25.0, Some(42));
+        let report_25 = check_remote_integrity(local_remote.as_ref(), "local-dir", &manifest, &opts_25);
+        assert!(report_25.is_clean());
+        assert!(report_25.remote_files_verified >= 1);
+        assert!(report_25.remote_files_verified < 4);
+        assert!(report_25.remote_bytes_verified >= total_bytes / 4);
+
+        // 3. Output formatting includes verified on-disk MD5 stats
+        let formatted = report_100.format_report(None, false);
+        assert!(
+            formatted.contains("verified on-disk MD5 for 4 files"),
+            "Formatted report must contain remote on-disk stats: {}",
+            formatted
         );
     }
 }

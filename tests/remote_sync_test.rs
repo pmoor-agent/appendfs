@@ -1,3 +1,4 @@
+use appendfs::CheckOptions;
 use appendfs::Clock;
 use appendfs::FsError;
 use appendfs::InMemoryFS;
@@ -126,7 +127,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     assert!(b2_sum_head.etag_md5().is_some());
 
     // 4. Run integrity check on remote_aws against manifest
-    let report = check_remote_integrity(remote_aws.as_ref(), "aws", &manifest);
+    let report = check_remote_integrity(remote_aws.as_ref(), "aws", &manifest, &CheckOptions::metadata_only());
     assert!(
         report.is_clean(),
         "Remote integrity check must pass with matching MD5 and size"
@@ -136,7 +137,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     remote_aws
         .put_object("000001.log", &mut &[0u8; 10][..], 10, None)
         .unwrap();
-    let corrupt_report = check_remote_integrity(remote_aws.as_ref(), "aws", &manifest);
+    let corrupt_report = check_remote_integrity(remote_aws.as_ref(), "aws", &manifest, &CheckOptions::metadata_only());
     assert!(
         !corrupt_report.is_clean(),
         "Integrity check must catch size and MD5 mismatch"
@@ -651,7 +652,12 @@ fn test_nfs_local_volume_replication_and_pruning() {
 
     // 3. Verify integrity check passes on the NFS remote
     let nas_store = registry_arc.read().unwrap().get_remote("nas").unwrap().build_store();
-    let report = check_remote_integrity(nas_store.as_ref(), "nas", &fs_arc.manifest.read().unwrap());
+    let report = check_remote_integrity(
+        nas_store.as_ref(),
+        "nas",
+        &fs_arc.manifest.read().unwrap(),
+        &CheckOptions::metadata_only(),
+    );
     assert!(report.is_clean(), "Integrity check against NFS remote must pass");
 
     // 4. Prune local 000001.log to simulate tiered storage eviction
@@ -1769,7 +1775,12 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     counting_store.metrics().reset();
 
     // Batch listing should perform 1 list_objects call and 0 head_object calls
-    let report = check_remote_integrity(counting_store.as_ref(), "counting", &manifest);
+    let report = check_remote_integrity(
+        counting_store.as_ref(),
+        "counting",
+        &manifest,
+        &CheckOptions::metadata_only(),
+    );
     assert!(report.is_clean(), "Integrity report must be clean");
     assert_eq!(
         counting_store.lists(),
@@ -1787,7 +1798,12 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     let failing_counting = Arc::new(CountingRemoteStore::new(failing_raw.clone()));
     failing_raw.fail_method("list_objects");
 
-    let failure_report = check_remote_integrity(failing_counting.as_ref(), "failing", &manifest);
+    let failure_report = check_remote_integrity(
+        failing_counting.as_ref(),
+        "failing",
+        &manifest,
+        &CheckOptions::metadata_only(),
+    );
     assert!(
         !failure_report.is_clean(),
         "Integrity check must fail when remote listing fails"

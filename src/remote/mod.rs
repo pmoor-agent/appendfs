@@ -209,4 +209,27 @@ pub trait RemoteStore: std::fmt::Debug + Send + Sync {
 
     /// Deletes an object from the remote store.
     fn delete_object(&self, key: &str) -> io::Result<()>;
+
+    /// Returns true if this remote store uses separate sibling/sidecar checksum files
+    /// (such as `LocalDirRemoteStore`) where object listings do not verify underlying file bytes.
+    fn has_sidecar_checksums(&self) -> bool {
+        false
+    }
+
+    /// Computes the cryptographic MD5 digest of the complete object on the remote store.
+    fn compute_object_md5(&self, key: &str) -> io::Result<[u8; 16]> {
+        let mut hasher = md5::Context::new();
+        struct Md5Writer<'a>(&'a mut md5::Context);
+        impl<'a> io::Write for Md5Writer<'a> {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.consume(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        self.get_object(key, &mut Md5Writer(&mut hasher))?;
+        Ok(hasher.compute().0)
+    }
 }
