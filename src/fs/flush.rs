@@ -14,7 +14,6 @@ use crate::operations::locks::LockManager;
 use crate::storage::Storage;
 use crate::sync::OpTag;
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
@@ -774,11 +773,6 @@ impl InMemoryFS {
         let manifest = self.manifest.read().unwrap().clone();
         let inner = self.inner.lock(OpTag::Stats).unwrap();
         crate::stats::calculate_generation_live_stats_from_nodes(inner.base.values().map(|a| a.as_ref()), &manifest)
-    }
-
-    /// Performs a comprehensive, read-only integrity check of the filesystem state.
-    pub fn check_integrity(&self, log_dir: Option<&Path>, verify_data: bool) -> crate::check::IntegrityReport {
-        crate::check::check_fs_integrity(self, log_dir, verify_data)
     }
 
     /// Exports a single-file summary snapshot of the current in-memory filesystem state to `storage`.
@@ -2110,8 +2104,12 @@ mod tests {
             assert_eq!(d, payload);
         }
 
-        let report =
-            crate::check::check_volume(storage.clone(), true, crate::crypto::VolumeKey::plaintext_arc()).unwrap();
+        let report = crate::check::check_volume(
+            storage.clone(),
+            &crate::check::CheckOptions::full_data(),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         assert!(report.is_clean(), "Integrity check must be clean: {:?}", report.issues);
     }
 

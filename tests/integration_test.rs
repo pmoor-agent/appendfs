@@ -1183,7 +1183,12 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
     fs.quiesce().unwrap();
 
     // 2. Check clean volume
-    let report = appendfs::check_volume(storage, true, appendfs::VolumeKey::plaintext_arc()).unwrap();
+    let report = appendfs::check_volume(
+        storage,
+        &appendfs::CheckOptions::full_data(),
+        appendfs::VolumeKey::plaintext_arc(),
+    )
+    .unwrap();
     assert!(report.is_clean(), "Clean volume must pass check: {:?}", report.issues);
     assert_eq!(report.error_count(), 0);
     assert_eq!(report.orphaned_inodes.len(), 0);
@@ -1209,7 +1214,8 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
         .base
         .insert(orphan_ino, std::sync::Arc::new(orphan_node));
 
-    let corrupted_report = appendfs::check_fs_integrity(&fs, Some(log_path), true);
+    let corrupted_report =
+        appendfs::check_fs_integrity(&fs, Some(log_path), &appendfs::CheckOptions::full_data(), None);
     assert!(!corrupted_report.is_clean());
     assert_eq!(corrupted_report.orphaned_inodes, vec![888]);
     assert_eq!(corrupted_report.error_count(), 1);
@@ -2911,7 +2917,8 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
             fs.export_summary(storage.as_ref()).unwrap();
         }
 
-        let report = appendfs::check_volume(storage.clone(), true, key.clone()).unwrap();
+        let report =
+            appendfs::check_volume(storage.clone(), &appendfs::CheckOptions::full_data(), key.clone()).unwrap();
         assert!(
             report.is_clean(),
             "{:?} volume reported {} errors: {:?}",
@@ -2926,7 +2933,7 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
         let len = bytes.len();
         storage.insert_file("000001.log", bytes[..len / 2].to_vec());
 
-        let truncated = appendfs::check_volume(storage, true, key).unwrap();
+        let truncated = appendfs::check_volume(storage, &appendfs::CheckOptions::full_data(), key).unwrap();
         assert!(
             !truncated.is_clean(),
             "{:?}: truncating the log must be detected",

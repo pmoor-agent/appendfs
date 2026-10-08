@@ -14,7 +14,9 @@
 //! Any subdirectories placed into `tests/fixtures/` are automatically discovered
 //! and tested by `test_all_fixture_versions`.
 
-use appendfs::compat::{CompatFixtureConfig, create_canonical_compat_volume, verify_compat_tree};
+use appendfs::compat::{
+    COMPAT_FSCK_REPORT_FILENAME, CompatFixtureConfig, create_canonical_compat_volume, verify_compat_tree,
+};
 use appendfs::operations::read_write::{create_core, open_core, read_core, release_core, write_core};
 use appendfs::storage::OsStorage;
 use appendfs::{InMemoryFS, LogWriter, RecoveryTarget, Storage, SummaryReader, recover_fs};
@@ -171,6 +173,11 @@ fn test_v1_stats_matches_latest_summary_dump() {
 }
 
 #[test]
+fn test_v1_fsck_matches_golden() {
+    verify_fsck_matches_golden(&fixture_v1_dir());
+}
+
+#[test]
 fn test_v1_deterministic_reproducibility() {
     let temp = tempfile::tempdir().unwrap();
     create_canonical_compat_volume(temp.path(), CompatFixtureConfig::UnencryptedUncompressed)
@@ -180,6 +187,7 @@ fn test_v1_deterministic_reproducibility() {
     for name in appendfs::compat::COMPAT_FIXTURE_FILES
         .iter()
         .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
+        .chain([COMPAT_FSCK_REPORT_FILENAME].iter())
     {
         let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
         let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
@@ -203,6 +211,7 @@ fn test_v1_passphrase_compressed_deterministic_reproducibility() {
     for name in appendfs::compat::COMPAT_FIXTURE_FILES
         .iter()
         .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
+        .chain([COMPAT_FSCK_REPORT_FILENAME].iter())
     {
         let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
         let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
@@ -227,6 +236,7 @@ fn test_v1_secret_key_passphrase_compressed_deterministic_reproducibility() {
         .iter()
         .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
         .chain([appendfs::compat::COMPAT_KEY_FILENAME].iter())
+        .chain([COMPAT_FSCK_REPORT_FILENAME].iter())
     {
         let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
         let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
@@ -477,6 +487,34 @@ pub fn verify_stats_matches_latest_summary_dump(fixture_dir: &Path) {
     );
 }
 
+/// Verifies that running fsck in full data verification mode against the canonical volume
+/// in `fixture_dir` produces an output identical to the checked-in golden `fsck-report.txt`.
+pub fn verify_fsck_matches_golden(fixture_dir: &Path) {
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(fixture_dir));
+    let volume_key = resolve_fixture_volume_key(fixture_dir);
+    let golden_path = fixture_dir.join(COMPAT_FSCK_REPORT_FILENAME);
+    assert!(
+        golden_path.is_file(),
+        "Missing golden fsck report file {} in fixture {}",
+        COMPAT_FSCK_REPORT_FILENAME,
+        fixture_dir.display()
+    );
+
+    let report = appendfs::check::check_volume(storage, &appendfs::check::CheckOptions::full_data(), volume_key)
+        .unwrap_or_else(|e| panic!("fsck failed on fixture {}: {}", fixture_dir.display(), e));
+    let actual_report = report.format_report(None, false);
+    let expected_report = fs::read_to_string(&golden_path)
+        .unwrap_or_else(|e| panic!("Failed to read golden fsck report {}: {}", golden_path.display(), e));
+
+    assert_eq!(
+        actual_report,
+        expected_report,
+        "fsck report in {} differs from golden fixture {}",
+        fixture_dir.display(),
+        golden_path.display()
+    );
+}
+
 #[test]
 fn test_all_fixture_versions() {
     let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -503,6 +541,7 @@ fn test_all_fixture_versions() {
         verify_no_plaintext_in_encrypted_fixture(version_dir);
         verify_fixture_dumps(version_dir);
         verify_stats_matches_latest_summary_dump(version_dir);
+        verify_fsck_matches_golden(version_dir);
         verify_python_restore_script(version_dir);
     }
 }

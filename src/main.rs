@@ -9,7 +9,10 @@ use appendfs::crypto::{
 };
 use appendfs::log::{LogWriter, SummaryReader};
 use appendfs::storage::{OsStorage, Storage};
-use appendfs::{VolumeStats, check_volume, dump_file, init_volume, latest_summary_file, recover_fs};
+use appendfs::{
+    CheckOptions, VolumeStats, check_fs_integrity, check_remote_integrity, dump_file, init_volume, latest_summary_file,
+    plan_sampled_verification, recover_fs,
+};
 
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -720,56 +723,75 @@ fn cmd_dump(args: DumpArgs) {
     }
 }
 
-fn cmd_fsck(args: FsckArgs) {
-    let log_dir = &args.log_dir;
-    if let Some(ref remote_name) = args.remote {
-        let OpenVolumeStorage {
-            storage, volume_key, ..
-        } = match open_volume_storage(log_dir, args.key_file.as_deref(), args.passphrase) {
-            Ok(res) => res,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        };
-        let registry = load_remote_registry(storage.as_ref());
-        let remote_cfg = match registry.get_remote(remote_name) {
-            Some(c) => c,
-            None => {
-                eprintln!("Error: Remote '{}' is not configured in remotes.toml.", remote_name);
-                std::process::exit(1);
-            }
-        };
-        let store = remote_cfg.build_store();
-        let summary_file = match latest_summary_file(storage.as_ref()) {
-            Ok(Some(f)) => f,
-            _ => {
-                eprintln!("Error: No summary files found in '{}'", log_dir.display());
-                std::process::exit(1);
-            }
-        };
-        let snapshot = match SummaryReader::open(storage.as_ref(), &summary_file, volume_key) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Failed to read summary '{}': {}", summary_file, e);
-                std::process::exit(1);
-            }
-        };
-        let target_descr = if let Some(ref p) = remote_cfg.path {
-            format!("path: '{}'", p.display())
-        } else {
-            format!("bucket: '{}'", remote_cfg.bucket.as_deref().unwrap_or(""))
-        };
-        println!(
-            "Checking remote '{}' ({}) against summary manifest...",
-            remote_name, target_descr
-        );
-        let report = appendfs::check_remote_integrity(store.as_ref(), remote_name, &snapshot.manifest);
-        print!("{}", report.format_report(Some(log_dir), args.verbose > 0));
-        if !report.is_clean() {
+fn confirm_remote_egress(plan: &appendfs::VerificationPlan, manifest: &appendfs::log::LogManifest) {
+    use std::io::{IsTerminal, Write};
+    print!("{}", plan.display_summary(manifest));
+    if !std::io::stdin().is_terminal() {
+        eprintln!("Error: Remote data verification requires interactive confirmation or the -y / --yes flag.");
+        std::process::exit(1);
+    }
+    print!("Proceed with remote data verification? [y/N]: ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() || !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+    {
+        println!("Aborted by user.");
+        std::process::exit(0);
+    }
+}
+
+fn resolve_fsck_target_remotes(args: &FsckArgs, registry: &appendfs::remote::RemoteRegistry) -> Vec<String> {
+    let mut target_remotes = Vec::new();
+    if args.remotes.is_empty() {
+        return target_remotes;
+    }
+
+    if args.remotes.iter().any(|r| r == "all") {
+        target_remotes = registry.remotes.keys().cloned().collect();
+        if target_remotes.is_empty() {
+            eprintln!("Warning: --remotes all specified, but no remotes configured in remotes.toml.");
+        } else if args.is_verify_data()
+            && !registry.remotes.values().any(|c| c.mode.is_readable())
+            && !args.remotes.iter().any(|r| r == "local")
+        {
+            eprintln!("Error: All configured remotes in 'all' are write-only and cannot be data verified.");
             std::process::exit(1);
         }
-        return;
+    } else {
+        for r in &args.remotes {
+            if r != "local" {
+                match registry.get_remote(r) {
+                    None => {
+                        eprintln!("Error: Remote '{}' is not configured in remotes.toml.", r);
+                        std::process::exit(1);
+                    }
+                    Some(cfg) if args.is_verify_data() && !cfg.mode.is_readable() => {
+                        eprintln!(
+                            "Error: Remote '{}' is configured as write-only and cannot be data verified.",
+                            r
+                        );
+                        std::process::exit(1);
+                    }
+                    _ => {}
+                }
+            }
+            target_remotes.push(r.clone());
+        }
+    }
+    target_remotes
+}
+
+fn cmd_fsck(args: FsckArgs) {
+    let log_dir = &args.log_dir;
+
+    if let Some(pct) = args.sample_percent
+        && (pct.is_nan() || pct <= 0.0 || pct > 100.0)
+    {
+        eprintln!(
+            "Error: --sample-percent must be greater than 0.0 and at most 100.0 (got {})",
+            pct
+        );
+        std::process::exit(1);
     }
 
     let OpenVolumeStorage {
@@ -782,17 +804,80 @@ fn cmd_fsck(args: FsckArgs) {
         }
     };
 
-    match check_volume(storage, args.verify_data, volume_key) {
-        Ok(report) => {
-            print!("{}", report.format_report(Some(log_dir), args.verbose > 0));
-            if !report.is_clean() {
-                std::process::exit(1);
-            }
-        }
+    let registry = load_remote_registry(storage.as_ref());
+    let target_remotes = resolve_fsck_target_remotes(&args, &registry);
+
+    let mut check_options = CheckOptions {
+        verify_data: args.is_verify_data(),
+        sample_percent: args.effective_sample_percent().unwrap_or(100.0),
+        remotes: target_remotes.clone(),
+        seed: args.seed,
+    };
+    if check_options.verify_data && check_options.seed.is_none() {
+        check_options.seed = Some(rand::random());
+    }
+
+    let mut fs = match recover_fs(
+        storage.clone(),
+        appendfs::log::RecoveryTarget::Latest,
+        Arc::new(SystemClock),
+        volume_key,
+    ) {
+        Ok(fs) => fs,
         Err(e) => {
-            eprintln!("Failed to check volume integrity at '{}': {}", log_dir.display(), e);
+            eprintln!("Failed to recover filesystem for integrity check: {}", e);
             std::process::exit(1);
         }
+    };
+    fs.set_storage(storage.clone());
+    fs.set_remote_registry(Arc::new(std::sync::RwLock::new(registry.clone())));
+
+    let mut combined_report = appendfs::IntegrityReport::default();
+    let manifest = fs.manifest.read().unwrap().clone();
+
+    // 1. If remotes were specified, check each remote's objects against manifest
+    if !target_remotes.is_empty() {
+        for remote_name in &target_remotes {
+            if remote_name == "local" {
+                continue;
+            }
+            if let Some(remote_cfg) = registry.get_remote(remote_name) {
+                let store = registry
+                    .store_overrides
+                    .get(remote_name)
+                    .cloned()
+                    .unwrap_or_else(|| remote_cfg.build_store());
+                let remote_opts = if remote_cfg.is_local_dir() && remote_cfg.mode.is_readable() {
+                    check_options.clone()
+                } else {
+                    CheckOptions::metadata_only()
+                };
+                let remote_rep = check_remote_integrity(store.as_ref(), remote_name, &manifest, &remote_opts);
+                combined_report.merge(remote_rep);
+            }
+        }
+    }
+
+    // 2. Pre-flight check & confirmation for sampled / full remote verification
+    let plan = if check_options.verify_data {
+        let p = plan_sampled_verification(&fs, &check_options);
+        let egress_bytes = p.total_remote_egress_bytes(&manifest);
+
+        if egress_bytes > 0 && !args.yes {
+            confirm_remote_egress(&p, &manifest);
+        }
+        Some(p)
+    } else {
+        None
+    };
+
+    // 3. Run filesystem integrity check (Pass 0-4 + sampled verification)
+    let fs_report = check_fs_integrity(&fs, Some(log_dir), &check_options, plan.as_ref());
+    combined_report.merge(fs_report);
+
+    print!("{}", combined_report.format_report(Some(log_dir), args.verbose > 0));
+    if !combined_report.is_clean() {
+        std::process::exit(1);
     }
 }
 

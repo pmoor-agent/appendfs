@@ -147,6 +147,9 @@ pub const COMPAT_FIXTURE_DUMP_FILES: &[&str] = &[
     "000001.summary-dump.txt",
 ];
 
+/// Canonical golden fsck report filename.
+pub const COMPAT_FSCK_REPORT_FILENAME: &str = "fsck-report.txt";
+
 /// Resolves the volume key required to open `fixture_dir`, unlocking encrypted fixtures
 /// with the canonical test credentials.
 pub fn resolve_fixture_volume_key(fixture_dir: &Path) -> Arc<VolumeKey> {
@@ -203,6 +206,16 @@ pub fn generate_compat_dump_files(dir: &Path, volume_key: Option<&VolumeKey>) ->
         let dump_text = crate::dump::dump_file(&storage, name, 1, volume_key)?;
         fs::write(dir.join(format!("{}-dump.txt", name)), dump_text)?;
     }
+    Ok(())
+}
+
+/// Generates golden `fsck-report.txt` file for the canonical volume in `dir`.
+pub fn generate_compat_fsck_report(dir: &Path, volume_key: Arc<VolumeKey>) -> io::Result<()> {
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(dir));
+    let report = crate::check::check_volume(storage, &crate::check::CheckOptions::full_data(), volume_key)
+        .map_err(io::Error::other)?;
+    let report_text = report.format_report(None, false);
+    fs::write(dir.join(COMPAT_FSCK_REPORT_FILENAME), report_text)?;
     Ok(())
 }
 
@@ -730,6 +743,9 @@ fn create_canonical_encrypted_compat_volume(out_dir: &Path, config: CompatFixtur
     // 5. Generate golden dumps
     generate_compat_dump_files(out_dir, Some(&volume_key_arc))?;
 
+    // 6. Generate golden fsck report
+    generate_compat_fsck_report(out_dir, volume_key_arc)?;
+
     Ok(())
 }
 
@@ -760,7 +776,7 @@ fn create_canonical_plaintext_compat_volume(out_dir: &Path, config: CompatFixtur
             clock.as_ref(),
             crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
-            volume_key_arc,
+            volume_key_arc.clone(),
         )
         .map_err(io::Error::other)?
         .with_key_salts(compat_key_salt)
@@ -784,6 +800,9 @@ fn create_canonical_plaintext_compat_volume(out_dir: &Path, config: CompatFixtur
 
     // 5. Generate golden dumps
     generate_compat_dump_files(out_dir, None)?;
+
+    // 6. Generate golden fsck report
+    generate_compat_fsck_report(out_dir, volume_key_arc)?;
 
     Ok(())
 }
