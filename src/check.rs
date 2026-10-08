@@ -768,14 +768,24 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
         all_live_blocks
     };
 
-    // 6. Assign selected blocks to eligible targets with boundary expansion for straddling records
+    // 6. Assign selected blocks to targets in contiguous ranges, expanding straddling records.
+    //
+    // The selected blocks (in volume order) are split into one contiguous range per target, so
+    // that blocks are only fetched from two targets where adjacent ranges meet. The ranges are
+    // rotated by a seeded offset, which varies both where the split points fall and which target
+    // reads which part of the volume from one run to the next.
+    let targets: Vec<Option<String>> = targets.into_iter().collect();
+    let rotation = if selected_blocks.is_empty() {
+        0
+    } else {
+        rng.gen_range(0..selected_blocks.len())
+    };
     let mut local_blocks: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
     let mut remote_blocks: BTreeMap<String, BTreeMap<u32, BTreeSet<u64>>> = BTreeMap::new();
-    let mut target_counts: HashMap<Option<String>, usize> = HashMap::new();
 
     let mut fetched_blocks: HashSet<(u32, u64)> = HashSet::new();
 
-    for &(generation, seed_blk) in &selected_blocks {
+    for (i, &(generation, seed_blk)) in selected_blocks.iter().enumerate() {
         if fetched_blocks.contains(&(generation, seed_blk)) {
             continue;
         }
@@ -790,14 +800,11 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
                 .as_ref()
                 .is_none_or(|cache| cache.storage().exists(&log_filename))
         };
-        let Some(chosen_target) = targets
-            .iter()
-            .filter(|t| t.is_some() || local_eligible)
-            .min_by(|a, b| {
-                let cnt_a = target_counts.get(*a).copied().unwrap_or(0);
-                let cnt_b = target_counts.get(*b).copied().unwrap_or(0);
-                cnt_a.cmp(&cnt_b).then_with(|| a.cmp(b))
-            })
+        // If the range's target is ineligible, the next target in order takes the block instead.
+        let range = ((i + rotation) % selected_blocks.len()) * targets.len() / selected_blocks.len();
+        let Some(chosen_target) = (0..targets.len())
+            .map(|d| &targets[(range + d) % targets.len()])
+            .find(|t| t.is_some() || local_eligible)
             .cloned()
         else {
             break;
@@ -839,7 +846,6 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
                 }
             }
         }
-        *target_counts.entry(chosen_target).or_default() += blocks_to_add.len();
     }
 
     // 7. Find all records whose required blocks are completely covered by fetched blocks
@@ -2857,8 +2863,8 @@ mod tests {
         fs.log_writer = Some(writer);
         fs.set_storage(storage.clone());
 
-        // Create 10 files of 300 KiB each spanning ~3 blocks (blocks 0, 1, 2)
-        for i in 0..10 {
+        // 100 files of 300 KB each: ~29 blocks, with records straddling most block boundaries.
+        for i in 0..100 {
             let f =
                 crate::operations::read_write::create_core(&fs, 1, &format!("dist_{}.txt", i), 0o644, 0, 1000, 1000)
                     .unwrap();
@@ -2868,55 +2874,78 @@ mod tests {
         fs.export_summary(storage.as_ref()).unwrap();
 
         let mut registry = RemoteRegistry::default();
-        let r1 = Arc::new(MockRemoteStore::new());
-        let r2 = Arc::new(MockRemoteStore::new());
         registry.add_remote("r1", RemoteTargetConfig::new("r1"));
         registry.add_remote("r2", RemoteTargetConfig::new("r2"));
-        registry.set_store_override("r1", r1);
-        registry.set_store_override("r2", r2);
+        registry.set_store_override("r1", Arc::new(MockRemoteStore::new()));
+        registry.set_store_override("r2", Arc::new(MockRemoteStore::new()));
         fs.set_remote_registry(Arc::new(std::sync::RwLock::new(registry)));
 
-        // Case 1: --remotes r1,r2 with 100% of blocks
-        // Total blocks = 3. Seed block 0 -> r1 (expanded to block 1 for the record straddling 0-1),
-        // seed block 2 -> r2. Each block is sampled once in total, not once per remote.
-        let opts_two_remotes = CheckOptions {
-            verify_data: true,
-            sample_percent: 100.0,
-            remotes: vec!["r1".to_string(), "r2".to_string()],
-            seed: Some(42),
-        };
-        let plan_two = plan_sampled_verification(&fs, &opts_two_remotes);
-        let r1_blocks = plan_two.remote_blocks.get("r1").unwrap().get(&1).unwrap();
-        let r2_blocks = plan_two.remote_blocks.get("r2").unwrap().get(&1).unwrap();
-        assert_eq!(r1_blocks, &BTreeSet::from([0, 1]));
-        // Block 1 is shared by r2's seed block 2: the record straddling blocks 1-2 must be readable
-        // in full from r2, so block 1 is fetched from both remotes.
-        assert_eq!(r2_blocks, &BTreeSet::from([1, 2]));
-        assert_eq!(
-            plan_two.sampled_records.len(),
-            plan_two.total_live_records,
-            "100% verification must cover every live record, including those straddling targets"
-        );
-        assert!(
-            plan_two.local_blocks.is_empty(),
-            "Local blocks must be empty when only r1 and r2 requested"
-        );
+        let empty = BTreeSet::new();
+        for (remotes, a, b) in [
+            (["r1", "r2"], Some("r1"), Some("r2")),
+            (["local", "r1"], None, Some("r1")),
+        ] {
+            let blocks_of = |plan: &VerificationPlan, target: Option<&str>| -> BTreeSet<u64> {
+                match target {
+                    None => plan.local_blocks.get(&1).unwrap_or(&empty).clone(),
+                    Some(name) => plan
+                        .remote_blocks
+                        .get(name)
+                        .and_then(|m| m.get(&1))
+                        .unwrap_or(&empty)
+                        .clone(),
+                }
+            };
 
-        // Case 2: --remotes local,r1 with 100% of blocks
-        // Seed block 0 -> local (expanded to block 1), seed block 2 -> r1 (expanded to block 1).
-        let opts_local_remote = CheckOptions {
-            verify_data: true,
-            sample_percent: 100.0,
-            remotes: vec!["local".to_string(), "r1".to_string()],
-            seed: Some(42),
-        };
-        let plan_lr = plan_sampled_verification(&fs, &opts_local_remote);
-        assert_eq!(plan_lr.local_blocks.get(&1).unwrap(), &BTreeSet::from([0, 1]));
-        assert_eq!(
-            plan_lr.remote_blocks.get("r1").unwrap().get(&1).unwrap(),
-            &BTreeSet::from([1, 2])
-        );
-        assert_eq!(plan_lr.sampled_records.len(), plan_lr.total_live_records);
+            let mut first_block_owners = BTreeSet::new();
+            for seed in 0..16 {
+                let opts = CheckOptions {
+                    verify_data: true,
+                    sample_percent: 100.0,
+                    remotes: remotes.iter().map(|r| r.to_string()).collect(),
+                    seed: Some(seed),
+                };
+                let plan = plan_sampled_verification(&fs, &opts);
+                assert_eq!(
+                    plan.sampled_records.len(),
+                    plan.total_live_records,
+                    "100% verification must cover every live record ({:?}, seed {})",
+                    remotes,
+                    seed
+                );
+
+                let (blocks_a, blocks_b) = (blocks_of(&plan, a), blocks_of(&plan, b));
+                let unique = blocks_a.union(&blocks_b).count();
+                let total = blocks_a.len() + blocks_b.len();
+                // Each target reads one contiguous range (wrapping around the end of the volume),
+                // so at most one shared block per range edge is read twice.
+                assert!(
+                    total - unique <= 2,
+                    "{:?} seed {}: {} blocks read for {} unique",
+                    remotes,
+                    seed,
+                    total,
+                    unique
+                );
+                for blocks in [&blocks_a, &blocks_b] {
+                    assert!(
+                        blocks.len() * 3 >= unique,
+                        "{:?} seed {}: unbalanced split {:?} / {:?}",
+                        remotes,
+                        seed,
+                        blocks_a,
+                        blocks_b
+                    );
+                }
+                first_block_owners.insert(if blocks_a.contains(&0) { a } else { b });
+            }
+            assert_eq!(
+                first_block_owners.len(),
+                2,
+                "{:?}: the seed must vary which target reads the start of the log",
+                remotes
+            );
+        }
     }
 
     #[test]
