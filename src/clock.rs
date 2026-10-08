@@ -111,21 +111,6 @@ pub fn format_utc_civil_time(time: SystemTime) -> String {
     }
 }
 
-/// Formats a `SystemTime` as a compact, filename-safe `YYYYMMDD-HHMMSS` in UTC.
-///
-/// UTC rather than local time so that names sort chronologically regardless of the
-/// timezone - or daylight saving transition - the process happened to start in.
-pub fn format_utc_compact(time: SystemTime) -> String {
-    let (secs, _) = system_time_to_unix(time);
-    match jiff::Timestamp::try_from(time) {
-        Ok(ts) => {
-            let zoned = ts.to_zoned(jiff::tz::TimeZone::UTC);
-            zoned.strftime("%Y%m%d-%H%M%S").to_string()
-        }
-        Err(_) => format!("unknown-{}", secs),
-    }
-}
-
 /// Parses a human-readable or unix timestamp string into `SystemTime`.
 /// Supports unix seconds (`1755424800`), decimals (`1755424800.5`),
 /// ISO 8601 / RFC 3339 (`2026-08-17T10:00:00Z`), `2026-08-17 10:00:00`, and `2026-08-17`.
@@ -426,21 +411,6 @@ mod tests {
         assert_eq!(&civil_part[10..11], " ");
         assert_eq!(&civil_part[13..14], ":");
         assert_eq!(&civil_part[16..17], ":");
-    }
-
-    #[test]
-    fn test_format_utc_compact_is_filename_safe_and_sorts() {
-        let base = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
-        let early = format_utc_compact(base);
-        let later = format_utc_compact(base + Duration::from_secs(3600));
-
-        assert_eq!(early.len(), 15, "fixed width keeps names aligned: {}", early);
-        assert!(
-            early.chars().all(|c| c.is_ascii_digit() || c == '-'),
-            "must be safe in a filename: {}",
-            early
-        );
-        assert!(early < later, "lexical order must follow chronological order");
     }
 
     #[test]
