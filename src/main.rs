@@ -740,6 +740,57 @@ fn confirm_remote_egress(plan: &appendfs::VerificationPlan, manifest: &appendfs:
     }
 }
 
+/// Prints `fsck` data verification progress to stderr, keeping stdout for the report.
+///
+/// On a terminal the line is redrawn in place every 0.1%. Otherwise a line is printed every
+/// 10%, so the output of an unattended run stays short.
+struct FsckProgress {
+    label: String,
+    tty: bool,
+    last_step: Option<u64>,
+}
+
+impl FsckProgress {
+    fn new(label: String) -> Self {
+        use std::io::IsTerminal;
+        Self {
+            label,
+            tty: std::io::stderr().is_terminal(),
+            last_step: None,
+        }
+    }
+
+    fn update(&mut self, done: u64, total: u64) {
+        let per_mille = if total == 0 {
+            1000
+        } else {
+            (done.min(total) as u128 * 1000 / total as u128) as u64
+        };
+        let step = if self.tty { per_mille } else { per_mille / 100 * 100 };
+        if self.last_step == Some(step) {
+            return;
+        }
+        self.last_step = Some(step);
+        let line = format!(
+            "{}: {} / {} ({}.{}%)",
+            self.label,
+            appendfs::stats::format_bytes(done.min(total)),
+            appendfs::stats::format_bytes(total),
+            per_mille / 10,
+            per_mille % 10
+        );
+        if self.tty {
+            // \x1b[K clears what is left of a longer previous line.
+            eprint!("\r{}\x1b[K", line);
+            if per_mille == 1000 {
+                eprintln!();
+            }
+        } else {
+            eprintln!("{}", line);
+        }
+    }
+}
+
 fn resolve_fsck_target_remotes(args: &FsckArgs, registry: &appendfs::remote::RemoteRegistry) -> Vec<String> {
     let mut target_remotes = Vec::new();
     if args.remotes.is_empty() {
@@ -817,6 +868,7 @@ fn cmd_fsck(args: FsckArgs) {
         check_options.seed = Some(rand::random());
     }
 
+    eprintln!("Recovering filesystem from '{}'...", log_dir.display());
     let mut fs = match recover_fs(
         storage.clone(),
         appendfs::log::RecoveryTarget::Latest,
@@ -852,7 +904,15 @@ fn cmd_fsck(args: FsckArgs) {
                 } else {
                     CheckOptions::metadata_only()
                 };
-                let remote_rep = check_remote_integrity(store.as_ref(), remote_name, &manifest, &remote_opts);
+                eprintln!("Checking remote '{}'...", remote_name);
+                let mut progress = FsckProgress::new(format!("Verifying remote '{}'", remote_name));
+                let remote_rep = check_remote_integrity(
+                    store.as_ref(),
+                    remote_name,
+                    &manifest,
+                    &remote_opts,
+                    Some(&mut |done, total| progress.update(done, total)),
+                );
                 combined_report.merge(remote_rep);
             }
         }
@@ -872,7 +932,15 @@ fn cmd_fsck(args: FsckArgs) {
     };
 
     // 3. Run filesystem integrity check (Pass 0-4 + sampled verification)
-    let fs_report = check_fs_integrity(&fs, Some(log_dir), &check_options, plan.as_ref());
+    eprintln!("Checking filesystem integrity...");
+    let mut progress = FsckProgress::new("Verifying data".to_string());
+    let fs_report = check_fs_integrity(
+        &fs,
+        Some(log_dir),
+        &check_options,
+        plan.as_ref(),
+        Some(&mut |done, total| progress.update(done, total)),
+    );
     combined_report.merge(fs_report);
 
     print!("{}", combined_report.format_report(Some(log_dir), args.verbose > 0));

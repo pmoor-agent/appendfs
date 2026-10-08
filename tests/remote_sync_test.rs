@@ -127,7 +127,13 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     assert!(b2_sum_head.etag_md5().is_some());
 
     // 4. Run integrity check on remote_aws against manifest
-    let report = check_remote_integrity(remote_aws.as_ref(), "aws", &manifest, &CheckOptions::metadata_only());
+    let report = check_remote_integrity(
+        remote_aws.as_ref(),
+        "aws",
+        &manifest,
+        &CheckOptions::metadata_only(),
+        None,
+    );
     assert!(
         report.is_clean(),
         "Remote integrity check must pass with matching MD5 and size"
@@ -137,7 +143,13 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     remote_aws
         .put_object("000001.log", &mut &[0u8; 10][..], 10, None)
         .unwrap();
-    let corrupt_report = check_remote_integrity(remote_aws.as_ref(), "aws", &manifest, &CheckOptions::metadata_only());
+    let corrupt_report = check_remote_integrity(
+        remote_aws.as_ref(),
+        "aws",
+        &manifest,
+        &CheckOptions::metadata_only(),
+        None,
+    );
     assert!(
         !corrupt_report.is_clean(),
         "Integrity check must catch size and MD5 mismatch"
@@ -657,6 +669,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
         "nas",
         &fs_arc.manifest.read().unwrap(),
         &CheckOptions::metadata_only(),
+        None,
     );
     assert!(report.is_clean(), "Integrity check against NFS remote must pass");
 
@@ -1780,6 +1793,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         "counting",
         &manifest,
         &CheckOptions::metadata_only(),
+        None,
     );
     assert!(report.is_clean(), "Integrity report must be clean");
     assert_eq!(
@@ -1803,6 +1817,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         "failing",
         &manifest,
         &CheckOptions::metadata_only(),
+        None,
     );
     assert!(
         !failure_report.is_clean(),

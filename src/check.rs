@@ -904,12 +904,15 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
 }
 
 /// Executes data verification for the sampled records in `plan`.
+///
+/// `progress`, if given, is called as data is read with `(bytes_read, bytes_total)`.
 #[allow(clippy::too_many_lines)]
 pub fn execute_sampled_verification(
     fs: &InMemoryFS,
     plan: &VerificationPlan,
     log_dir: Option<&Path>,
     report: &mut IntegrityReport,
+    mut progress: Option<&mut dyn FnMut(u64, u64)>,
 ) {
     for remote_name in &plan.write_only_remotes {
         report.issues.push(IntegrityIssue::error(
@@ -930,6 +933,48 @@ pub fn execute_sampled_verification(
 
     let manifest = fs.manifest.read().unwrap();
     const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
+
+    let gen_len = |generation: u32| {
+        manifest
+            .get_by_generation(generation)
+            .map(|l| l.total_bytes)
+            .or_else(|| {
+                fs.log_writer
+                    .as_ref()
+                    .filter(|w| w.generation() == generation)
+                    .map(|w| w.current_offset())
+            })
+            .unwrap_or(0)
+    };
+    let blocks_bytes = |generation: u32, blocks: &BTreeSet<u64>| -> u64 {
+        let file_len = gen_len(generation);
+        blocks
+            .iter()
+            .map(|&b| file_len.saturating_sub(b * BLOCK_SIZE).min(BLOCK_SIZE))
+            .sum()
+    };
+
+    // Progress counts remote block bytes fetched plus local record bytes read. Records skipped
+    // on an error still count, so a run with errors finishes at 100% too.
+    let total_bytes: u64 = plan
+        .remote_blocks
+        .values()
+        .flat_map(|gen_map| gen_map.iter())
+        .map(|(&generation, blocks)| blocks_bytes(generation, blocks))
+        .sum::<u64>()
+        + plan
+            .record_targets
+            .iter()
+            .filter(|(_, target)| target.is_none())
+            .map(|(rec, _)| rec.record_size as u64)
+            .sum::<u64>();
+    let mut done_bytes = 0u64;
+    let mut advance = |bytes: u64| {
+        done_bytes += bytes;
+        if let Some(p) = progress.as_mut() {
+            p(done_bytes, total_bytes);
+        }
+    };
 
     let mut verified_count = 0usize;
     let mut verified_bytes = 0u64;
@@ -983,6 +1028,7 @@ pub fn execute_sampled_verification(
                             None,
                             format!("Remote '{}' is not configured in remotes.toml", remote_name),
                         ));
+                        advance(gen_map.iter().map(|(&g, blocks)| blocks_bytes(g, blocks)).sum());
                         continue;
                     }
                 },
@@ -1005,6 +1051,7 @@ pub fn execute_sampled_verification(
                             remote_name, filename, e
                         ),
                     ));
+                    advance(blocks_bytes(generation, blocks));
                     continue;
                 }
                 let Ok(hdr_array): Result<[u8; FILE_HEADER_SIZE], _> = hdr_bytes.try_into() else {
@@ -1013,6 +1060,7 @@ pub fn execute_sampled_verification(
                         None,
                         format!("Invalid header length in {} on remote '{}'", filename, remote_name),
                     ));
+                    advance(blocks_bytes(generation, blocks));
                     continue;
                 };
                 let file_header = match FileHeader::from_bytes(&hdr_array) {
@@ -1023,21 +1071,13 @@ pub fn execute_sampled_verification(
                             None,
                             format!("Invalid header in {} on remote '{}': {}", filename, remote_name, e),
                         ));
+                        advance(blocks_bytes(generation, blocks));
                         continue;
                     }
                 };
                 let file_key = Arc::new(fs.volume_key.log_file_key(&file_header.key_salt));
 
-                let manifest_len = manifest
-                    .get_by_generation(generation)
-                    .map(|l| l.total_bytes)
-                    .or_else(|| {
-                        fs.log_writer
-                            .as_ref()
-                            .filter(|w| w.generation() == generation)
-                            .map(|w| w.current_offset())
-                    })
-                    .unwrap_or(0);
+                let manifest_len = gen_len(generation);
 
                 let records = remote_records_by_gen
                     .get(&(remote_name.as_str(), generation))
@@ -1064,6 +1104,7 @@ pub fn execute_sampled_verification(
                         } else {
                             window.insert(b, block_buf);
                         }
+                        advance(len);
                     }
 
                     // Process all records whose required blocks end on or before block `b`
@@ -1141,6 +1182,7 @@ pub fn execute_sampled_verification(
         .or_else(|| log_dir.map(|d| Arc::new(LogFileCache::new(d))));
 
     for (&generation, records) in &local_records_by_gen {
+        let records_bytes: u64 = records.iter().map(|r| r.record_size as u64).sum();
         if let Some(ref c) = local_cache {
             let log_filename = manifest
                 .get_by_generation(generation)
@@ -1157,6 +1199,7 @@ pub fn execute_sampled_verification(
                         ),
                     ));
                 }
+                advance(records_bytes);
                 continue;
             }
 
@@ -1170,6 +1213,7 @@ pub fn execute_sampled_verification(
                             format!("Failed to read file size for {}: {}", log_filename, e),
                         ));
                     }
+                    advance(records_bytes);
                     continue;
                 }
             };
@@ -1184,11 +1228,13 @@ pub fn execute_sampled_verification(
                             format!("Failed to open log file {}: {}", log_filename, e),
                         ));
                     }
+                    advance(records_bytes);
                     continue;
                 }
             };
 
             for rec in records {
+                advance(rec.record_size as u64);
                 if file_len < rec.record_log_offset + rec.record_size as u64 {
                     report.issues.push(IntegrityIssue::error(
                         "EXTENT_PAST_LOG_EOF",
@@ -1228,6 +1274,8 @@ pub fn execute_sampled_verification(
                     }
                 }
             }
+        } else {
+            advance(records_bytes);
         }
     }
 
@@ -1246,6 +1294,7 @@ pub fn check_fs_integrity(
     log_dir: Option<&Path>,
     options: &CheckOptions,
     plan: Option<&VerificationPlan>,
+    progress: Option<&mut dyn FnMut(u64, u64)>,
 ) -> IntegrityReport {
     let mut report = IntegrityReport::default();
 
@@ -1624,10 +1673,10 @@ pub fn check_fs_integrity(
 
     if options.verify_data {
         if let Some(p) = plan {
-            execute_sampled_verification(fs, p, log_dir, &mut report);
+            execute_sampled_verification(fs, p, log_dir, &mut report, progress);
         } else {
             let p = plan_sampled_verification(fs, options);
-            execute_sampled_verification(fs, &p, log_dir, &mut report);
+            execute_sampled_verification(fs, &p, log_dir, &mut report, progress);
         }
     }
 
@@ -1683,7 +1732,7 @@ pub fn check_volume(
         std::sync::Arc::new(crate::clock::SystemClock),
         volume_key,
     )?;
-    Ok(check_fs_integrity(&fs, None, options, None))
+    Ok(check_fs_integrity(&fs, None, options, None, None))
 }
 
 #[derive(Debug, Clone)]
@@ -1694,31 +1743,36 @@ struct RemoteFileCandidate {
     sidecar_md5: Option<[u8; 16]>,
 }
 
-fn compute_remote_object_md5(remote: &dyn crate::remote::RemoteStore, key: &str) -> std::io::Result<[u8; 16]> {
+/// Streams `key` from `remote` and computes its MD5, calling `on_read` with the size of each chunk read.
+fn compute_remote_object_md5(
+    remote: &dyn crate::remote::RemoteStore,
+    key: &str,
+    on_read: &mut dyn FnMut(u64),
+) -> std::io::Result<[u8; 16]> {
     let mut hasher = md5::Context::new();
-    struct Md5Writer<'a>(&'a mut md5::Context);
+    struct Md5Writer<'a>(&'a mut md5::Context, &'a mut dyn FnMut(u64));
     impl<'a> std::io::Write for Md5Writer<'a> {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0.consume(buf);
+            (self.1)(buf.len() as u64);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    remote.get_object(key, &mut Md5Writer(&mut hasher))?;
+    remote.get_object(key, &mut Md5Writer(&mut hasher, on_read))?;
     Ok(hasher.compute().0)
 }
 
-fn verify_remote_sidecar_files_md5(
-    remote: &dyn crate::remote::RemoteStore,
-    remote_name: &str,
-    candidates: &[RemoteFileCandidate],
+/// Picks the remote objects to download for MD5 verification, weighted by size so that the
+/// selection covers `options.sample_percent` of the bytes.
+fn select_remote_md5_candidates<'a>(
+    candidates: &'a [RemoteFileCandidate],
     options: &CheckOptions,
-    report: &mut IntegrityReport,
-) {
+) -> Vec<&'a RemoteFileCandidate> {
     if candidates.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let total_bytes: u64 = candidates.iter().map(|c| c.total_bytes).sum();
@@ -1731,10 +1785,10 @@ fn verify_remote_sidecar_files_md5(
     };
 
     if target_bytes == 0 {
-        return;
+        return Vec::new();
     }
 
-    let selected: Vec<&RemoteFileCandidate> = if sample_pct >= 100.0 {
+    if sample_pct >= 100.0 {
         candidates.iter().collect()
     } else {
         let seed = options.seed.unwrap_or_else(rand::random::<u64>);
@@ -1765,7 +1819,20 @@ fn verify_remote_sidecar_files_md5(
             }
         }
         picked
-    };
+    }
+}
+
+fn verify_remote_sidecar_files_md5(
+    remote: &dyn crate::remote::RemoteStore,
+    remote_name: &str,
+    candidates: &[RemoteFileCandidate],
+    options: &CheckOptions,
+    report: &mut IntegrityReport,
+    mut progress: Option<&mut dyn FnMut(u64, u64)>,
+) {
+    let selected = select_remote_md5_candidates(candidates, options);
+    let selected_bytes: u64 = selected.iter().map(|c| c.total_bytes).sum();
+    let mut done_bytes = 0u64;
 
     for candidate in selected {
         let sidecar_md5 = candidate.sidecar_md5.or_else(|| {
@@ -1776,7 +1843,19 @@ fn verify_remote_sidecar_files_md5(
                 .and_then(|o| o.etag_md5())
         });
 
-        match compute_remote_object_md5(remote, &candidate.filename) {
+        let file_start = done_bytes;
+        let md5 = compute_remote_object_md5(remote, &candidate.filename, &mut |n| {
+            done_bytes += n;
+            if let Some(p) = progress.as_mut() {
+                p(done_bytes, selected_bytes);
+            }
+        });
+        // A failed or short read still accounts for the whole object, so progress ends at 100%.
+        done_bytes = file_start + candidate.total_bytes;
+        if let Some(p) = progress.as_mut() {
+            p(done_bytes, selected_bytes);
+        }
+        match md5 {
             Ok(computed_md5) => {
                 if computed_md5 != candidate.expected_md5 {
                     report.issues.push(IntegrityIssue::error(
@@ -1832,6 +1911,7 @@ pub fn check_remote_integrity(
     remote_name: &str,
     manifest: &crate::log::LogManifest,
     options: &CheckOptions,
+    progress: Option<&mut dyn FnMut(u64, u64)>,
 ) -> IntegrityReport {
     let mut report = IntegrityReport::default();
     report.remotes_checked.push(remote_name.to_string());
@@ -1931,7 +2011,7 @@ pub fn check_remote_integrity(
     candidates.sort_by(|a, b| a.filename.cmp(&b.filename));
 
     if options.verify_data {
-        verify_remote_sidecar_files_md5(remote, remote_name, &candidates, options, &mut report);
+        verify_remote_sidecar_files_md5(remote, remote_name, &candidates, options, &mut report, progress);
     }
 
     report
@@ -1998,6 +2078,70 @@ mod tests {
         assert_eq!(report.sampled_records, 1);
     }
 
+    /// Asserts progress never goes backwards, always reports `expected_total`, and ends complete.
+    fn assert_progress_completes(calls: &[(u64, u64)], expected_total: u64) {
+        assert!(!calls.is_empty(), "Progress must be reported");
+        assert!(
+            calls.windows(2).all(|w| w[0].0 <= w[1].0),
+            "Progress must not go backwards: {:?}",
+            calls
+        );
+        assert!(calls.iter().all(|&(_, total)| total == expected_total), "{:?}", calls);
+        assert_eq!(calls.last().unwrap().0, expected_total);
+    }
+
+    #[test]
+    fn test_local_data_verification_reports_progress() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        crate::init_volume(
+            storage.clone(),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
+
+        let mut fs = crate::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_storage(storage.clone());
+
+        for i in 0..3 {
+            let f =
+                crate::operations::read_write::create_core(&fs, 1, &format!("f{}", i), 0o644, 0, 1000, 1000).unwrap();
+            crate::operations::read_write::write_core(&fs, f.ino, &vec![b'x'; 1000 * (i + 1)], 0).unwrap();
+        }
+        fs.quiesce().unwrap();
+
+        let mut calls = Vec::new();
+        let report = check_fs_integrity(
+            &fs,
+            None,
+            &CheckOptions::full_data(),
+            None,
+            Some(&mut |done, total| calls.push((done, total))),
+        );
+        assert!(report.is_clean(), "Report must be clean: {:?}", report.issues);
+        assert_eq!(report.sampled_records, 3);
+        assert_progress_completes(&calls, report.sampled_data_bytes);
+    }
+
     #[test]
     fn test_orphan_inode_detection() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
@@ -2030,7 +2174,7 @@ mod tests {
             .base
             .insert(orphan_ino, Arc::new(orphan_node));
 
-        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
         assert!(!report.is_clean());
         assert_eq!(report.orphaned_inodes, vec![999]);
         let orphan_issue = report.issues.iter().find(|i| i.code == "ORPHAN_INODE").unwrap();
@@ -2081,7 +2225,7 @@ mod tests {
             *node_arc = Arc::new(node);
         }
 
-        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
         assert!(!report.is_clean());
         let issue = report.issues.iter().find(|i| i.code == "NLINK_MISMATCH").unwrap();
         assert_eq!(issue.inode, Some(f.ino));
@@ -2127,7 +2271,7 @@ mod tests {
             *root_arc = Arc::new(root);
         }
 
-        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
         assert!(!report.is_clean());
         let issue = report.issues.iter().find(|i| i.code == "EXTENT_PAST_EOF").unwrap();
         assert_eq!(issue.inode, Some(2));
@@ -2192,7 +2336,7 @@ mod tests {
         }
 
         // Even with verify_data = false (pure metadata check), must catch EXTENT_PAST_MANIFEST_EOF
-        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
         assert!(!report.is_clean());
         let issue = report.issues.iter().find(|i| i.code == "EXTENT_PAST_MANIFEST_EOF");
         assert!(
@@ -2255,12 +2399,12 @@ mod tests {
             *node_arc = Arc::new(node);
         }
 
-        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
         assert!(!report.is_clean());
         assert!(report.issues.iter().any(|i| i.code == "EXTENT_INVALID_RECORD_SIZE"));
 
         // Must not panic when verify_data is enabled!
-        let full_report = check_fs_integrity(&fs, None, &CheckOptions::full_data(), None);
+        let full_report = check_fs_integrity(&fs, None, &CheckOptions::full_data(), None, None);
         assert!(!full_report.is_clean());
         assert!(
             full_report
@@ -2317,7 +2461,7 @@ mod tests {
             *node_arc = Arc::new(node);
         }
 
-        let report = check_fs_integrity(&fs, None, &CheckOptions::full_data(), None);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::full_data(), None, None);
         assert!(!report.is_clean());
         assert!(
             report
@@ -2373,7 +2517,7 @@ mod tests {
             *root_arc = Arc::new(root);
         }
 
-        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
         assert!(!report.is_clean());
         let cycle_issue = report.issues.iter().find(|i| i.code == "DIR_CYCLE");
         assert!(cycle_issue.is_some(), "Must report DIR_CYCLE: {:?}", report.issues);
@@ -2419,7 +2563,7 @@ mod tests {
             *root_arc = Arc::new(root);
         }
 
-        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
         assert!(!report.is_clean());
         assert!(report.issues.iter().any(|i| i.code == "DANGLING_ENTRY"));
         assert!(report.issues.iter().any(|i| i.code == "INVALID_PARENT"));
@@ -2484,7 +2628,7 @@ mod tests {
         storage.insert_file("000001.log", bytes);
 
         // 3. Re-check: must catch CORRUPT_LOG_RECORD
-        let corrupt_report = check_fs_integrity(&fs, None, &CheckOptions::full_data(), None);
+        let corrupt_report = check_fs_integrity(&fs, None, &CheckOptions::full_data(), None, None);
         assert!(!corrupt_report.is_clean());
         assert!(corrupt_report.issues.iter().any(|i| i.code == "CORRUPT_LOG_RECORD"));
     }
@@ -2527,7 +2671,7 @@ mod tests {
         inner.base.insert(2, Arc::new(child_node));
         drop(inner);
 
-        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None);
+        let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
         assert!(!report.is_clean());
         assert!(report.issues.iter().any(|i| i.code == "NAME_TOO_LONG"));
     }
@@ -2581,7 +2725,7 @@ mod tests {
         assert!(!blocks.is_empty(), "Should sample at least 1 block");
         assert!(blocks.len() < 3, "Should sample a subset of blocks");
 
-        let report = check_fs_integrity(&fs, None, &opts, None);
+        let report = check_fs_integrity(&fs, None, &opts, None, None);
         assert!(report.is_clean(), "Report must be clean: {:?}", report.issues);
         assert_eq!(report.sampled_records, plan.sampled_records.len());
         assert_eq!(report.sample_percent, Some(0.05));
@@ -2654,7 +2798,7 @@ mod tests {
             }
         }
 
-        let report = check_fs_integrity(&fs, None, &opts, None);
+        let report = check_fs_integrity(&fs, None, &opts, None, None);
         assert!(report.is_clean());
         assert_eq!(report.sampled_records, plan.sampled_records.len());
     }
@@ -2790,9 +2934,12 @@ mod tests {
             remotes: vec!["backup1".to_string(), "backup2".to_string()],
             seed: Some(123),
         };
-        let clean_report = check_fs_integrity(&fs, None, &opts, None);
+        let mut calls = Vec::new();
+        let clean_report = check_fs_integrity(&fs, None, &opts, None, Some(&mut |d, t| calls.push((d, t))));
         assert!(clean_report.is_clean(), "Must be clean: {:?}", clean_report.issues);
         assert!(clean_report.sampled_records > 0);
+        // A single 1 MiB block covers the whole log, so progress counts the whole file fetched.
+        assert_progress_completes(&calls, log_bytes.len() as u64);
 
         // 2. Corrupt a byte in 000001.log on backup1
         let mut corrupted_log = log_bytes.clone();
@@ -2814,7 +2961,7 @@ mod tests {
             remotes: vec!["backup1".to_string()],
             seed: Some(123),
         };
-        let corrupt_report = check_fs_integrity(&fs, None, &opts1, None);
+        let corrupt_report = check_fs_integrity(&fs, None, &opts1, None, None);
         assert!(!corrupt_report.is_clean());
         let issue = corrupt_report
             .issues
@@ -3068,7 +3215,7 @@ mod tests {
         assert_eq!(plan.total_blocks(), 0, "Nothing may be verified in place of 'glacier'");
         assert!(plan.sampled_records.is_empty());
         assert_eq!(plan.write_only_remotes, vec!["glacier".to_string()]);
-        let report = check_fs_integrity(&fs, None, &opts, None);
+        let report = check_fs_integrity(&fs, None, &opts, None, None);
         assert!(
             report.issues.iter().any(|i| i.code == "REMOTE_WRITE_ONLY"),
             "Must contain REMOTE_WRITE_ONLY error, found: {:?}",
@@ -3092,7 +3239,7 @@ mod tests {
             remotes: vec!["glacier".to_string()],
             seed: None,
         };
-        let report_meta = check_fs_integrity(&fs, None, &opts_meta, None);
+        let report_meta = check_fs_integrity(&fs, None, &opts_meta, None, None);
         assert!(report_meta.is_clean());
 
         // 3. --remotes all with verify_data filters out write-only remotes from sampling targets
@@ -3185,11 +3332,23 @@ mod tests {
             .unwrap();
 
         // 1. Clean verification: both metadata-only and verify_data pass
-        let meta_report =
-            check_remote_integrity(local_remote.as_ref(), "nas", &manifest, &CheckOptions::metadata_only());
+        let meta_report = check_remote_integrity(
+            local_remote.as_ref(),
+            "nas",
+            &manifest,
+            &CheckOptions::metadata_only(),
+            None,
+        );
         assert!(meta_report.is_clean(), "Metadata check must pass on clean replica");
 
-        let data_report = check_remote_integrity(local_remote.as_ref(), "nas", &manifest, &CheckOptions::full_data());
+        let mut calls = Vec::new();
+        let data_report = check_remote_integrity(
+            local_remote.as_ref(),
+            "nas",
+            &manifest,
+            &CheckOptions::full_data(),
+            Some(&mut |d, t| calls.push((d, t))),
+        );
         assert!(
             data_report.is_clean(),
             "Data check must pass on clean replica: {:?}",
@@ -3197,6 +3356,7 @@ mod tests {
         );
         assert_eq!(data_report.remote_files_verified, 1);
         assert_eq!(data_report.remote_bytes_verified, log_data.len() as u64);
+        assert_progress_completes(&calls, log_data.len() as u64);
 
         // 2. Simulate bit rot: corrupt a byte in 000001.log on disk, but leave 000001.log.md5 intact
         let file_path = temp_dir.path().join("000001.log");
@@ -3205,16 +3365,26 @@ mod tests {
         std::fs::write(&file_path, &on_disk_bytes).unwrap();
 
         // Metadata check reads .md5 sidecar, so it PASSES (the blind spot)
-        let blind_spot_report =
-            check_remote_integrity(local_remote.as_ref(), "nas", &manifest, &CheckOptions::metadata_only());
+        let blind_spot_report = check_remote_integrity(
+            local_remote.as_ref(),
+            "nas",
+            &manifest,
+            &CheckOptions::metadata_only(),
+            None,
+        );
         assert!(
             blind_spot_report.is_clean(),
             "Metadata-only check misses on-disk bit rot because .md5 sidecar matches manifest"
         );
 
         // Data verification hashes the actual file on disk, so it FAILS with REMOTE_FILE_MD5_MISMATCH
-        let detected_report =
-            check_remote_integrity(local_remote.as_ref(), "nas", &manifest, &CheckOptions::full_data());
+        let detected_report = check_remote_integrity(
+            local_remote.as_ref(),
+            "nas",
+            &manifest,
+            &CheckOptions::full_data(),
+            None,
+        );
         assert!(
             !detected_report.is_clean(),
             "Data verification must detect on-disk bit rot"
@@ -3274,20 +3444,20 @@ mod tests {
 
         // 1. 100% data verification samples all 4 files
         let opts_100 = CheckOptions::full_data();
-        let report_100 = check_remote_integrity(local_remote.as_ref(), "local-dir", &manifest, &opts_100);
+        let report_100 = check_remote_integrity(local_remote.as_ref(), "local-dir", &manifest, &opts_100, None);
         assert!(report_100.is_clean());
         assert_eq!(report_100.remote_files_verified, 4);
         assert_eq!(report_100.remote_bytes_verified, total_bytes);
 
         // 2. 25% data verification with seed samples a subset and is deterministically reproducible
         let opts_25 = CheckOptions::sampled(25.0, Some(42));
-        let report_25 = check_remote_integrity(local_remote.as_ref(), "local-dir", &manifest, &opts_25);
+        let report_25 = check_remote_integrity(local_remote.as_ref(), "local-dir", &manifest, &opts_25, None);
         assert!(report_25.is_clean());
         assert!(report_25.remote_files_verified >= 1);
         assert!(report_25.remote_files_verified < 4);
         assert!(report_25.remote_bytes_verified >= total_bytes / 4);
 
-        let report_25_repeat = check_remote_integrity(local_remote.as_ref(), "local-dir", &manifest, &opts_25);
+        let report_25_repeat = check_remote_integrity(local_remote.as_ref(), "local-dir", &manifest, &opts_25, None);
         assert_eq!(report_25.remote_files_verified, report_25_repeat.remote_files_verified);
         assert_eq!(report_25.remote_bytes_verified, report_25_repeat.remote_bytes_verified);
 
@@ -3376,7 +3546,7 @@ mod tests {
             total_sampled_blocks
         );
 
-        let report = check_fs_integrity(&fs, None, &opts, Some(&plan));
+        let report = check_fs_integrity(&fs, None, &opts, Some(&plan), None);
         assert!(report.is_clean(), "issues: {:?}", report.issues);
         assert_eq!(report.sampled_blocks, total_sampled_blocks);
     }
