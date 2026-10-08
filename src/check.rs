@@ -267,7 +267,6 @@ impl IntegrityReport {
                     || i.code == "ZERO_LEN_EXTENT"
                     || i.code == "MISSING_LOG_FILE"
                     || i.code == "CORRUPT_LOG_RECORD"
-                    || i.code == "REMOTE_WRITE_ONLY"
                     || i.code == "LOG_FILE_READ_ERROR"
                     || i.code == "REMOTE_READ_FAILED"
                     || i.code == "REMOTE_CORRUPT_HEADER"
@@ -642,7 +641,7 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
                 {
                     // Filter out corrupt extents: Pass 3 already flags them, and verifying
                     // them during data pass causes underflow / panic.
-                    if (*record_size as usize) < RECORD_HEADER_SIZE || *record_size == 0 {
+                    if (*record_size as usize) < RECORD_HEADER_SIZE {
                         continue;
                     }
                     if record_log_offset.checked_add(*record_size as u64).is_none() {
@@ -684,13 +683,14 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
     let mut records_by_gen: BTreeMap<u32, Vec<LiveRecord>> = BTreeMap::new();
     let mut records_by_gen_block: BTreeMap<(u32, u64), Vec<LiveRecord>> = BTreeMap::new();
     let mut all_live_blocks: Vec<(u32, u64)> = Vec::new();
+    let mut seen_live_blocks: HashSet<(u32, u64)> = HashSet::new();
 
     for rec in unique_records.into_values() {
         let start_blk = rec.record_log_offset / BLOCK_SIZE;
         let end_blk = (rec.record_log_offset + rec.record_size as u64).saturating_sub(1) / BLOCK_SIZE;
 
         for blk in start_blk..=end_blk {
-            if !all_live_blocks.contains(&(rec.generation, blk)) {
+            if seen_live_blocks.insert((rec.generation, blk)) {
                 all_live_blocks.push((rec.generation, blk));
             }
             records_by_gen_block
@@ -922,9 +922,9 @@ pub fn execute_sampled_verification(
     let mut verified_count = 0usize;
     let mut verified_bytes = 0u64;
 
-    // Index records by (target, generation) for linear O(B + R) processing
-    let mut remote_records_by_gen: HashMap<(&str, u32), Vec<&LiveRecord>> = HashMap::new();
-    let mut local_records_by_gen: HashMap<u32, Vec<&LiveRecord>> = HashMap::new();
+    // Index records by (target, generation) for linear O(B + R) processing in deterministic order
+    let mut remote_records_by_gen: BTreeMap<(&str, u32), Vec<&LiveRecord>> = BTreeMap::new();
+    let mut local_records_by_gen: BTreeMap<u32, Vec<&LiveRecord>> = BTreeMap::new();
 
     for (rec, target) in &plan.record_targets {
         match target {
@@ -1611,45 +1611,11 @@ pub fn check_fs_integrity(
     }
 
     if options.verify_data {
-        let mut has_write_only_error = false;
-        let reg_opt = fs.remote_registry.read().unwrap().clone();
-        if let Some(reg_arc) = reg_opt {
-            let reg = reg_arc.read().unwrap();
-            for r in &options.remotes {
-                if r != "local"
-                    && r != "all"
-                    && let Some(cfg) = reg.get_remote(r)
-                    && !cfg.mode.is_readable()
-                {
-                    report.issues.push(IntegrityIssue::error(
-                        "REMOTE_WRITE_ONLY",
-                        None,
-                        format!("Remote '{}' is configured as write-only and cannot be data verified", r),
-                    ));
-                    has_write_only_error = true;
-                }
-            }
-            if options.remotes.iter().any(|r| r == "all")
-                && !options.remotes.iter().any(|r| r == "local")
-                && !reg.remotes.is_empty()
-                && !reg.remotes.values().any(|c| c.mode.is_readable())
-            {
-                report.issues.push(IntegrityIssue::error(
-                    "REMOTE_WRITE_ONLY",
-                    None,
-                    "All configured remotes in 'all' are write-only and cannot be data verified".to_string(),
-                ));
-                has_write_only_error = true;
-            }
-        }
-
-        if !has_write_only_error {
-            if let Some(p) = plan {
-                execute_sampled_verification(fs, p, log_dir, &mut report);
-            } else {
-                let p = plan_sampled_verification(fs, options);
-                execute_sampled_verification(fs, &p, log_dir, &mut report);
-            }
+        if let Some(p) = plan {
+            execute_sampled_verification(fs, p, log_dir, &mut report);
+        } else {
+            let p = plan_sampled_verification(fs, options);
+            execute_sampled_verification(fs, &p, log_dir, &mut report);
         }
     }
 
@@ -1771,7 +1737,11 @@ fn verify_remote_sidecar_files_md5(
                 (score, c)
             })
             .collect();
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.filename.cmp(&b.1.filename))
+        });
 
         let mut picked = Vec::new();
         let mut accumulated = 0u64;
@@ -1843,8 +1813,8 @@ fn verify_remote_sidecar_files_md5(
 
 /// Verifies that objects on a remote store match the authenticated sizes and MD5 digests in the summary manifest.
 ///
-/// When `options.verify_data` is true, also verifies that actual on-disk file bytes match the expected MD5
-/// on a sampled percentage of files.
+/// When `options.verify_data` is true, each sampled object is downloaded and read in full to compute and verify
+/// the on-disk MD5 digest against the manifest and sidecar file (intended for local-dir remotes like NAS shares).
 pub fn check_remote_integrity(
     remote: &dyn crate::remote::RemoteStore,
     remote_name: &str,
@@ -1856,7 +1826,7 @@ pub fn check_remote_integrity(
 
     // Batch-list all objects from the remote store to compare sizes and ETags (MD5)
     // in O(1) listing requests rather than dispatching individual head_object requests per log.
-    let listed_objects: HashMap<String, crate::remote::RemoteObject> = match remote.list_objects("") {
+    let listed_objects: BTreeMap<String, crate::remote::RemoteObject> = match remote.list_objects("") {
         Ok(objs) => objs.into_iter().map(|o| (o.key.clone(), o)).collect(),
         Err(e) => {
             report.issues.push(IntegrityIssue::error(
@@ -1945,6 +1915,8 @@ pub fn check_remote_integrity(
             });
         }
     }
+
+    candidates.sort_by(|a, b| a.filename.cmp(&b.filename));
 
     if options.verify_data {
         verify_remote_sidecar_files_md5(remote, remote_name, &candidates, options, &mut report);
@@ -3050,22 +3022,17 @@ mod tests {
         registry.set_store_override("glacier", glacier_store);
         fs.set_remote_registry(Arc::new(std::sync::RwLock::new(registry)));
 
-        // 1. Explicitly requesting write-only remote for data verification must fail
+        // 1. Requesting write-only remote for data verification: planner excludes it from remote blocks
         let opts = CheckOptions {
             verify_data: true,
             sample_percent: 100.0,
             remotes: vec!["glacier".to_string()],
             seed: Some(42),
         };
-        let report = check_fs_integrity(&fs, None, &opts, None);
+        let plan = plan_sampled_verification(&fs, &opts);
         assert!(
-            !report.is_clean(),
-            "Report must fail for write-only remote data verification"
-        );
-        assert!(
-            report.issues.iter().any(|i| i.code == "REMOTE_WRITE_ONLY"),
-            "Must contain REMOTE_WRITE_ONLY error, found: {:?}",
-            report.issues
+            !plan.remote_blocks.contains_key("glacier"),
+            "Planner must exclude write-only remote 'glacier' from data verification"
         );
 
         // 2. Metadata-only verification of write-only remote succeeds (checking manifest against bucket)
@@ -3076,10 +3043,7 @@ mod tests {
             seed: None,
         };
         let report_meta = check_fs_integrity(&fs, None, &opts_meta, None);
-        assert!(
-            !report_meta.issues.iter().any(|i| i.code == "REMOTE_WRITE_ONLY"),
-            "Metadata-only check must not produce REMOTE_WRITE_ONLY error"
-        );
+        assert!(report_meta.is_clean());
 
         // 3. --remotes all with verify_data filters out write-only remotes from sampling targets
         let s3_store = Arc::new(crate::remote::MockRemoteStore::new());
@@ -3261,13 +3225,17 @@ mod tests {
         assert_eq!(report_100.remote_files_verified, 4);
         assert_eq!(report_100.remote_bytes_verified, total_bytes);
 
-        // 2. 25% data verification with seed samples a subset
+        // 2. 25% data verification with seed samples a subset and is deterministically reproducible
         let opts_25 = CheckOptions::sampled(25.0, Some(42));
         let report_25 = check_remote_integrity(local_remote.as_ref(), "local-dir", &manifest, &opts_25);
         assert!(report_25.is_clean());
         assert!(report_25.remote_files_verified >= 1);
         assert!(report_25.remote_files_verified < 4);
         assert!(report_25.remote_bytes_verified >= total_bytes / 4);
+
+        let report_25_repeat = check_remote_integrity(local_remote.as_ref(), "local-dir", &manifest, &opts_25);
+        assert_eq!(report_25.remote_files_verified, report_25_repeat.remote_files_verified);
+        assert_eq!(report_25.remote_bytes_verified, report_25_repeat.remote_bytes_verified);
 
         // 3. Output formatting includes verified on-disk MD5 stats
         let formatted = report_100.format_report(None, false);

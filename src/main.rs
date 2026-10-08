@@ -847,10 +847,7 @@ fn cmd_fsck(args: FsckArgs) {
                     .get(remote_name)
                     .cloned()
                     .unwrap_or_else(|| remote_cfg.build_store());
-                let remote_opts = if (remote_cfg.path.is_some()
-                    || remote_cfg.endpoint.as_deref().unwrap_or("").starts_with("file://"))
-                    && remote_cfg.mode.is_readable()
-                {
+                let remote_opts = if remote_cfg.is_local_dir() && remote_cfg.mode.is_readable() {
                     check_options.clone()
                 } else {
                     CheckOptions::metadata_only()

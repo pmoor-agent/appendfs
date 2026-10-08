@@ -549,8 +549,8 @@ pub struct FsckArgs {
     #[arg(long = "remotes", value_delimiter = ',')]
     pub remotes: Vec<String>,
 
-    /// Reproducible seed for sampled block selection (default: random)
-    #[arg(long = "seed")]
+    /// Reproducible seed for sampled block selection (default: random). Accepts decimal or hex (e.g. 0x1a2b).
+    #[arg(long = "seed", value_parser = parse_seed)]
     pub seed: Option<u64>,
 
     /// Automatically confirm cloud egress prompt without interactive confirmation
@@ -585,6 +585,16 @@ impl FsckArgs {
         } else {
             None
         }
+    }
+}
+
+/// Parses a 64-bit integer seed from decimal or hexadecimal format (e.g. `12345` or `0x1a2b`).
+pub fn parse_seed(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if let Some(hex_str) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex_str, 16).map_err(|e| format!("invalid hex seed '{s}': {e}"))
+    } else {
+        s.parse::<u64>().map_err(|e| format!("invalid seed '{s}': {e}"))
     }
 }
 
@@ -712,5 +722,29 @@ mod tests {
         assert_eq!(args_sampled.remotes, vec!["aws".to_string(), "wasabi".to_string()]);
         assert_eq!(args_sampled.seed, Some(12345));
         assert!(args_sampled.yes);
+
+        let cli_hex_seed = Cli::parse_from([
+            "appendfs",
+            "fsck",
+            "--verify-data",
+            "--seed",
+            "0x000000000000002a",
+            "/path/to/log",
+        ]);
+        let Commands::Fsck(args_hex_seed) = cli_hex_seed.command else {
+            panic!("expected Fsck command");
+        };
+        assert_eq!(args_hex_seed.seed, Some(42));
+    }
+
+    #[test]
+    fn test_parse_seed() {
+        assert_eq!(parse_seed("12345").unwrap(), 12345);
+        assert_eq!(parse_seed("0").unwrap(), 0);
+        assert_eq!(parse_seed("0x2a").unwrap(), 42);
+        assert_eq!(parse_seed("0X2A").unwrap(), 42);
+        assert_eq!(parse_seed(" 0x1234abcd5678ef01 ").unwrap(), 0x1234abcd5678ef01);
+        assert!(parse_seed("not_a_number").is_err());
+        assert!(parse_seed("0xnot_hex").is_err());
     }
 }
