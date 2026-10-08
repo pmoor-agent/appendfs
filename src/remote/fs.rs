@@ -171,25 +171,6 @@ impl RemoteStore for LocalDirRemoteStore {
         let _ = fs::remove_file(&md5_path);
         Ok(())
     }
-
-    fn has_sidecar_checksums(&self) -> bool {
-        true
-    }
-
-    fn compute_object_md5(&self, key: &str) -> io::Result<[u8; 16]> {
-        let file_path = self.root.join(key);
-        let mut file = File::open(&file_path)?;
-        let mut hasher = md5::Context::new();
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.consume(&buf[..n]);
-        }
-        Ok(hasher.compute().0)
-    }
 }
 
 #[cfg(test)]

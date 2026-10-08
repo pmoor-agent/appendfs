@@ -146,14 +146,6 @@ impl RemoteStore for LatencyRemoteStore {
         self.apply_delay("delete_object", 0);
         self.inner.delete_object(key)
     }
-
-    fn has_sidecar_checksums(&self) -> bool {
-        self.inner.has_sidecar_checksums()
-    }
-
-    fn compute_object_md5(&self, key: &str) -> io::Result<[u8; 16]> {
-        self.inner.compute_object_md5(key)
-    }
 }
 
 #[cfg(test)]

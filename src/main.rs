@@ -847,7 +847,14 @@ fn cmd_fsck(args: FsckArgs) {
                     .get(remote_name)
                     .cloned()
                     .unwrap_or_else(|| remote_cfg.build_store());
-                let remote_rep = check_remote_integrity(store.as_ref(), remote_name, &manifest, &check_options);
+                let remote_opts = if remote_cfg.path.is_some()
+                    || remote_cfg.endpoint.as_deref().unwrap_or("").starts_with("file://")
+                {
+                    check_options.clone()
+                } else {
+                    CheckOptions::metadata_only()
+                };
+                let remote_rep = check_remote_integrity(store.as_ref(), remote_name, &manifest, &remote_opts);
                 combined_report.merge(remote_rep);
             }
         }

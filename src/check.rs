@@ -1635,6 +1635,22 @@ struct RemoteFileCandidate {
     sidecar_md5: Option<[u8; 16]>,
 }
 
+fn compute_remote_object_md5(remote: &dyn crate::remote::RemoteStore, key: &str) -> std::io::Result<[u8; 16]> {
+    let mut hasher = md5::Context::new();
+    struct Md5Writer<'a>(&'a mut md5::Context);
+    impl<'a> std::io::Write for Md5Writer<'a> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.consume(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    remote.get_object(key, &mut Md5Writer(&mut hasher))?;
+    Ok(hasher.compute().0)
+}
+
 fn verify_remote_sidecar_files_md5(
     remote: &dyn crate::remote::RemoteStore,
     remote_name: &str,
@@ -1689,7 +1705,15 @@ fn verify_remote_sidecar_files_md5(
     };
 
     for candidate in selected {
-        match remote.compute_object_md5(&candidate.filename) {
+        let sidecar_md5 = candidate.sidecar_md5.or_else(|| {
+            remote
+                .head_object(&candidate.filename)
+                .ok()
+                .flatten()
+                .and_then(|o| o.etag_md5())
+        });
+
+        match compute_remote_object_md5(remote, &candidate.filename) {
             Ok(computed_md5) => {
                 if computed_md5 != candidate.expected_md5 {
                     report.issues.push(IntegrityIssue::error(
@@ -1703,7 +1727,7 @@ fn verify_remote_sidecar_files_md5(
                             hex::encode(computed_md5)
                         ),
                     ));
-                } else if let Some(sidecar_md5) = candidate.sidecar_md5
+                } else if let Some(sidecar_md5) = sidecar_md5
                     && sidecar_md5 != computed_md5
                 {
                     report.issues.push(IntegrityIssue::error(
@@ -1738,8 +1762,8 @@ fn verify_remote_sidecar_files_md5(
 
 /// Verifies that objects on a remote store match the authenticated sizes and MD5 digests in the summary manifest.
 ///
-/// When `options.verify_data` is true and the store uses sidecar checksum files (`has_sidecar_checksums`),
-/// also verifies that actual on-disk file bytes match the expected MD5 on a sampled percentage of files.
+/// When `options.verify_data` is true, also verifies that actual on-disk file bytes match the expected MD5
+/// on a sampled percentage of files.
 pub fn check_remote_integrity(
     remote: &dyn crate::remote::RemoteStore,
     remote_name: &str,
@@ -1841,7 +1865,7 @@ pub fn check_remote_integrity(
         }
     }
 
-    if options.verify_data && remote.has_sidecar_checksums() {
+    if options.verify_data {
         verify_remote_sidecar_files_md5(remote, remote_name, &candidates, options, &mut report);
     }
 
