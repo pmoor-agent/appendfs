@@ -1127,7 +1127,12 @@ impl RemoteReplicationWorker {
 
                         match md5_res {
                             Ok(sum_md5) => {
-                                log::info!("Syncing summary {} to remote '{}'...", sum_file, r.name);
+                                log::info!(
+                                    "Syncing summary {} ({} bytes) to remote '{}'...",
+                                    sum_file,
+                                    local_len,
+                                    r.name
+                                );
                                 match upload_storage_file(storage.as_ref(), r.store.as_ref(), sum_file, Some(sum_md5)) {
                                     Ok(()) => sync_succeeded = true,
                                     Err(e) => {
