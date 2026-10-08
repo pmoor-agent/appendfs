@@ -847,8 +847,9 @@ fn cmd_fsck(args: FsckArgs) {
                     .get(remote_name)
                     .cloned()
                     .unwrap_or_else(|| remote_cfg.build_store());
-                let remote_opts = if remote_cfg.path.is_some()
-                    || remote_cfg.endpoint.as_deref().unwrap_or("").starts_with("file://")
+                let remote_opts = if (remote_cfg.path.is_some()
+                    || remote_cfg.endpoint.as_deref().unwrap_or("").starts_with("file://"))
+                    && remote_cfg.mode.is_readable()
                 {
                     check_options.clone()
                 } else {
@@ -861,17 +862,20 @@ fn cmd_fsck(args: FsckArgs) {
     }
 
     // 2. Pre-flight check & confirmation for sampled / full remote verification
-    if check_options.verify_data {
-        let plan = plan_sampled_verification(&fs, &check_options);
-        let egress_bytes = plan.total_remote_egress_bytes(&manifest);
+    let plan = if check_options.verify_data {
+        let p = plan_sampled_verification(&fs, &check_options);
+        let egress_bytes = p.total_remote_egress_bytes(&manifest);
 
         if egress_bytes > 0 && !args.yes {
-            confirm_remote_egress(&plan, &manifest);
+            confirm_remote_egress(&p, &manifest);
         }
-    }
+        Some(p)
+    } else {
+        None
+    };
 
     // 3. Run filesystem integrity check (Pass 0-4 + sampled verification)
-    let fs_report = check_fs_integrity(&fs, Some(log_dir), &check_options);
+    let fs_report = check_fs_integrity(&fs, Some(log_dir), &check_options, plan.as_ref());
     combined_report.merge(fs_report);
 
     print!("{}", combined_report.format_report(Some(log_dir), args.verbose > 0));
