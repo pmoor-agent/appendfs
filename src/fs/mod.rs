@@ -283,8 +283,8 @@ pub enum FlushReason {
     /// An explicit sync point: `quiesce`, and through it unmount, summary export, and the
     /// one-shot CLI tools.
     Quiesce,
-    /// The flusher's inactivity tick, with nobody waiting.
-    Inactivity,
+    /// The flusher's periodic tick, with nobody waiting.
+    Periodic,
     /// Staged bytes or ops in `live` reached the configured flush thresholds.
     Threshold,
 }
@@ -295,7 +295,7 @@ impl FlushReason {
         FlushReason::Fsync,
         FlushReason::Fsyncdir,
         FlushReason::Quiesce,
-        FlushReason::Inactivity,
+        FlushReason::Periodic,
         FlushReason::Threshold,
     ];
 
@@ -305,7 +305,7 @@ impl FlushReason {
             FlushReason::Fsync => 0,
             FlushReason::Fsyncdir => 1,
             FlushReason::Quiesce => 2,
-            FlushReason::Inactivity => 3,
+            FlushReason::Periodic => 3,
             FlushReason::Threshold => 4,
         }
     }
@@ -315,7 +315,7 @@ impl FlushReason {
             FlushReason::Fsync => "fsync",
             FlushReason::Fsyncdir => "fsyncdir",
             FlushReason::Quiesce => "quiesce",
-            FlushReason::Inactivity => "inactivity",
+            FlushReason::Periodic => "periodic",
             FlushReason::Threshold => "threshold",
         }
     }
@@ -458,6 +458,8 @@ pub struct FsInner {
     /// Completion handle for whatever is currently in `live`, travelling with the data when
     /// it is frozen. Lets a waiter register before the batch it will belong to exists.
     pub live_completion: BatchCompletion,
+    /// Monotonic timestamp when mutations were first staged into the current `live` layer.
+    pub live_staged_at: Option<Duration>,
     /// Set when someone needs `live` flushed regardless of how little is staged, recording
     /// why. Taken by the freeze that honors it, which stamps the reason onto the batch.
     ///
@@ -533,7 +535,10 @@ impl FsInner {
     }
 
     /// Records a mutation of `additional_bytes` and increments staged operation count by 1.
-    pub fn record_mutation(&mut self, additional_bytes: usize) {
+    pub fn record_mutation(&mut self, additional_bytes: usize, now: Duration) {
+        if self.live_staged_at.is_none() {
+            self.live_staged_at = Some(now);
+        }
         self.staged_bytes += additional_bytes;
         self.staged_ops += 1;
     }
@@ -572,11 +577,16 @@ impl FsInner {
             return false;
         }
         if !self.live.is_empty() {
+            debug_assert!(
+                self.live_staged_at.is_some(),
+                "live mutations must have live_staged_at set by record_mutation"
+            );
             let entries = std::mem::take(&mut self.live);
             let chunk_size = self.live_arena.chunk_size;
             let arena = std::mem::replace(&mut self.live_arena, WriteArena::with_chunk_size(chunk_size));
             let bytes = self.staged_bytes;
             let ops = self.staged_ops;
+            self.live_staged_at = None;
             self.staged_bytes = 0;
             self.staged_ops = 0;
             self.flushing_bytes += bytes;
@@ -710,14 +720,19 @@ pub struct FsInnerGuard<'a> {
     guard: ActionGuard<'a, FsInner>,
     fs: &'a InMemoryFS,
     mutation_occurred: bool,
+    first_staged: bool,
 }
 
 impl<'a> FsInnerGuard<'a> {
     /// Records a mutation of `additional_bytes`, increments staged operation count by 1,
     /// and flags that a mutation occurred in this lock session.
     pub fn record_mutation(&mut self, additional_bytes: usize) {
-        self.guard.record_mutation(additional_bytes);
+        let first = self.guard.live_staged_at.is_none();
+        self.guard.record_mutation(additional_bytes, self.fs.clock.monotonic());
         self.mutation_occurred = true;
+        if first {
+            self.first_staged = true;
+        }
     }
 
     /// Parks a task to be executed immediately after the mutex lock is released.
@@ -773,6 +788,9 @@ impl<'a> Drop for FsInnerGuard<'a> {
                 let fs = self.fs;
                 self.guard.defer(move || fs.wake_flusher());
             }
+        } else if self.first_staged && self.fs.flusher.is_background() {
+            let fs = self.fs;
+            self.guard.defer(move || fs.wake_flusher());
         }
         self.fs.sync_pushback_saturation(&self.guard);
     }
@@ -915,6 +933,7 @@ impl InMemoryFS {
             live: HashMap::new(),
             live_arena: WriteArena::new(),
             live_completion: BatchCompletion::new(),
+            live_staged_at: None,
             freeze_requested: None,
             handles: HashMap::new(),
             open_counts: HashMap::new(),
@@ -983,6 +1002,7 @@ impl InMemoryFS {
             guard: self.inner.lock(tag).unwrap(),
             fs: self,
             mutation_occurred: false,
+            first_staged: false,
         }
     }
 
@@ -1355,7 +1375,7 @@ mod tests {
         // column after it.
         assert_eq!(format!("{:<11}|", FlushReason::Fsync), "fsync      |");
         assert_eq!(format!("{:>11}|", FlushReason::Quiesce), "    quiesce|");
-        assert_eq!(format!("{}", FlushReason::Inactivity), "inactivity");
+        assert_eq!(format!("{}", FlushReason::Periodic), "periodic");
     }
 
     #[test]

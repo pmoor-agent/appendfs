@@ -127,6 +127,7 @@ impl InMemoryFS {
                         && attr.nlink == 0
                     {
                         inner.tombstone(ino);
+                        inner.record_mutation(0);
                     }
                     true
                 } else {
