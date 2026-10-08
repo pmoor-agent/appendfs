@@ -1,3 +1,5 @@
+// Drives the mounted filesystem through raw syscalls that std does not expose.
+#![allow(unsafe_code)]
 use std::process::Command;
 use tempfile::TempDir;
 

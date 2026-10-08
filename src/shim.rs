@@ -1101,6 +1101,11 @@ pub trait Filesystem {
     fn removexattr(&self, ino: u64, name: &str) -> Result<FuseResponse<'static>, FsError>;
 }
 
+/// Real uid and gid of the calling process.
+pub fn current_uid_gid() -> (u32, u32) {
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
 #[inline]
 fn c_str_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
     if ptr.is_null() {

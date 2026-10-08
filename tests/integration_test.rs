@@ -1,3 +1,5 @@
+// Drives the mounted filesystem through raw syscalls that std does not expose.
+#![allow(unsafe_code)]
 mod common;
 use appendfs::Clock;
 use appendfs::storage::{MemoryStorage, OsStorage, Storage};

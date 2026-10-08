@@ -885,8 +885,7 @@ impl InMemoryFS {
 
     pub fn with_clock_and_log(clock: Arc<dyn Clock>, log_writer: Option<Arc<LogWriter>>) -> Self {
         let mut map = HashMap::new();
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
+        let (uid, gid) = crate::shim::current_uid_gid();
         let now = clock.now();
 
         // Start with only the root directory (Inode 1), which is empty, nlink is 2 (parent entry and '.' link)
