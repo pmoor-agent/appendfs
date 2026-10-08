@@ -7,6 +7,7 @@
 // freezing and folding batches underneath the workers, which a single-threaded fuzz test
 // structurally cannot exercise.
 mod common;
+use appendfs::FsTestExt;
 use appendfs::InMemoryFS;
 use appendfs::LogWriter;
 use appendfs::clock::{Clock, SystemClock};
@@ -17,7 +18,7 @@ use appendfs::operations::dir::{list_dir_core, mkdir_core, opendir_core, release
 use appendfs::operations::links::{link_core, readlink_core, rename_core, symlink_core, unlink_core};
 use appendfs::operations::locks::{flock_core, getlk_core, setlk_core};
 use appendfs::operations::read_write::{
-    FUSE_SET_ATTR_SIZE, create_core, getattr_core, open_core, read_core, release_core, setattr_core, write_core,
+    FUSE_SET_ATTR_SIZE, create_core, getattr_core, open_core, release_core, setattr_core,
 };
 use appendfs::operations::xattr::{getxattr_core, listxattr_core, removexattr_core, setxattr_core};
 use appendfs::shim::{FileType, ShimFlock};
@@ -90,21 +91,21 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                 let name = FILE_NAMES[rng.gen_range(0, FILE_NAMES.len() - 1)];
                 if let Ok(attr) = create_core(&fs, dir_a, name, 0o644, 0, UID, GID) {
                     let data = vec![b'x'; rng.gen_range(1, 64)];
-                    let _ = write_core(&fs, attr.ino, &data, 0);
+                    let _ = fs.write_at(attr.ino, &data, 0);
                 }
             }
             2 => {
                 if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng) {
                     let data = vec![b'y'; rng.gen_range(1, 64)];
                     let offset = rng.gen_range(0, 128) as i64;
-                    let _ = write_core(&fs, ino, &data, offset);
+                    let _ = fs.write_at(ino, &data, offset);
                 }
             }
             3 => {
                 if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
                     && let Ok(fh) = open_core(&fs, ino, 0)
                 {
-                    let _ = read_core(&fs, ino, fh, 0, 64);
+                    let _ = fs.read_blocking(ino, fh, 0, 64);
                     let _ = release_core(&fs, ino, fh);
                 }
             }
@@ -152,7 +153,7 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                 {
                     let offset = rng.gen_range(0, 128) as i64;
                     let size = rng.gen_range(1, 128 * 1024);
-                    let _ = read_core(&fs, ino, fh, offset, size);
+                    let _ = fs.read_blocking(ino, fh, offset, size);
                     let _ = release_core(&fs, ino, fh);
                 }
             }

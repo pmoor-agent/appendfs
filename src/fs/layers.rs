@@ -659,6 +659,7 @@ mod tests {
     use super::*;
     use crate::extent_map::{Extent, ExtentMap};
     use crate::fs::{FlushBatch, WriteArena};
+    use crate::test_utils::FsTestExt;
 
     #[test]
     fn test_get_attr_across_layers() {
@@ -695,7 +696,7 @@ mod tests {
     fn test_plan_read_file_data_staged_and_holes() {
         let fs = InMemoryFS::new();
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, attr.ino, &[0xAA; 100], 0).unwrap();
+        fs.write_at(attr.ino, &[0xAA; 100], 0).unwrap();
         crate::operations::read_write::fallocate_core(
             &fs,
             attr.ino,
@@ -949,16 +950,16 @@ mod tests {
         let data3 = vec![0x33u8; 200];
         let data4 = vec![0x44u8; 200];
 
-        crate::operations::read_write::write_core(&fs, attr.ino, &data1, 0).unwrap();
+        fs.write_at(attr.ino, &data1, 0).unwrap();
         fs.quiesce().unwrap();
 
-        crate::operations::read_write::write_core(&fs, attr.ino, &data2, 200).unwrap();
+        fs.write_at(attr.ino, &data2, 200).unwrap();
         fs.quiesce().unwrap();
 
-        crate::operations::read_write::write_core(&fs, attr.ino, &data3, 400).unwrap();
+        fs.write_at(attr.ino, &data3, 400).unwrap();
         fs.quiesce().unwrap();
 
-        crate::operations::read_write::write_core(&fs, attr.ino, &data4, 600).unwrap();
+        fs.write_at(attr.ino, &data4, 600).unwrap();
         fs.quiesce().unwrap();
 
         // Clear decrypted record cache to force actual cold disk decoding
@@ -1116,7 +1117,7 @@ mod tests {
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "single_cold.bin", 0o644, 0, 1000, 1000).unwrap();
         let payload = vec![0xEFu8; 1024];
-        crate::operations::read_write::write_core(&fs, attr.ino, &payload, 0).unwrap();
+        fs.write_at(attr.ino, &payload, 0).unwrap();
         fs.quiesce().unwrap();
 
         // Evict from decrypted cache to force single cold disk direct read

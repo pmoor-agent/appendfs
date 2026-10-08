@@ -120,7 +120,8 @@ mod tests {
     use crate::error::FsError;
     use crate::operations::dir::{iter_dir_entries, list_dir_core};
     use crate::operations::links::{rename_core, unlink_core};
-    use crate::operations::read_write::{create_core, fallocate_core, read_core, setattr_core, write_core};
+    use crate::operations::read_write::{create_core, fallocate_core, setattr_core};
+    use crate::test_utils::FsTestExt;
 
     #[test]
     fn test_virtual_file_registry_crud() {
@@ -163,31 +164,28 @@ mod tests {
         assert!(fh2 > 0);
 
         // 3. Read sequentially through each handle: yields frozen content
-        let data1 = read_core(&fs, v_ino, fh1, 0, 100).unwrap().into_bytes().unwrap();
+        let data1 = fs.read_blocking(v_ino, fh1, 0, 100).unwrap();
         assert_eq!(data1, b"counter: 0\n");
-        let data2 = read_core(&fs, v_ino, fh2, 0, 100).unwrap().into_bytes().unwrap();
+        let data2 = fs.read_blocking(v_ino, fh2, 0, 100).unwrap();
         assert_eq!(data2, b"counter: 1\n");
 
         // 4. Invalid handle returns EBADF
-        assert_eq!(read_core(&fs, v_ino, 9999, 0, 100), Err(FsError::EBADF));
+        assert_eq!(fs.read_blocking(v_ino, 9999, 0, 100), Err(FsError::EBADF));
 
         // 5. Open a third handle: freezes counter = 2
         let fh3 = fs.open_file_handle(v_ino, 0);
-        let data3 = read_core(&fs, v_ino, fh3, 0, 100).unwrap().into_bytes().unwrap();
+        let data3 = fs.read_blocking(v_ino, fh3, 0, 100).unwrap();
         assert_eq!(data3, b"counter: 2\n");
         fs.release_file_handle(fh3, v_ino).unwrap();
 
         // 5. Release fh1: handle is freed and subsequent read returns EBADF
         fs.release_file_handle(fh1, v_ino).unwrap();
-        assert_eq!(read_core(&fs, v_ino, fh1, 0, 100), Err(FsError::EBADF));
+        assert_eq!(fs.read_blocking(v_ino, fh1, 0, 100), Err(FsError::EBADF));
         // fh2 remains untouched
-        assert_eq!(
-            read_core(&fs, v_ino, fh2, 0, 100).unwrap().into_bytes().unwrap(),
-            b"counter: 1\n"
-        );
+        assert_eq!(fs.read_blocking(v_ino, fh2, 0, 100).unwrap(), b"counter: 1\n");
 
         fs.release_file_handle(fh2, v_ino).unwrap();
-        assert_eq!(read_core(&fs, v_ino, fh2, 0, 100), Err(FsError::EBADF));
+        assert_eq!(fs.read_blocking(v_ino, fh2, 0, 100), Err(FsError::EBADF));
     }
 
     #[test]
@@ -260,7 +258,7 @@ mod tests {
         let v_ino = fs.virtual_files.get_ino_by_name(".remotes").unwrap();
 
         // 1. Writes are rejected with EPERM
-        assert_eq!(write_core(&fs, v_ino, b"mutate", 0), Err(FsError::EPERM));
+        assert_eq!(fs.write_at(v_ino, b"mutate", 0), Err(FsError::EPERM));
 
         // 2. Setattr is rejected with EPERM
         assert_eq!(
@@ -318,7 +316,7 @@ mod tests {
 
         // 9. Status virtual file has identical mutation protections
         let status_ino = fs.virtual_files.get_ino_by_name(".status").unwrap();
-        assert_eq!(write_core(&fs, status_ino, b"mutate", 0), Err(FsError::EPERM));
+        assert_eq!(fs.write_at(status_ino, b"mutate", 0), Err(FsError::EPERM));
         assert_eq!(unlink_core(&fs, 1, ".status"), Err(FsError::EPERM));
         assert_eq!(rename_core(&fs, 1, ".status", 1, "renamed.txt"), Err(FsError::EPERM));
     }
@@ -330,9 +328,9 @@ mod tests {
 
         let v_ino = fs.lookup_child(1, ".remotes").unwrap();
 
-        // Check unconfigured default via read_core
+        // Check unconfigured default via read_blocking
         let fh1 = fs.open_file_handle(v_ino, 0);
-        let initial_bytes = read_core(&fs, v_ino, fh1, 0, 4096).unwrap().into_bytes().unwrap();
+        let initial_bytes = fs.read_blocking(v_ino, fh1, 0, 4096).unwrap();
         let initial_status = String::from_utf8(initial_bytes).unwrap();
         fs.release_file_handle(fh1, v_ino).unwrap();
         assert!(initial_status.contains("No remotes configured."));
@@ -374,7 +372,7 @@ mod tests {
         }
 
         let fh2 = fs.open_file_handle(v_ino, 0);
-        let updated_bytes = read_core(&fs, v_ino, fh2, 0, 4096).unwrap().into_bytes().unwrap();
+        let updated_bytes = fs.read_blocking(v_ino, fh2, 0, 4096).unwrap();
         let updated_status = String::from_utf8(updated_bytes).unwrap();
         fs.release_file_handle(fh2, v_ino).unwrap();
 

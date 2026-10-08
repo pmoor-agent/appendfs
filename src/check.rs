@@ -2025,6 +2025,7 @@ mod tests {
     use crate::extent_map::ExtentMap;
     use crate::log::LogWriter;
     use crate::node::{InodeMeta, Node, NodeKind};
+    use crate::test_utils::FsTestExt;
     use std::sync::Arc;
 
     #[test]
@@ -2062,7 +2063,7 @@ mod tests {
         // Create dir, file, symlink, hardlink
         let d = crate::operations::dir::mkdir_core(&fs, 1, "mydir", 0o755, 1000, 1000).unwrap();
         let f = crate::operations::read_write::create_core(&fs, d.ino, "file.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f.ino, b"hello integrity checker", 0).unwrap();
+        fs.write_at(f.ino, b"hello integrity checker", 0).unwrap();
         let _s = crate::operations::links::symlink_core(&fs, 1, "link_to_file", "mydir/file.txt", 1000, 1000).unwrap();
         let _h = crate::operations::links::link_core(&fs, f.ino, 1, "hardlink.txt").unwrap();
 
@@ -2125,7 +2126,7 @@ mod tests {
         for i in 0..3 {
             let f =
                 crate::operations::read_write::create_core(&fs, 1, &format!("f{}", i), 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f.ino, &vec![b'x'; 1000 * (i + 1)], 0).unwrap();
+            fs.write_at(f.ino, &vec![b'x'; 1000 * (i + 1)], 0).unwrap();
         }
         fs.quiesce().unwrap();
 
@@ -2310,7 +2311,7 @@ mod tests {
         fs.set_storage(storage.clone());
 
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f.ino, b"small payload", 0).unwrap();
+        fs.write_at(f.ino, b"small payload", 0).unwrap();
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
 
@@ -2379,7 +2380,7 @@ mod tests {
         fs.set_storage(storage);
 
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f.ino, b"small payload", 0).unwrap();
+        fs.write_at(f.ino, b"small payload", 0).unwrap();
         fs.quiesce().unwrap();
 
         // Inject extent with record_size smaller than RECORD_HEADER_SIZE (32 bytes)
@@ -2447,7 +2448,7 @@ mod tests {
         fs.set_storage(storage);
 
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f.ino, b"small payload", 0).unwrap();
+        fs.write_at(f.ino, b"small payload", 0).unwrap();
         fs.quiesce().unwrap();
 
         // Inject extent with record_size 0 at record_log_offset 0 (which previously caused underflow in planner)
@@ -2601,7 +2602,7 @@ mod tests {
         fs.log_writer = Some(writer);
 
         let f = crate::operations::read_write::create_core(&fs, 1, "data.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f.ino, b"original clean payload bytes", 0).unwrap();
+        fs.write_at(f.ino, b"original clean payload bytes", 0).unwrap();
         fs.quiesce().unwrap();
 
         // 1. Initial check must be clean
@@ -2713,7 +2714,7 @@ mod tests {
             let name = format!("file_{}.txt", i);
             let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
             let payload = vec![(i as u8) + 1; 300_000];
-            crate::operations::read_write::write_core(&fs, f.ino, &payload, 0).unwrap();
+            fs.write_at(f.ino, &payload, 0).unwrap();
         }
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
@@ -2767,17 +2768,17 @@ mod tests {
         for i in 0..4 {
             let name = format!("blk0_file_{}.txt", i);
             let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f.ino, &vec![b'A' + i; 10_000], 0).unwrap();
+            fs.write_at(f.ino, &vec![b'A' + i; 10_000], 0).unwrap();
         }
         // Write a 1.5 MiB file to advance into block 1 and block 2
         let filler = crate::operations::read_write::create_core(&fs, 1, "filler.bin", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, filler.ino, &vec![b'X'; 1_500_000], 0).unwrap();
+        fs.write_at(filler.ino, &vec![b'X'; 1_500_000], 0).unwrap();
 
         // In block 2, create 3 small files
         for i in 0..3 {
             let name = format!("blk2_file_{}.txt", i);
             let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f.ino, &vec![b'B' + i; 10_000], 0).unwrap();
+            fs.write_at(f.ino, &vec![b'B' + i; 10_000], 0).unwrap();
         }
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
@@ -2887,7 +2888,7 @@ mod tests {
         fs.set_storage(storage.clone());
 
         let f = crate::operations::read_write::create_core(&fs, 1, "cloud_file.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f.ino, b"cloud data content verification", 0).unwrap();
+        fs.write_at(f.ino, b"cloud data content verification", 0).unwrap();
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
 
@@ -3015,7 +3016,7 @@ mod tests {
             let f =
                 crate::operations::read_write::create_core(&fs, 1, &format!("dist_{}.txt", i), 0o644, 0, 1000, 1000)
                     .unwrap();
-            crate::operations::read_write::write_core(&fs, f.ino, &vec![0xAA; 300_000], 0).unwrap();
+            fs.write_at(f.ino, &vec![0xAA; 300_000], 0).unwrap();
         }
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
@@ -3133,7 +3134,7 @@ mod tests {
             let file =
                 crate::operations::read_write::create_core(&fs, 1, &format!("file_{}.dat", i), 0o644, 0, 1000, 1000)
                     .unwrap();
-            crate::operations::read_write::write_core(&fs, file.ino, &chunk, 0).unwrap();
+            fs.write_at(file.ino, &chunk, 0).unwrap();
         }
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
@@ -3191,7 +3192,7 @@ mod tests {
         fs.set_storage(storage.clone());
 
         let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, file.ino, b"hello world data", 0).unwrap();
+        fs.write_at(file.ino, b"hello world data", 0).unwrap();
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
 
@@ -3312,7 +3313,7 @@ mod tests {
         fs.set_storage(storage.clone());
 
         let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, file.ino, b"crucial data that must not rot", 0).unwrap();
+        fs.write_at(file.ino, b"crucial data that must not rot", 0).unwrap();
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
 
@@ -3508,13 +3509,13 @@ mod tests {
             let f1 =
                 crate::operations::read_write::create_core(&fs, 1, &format!("gen{}_f1.bin", g), 0o644, 0, 1000, 1000)
                     .unwrap();
-            crate::operations::read_write::write_core(&fs, f1.ino, &vec![g as u8; 100_000], 0).unwrap();
+            fs.write_at(f1.ino, &vec![g as u8; 100_000], 0).unwrap();
 
             let f2 =
                 crate::operations::read_write::create_core(&fs, 1, &format!("gen{}_f2.bin", g), 0o644, 0, 1000, 1000)
                     .unwrap();
             // Advance offset into block 1 (> 1 MiB)
-            crate::operations::read_write::write_core(&fs, f2.ino, &vec![g as u8 + 10; 1_200_000], 0).unwrap();
+            fs.write_at(f2.ino, &vec![g as u8 + 10; 1_200_000], 0).unwrap();
 
             fs.quiesce().unwrap();
             let file_len = storage.file_len(&crate::log::log_filename(g)).unwrap();

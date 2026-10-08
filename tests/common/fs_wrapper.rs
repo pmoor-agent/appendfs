@@ -1,4 +1,5 @@
 use appendfs::FsError;
+use appendfs::FsTestExt;
 use appendfs::InMemoryFS;
 use appendfs::clock::{Clock, SystemClock};
 use appendfs::crypto::VolumeKey;
@@ -13,7 +14,7 @@ use std::time::SystemTime;
 
 /// Per-inode snapshot entry produced by `TestFS::get_tree_snapshot` - built entirely
 /// from the same core handlers real FUSE dispatch uses (`getattr_core`, `list_dir_core`,
-/// `readlink_core`, `read_core`), never by reading `fs.inodes` directly.
+/// `readlink_core`, `FsTestExt::read_blocking`), never by reading `fs.inodes` directly.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum SnapshotNode {
@@ -305,19 +306,15 @@ impl TestFS {
     }
 
     pub fn write(&self, ino: u64, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        appendfs::operations::read_write::write_core(&self.fs, ino, buf, offset as i64)
+        self.fs.write_at(ino, buf, offset as i64)
     }
 
     pub fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        let fh = self.open(ino, libc::O_RDONLY as u32)?;
-        let res = appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset as i64, len);
-        let _ = self.release(ino, fh);
-        res.and_then(|resp| resp.into_bytes().ok_or(FsError::EIO))
+        self.fs.read_at(ino, offset as i64, len)
     }
 
     pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset as i64, len)
-            .and_then(|resp| resp.into_bytes().ok_or(FsError::EIO))
+        self.fs.read_blocking(ino, fh, offset as i64, len)
     }
 
     pub fn read_all(&self, ino: u64) -> Result<Vec<u8>, FsError> {
@@ -326,14 +323,13 @@ impl TestFS {
         let chunk_size = 64 * 1024;
         let mut offset = 0i64;
         let res = loop {
-            match appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset, chunk_size) {
-                Ok(resp) => {
-                    let chunk = resp.as_bytes().unwrap_or_default();
+            match self.fs.read_blocking(ino, fh, offset, chunk_size) {
+                Ok(chunk) => {
                     if chunk.is_empty() {
                         break Ok(result);
                     }
                     let read_len = chunk.len();
-                    result.extend_from_slice(chunk);
+                    result.extend_from_slice(&chunk);
                     if read_len < chunk_size {
                         break Ok(result);
                     }

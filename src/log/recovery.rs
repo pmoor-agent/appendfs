@@ -448,6 +448,7 @@ mod tests {
     use super::*;
     use crate::clock::{AdvancingClock, SystemClock};
     use crate::log::LogWriter;
+    use crate::test_utils::FsTestExt;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -490,13 +491,13 @@ mod tests {
 
         // Batch 2: Create file "file1.txt" inside "step1"
         let f1 = crate::operations::read_write::create_core(&fs, d1.ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f1.ino, b"version 1", 0).unwrap();
+        fs.write_at(f1.ino, b"version 1", 0).unwrap();
         fs.quiesce().unwrap();
         let batch_after_file1 = fs.log_writer.as_ref().unwrap().last_batch_id();
 
         // Batch 3: Create file "file2.txt" inside "step1"
         let f2 = crate::operations::read_write::create_core(&fs, d1.ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f2.ino, b"version 2", 0).unwrap();
+        fs.write_at(f2.ino, b"version 2", 0).unwrap();
         fs.quiesce().unwrap();
 
         // 1. Recover to Latest -> step1, file1.txt, file2.txt all exist
@@ -1068,7 +1069,7 @@ mod tests {
             fs.set_storage(storage.clone());
 
             let f1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f1.ino, b"data1", 0).unwrap();
+            fs.write_at(f1.ino, b"data1", 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000001.summary"));
@@ -1094,7 +1095,7 @@ mod tests {
             fs.set_storage(storage.clone());
 
             let f2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f2.ino, b"data2", 0).unwrap();
+            fs.write_at(f2.ino, b"data2", 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000002.summary"));
@@ -1156,7 +1157,7 @@ mod tests {
             fs.set_storage(storage.clone());
 
             let f1 = crate::operations::read_write::create_core(&fs, 1, "target.txt", 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f1.ino, b"data1", 0).unwrap();
+            fs.write_at(f1.ino, b"data1", 0).unwrap();
             fs.quiesce().unwrap();
             batch_gen1 = fs.log_writer.as_ref().unwrap().last_batch_id();
             fs.export_summary(storage.as_ref()).unwrap();
@@ -1183,7 +1184,7 @@ mod tests {
             fs.set_storage(storage.clone());
 
             let f2 = crate::operations::read_write::create_core(&fs, 1, "future.txt", 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f2.ino, b"data2", 0).unwrap();
+            fs.write_at(f2.ino, b"data2", 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000002.summary"));
@@ -1257,7 +1258,7 @@ mod tests {
             fs.set_storage(storage.clone());
 
             let f1 = crate::operations::read_write::create_core(&fs, 1, "rev0.txt", 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f1.ino, b"data0", 0).unwrap();
+            fs.write_at(f1.ino, b"data0", 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000001.summary"));
@@ -1265,7 +1266,7 @@ mod tests {
 
             // In the same session, write rev1.txt and export another summary
             let f2 = crate::operations::read_write::create_core(&fs, 1, "rev1.txt", 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f2.ino, b"data1", 0).unwrap();
+            fs.write_at(f2.ino, b"data1", 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
 

@@ -1367,6 +1367,7 @@ pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::FsTestExt;
 
     #[test]
     fn test_flush_reason_display_honors_width() {
@@ -1417,14 +1418,14 @@ mod tests {
         assert_eq!(fs.staged_ops(), 1);
 
         // Perform write below threshold (20 bytes: staged_bytes = 28, staged_ops = 2)
-        crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 20], 0).unwrap();
+        fs.write_at(file.ino, &[0xAA; 20], 0).unwrap();
         assert_eq!(fs.flush_queue_depth(), 0);
         assert_eq!(fs.staged_bytes(), 28);
         assert_eq!(fs.staged_ops(), 2);
 
         // Perform write that crosses max_buffer_size (30 bytes: 28 + 30 = 58 >= 50)
-        crate::operations::read_write::write_core(&fs, file.ino, &[0xBB; 30], 20).unwrap();
-        // Guard drop during write_core should have auto-frozen live into flushing queue
+        fs.write_at(file.ino, &[0xBB; 30], 20).unwrap();
+        // Guard drop during write_at should have auto-frozen live into flushing queue
         assert_eq!(fs.flush_queue_depth(), 1);
         assert_eq!(fs.staged_bytes(), 0);
         assert_eq!(fs.staged_ops(), 0);
@@ -1442,7 +1443,7 @@ mod tests {
         assert!(!fs.track_atime, "track_atime should default to false");
 
         let file = crate::operations::read_write::create_core(&fs, 1, "atime_test.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, file.ino, b"data", 0).unwrap();
+        fs.write_at(file.ino, b"data", 0).unwrap();
 
         let initial_attr = fs.get_attr(file.ino).unwrap();
         assert_eq!(initial_attr.atime, crate::clock::unix_to_system_time(1_700_000_000, 0));
@@ -1450,7 +1451,7 @@ mod tests {
         // Advance clock and read with default track_atime = false
         clock.advance(Duration::from_secs(1000));
         let fh = crate::operations::read_write::open_core(&fs, file.ino, libc::O_RDONLY as u32).unwrap();
-        let _ = crate::operations::read_write::read_core(&fs, file.ino, fh, 0, 4).unwrap();
+        let _ = fs.read_blocking(file.ino, fh, 0, 4).unwrap();
         crate::operations::read_write::release_core(&fs, file.ino, fh).unwrap();
 
         let after_read_attr = fs.get_attr(file.ino).unwrap();
@@ -1464,12 +1465,12 @@ mod tests {
         fs_with_atime.track_atime = true;
         let file2 =
             crate::operations::read_write::create_core(&fs_with_atime, 1, "atime2.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs_with_atime, file2.ino, b"data", 0).unwrap();
+        fs_with_atime.write_at(file2.ino, b"data", 0).unwrap();
 
         clock.advance(Duration::from_secs(1000));
         let expected_time = clock.now();
         let fh2 = crate::operations::read_write::open_core(&fs_with_atime, file2.ino, libc::O_RDONLY as u32).unwrap();
-        let _ = crate::operations::read_write::read_core(&fs_with_atime, file2.ino, fh2, 0, 4).unwrap();
+        let _ = fs_with_atime.read_blocking(file2.ino, fh2, 0, 4).unwrap();
         crate::operations::read_write::release_core(&fs_with_atime, file2.ino, fh2).unwrap();
 
         let attr_after_enabled_read = fs_with_atime.get_attr(file2.ino).unwrap();

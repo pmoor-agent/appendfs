@@ -14,22 +14,13 @@
 //! Any subdirectories placed into `tests/fixtures/` are automatically discovered
 //! and tested by `test_all_fixture_versions`.
 
+use appendfs::FsTestExt;
 use appendfs::compat::{
     COMPAT_FSCK_REPORT_FILENAME, CompatFixtureConfig, create_canonical_compat_volume, verify_compat_tree,
 };
-use appendfs::operations::read_write::{create_core, open_core, read_core, release_core, write_core};
+use appendfs::operations::read_write::create_core;
 use appendfs::storage::OsStorage;
 use appendfs::{InMemoryFS, LogWriter, RecoveryTarget, Storage, SummaryReader, recover_fs};
-
-fn read_test(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<u8> {
-    let fh = open_core(fs, ino, libc::O_RDONLY as u32).expect("open file");
-    let data = read_core(fs, ino, fh, offset, size)
-        .expect("read file")
-        .into_bytes()
-        .unwrap();
-    release_core(fs, ino, fh).expect("release file");
-    data
-}
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -96,10 +87,11 @@ pub fn verify_recovery_with_latest_summary_missing(fixture_dir: &Path) {
 
     let new_file = create_core(&fs, 1, "new_after_reconstruction.txt", 0o644, 0, 1000, 1000)
         .expect("create file after reconstruction");
-    write_core(&fs, new_file.ino, b"reconstruction test forward write works!", 0).expect("write after reconstruction");
+    fs.write_at(new_file.ino, b"reconstruction test forward write works!", 0)
+        .expect("write after reconstruction");
     fs.quiesce().expect("flush after reconstruction");
 
-    let read_back = read_test(&fs, new_file.ino, 40, 0);
+    let read_back = fs.read_at(new_file.ino, 0, 40).expect("read file");
     assert_eq!(read_back, b"reconstruction test forward write works!");
 }
 
@@ -150,10 +142,11 @@ pub fn verify_recovery_from_latest_summary_snapshot(fixture_dir: &Path) {
 
     let new_file =
         create_core(&fs, 1, "new_after_summary.txt", 0o644, 0, 1000, 1000).expect("create file after summary");
-    write_core(&fs, new_file.ino, b"summary test forward write works!", 0).expect("write after summary");
+    fs.write_at(new_file.ino, b"summary test forward write works!", 0)
+        .expect("write after summary");
     fs.quiesce().expect("flush after summary");
 
-    let read_back = read_test(&fs, new_file.ino, 33, 0);
+    let read_back = fs.read_at(new_file.ino, 0, 33).expect("read file");
     assert_eq!(read_back, b"summary test forward write works!");
 }
 

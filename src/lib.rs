@@ -80,7 +80,7 @@ pub use storage::{
 };
 pub use sync::{ActionGuard, ActionMutex, OpStatSnapshot, OpTag, PostUnlockQueue};
 #[cfg(any(test, feature = "testing"))]
-pub use test_utils::wait_until;
+pub use test_utils::{FsTestExt, wait_until};
 
 pub fn mount(args: Vec<String>, fs: InMemoryFS) -> Result<(), FsError> {
     shim::mount(args, fs)

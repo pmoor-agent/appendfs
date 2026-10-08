@@ -1115,6 +1115,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
 mod tests {
     use super::*;
     use crate::sync::OpTag;
+    use crate::test_utils::FsTestExt;
     use std::sync::Arc;
 
     #[test]
@@ -1431,7 +1432,7 @@ mod tests {
         crate::operations::links::symlink_core(&fs, 1, "link.txt", "f1.txt", 1000, 1000).unwrap();
 
         // Write some staged data
-        crate::operations::read_write::write_core(&fs, f1.ino, b"hello world staged data", 0).unwrap();
+        fs.write_at(f1.ino, b"hello world staged data", 0).unwrap();
 
         // Open handles
         let fh_file1 = fs.open_file_handle(f1.ino, 0);
@@ -1511,7 +1512,7 @@ mod tests {
     fn test_inode_counts_overlay_layers() {
         use crate::operations::dir::mkdir_core;
         use crate::operations::links::{symlink_core, unlink_core};
-        use crate::operations::read_write::{create_core, write_core};
+        use crate::operations::read_write::create_core;
 
         let fs = InMemoryFS::new();
         // Base state: 1 root directory
@@ -1524,8 +1525,8 @@ mod tests {
         let d1 = mkdir_core(&fs, 1, "d1", 0o755, 1000, 1000).unwrap();
         let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
         let f2 = create_core(&fs, d1.ino, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
-        write_core(&fs, f1.ino, &[0u8; 100], 0).unwrap();
-        write_core(&fs, f2.ino, &[0u8; 50], 0).unwrap();
+        fs.write_at(f1.ino, &[0u8; 100], 0).unwrap();
+        fs.write_at(f2.ino, &[0u8; 50], 0).unwrap();
         symlink_core(&fs, 1, "s1.lnk", "f1.txt", 1000, 1000).unwrap();
 
         let counts_live = fs.inode_counts();
@@ -1547,7 +1548,7 @@ mod tests {
         // In live, unlink f2 and add f3
         unlink_core(&fs, d1.ino, "f2.txt").unwrap();
         let f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
-        write_core(&fs, f3.ino, &[0u8; 30], 0).unwrap();
+        fs.write_at(f3.ino, &[0u8; 30], 0).unwrap();
 
         let counts_mixed = fs.inode_counts();
         assert_eq!(counts_mixed.directories, 2);
