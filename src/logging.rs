@@ -14,6 +14,10 @@
 //! anyway via `/dev/stderr`, or discards via `/dev/null`, which is why there is no separate
 //! flag for either.
 //!
+//! Times are the machine's local time, in file names and records alike, because that is
+//! what whoever reads them is going to compare against. Records carry their UTC offset, so
+//! they stay unambiguous across a daylight saving change and between machines.
+//!
 //! Every run opens with its own command line, so a log identifies what it was for without
 //! being cross-referenced against anything. Credential values are redacted first: several
 //! flags take a secret key as an argument, and a log file is not the place for one.
@@ -26,10 +30,11 @@
 //! Logging never takes the filesystem down: if the file cannot be opened or written, the
 //! mount continues and the records are dropped.
 
+use jiff::Zoned;
+use jiff::tz::TimeZone;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Subdirectory of the volume log directory holding diagnostic logs.
 pub const LOG_SUBDIR: &str = "logs";
@@ -42,25 +47,28 @@ pub fn log_directory(log_dir: &Path) -> PathBuf {
     log_dir.join(LOG_SUBDIR)
 }
 
-/// Names one run's log file: `appendfs-<YYYYMMDD>-<HHMMSS>.<mmm>.log`, which sorts
-/// chronologically.
+/// Names one run's log file: `appendfs-<YYYYMMDD>-<HHMMSS>.<mmm>.log` in the time zone
+/// `started` is in, which sorts chronologically.
 ///
 /// The milliseconds keep two runs started within the same second - `init` followed by
 /// `mount` in a script - in files of their own. A pid would too, but a backgrounded mount
 /// opens its log before libfuse forks it into the daemon, so the pid at hand would be the
 /// parent's, which exits straight away.
-pub fn log_file_name(started: SystemTime) -> String {
-    let millis = started.duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_millis());
-    format!(
-        "appendfs-{}.{:03}.log",
-        crate::clock::format_utc_compact(started),
-        millis
-    )
+///
+/// The name carries no offset, so the hour repeated when daylight saving ends sorts out of
+/// order. The first record inside the file does carry one.
+pub fn log_file_name(started: &Zoned) -> String {
+    started.strftime("appendfs-%Y%m%d-%H%M%S.%3f.log").to_string()
 }
 
 /// The log file for a run starting at `started`.
-pub fn log_file_path(log_dir: &Path, started: SystemTime) -> PathBuf {
+pub fn log_file_path(log_dir: &Path, started: &Zoned) -> PathBuf {
     log_directory(log_dir).join(log_file_name(started))
+}
+
+/// A record's timestamp: RFC 3339 to the millisecond, with its UTC offset.
+fn record_timestamp(now: &Zoned) -> String {
+    now.strftime("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string()
 }
 
 /// A log file that drops records rather than failing.
@@ -111,6 +119,20 @@ impl Write for LogSink {
 /// worth mounting.
 pub fn init(path: &Path, level: &str) -> Option<PathBuf> {
     let builder = &mut env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level));
+    // Resolved once: the system zone's rules already cover daylight saving changes.
+    let tz = TimeZone::system();
+    // env_logger's own layout, but in local time: its built-in timestamps are UTC only.
+    builder.format(move |buf, record| {
+        let now = Zoned::new(jiff::Timestamp::now(), tz.clone());
+        writeln!(
+            buf,
+            "[{} {:<5} {}] {}",
+            record_timestamp(&now),
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
     match LogSink::create(path) {
         Ok(sink) => {
             builder.target(env_logger::Target::Pipe(Box::new(sink))).init();
@@ -132,7 +154,7 @@ pub fn init(path: &Path, level: &str) -> Option<PathBuf> {
 /// Canonicalized because `fuse_daemonize` chdirs to `/` shortly after a mount sets this up.
 pub fn run_log_path(log_dir: &Path) -> PathBuf {
     let root = fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
-    log_file_path(&root, SystemTime::now())
+    log_file_path(&root, &Zoned::now())
 }
 
 /// Whether a flag's value is a credential that must not reach a log file.
@@ -181,21 +203,37 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// 2025-12-17 19:33:20.042 UTC, as seen from a zone `offset_hours` east of it.
+    fn started_at(offset_hours: i8) -> Zoned {
+        let tz = TimeZone::fixed(jiff::tz::offset(offset_hours));
+        jiff::Timestamp::from_millisecond(1_766_000_000_042)
+            .unwrap()
+            .to_zoned(tz)
+    }
+
     #[test]
-    fn test_log_file_name_identifies_the_run() {
-        let started = UNIX_EPOCH + Duration::from_millis(1_766_000_000_042);
-        assert_eq!(log_file_name(started), "appendfs-20251217-193320.042.log");
+    fn test_log_file_name_identifies_the_run_in_local_time() {
+        assert_eq!(log_file_name(&started_at(0)), "appendfs-20251217-193320.042.log");
+        assert_eq!(log_file_name(&started_at(-8)), "appendfs-20251217-113320.042.log");
+        assert_eq!(log_file_name(&started_at(9)), "appendfs-20251218-043320.042.log");
     }
 
     #[test]
     fn test_runs_in_the_same_second_get_files_of_their_own() {
-        let started = UNIX_EPOCH + Duration::from_millis(1_766_000_000_042);
-        let next = started + Duration::from_millis(1);
-        assert_ne!(log_file_name(started), log_file_name(next));
+        let started = started_at(2);
+        let after = |d: Duration| started.checked_add(d).unwrap();
+        let next = after(Duration::from_millis(1));
+        assert_ne!(log_file_name(&started), log_file_name(&next));
 
         // And a later run sorts after an earlier one, across a second boundary too.
-        assert!(log_file_name(started) < log_file_name(next));
-        assert!(log_file_name(started + Duration::from_millis(957)) < log_file_name(started + Duration::from_secs(1)));
+        assert!(log_file_name(&started) < log_file_name(&next));
+        assert!(log_file_name(&after(Duration::from_millis(957))) < log_file_name(&after(Duration::from_secs(1))));
+    }
+
+    #[test]
+    fn test_record_timestamp_is_local_with_its_offset() {
+        assert_eq!(record_timestamp(&started_at(0)), "2025-12-17T19:33:20.042+00:00");
+        assert_eq!(record_timestamp(&started_at(-8)), "2025-12-17T11:33:20.042-08:00");
     }
 
     #[test]
@@ -260,7 +298,7 @@ mod tests {
         // file: `list_files` is non-recursive and file-only, so a subdirectory is invisible.
         let dir = tempfile::tempdir().unwrap();
         let storage = crate::storage::OsStorage::new(dir.path());
-        let path = log_file_path(dir.path(), SystemTime::now());
+        let path = log_file_path(dir.path(), &Zoned::now());
 
         let mut sink = LogSink::create(&path).unwrap();
         sink.write_all(b"a log record\n").unwrap();
@@ -279,15 +317,15 @@ mod tests {
     fn test_a_second_run_leaves_the_first_run_intact() {
         // A crashed run's log has to survive the restart that follows it.
         let dir = tempfile::tempdir().unwrap();
-        let started = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
+        let started = started_at(0);
 
-        let first = log_file_path(dir.path(), started);
+        let first = log_file_path(dir.path(), &started);
         let mut sink = LogSink::create(&first).unwrap();
         sink.write_all(b"from the first run\n").unwrap();
         sink.flush().unwrap();
         drop(sink);
 
-        let second = log_file_path(dir.path(), started + Duration::from_secs(5));
+        let second = log_file_path(dir.path(), &started.checked_add(Duration::from_secs(5)).unwrap());
         let mut sink = LogSink::create(&second).unwrap();
         sink.write_all(b"from the second run\n").unwrap();
         sink.flush().unwrap();
@@ -300,7 +338,7 @@ mod tests {
     fn test_writes_keep_succeeding_after_the_file_is_lost() {
         // A filesystem must not fail because its log file did.
         let dir = tempfile::tempdir().unwrap();
-        let path = log_file_path(dir.path(), SystemTime::now());
+        let path = log_file_path(dir.path(), &Zoned::now());
         let mut sink = LogSink::create(&path).unwrap();
         sink.write_all(b"before\n").unwrap();
         sink.file = None;
