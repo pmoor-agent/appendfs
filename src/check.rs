@@ -271,6 +271,7 @@ impl IntegrityReport {
                     || i.code == "REMOTE_READ_FAILED"
                     || i.code == "REMOTE_CORRUPT_HEADER"
                     || i.code == "REMOTE_UNKNOWN"
+                    || i.code == "REMOTE_WRITE_ONLY"
             })
             .count();
         if extent_issues == 0 {
@@ -410,6 +411,8 @@ pub struct VerificationPlan {
     pub remote_blocks: BTreeMap<String, BTreeMap<u32, BTreeSet<u64>>>,
     /// Which target (None = local, Some(remote_name) = remote) is assigned to verify each sampled record.
     pub record_targets: Vec<(LiveRecord, Option<String>)>,
+    /// Requested remotes that were left out of data verification because they are write-only.
+    pub write_only_remotes: Vec<String>,
 }
 
 impl VerificationPlan {
@@ -709,37 +712,43 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
     let seed = options.seed.unwrap_or_else(rand::random);
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
-    // 4. Resolve target remotes
-    let mut target_remotes = Vec::new();
-    if !options.remotes.is_empty() {
+    // 4. Resolve verification targets (None = local storage, Some(name) = remote). Write-only
+    // remotes cannot be read back; they are recorded so the executor can report them rather than
+    // silently verifying local storage in their place.
+    let mut targets: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut write_only_remotes = Vec::new();
+    let mut write_only_in_all = Vec::new();
+    {
         let reg_opt = fs.remote_registry.read().unwrap().clone();
-        if let Some(reg_arc) = reg_opt {
-            let reg = reg_arc.read().unwrap();
-            if options.remotes.iter().any(|r| r == "all") {
-                target_remotes = reg
-                    .remotes
-                    .iter()
-                    .filter(|(_, cfg)| cfg.mode.is_readable())
-                    .map(|(name, _)| name.clone())
-                    .collect();
-            } else {
-                for r in &options.remotes {
-                    if r == "local" {
-                        target_remotes.push(r.clone());
-                    } else if let Some(cfg) = reg.get_remote(r)
-                        && cfg.mode.is_readable()
-                    {
-                        target_remotes.push(r.clone());
+        let reg = reg_opt.as_ref().map(|r| r.read().unwrap());
+        for r in &options.remotes {
+            if r == "local" {
+                targets.insert(None);
+            } else if r == "all" {
+                for (name, cfg) in reg.iter().flat_map(|reg| reg.remotes.iter()) {
+                    if cfg.mode.is_readable() {
+                        targets.insert(Some(name.clone()));
+                    } else {
+                        write_only_in_all.push(name.clone());
                     }
                 }
-            }
-        } else {
-            for r in &options.remotes {
-                if r != "all" {
-                    target_remotes.push(r.clone());
-                }
+            } else if let Some(cfg) = reg.as_ref().and_then(|reg| reg.get_remote(r))
+                && !cfg.mode.is_readable()
+            {
+                write_only_remotes.push(r.clone());
+            } else {
+                // Unknown remotes are reported as REMOTE_UNKNOWN by the executor.
+                targets.insert(Some(r.clone()));
             }
         }
+    }
+    // `all` quietly skips write-only remotes, unless that leaves nothing to verify.
+    if targets.is_empty() {
+        write_only_remotes.append(&mut write_only_in_all);
+    }
+    // No remotes requested (or `all` with no remotes configured) verifies local storage.
+    if targets.is_empty() && write_only_remotes.is_empty() {
+        targets.insert(None);
     }
 
     // 5. Sample blocks across the entire volume based on total block count
@@ -759,70 +768,62 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
         all_live_blocks
     };
 
-    // 6. Assign selected blocks to eligible targets with boundary expansion for straddling records
+    // 6. Assign selected blocks to targets in contiguous ranges, expanding straddling records.
+    //
+    // The selected blocks (in volume order) are split into one contiguous range per target, so
+    // that blocks are only fetched from two targets where adjacent ranges meet. The ranges are
+    // rotated by a seeded offset, which varies both where the split points fall and which target
+    // reads which part of the volume from one run to the next.
+    let targets: Vec<Option<String>> = targets.into_iter().collect();
+    let rotation = if selected_blocks.is_empty() {
+        0
+    } else {
+        rng.gen_range(0..selected_blocks.len())
+    };
     let mut local_blocks: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
     let mut remote_blocks: BTreeMap<String, BTreeMap<u32, BTreeSet<u64>>> = BTreeMap::new();
-    let mut target_counts: HashMap<Option<String>, usize> = HashMap::new();
-
-    if target_remotes.is_empty() {
-        target_counts.insert(None, 0);
-    } else {
-        for r in &target_remotes {
-            if r == "local" {
-                target_counts.insert(None, 0);
-            } else {
-                target_counts.insert(Some(r.clone()), 0);
-            }
-        }
-    }
 
     let mut fetched_blocks: HashSet<(u32, u64)> = HashSet::new();
 
-    for &(generation, seed_blk) in &selected_blocks {
+    for (i, &(generation, seed_blk)) in selected_blocks.iter().enumerate() {
         if fetched_blocks.contains(&(generation, seed_blk)) {
             continue;
         }
 
-        let mut eligible_targets: Vec<Option<String>> = Vec::new();
-        if target_remotes.is_empty() || target_remotes.iter().any(|r| r == "local") {
+        // Local storage is skipped for generations already pruned locally, unless it is the only target.
+        let local_eligible = targets.len() == 1 || {
             let log_filename = manifest
                 .get_by_generation(generation)
                 .map(|l| l.filename.clone())
                 .unwrap_or_else(|| crate::log::log_filename(generation));
-            let local_has_file = if let Some(ref cache) = fs.log_cache {
-                cache.storage().exists(&log_filename)
-            } else {
-                true
-            };
-            if local_has_file || target_remotes.is_empty() {
-                eligible_targets.push(None);
-            }
-        }
-        for r in &target_remotes {
-            if r != "local" {
-                eligible_targets.push(Some(r.clone()));
-            }
-        }
-        if eligible_targets.is_empty() {
-            eligible_targets.push(None);
-        }
+            fs.log_cache
+                .as_ref()
+                .is_none_or(|cache| cache.storage().exists(&log_filename))
+        };
+        // If the range's target is ineligible, the next target in order takes the block instead.
+        let range = ((i + rotation) % selected_blocks.len()) * targets.len() / selected_blocks.len();
+        let Some(chosen_target) = (0..targets.len())
+            .map(|d| &targets[(range + d) % targets.len()])
+            .find(|t| t.is_some() || local_eligible)
+            .cloned()
+        else {
+            break;
+        };
 
-        let chosen_target = eligible_targets
-            .into_iter()
-            .min_by(|a, b| {
-                let cnt_a = target_counts.get(a).copied().unwrap_or(0);
-                let cnt_b = target_counts.get(b).copied().unwrap_or(0);
-                cnt_a.cmp(&cnt_b).then_with(|| a.cmp(b))
-            })
-            .unwrap();
-
+        // Every record touching the seed block must be fully readable from the chosen target. A
+        // neighbouring block already assigned to a different target is fetched again here, since
+        // a record split across two targets could otherwise never be assembled and verified.
+        let assigned = match &chosen_target {
+            None => local_blocks.get(&generation),
+            Some(name) => remote_blocks.get(name).and_then(|m| m.get(&generation)),
+        };
         let mut blocks_to_add = vec![seed_blk];
         if let Some(straddling_records) = records_by_gen_block.get(&(generation, seed_blk)) {
             for rec in straddling_records {
                 let start_blk = rec.record_log_offset / BLOCK_SIZE;
                 let end_blk = (rec.record_log_offset + rec.record_size as u64).saturating_sub(1) / BLOCK_SIZE;
                 for blk in start_blk..=end_blk {
-                    if !fetched_blocks.contains(&(generation, blk)) && !blocks_to_add.contains(&blk) {
+                    if !assigned.is_some_and(|a| a.contains(&blk)) && !blocks_to_add.contains(&blk) {
                         blocks_to_add.push(blk);
                     }
                 }
@@ -845,7 +846,6 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
                 }
             }
         }
-        *target_counts.entry(chosen_target).or_default() += blocks_to_add.len();
     }
 
     // 7. Find all records whose required blocks are completely covered by fetched blocks
@@ -899,6 +899,7 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
         local_blocks,
         remote_blocks,
         record_targets,
+        write_only_remotes,
     }
 }
 
@@ -910,6 +911,17 @@ pub fn execute_sampled_verification(
     log_dir: Option<&Path>,
     report: &mut IntegrityReport,
 ) {
+    for remote_name in &plan.write_only_remotes {
+        report.issues.push(IntegrityIssue::error(
+            "REMOTE_WRITE_ONLY",
+            None,
+            format!(
+                "Remote '{}' is configured as write-only and cannot be data verified",
+                remote_name
+            ),
+        ));
+    }
+
     if plan.sampled_records.is_empty() {
         report.sample_percent = Some(plan.sample_percent);
         report.seed = Some(plan.seed);
@@ -2851,8 +2863,8 @@ mod tests {
         fs.log_writer = Some(writer);
         fs.set_storage(storage.clone());
 
-        // Create 10 files of 300 KiB each spanning ~3 blocks (blocks 0, 1, 2)
-        for i in 0..10 {
+        // 100 files of 300 KB each: ~29 blocks, with records straddling most block boundaries.
+        for i in 0..100 {
             let f =
                 crate::operations::read_write::create_core(&fs, 1, &format!("dist_{}.txt", i), 0o644, 0, 1000, 1000)
                     .unwrap();
@@ -2862,56 +2874,78 @@ mod tests {
         fs.export_summary(storage.as_ref()).unwrap();
 
         let mut registry = RemoteRegistry::default();
-        let r1 = Arc::new(MockRemoteStore::new());
-        let r2 = Arc::new(MockRemoteStore::new());
         registry.add_remote("r1", RemoteTargetConfig::new("r1"));
         registry.add_remote("r2", RemoteTargetConfig::new("r2"));
-        registry.set_store_override("r1", r1);
-        registry.set_store_override("r2", r2);
+        registry.set_store_override("r1", Arc::new(MockRemoteStore::new()));
+        registry.set_store_override("r2", Arc::new(MockRemoteStore::new()));
         fs.set_remote_registry(Arc::new(std::sync::RwLock::new(registry)));
 
-        // Case 1: --remotes r1,r2 with 100% of blocks
-        // Total blocks = 3. Round robin: blk 0 -> r1, blk 1 -> r2, blk 2 -> r1.
-        // Total sampled blocks is 3 (100% in total, NOT 3 on r1 and 3 on r2).
-        let opts_two_remotes = CheckOptions {
-            verify_data: true,
-            sample_percent: 100.0,
-            remotes: vec!["r1".to_string(), "r2".to_string()],
-            seed: Some(42),
-        };
-        let plan_two = plan_sampled_verification(&fs, &opts_two_remotes);
-        let r1_blocks = plan_two.remote_blocks.get("r1").unwrap().get(&1).unwrap().len();
-        let r2_blocks = plan_two.remote_blocks.get("r2").unwrap().get(&1).unwrap().len();
-        assert_eq!(
-            r1_blocks + r2_blocks,
-            3,
-            "Total blocks across all remotes must equal total volume blocks"
-        );
-        assert_eq!(r1_blocks, 2);
-        assert_eq!(r2_blocks, 1);
-        assert!(
-            plan_two.local_blocks.is_empty(),
-            "Local blocks must be empty when only r1 and r2 requested"
-        );
+        let empty = BTreeSet::new();
+        for (remotes, a, b) in [
+            (["r1", "r2"], Some("r1"), Some("r2")),
+            (["local", "r1"], None, Some("r1")),
+        ] {
+            let blocks_of = |plan: &VerificationPlan, target: Option<&str>| -> BTreeSet<u64> {
+                match target {
+                    None => plan.local_blocks.get(&1).unwrap_or(&empty).clone(),
+                    Some(name) => plan
+                        .remote_blocks
+                        .get(name)
+                        .and_then(|m| m.get(&1))
+                        .unwrap_or(&empty)
+                        .clone(),
+                }
+            };
 
-        // Case 2: --remotes local,r1 with 100% of blocks
-        // Round robin: blk 0 -> local, blk 1 -> r1, blk 2 -> local.
-        let opts_local_remote = CheckOptions {
-            verify_data: true,
-            sample_percent: 100.0,
-            remotes: vec!["local".to_string(), "r1".to_string()],
-            seed: Some(42),
-        };
-        let plan_lr = plan_sampled_verification(&fs, &opts_local_remote);
-        let loc_count = plan_lr.local_blocks.get(&1).unwrap().len();
-        let rem_count = plan_lr.remote_blocks.get("r1").unwrap().get(&1).unwrap().len();
-        assert_eq!(
-            loc_count + rem_count,
-            3,
-            "Total blocks across local + remote must equal total volume blocks"
-        );
-        assert_eq!(loc_count, 2);
-        assert_eq!(rem_count, 1);
+            let mut first_block_owners = BTreeSet::new();
+            for seed in 0..16 {
+                let opts = CheckOptions {
+                    verify_data: true,
+                    sample_percent: 100.0,
+                    remotes: remotes.iter().map(|r| r.to_string()).collect(),
+                    seed: Some(seed),
+                };
+                let plan = plan_sampled_verification(&fs, &opts);
+                assert_eq!(
+                    plan.sampled_records.len(),
+                    plan.total_live_records,
+                    "100% verification must cover every live record ({:?}, seed {})",
+                    remotes,
+                    seed
+                );
+
+                let (blocks_a, blocks_b) = (blocks_of(&plan, a), blocks_of(&plan, b));
+                let unique = blocks_a.union(&blocks_b).count();
+                let total = blocks_a.len() + blocks_b.len();
+                // Each target reads one contiguous range (wrapping around the end of the volume),
+                // so at most one shared block per range edge is read twice.
+                assert!(
+                    total - unique <= 2,
+                    "{:?} seed {}: {} blocks read for {} unique",
+                    remotes,
+                    seed,
+                    total,
+                    unique
+                );
+                for blocks in [&blocks_a, &blocks_b] {
+                    assert!(
+                        blocks.len() * 3 >= unique,
+                        "{:?} seed {}: unbalanced split {:?} / {:?}",
+                        remotes,
+                        seed,
+                        blocks_a,
+                        blocks_b
+                    );
+                }
+                first_block_owners.insert(if blocks_a.contains(&0) { a } else { b });
+            }
+            assert_eq!(
+                first_block_owners.len(),
+                2,
+                "{:?}: the seed must vary which target reads the start of the log",
+                remotes
+            );
+        }
     }
 
     #[test]
@@ -3022,7 +3056,8 @@ mod tests {
         registry.set_store_override("glacier", glacier_store);
         fs.set_remote_registry(Arc::new(std::sync::RwLock::new(registry)));
 
-        // 1. Requesting write-only remote for data verification: planner excludes it from remote blocks
+        // 1. Requesting a write-only remote for data verification is reported, and must not fall
+        // back to verifying local storage instead.
         let opts = CheckOptions {
             verify_data: true,
             sample_percent: 100.0,
@@ -3030,10 +3065,25 @@ mod tests {
             seed: Some(42),
         };
         let plan = plan_sampled_verification(&fs, &opts);
+        assert_eq!(plan.total_blocks(), 0, "Nothing may be verified in place of 'glacier'");
+        assert!(plan.sampled_records.is_empty());
+        assert_eq!(plan.write_only_remotes, vec!["glacier".to_string()]);
+        let report = check_fs_integrity(&fs, None, &opts, None);
         assert!(
-            !plan.remote_blocks.contains_key("glacier"),
-            "Planner must exclude write-only remote 'glacier' from data verification"
+            report.issues.iter().any(|i| i.code == "REMOTE_WRITE_ONLY"),
+            "Must contain REMOTE_WRITE_ONLY error, found: {:?}",
+            report.issues
         );
+        assert!(!report.is_clean());
+
+        // `all` with only write-only remotes configured is reported the same way.
+        let opts_all_write_only = CheckOptions {
+            remotes: vec!["all".to_string()],
+            ..opts.clone()
+        };
+        let plan = plan_sampled_verification(&fs, &opts_all_write_only);
+        assert_eq!(plan.total_blocks(), 0);
+        assert_eq!(plan.write_only_remotes, vec!["glacier".to_string()]);
 
         // 2. Metadata-only verification of write-only remote succeeds (checking manifest against bucket)
         let opts_meta = CheckOptions {
@@ -3070,6 +3120,10 @@ mod tests {
         assert!(
             !plan_all.remote_blocks.contains_key("glacier"),
             "Write-only remote 'glacier' must NOT be sampled"
+        );
+        assert!(
+            plan_all.write_only_remotes.is_empty(),
+            "`all` skips write-only remotes silently while a readable remote remains"
         );
     }
 

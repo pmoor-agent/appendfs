@@ -231,26 +231,16 @@ impl RemoteTargetConfig {
 
     /// Returns true if this remote target is backed by a local directory store (e.g. NFS/SMB NAS share, external drive).
     pub fn is_local_dir(&self) -> bool {
-        self.path.is_some()
-            || self
-                .endpoint
-                .as_deref()
-                .map(|ep| ep.starts_with("file://"))
-                .unwrap_or(false)
+        self.path.is_some() || self.endpoint.as_deref().is_some_and(|ep| ep.starts_with("file://"))
     }
 
     /// Builds an `Arc<dyn RemoteStore>` client for this target.
     pub fn build_store(&self) -> Arc<dyn RemoteStore> {
-        if self.is_local_dir() {
-            if let Some(ref path) = self.path {
-                return Arc::new(crate::remote::LocalDirRemoteStore::new(path));
-            }
-            if let Some(ref ep) = self.endpoint
-                && ep.starts_with("file://")
-            {
-                let local_path = ep.trim_start_matches("file://");
-                return Arc::new(crate::remote::LocalDirRemoteStore::new(local_path));
-            }
+        if let Some(ref path) = self.path {
+            return Arc::new(crate::remote::LocalDirRemoteStore::new(path));
+        }
+        if let Some(local_path) = self.endpoint.as_deref().and_then(|ep| ep.strip_prefix("file://")) {
+            return Arc::new(crate::remote::LocalDirRemoteStore::new(local_path));
         }
 
         let bucket = self.bucket.as_deref().unwrap_or("appendfs-bucket");
