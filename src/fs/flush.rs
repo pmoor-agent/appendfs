@@ -582,15 +582,6 @@ impl InMemoryFS {
         }
     }
 
-    /// Marks `live` for freezing on the next cycle, however little is staged.
-    pub(crate) fn request_freeze(&self, reason: FlushReason) {
-        self.inner
-            .lock(OpTag::Flush)
-            .unwrap()
-            .freeze_requested
-            .get_or_insert(reason);
-    }
-
     /// Asks for a flush cycle: wakes the background thread, or runs one here in inline mode.
     ///
     /// Returns without waiting for the cycle to finish. Callers that need the queue drained
@@ -2782,7 +2773,7 @@ mod tests {
         // Record mutations exceeding max_buffer_size directly on inner
         {
             let mut inner = fs.inner.lock_for_tests().unwrap();
-            inner.record_mutation(90); // 20 + 90 = 110 >= 100
+            inner.record_mutation(90, Duration::ZERO); // 20 + 90 = 110 >= 100
             assert!(fs.freeze_if_due_locked(&mut inner));
         }
         assert_eq!(fs.staged_bytes(), 0);
@@ -2854,7 +2845,7 @@ mod tests {
             (FlushReason::Fsync, "fsync"),
             (FlushReason::Fsyncdir, "fsyncdir"),
             (FlushReason::Quiesce, "quiesce"),
-            (FlushReason::Inactivity, "inactivity"),
+            (FlushReason::Periodic, "periodic"),
             (FlushReason::Threshold, "threshold"),
         ] {
             let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
@@ -2897,9 +2888,9 @@ mod tests {
                     let mut inner = fs.inner.lock_for_tests().unwrap();
                     fs.pending_completion_locked(&mut inner, FlushReason::Quiesce);
                 }
-                FlushReason::Inactivity => {
-                    fs.request_freeze(FlushReason::Inactivity);
+                FlushReason::Periodic => {
                     let mut inner = fs.inner.lock_for_tests().unwrap();
+                    inner.freeze_requested.get_or_insert(FlushReason::Periodic);
                     assert!(fs.freeze_if_due_locked(&mut inner));
                 }
                 // Already frozen by the guard drop when the write crossed the threshold.

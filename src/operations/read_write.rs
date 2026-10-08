@@ -1,6 +1,6 @@
 use crate::error::FsError;
 use crate::extent_map::{Extent, ExtentMap};
-use crate::fs::{FileHandle, FlushReason, FsInner, InMemoryFS, execute_read_plan, is_virtual_ino};
+use crate::fs::{FileHandle, FlushReason, FsInnerGuard, InMemoryFS, execute_read_plan, is_virtual_ino};
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
 use crate::shim::{
     DeferredCompletion, DeferredResult, DeferredToken, FileAttr, FileType, FuseResponse, RequestContext,
@@ -306,7 +306,13 @@ pub fn setattr_core(
 }
 
 /// Internal helper: punches a zero hole in `[offset, offset + len)` within an already-locked `FsInner`.
-fn punch_hole_locked(inner: &mut FsInner, ino: u64, offset: u64, len: u64, now: SystemTime) -> Result<(), FsError> {
+fn punch_hole_locked(
+    inner: &mut FsInnerGuard<'_>,
+    ino: u64,
+    offset: u64,
+    len: u64,
+    now: SystemTime,
+) -> Result<(), FsError> {
     let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
     if attr.file_type != FileType::RegularFile {
         return Err(FsError::EISDIR);
@@ -351,7 +357,7 @@ pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Resu
 }
 
 /// Internal helper: raises a file's recorded size to `new_size` within an already-locked `FsInner`.
-fn grow_size_locked(inner: &mut FsInner, ino: u64, new_size: u64, now: SystemTime) -> Result<(), FsError> {
+fn grow_size_locked(inner: &mut FsInnerGuard<'_>, ino: u64, new_size: u64, now: SystemTime) -> Result<(), FsError> {
     let attr = inner.get_attr(ino).ok_or(FsError::ENOENT)?;
     let entry = inner
         .live

@@ -10,7 +10,7 @@
 //! on the thread that asked for it. Both modes go through the same `wake` / `quiesce` calls,
 //! so no caller has to know which one it is talking to.
 
-use super::{FLUSH_HISTORY_CAPACITY, FlushRecord, FlushStats, InMemoryFS};
+use super::{FLUSH_HISTORY_CAPACITY, FlushReason, FlushRecord, FlushStats, InMemoryFS};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -215,24 +215,62 @@ impl Drop for Flusher {
     }
 }
 
+impl InMemoryFS {
+    /// Evaluates whether staged mutations are due for a periodic flush, executes a cycle
+    /// if due or if batches are queued, and returns the duration until the next check.
+    pub(crate) fn run_flusher_step(&self, interval: Option<Duration>) -> Option<Duration> {
+        let now = self.clock.monotonic();
+
+        // Check whether dirty entries in `live` have reached the periodic flush interval.
+        {
+            let mut inner = self.inner.lock(crate::sync::OpTag::Flush).unwrap();
+            if let (Some(staged_at), Some(int)) = (inner.live_staged_at, interval) {
+                let age = now.saturating_sub(staged_at);
+                if age >= int {
+                    inner.freeze_requested.get_or_insert(FlushReason::Periodic);
+                    self.freeze_if_due_locked(&mut inner);
+                }
+            }
+        }
+
+        // Run the flush cycle (folds flushing queue and rolls aged-out logs).
+        match self.run_flush_cycle() {
+            Ok(()) => {
+                let inner = self.inner.lock(crate::sync::OpTag::Flush).unwrap();
+                if !inner.flushing.is_empty() {
+                    Some(Duration::ZERO)
+                } else if let (Some(staged_at), Some(int)) = (inner.live_staged_at, interval) {
+                    let cur_now = self.clock.monotonic();
+                    let age = cur_now.saturating_sub(staged_at);
+                    Some(int.saturating_sub(age))
+                } else {
+                    interval
+                }
+            }
+            Err(e) => {
+                log::error!("Flush cycle failed: {}", e);
+                Some(RETRY_DELAY)
+            }
+        }
+    }
+}
+
 fn run_background(weak: &Weak<InMemoryFS>, wakeup: &Arc<(Mutex<Wakeup>, Condvar)>, interval: Option<Duration>) {
     let (lock, cvar) = &**wakeup;
     let mut delay = interval;
     loop {
-        let mut idle = false;
         {
             let mut state = lock.lock().unwrap();
-            while !state.stop && !state.wake {
+            if !state.stop && !state.wake {
                 match delay {
                     Some(d) => {
-                        let (guard, timeout) = cvar.wait_timeout(state, d).unwrap();
-                        state = guard;
-                        if timeout.timed_out() {
-                            idle = true;
-                            break;
+                        state = cvar.wait_timeout(state, d).unwrap().0;
+                    }
+                    None => {
+                        while !state.stop && !state.wake {
+                            state = cvar.wait(state).unwrap();
                         }
                     }
-                    None => state = cvar.wait(state).unwrap(),
                 }
             }
             if state.stop {
@@ -243,20 +281,7 @@ fn run_background(weak: &Weak<InMemoryFS>, wakeup: &Arc<(Mutex<Wakeup>, Condvar)
 
         // Dropped between the wake-up and here: nothing left to flush into.
         let Some(fs) = weak.upgrade() else { return };
-        // Nobody asked for this cycle, so nobody has frozen `live`. Ask on their behalf -
-        // this is the inactivity flush.
-        if idle {
-            fs.request_freeze(crate::fs::FlushReason::Inactivity);
-        }
-        // Back off briefly rather than sitting out the whole interval, so a transient
-        // failure does not strand committed mutations in the queue.
-        delay = match fs.run_flush_cycle() {
-            Ok(()) => interval,
-            Err(e) => {
-                log::error!("Flush cycle failed: {}", e);
-                Some(RETRY_DELAY)
-            }
-        };
+        delay = fs.run_flusher_step(interval);
     }
 }
 
@@ -310,12 +335,12 @@ mod tests {
     }
 
     #[test]
-    fn test_background_flusher_flushes_live_after_inactivity() {
+    fn test_background_flusher_flushes_live_after_periodic_interval() {
         let fs = test_fs();
         fs.flusher.start(&fs, Some(Duration::from_millis(50)));
 
         // Left in `live`, well below any staged threshold, and never frozen by the writer:
-        // only the inactivity tick can move it.
+        // only the periodic tick can move it.
         stage_a_write(&fs, "idle.bin");
         assert!(fs.staged_bytes() > 0);
 
@@ -323,7 +348,53 @@ mod tests {
             || fs.staged_bytes() == 0 && fs.flush_queue_depth() == 0,
             Duration::from_secs(3)
         ));
+        assert_eq!(fs.flush_stats().count_for(crate::fs::FlushReason::Periodic), 1);
         fs.destroy();
+    }
+
+    #[test]
+    fn test_periodic_flush_timing() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(crate::clock::AdvancingClock::new(
+            std::time::UNIX_EPOCH + Duration::from_secs(1_000_000),
+        ));
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage);
+        fs.log_writer = Some(writer);
+
+        let interval = Duration::from_millis(200);
+
+        // Before any writes, calling run_flusher_step does nothing and returns interval.
+        assert_eq!(fs.run_flusher_step(Some(interval)), Some(interval));
+        assert_eq!(fs.flush_stats().total_batches, 0);
+
+        // Stage a write at t = 0
+        stage_a_write(&fs, "file1.bin");
+        assert_eq!(fs.flush_stats().total_batches, 0);
+
+        // Advance mock clock by 50ms (age = 50ms < 200ms)
+        clock.advance(Duration::from_millis(50));
+        let next_delay = fs.run_flusher_step(Some(interval));
+        assert_eq!(next_delay, Some(Duration::from_millis(150)));
+        assert_eq!(fs.flush_stats().total_batches, 0);
+
+        // Advance mock clock by another 150ms (age = 200ms >= 200ms)
+        clock.advance(Duration::from_millis(150));
+        let next_delay2 = fs.run_flusher_step(Some(interval));
+        assert_eq!(fs.flush_stats().total_batches, 1);
+        let record = fs.flush_stats().recent.pop().unwrap();
+        assert_eq!(record.reason, FlushReason::Periodic);
+        assert_eq!(next_delay2, Some(interval));
     }
 
     #[test]

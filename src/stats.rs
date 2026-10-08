@@ -881,8 +881,8 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push_str(&format!(
         "  Mode:               {}\n",
         match (flush.background, flush.interval) {
-            (true, Some(i)) => format!("background (flushes after {} idle)", format_duration(i)),
-            (true, None) => "background (no inactivity flush)".to_string(),
+            (true, Some(i)) => format!("background (periodic flush every {})", format_duration(i)),
+            (true, None) => "background (no periodic flush)".to_string(),
             (false, _) => "inline (runs on the calling thread)".to_string(),
         }
     ));
