@@ -5,42 +5,76 @@ use std::fmt;
 /// A transparent newtype over `i32` preserving POSIX integer error semantics while
 /// preventing accidental confusion with file handles, byte counts, or inode numbers.
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FsError(pub i32);
 
-impl FsError {
-    pub const EPERM: Self = Self(libc::EPERM);
-    pub const ENOENT: Self = Self(libc::ENOENT);
-    pub const EIO: Self = Self(libc::EIO);
-    pub const E2BIG: Self = Self(libc::E2BIG);
-    pub const EBADF: Self = Self(libc::EBADF);
-    pub const EAGAIN: Self = Self(libc::EAGAIN);
-    pub const EWOULDBLOCK: Self = Self(libc::EWOULDBLOCK);
-    pub const EACCES: Self = Self(libc::EACCES);
-    pub const EEXIST: Self = Self(libc::EEXIST);
-    pub const EXDEV: Self = Self(libc::EXDEV);
-    pub const ENODEV: Self = Self(libc::ENODEV);
-    pub const ENOTDIR: Self = Self(libc::ENOTDIR);
-    pub const EISDIR: Self = Self(libc::EISDIR);
-    pub const EINVAL: Self = Self(libc::EINVAL);
-    pub const ENFILE: Self = Self(libc::ENFILE);
-    pub const EMFILE: Self = Self(libc::EMFILE);
-    pub const EFBIG: Self = Self(libc::EFBIG);
-    pub const ENOSPC: Self = Self(libc::ENOSPC);
-    pub const EROFS: Self = Self(libc::EROFS);
-    pub const EMLINK: Self = Self(libc::EMLINK);
-    pub const EBUSY: Self = Self(libc::EBUSY);
-    pub const EDEADLK: Self = Self(libc::EDEADLK);
-    pub const ENAMETOOLONG: Self = Self(libc::ENAMETOOLONG);
-    pub const ENOTEMPTY: Self = Self(libc::ENOTEMPTY);
-    pub const ENOSYS: Self = Self(libc::ENOSYS);
-    pub const ENODATA: Self = Self(libc::ENODATA);
-    pub const EOVERFLOW: Self = Self(libc::EOVERFLOW);
-    pub const EOPNOTSUPP: Self = Self(libc::EOPNOTSUPP);
-    pub const ENOTSUP: Self = Self(libc::ENOTSUP);
-    pub const ECANCELED: Self = Self(libc::ECANCELED);
-    pub const ERANGE: Self = Self(libc::ERANGE);
+/// Defines an `FsError` constant per errno and the matching name lookup from one list, so
+/// the two cannot drift apart. Where Linux gives two names the same value (`EAGAIN` and
+/// `EWOULDBLOCK`, `EOPNOTSUPP` and `ENOTSUP`), the first one listed is the name reported.
+macro_rules! errnos {
+    ($($name:ident),* $(,)?) => {
+        impl FsError {
+            $(pub const $name: Self = Self(libc::$name);)*
 
+            /// Returns the symbolic name of this errno, e.g. `"ENOENT"`, if it is one of the
+            /// constants above.
+            fn name(self) -> Option<&'static str> {
+                $(if self.0 == libc::$name {
+                    return Some(stringify!($name));
+                })*
+                None
+            }
+        }
+    };
+}
+
+errnos! {
+    EPERM,
+    ENOENT,
+    EIO,
+    E2BIG,
+    EBADF,
+    EAGAIN,
+    EWOULDBLOCK,
+    EACCES,
+    EEXIST,
+    EXDEV,
+    ENODEV,
+    ENOTDIR,
+    EISDIR,
+    EINVAL,
+    ENFILE,
+    EMFILE,
+    EFBIG,
+    ENOSPC,
+    EROFS,
+    EMLINK,
+    EBUSY,
+    EDEADLK,
+    ENAMETOOLONG,
+    ENOTEMPTY,
+    ENOSYS,
+    ENODATA,
+    EOVERFLOW,
+    EOPNOTSUPP,
+    ENOTSUP,
+    ECANCELED,
+    ERANGE,
+}
+
+impl fmt::Debug for FsError {
+    /// Prints the errno by name, as it is written in code (`FsError::ENOENT`), so a failed
+    /// `assert_eq!` on an error reads without a lookup table. Codes without a constant fall
+    /// back to the number.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name() {
+            Some(name) => write!(f, "FsError::{}", name),
+            None => write!(f, "FsError({})", self.0),
+        }
+    }
+}
+
+impl FsError {
     /// Returns the raw POSIX error code as an integer.
     #[inline]
     pub const fn raw(self) -> i32 {
@@ -122,6 +156,20 @@ mod tests {
         assert_eq!(FsError::ENOENT, libc::ENOENT);
         assert_eq!(libc::ENOENT, FsError::ENOENT);
         assert_ne!(FsError::ENOENT, libc::EIO);
+    }
+
+    #[test]
+    fn test_fs_error_debug_prints_the_errno_name() {
+        assert_eq!(format!("{:?}", FsError::EACCES), "FsError::EACCES");
+        assert_eq!(format!("{:?}", Err::<(), _>(FsError::ENOENT)), "Err(FsError::ENOENT)");
+        // Aliases share a value; the first name listed is the one reported.
+        assert_eq!(format!("{:?}", FsError::EWOULDBLOCK), "FsError::EAGAIN");
+        assert_eq!(format!("{:?}", FsError::ENOTSUP), "FsError::EOPNOTSUPP");
+        // Codes without a constant fall back to the number.
+        assert_eq!(
+            format!("{:?}", FsError::from_raw(libc::ETIMEDOUT)),
+            format!("FsError({})", libc::ETIMEDOUT)
+        );
     }
 
     #[test]
