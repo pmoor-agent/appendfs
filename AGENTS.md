@@ -69,8 +69,9 @@ All code contributions follow a standard fork-and-pull-request workflow:
 5. **Repeat until all unresolved comments are resolved**.
 6. **Wait for PR to be approved and merged** into `upstream/main`.
 7. **Clean up local and remote feature branches**:
-   - Fetch `upstream/main`, fast-forward local `main`, and push `main` to `origin/main`.
-   - Delete the local feature branch (`git branch -d <branch-name>`).
+   - Never check out `main` in any worktree. `git fetch upstream` keeps local `main` mirrored to `upstream/main` on its own, and refuses to update a `main` that is checked out somewhere, which breaks the fetch for every worktree.
+   - Update the fork's `main` without touching local branches: `git fetch upstream && git push origin upstream/main:main`.
+   - Detach the worktree from the merged branch (`git checkout --detach`), then delete the local feature branch (`git branch -d <branch-name>`).
    - Delete / prune the merged remote branch on `origin` (`git remote prune origin`).
    - Clean build artifacts in the worktree to reclaim disk space (`cargo clean`).
 
