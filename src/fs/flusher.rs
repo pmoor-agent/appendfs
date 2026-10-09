@@ -345,10 +345,11 @@ mod tests {
         assert!(fs.staged_bytes() > 0);
 
         assert!(crate::wait_until(
-            || fs.staged_bytes() == 0 && fs.flush_queue_depth() == 0,
+            || fs.staged_bytes() == 0
+                && fs.flush_queue_depth() == 0
+                && fs.flush_stats().count_for(crate::fs::FlushReason::Periodic) == 1,
             Duration::from_secs(3)
         ));
-        assert_eq!(fs.flush_stats().count_for(crate::fs::FlushReason::Periodic), 1);
         fs.destroy();
     }
 
