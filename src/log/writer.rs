@@ -23,6 +23,8 @@ struct ActiveLogFile {
     /// a nonce the failed attempt already used, since those bytes may already be on disk.
     next_sequence: u64,
     current_offset: u64,
+    /// End of the prefix the last successful sync made durable. Never ahead of `current_offset`.
+    synced_offset: u64,
     filename: String,
     created_at: std::time::SystemTime,
     record_count: u32,
@@ -271,19 +273,18 @@ enum ActiveLogState {
 }
 
 impl ActiveLogState {
-    fn get_or_open(&mut self, storage: &Arc<dyn Storage>, keying: &FileKeying) -> io::Result<&mut ActiveLogFile> {
+    fn position(&self) -> LogPosition {
         match self {
-            ActiveLogState::Open(a) => Ok(a),
-            ActiveLogState::Unopened { generation, created_at } => {
-                let gen_num = *generation;
-                let c_time = created_at.unwrap_or_else(std::time::SystemTime::now);
-                let active_file = open_generation_file(storage, keying, gen_num, c_time)?;
-                *self = ActiveLogState::Open(active_file);
-                match self {
-                    ActiveLogState::Open(a) => Ok(a),
-                    _ => unreachable!(),
-                }
-            }
+            ActiveLogState::Unopened { generation, .. } => LogPosition {
+                generation: *generation,
+                is_open: false,
+                synced_offset: 0,
+            },
+            ActiveLogState::Open(active) => LogPosition {
+                generation: active.generation,
+                is_open: true,
+                synced_offset: active.synced_offset,
+            },
         }
     }
 }
@@ -386,6 +387,7 @@ fn open_generation_file(
         file_key: keying.volume_key.log_file_key(&key_salt),
         next_sequence: 0,
         current_offset: FILE_HEADER_SIZE as u64,
+        synced_offset: FILE_HEADER_SIZE as u64,
         filename,
         created_at,
         record_count: 0,
@@ -440,9 +442,26 @@ impl std::fmt::Debug for LogCheckpoint {
     }
 }
 
+/// Where the active log stands as of its last open, seal, or sync.
+///
+/// Published by [`LogWriter::position`] without waiting on log I/O, so a slow `write` or
+/// `fsync` never stalls the readers - status reporting and replication - that only need this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogPosition {
+    pub generation: u32,
+    /// Whether the generation's `.log` file exists on disk.
+    pub is_open: bool,
+    /// End of the durable prefix of the generation's file; `0` while it is unopened. Bytes
+    /// past it may still be rolled back, so nothing should be shipped from beyond it.
+    pub synced_offset: u64,
+}
+
 /// Active log writer managing append-only writes to generation log files with automatic rolling.
 pub struct LogWriter {
+    /// Held across log writes and syncs, so anything waiting on it waits on the disk.
     active_state: Mutex<ActiveLogState>,
+    /// [`ActiveLogState::position`] as of the last change to it, written while `active_state` is held.
+    position: Mutex<LogPosition>,
     batch_id: AtomicU64,
     storage: Arc<dyn Storage>,
     max_log_size: u64,
@@ -477,9 +496,10 @@ impl LogWriter {
     ) -> io::Result<Self> {
         let lock = storage.acquire_exclusive_lock()?;
         let keying = FileKeying::random(volume_key);
-        let active_file = open_generation_file(&storage, &keying, generation, clock.now())?;
+        let active_state = ActiveLogState::Open(open_generation_file(&storage, &keying, generation, clock.now())?);
         Ok(Self {
-            active_state: Mutex::new(ActiveLogState::Open(active_file)),
+            position: Mutex::new(active_state.position()),
+            active_state: Mutex::new(active_state),
             batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
@@ -500,11 +520,13 @@ impl LogWriter {
         volume_key: Arc<VolumeKey>,
     ) -> io::Result<Self> {
         let lock = storage.acquire_exclusive_lock()?;
+        let active_state = ActiveLogState::Unopened {
+            generation,
+            created_at: None,
+        };
         Ok(Self {
-            active_state: Mutex::new(ActiveLogState::Unopened {
-                generation,
-                created_at: None,
-            }),
+            position: Mutex::new(active_state.position()),
+            active_state: Mutex::new(active_state),
             batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
@@ -526,11 +548,13 @@ impl LogWriter {
         volume_key: Arc<VolumeKey>,
     ) -> io::Result<Self> {
         let lock = storage.acquire_exclusive_lock()?;
+        let active_state = ActiveLogState::Unopened {
+            generation,
+            created_at: Some(clock.now()),
+        };
         Ok(Self {
-            active_state: Mutex::new(ActiveLogState::Unopened {
-                generation,
-                created_at: Some(clock.now()),
-            }),
+            position: Mutex::new(active_state.position()),
+            active_state: Mutex::new(active_state),
             batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
@@ -584,11 +608,38 @@ impl LogWriter {
 
     /// Returns `true` if a physical `.log` file has been created on disk.
     pub fn is_open(&self) -> bool {
-        let state = match self.active_state.lock() {
+        self.position().is_open
+    }
+
+    /// Returns where the active log stands, without waiting on any write or sync in progress.
+    pub fn position(&self) -> LogPosition {
+        match self.position.lock() {
+            Ok(g) => *g,
+            Err(e) => *e.into_inner(),
+        }
+    }
+
+    /// Republishes [`LogWriter::position`] from `state`. Called with `active_state` held after
+    /// every change to the generation, its open state, or its synced offset.
+    fn publish(&self, state: &ActiveLogState) {
+        let mut position = match self.position.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        matches!(*state, ActiveLogState::Open(_))
+        *position = state.position();
+    }
+
+    /// Returns the open active file, lazily creating it if the writer is unopened.
+    fn active_file<'a>(&self, state: &'a mut ActiveLogState) -> io::Result<&'a mut ActiveLogFile> {
+        if let ActiveLogState::Unopened { generation, created_at } = *state {
+            let c_time = created_at.unwrap_or_else(std::time::SystemTime::now);
+            *state = ActiveLogState::Open(open_generation_file(&self.storage, &self.keying, generation, c_time)?);
+            self.publish(state);
+        }
+        match state {
+            ActiveLogState::Open(active) => Ok(active),
+            ActiveLogState::Unopened { .. } => unreachable!(),
+        }
     }
 
     /// Seals the active generation if it has reached `max_log_size` or `max_log_age`, leaving
@@ -609,7 +660,9 @@ impl LogWriter {
         if !size_exceeded && !age_exceeded {
             return Ok(None);
         }
-        seal_into_lazy(&mut state, clock)
+        let res = seal_into_lazy(&mut state, clock);
+        self.publish(&state);
+        res
     }
 
     /// Ensures that the active log file is open. If it is currently lazy/unopened,
@@ -624,6 +677,7 @@ impl LogWriter {
             let c_time = created_at.unwrap_or_else(|| clock.now());
             let active_file = open_generation_file(&self.storage, &self.keying, generation, c_time)?;
             *state = ActiveLogState::Open(active_file);
+            self.publish(&state);
             log::info!("Lazily opened log file for generation {}", generation);
         }
         Ok(())
@@ -658,7 +712,7 @@ impl LogWriter {
         };
 
         let next_gen = next_generation(active.generation)?;
-        match seal_and_open_next(active, &self.storage, &self.keying, clock, "Force-rolled") {
+        let res = match seal_and_open_next(active, &self.storage, &self.keying, clock, "Force-rolled") {
             Ok((next_active, sealed_info)) => {
                 *state = ActiveLogState::Open(next_active);
                 Ok(Some(sealed_info))
@@ -670,7 +724,9 @@ impl LogWriter {
                 };
                 Err(e)
             }
-        }
+        };
+        self.publish(&state);
+        res
     }
 
     /// If the active log file is currently open and has committed data, syncs and seals it,
@@ -681,7 +737,9 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        seal_into_lazy(&mut state, clock)
+        let res = seal_into_lazy(&mut state, clock);
+        self.publish(&state);
+        res
     }
 
     /// Captures a point-in-time snapshot of the log writer state (generation, offset,
@@ -726,7 +784,7 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        let active = state.get_or_open(&self.storage, &self.keying)?;
+        let active = self.active_file(&mut state)?;
         active.append_serialized(op_code, inode, value)
     }
 
@@ -744,7 +802,7 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        let active = state.get_or_open(&self.storage, &self.keying)?;
+        let active = self.active_file(&mut state)?;
         active.append_data_slices(self.compression, inode, slices, total_uncompressed_len)
     }
 
@@ -765,7 +823,7 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        let active = state.get_or_open(&self.storage, &self.keying)?;
+        let active = self.active_file(&mut state)?;
         active.append_raw_payload(op_code, inode, payload)
     }
 
@@ -793,6 +851,11 @@ impl LogWriter {
             }
             active.record_count = checkpoint.record_count;
             active.total_data_bytes = checkpoint.total_data_bytes;
+            // Only reached if a rollback discards bytes that already synced.
+            if active.synced_offset > checkpoint.offset {
+                active.synced_offset = checkpoint.offset;
+                self.publish(&state);
+            }
             res?;
         }
         Ok(())
@@ -845,20 +908,15 @@ impl LogWriter {
         };
         if let ActiveLogState::Open(active) = &mut *state {
             active.writer.sync()?;
+            active.synced_offset = active.current_offset;
+            self.publish(&state);
         }
         Ok(())
     }
 
     /// Returns the current active generation number.
     pub fn generation(&self) -> u32 {
-        let state = match self.active_state.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-        match &*state {
-            ActiveLogState::Unopened { generation, .. } => *generation,
-            ActiveLogState::Open(active) => active.generation,
-        }
+        self.position().generation
     }
 
     /// Returns the active log file name.
@@ -1329,5 +1387,84 @@ mod tests {
         assert_eq!(records2.len(), 2);
         assert_eq!(records2[1].header.op_code, OpCode::Data);
         assert_eq!(records2[1].payload, incompressible);
+    }
+
+    #[test]
+    fn test_position_does_not_wait_on_log_io() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = SystemClock;
+        let writer = Arc::new(LogWriter::create(storage, 1, &clock, 100_000, 1, VolumeKey::plaintext_arc()).unwrap());
+
+        // Holding the state lock stands in for a write or sync that is stuck on the disk.
+        let _in_progress = writer.active_state.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = Arc::clone(&writer);
+        std::thread::spawn(move || {
+            let _ = tx.send((reader.position(), reader.generation(), reader.is_open()));
+        });
+        let (position, generation, is_open) = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("position queries waited on the log I/O lock");
+        assert_eq!(
+            position,
+            LogPosition {
+                generation: 1,
+                is_open: true,
+                synced_offset: FILE_HEADER_SIZE as u64,
+            }
+        );
+        assert_eq!(generation, 1);
+        assert!(is_open);
+    }
+
+    #[test]
+    fn test_position_tracks_open_sync_rollback_and_seal() {
+        let fault = Arc::new(crate::storage::FaultStorage::new(Arc::new(MemoryStorage::new())));
+        let clock = SystemClock;
+        let writer =
+            LogWriter::create_lazy(fault.clone(), 1, DEFAULT_MAX_LOG_SIZE, 1, VolumeKey::plaintext_arc()).unwrap();
+        let unopened = LogPosition {
+            generation: 1,
+            is_open: false,
+            synced_offset: 0,
+        };
+        assert_eq!(writer.position(), unopened);
+
+        // Opening syncs the header; records appended after it are not durable until a flush.
+        writer.append_data(1, b"first batch").unwrap();
+        writer.emit_flush_commit(1, 11, clock.now()).unwrap();
+        assert_eq!(
+            writer.position(),
+            LogPosition {
+                generation: 1,
+                is_open: true,
+                synced_offset: FILE_HEADER_SIZE as u64,
+            }
+        );
+        writer.flush().unwrap();
+        let synced = writer.current_offset();
+        assert_eq!(writer.position().synced_offset, synced);
+
+        // A batch whose sync fails is rolled back without ever being published as synced.
+        let checkpoint = writer.checkpoint();
+        writer.append_data(1, b"second batch").unwrap();
+        writer.emit_flush_commit(1, 12, clock.now()).unwrap();
+        fault.fail_syncs(true);
+        assert!(writer.flush().is_err());
+        assert_eq!(writer.position().synced_offset, synced);
+        writer.rollback_to(&checkpoint).unwrap();
+        fault.fail_syncs(false);
+        assert_eq!(writer.position().synced_offset, synced);
+
+        // The successor is published only once the seal has finished.
+        writer.seal_active(&clock).unwrap().unwrap();
+        assert_eq!(
+            writer.position(),
+            LogPosition {
+                generation: 2,
+                is_open: false,
+                synced_offset: 0,
+            }
+        );
     }
 }

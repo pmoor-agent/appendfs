@@ -551,6 +551,61 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
 }
 
 #[test]
+fn test_active_log_part_ships_only_synced_bytes() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_storage(storage.clone());
+
+    let remote = Arc::new(MockRemoteStore::new());
+    let mut registry = RemoteRegistry::new();
+    registry.policy.active_sync_interval_secs = 0;
+    registry.add_remote("primary", RemoteTargetConfig::new("my-bucket"));
+    registry.set_store_override("primary", remote.clone());
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    let fs_arc = Arc::new(fs);
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+    let mut run_cycle = |last_part_sync: &mut std::time::SystemTime| {
+        appendfs::remote::RemoteReplicationWorker::run_cycle(
+            &fs_arc,
+            &registry_arc,
+            Path::new("/memory"),
+            last_part_sync,
+            &mut uploaded_parts,
+        )
+        .unwrap();
+    };
+
+    // A record at least as large as the writer's userspace buffer goes straight to the file, so
+    // mid-batch the file holds exactly what has been written so far. None of it is committed or
+    // synced yet, and a failed batch would be rolled back, so it must stay local.
+    let payload = vec![0x5a; 4 * appendfs::storage::DEFAULT_STORAGE_BUFFER_CAPACITY];
+    writer.append_data(10, &payload).unwrap();
+    run_cycle(&mut last_part_sync);
+    assert!(remote.head_object("000001.part0000.log").unwrap().is_none());
+
+    writer.emit_flush_commit(1, payload.len() as u64, clock.now()).unwrap();
+    writer.flush().unwrap();
+    last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    run_cycle(&mut last_part_sync);
+    let part0 = remote.head_object("000001.part0000.log").unwrap().unwrap();
+    assert_eq!(part0.size, writer.current_offset());
+}
+
+#[test]
 fn test_local_dir_remote_store_streaming_and_md5_sidecars() {
     let dir = TempDir::new().unwrap();
     let store = LocalDirRemoteStore::new(dir.path());

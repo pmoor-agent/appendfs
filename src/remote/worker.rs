@@ -695,8 +695,12 @@ impl RemoteReplicationWorker {
             None => return Ok(()),
         };
 
+        // Only the synced prefix is shipped: bytes beyond it are rolled back if their sync fails.
         let (active_gen, active_offset) = match fs.log_writer {
-            Some(ref w) => (w.generation(), w.current_offset()),
+            Some(ref w) => {
+                let position = w.position();
+                (position.generation, position.synced_offset)
+            }
             None => return Ok(()),
         };
 
