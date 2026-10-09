@@ -584,9 +584,10 @@ fn test_open_cache_flags_and_timeout_delineation() {
 
 #[test]
 fn test_cold_read_deferred_threadpool_execution() {
+    use appendfs::FsTestExt;
     use appendfs::crypto::{VolumeHeader, VolumeKey};
     use appendfs::log::{LogWriter, RecoveryTarget};
-    use appendfs::operations::read_write::{create_core, open_core, write_core};
+    use appendfs::operations::read_write::{create_core, open_core};
     use appendfs::storage::MemoryStorage;
 
     let storage = Arc::new(MemoryStorage::new());
@@ -612,7 +613,7 @@ fn test_cold_read_deferred_threadpool_execution() {
     let file = create_core(&fs, 1, "deferred_read.txt", 0o644, 0, 1000, 1000).unwrap();
     let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
     let payload = b"cold read deferred threadpool test".to_vec();
-    write_core(&fs, file.ino, &payload, 0).unwrap();
+    fs.write_at(file.ino, &payload, 0).unwrap();
 
     // 1. In-memory read before flush: must be 100% in-memory and immediately Ready
     let in_mem_res = read_response(&fs, file.ino, fh, 0, payload.len());

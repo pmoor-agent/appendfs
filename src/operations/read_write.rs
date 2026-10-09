@@ -78,17 +78,6 @@ pub fn read_response(
     DeferredResult::deferred(receiver)
 }
 
-#[cfg(any(test, feature = "testing"))]
-pub fn read_core(
-    fs: &InMemoryFS,
-    ino: u64,
-    fh: u64,
-    offset: i64,
-    size: usize,
-) -> Result<FuseResponse<'static>, FsError> {
-    read_response(fs, ino, fh, offset, size).wait()
-}
-
 pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> {
     let write_requested = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0;
 
@@ -205,17 +194,6 @@ pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset:
         inner.record_mutation(write_len as usize);
         Ok(buf.len())
     })
-}
-
-#[cfg(any(test, feature = "testing"))]
-pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
-    if is_virtual_ino(ino) {
-        return Err(FsError::EPERM);
-    }
-    let fh = open_core(fs, ino, libc::O_RDWR as u32)?;
-    let res = write_handle_core(fs, ino, fh, buf, offset);
-    let _ = release_core(fs, ino, fh);
-    res
 }
 
 pub fn write_response(
@@ -578,18 +556,6 @@ pub fn create_response(
         .map(|(attr, fh)| FuseResponse::create(attr, fh.unwrap()))
 }
 
-#[cfg(any(test, feature = "testing"))]
-pub fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), FsError> {
-    fsync_core_with_reason(fs, ino, fh, FlushReason::Fsync)
-}
-
-/// Shared body for `fsync` and `fsyncdir`, which differ only in what they report as the
-/// reason for the flush.
-#[cfg(any(test, feature = "testing"))]
-pub fn fsync_core_with_reason(fs: &InMemoryFS, ino: u64, fh: u64, reason: FlushReason) -> Result<(), FsError> {
-    fsync_response(fs, ino, fh, reason).wait().map(|_| ())
-}
-
 pub struct FsyncDeferred(pub crate::fs::BatchCompletion);
 
 impl DeferredCompletion<FuseResponse<'static>> for FsyncDeferred {
@@ -635,11 +601,12 @@ pub fn release_response(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<FuseRespon
 mod tests {
     use super::*;
     use crate::fs::InMemoryFS;
+    use crate::test_utils::FsTestExt;
     use crate::{LogWriter, Storage, SystemClock};
 
     fn file_with(fs: &InMemoryFS, contents: &[u8]) -> u64 {
         let attr = create_core(fs, 1, "f.bin", 0o644, 0, 1000, 1000).unwrap();
-        write_core(fs, attr.ino, contents, 0).unwrap();
+        fs.write_at(attr.ino, contents, 0).unwrap();
         attr.ino
     }
 
@@ -809,13 +776,13 @@ mod tests {
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
         let file = create_core(&fs, 1, "fsync_lock.bin", 0o644, 0, 1000, 1000).unwrap();
         let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
-        write_core(&fs, file.ino, b"test", 0).unwrap();
+        fs.write_at(file.ino, b"test", 0).unwrap();
 
         let pre_total = fs.inner.lock_count();
         let pre_stats = fs.inner.op_stats();
         let pre_flush = pre_stats.iter().find(|s| s.tag == OpTag::Flush).unwrap().count;
 
-        // Call fsync_core rollover with open file handle fh
+        // Call the fsync rollover with open file handle fh
         let res = fs.rollover_for_fsync(file.ino, fh, FlushReason::Fsync);
         assert!(res.is_ok());
 
@@ -829,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fsync_and_fsyncdir_core() {
+    fn test_fsync_and_fsyncdir() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
@@ -844,14 +811,14 @@ mod tests {
             .unwrap(),
         );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
-        let file = create_core(&fs, 1, "fsync_core.bin", 0o644, 0, 1000, 1000).unwrap();
+        let file = create_core(&fs, 1, "fsync.bin", 0o644, 0, 1000, 1000).unwrap();
         let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
-        write_core(&fs, file.ino, b"fsync test", 0).unwrap();
+        fs.write_at(file.ino, b"fsync test", 0).unwrap();
 
-        let res = fsync_core(&fs, file.ino, fh);
+        let res = fs.fsync_blocking(file.ino, fh);
         assert_eq!(res, Ok(()));
 
-        let dir_res = crate::operations::dir::fsyncdir_core(&fs);
+        let dir_res = fs.fsyncdir_blocking(1);
         assert_eq!(dir_res, Ok(()));
     }
 

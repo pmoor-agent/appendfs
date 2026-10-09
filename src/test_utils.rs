@@ -1,5 +1,63 @@
+use crate::error::FsError;
+use crate::fs::{FlushReason, InMemoryFS};
+use crate::operations::dir::fsyncdir_response;
+use crate::operations::read_write::{fsync_response, open_core, read_response, release_core, write_handle_core};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Blocking, handle-managing shortcuts for driving an `InMemoryFS` from tests.
+///
+/// Production code reaches the filesystem through the FUSE entry points, which hand back
+/// deferred replies and expect the caller to manage file handles. Tests usually just want
+/// the outcome, so these wrap those same entry points and wait for the result.
+pub trait FsTestExt {
+    /// Writes `buf` at `offset` through a read-write handle opened and released around the
+    /// call, so the caller does not need one of its own.
+    fn write_at(&self, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError>;
+
+    /// Reads up to `size` bytes at `offset` through a read-only handle opened and released
+    /// around the call.
+    fn read_at(&self, ino: u64, offset: i64, size: usize) -> Result<Vec<u8>, FsError>;
+
+    /// Reads up to `size` bytes at `offset` through the open handle `fh`, waiting for the
+    /// reply if the read was deferred to the read pool.
+    fn read_blocking(&self, ino: u64, fh: u64, offset: i64, size: usize) -> Result<Vec<u8>, FsError>;
+
+    /// Runs `fsync` on `fh` and waits for the flush it triggers to become durable.
+    fn fsync_blocking(&self, ino: u64, fh: u64) -> Result<(), FsError>;
+
+    /// Runs `fsyncdir` on `ino` and waits for the flush it triggers to become durable.
+    fn fsyncdir_blocking(&self, ino: u64) -> Result<(), FsError>;
+}
+
+impl FsTestExt for InMemoryFS {
+    fn write_at(&self, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
+        let fh = open_core(self, ino, libc::O_RDWR as u32)?;
+        let res = write_handle_core(self, ino, fh, buf, offset);
+        let _ = release_core(self, ino, fh);
+        res
+    }
+
+    fn read_at(&self, ino: u64, offset: i64, size: usize) -> Result<Vec<u8>, FsError> {
+        let fh = open_core(self, ino, libc::O_RDONLY as u32)?;
+        let res = self.read_blocking(ino, fh, offset, size);
+        let _ = release_core(self, ino, fh);
+        res
+    }
+
+    fn read_blocking(&self, ino: u64, fh: u64, offset: i64, size: usize) -> Result<Vec<u8>, FsError> {
+        let reply = read_response(self, ino, fh, offset, size).wait()?;
+        Ok(reply.into_bytes().expect("read replied without a data buffer"))
+    }
+
+    fn fsync_blocking(&self, ino: u64, fh: u64) -> Result<(), FsError> {
+        fsync_response(self, ino, fh, FlushReason::Fsync).wait().map(|_| ())
+    }
+
+    fn fsyncdir_blocking(&self, ino: u64) -> Result<(), FsError> {
+        fsyncdir_response(self, ino, false).wait().map(|_| ())
+    }
+}
 
 /// Repeatedly executes `condition` until it returns `true` or `timeout` has elapsed.
 ///

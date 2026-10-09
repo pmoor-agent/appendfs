@@ -921,8 +921,8 @@ mod tests {
     use crate::clock::{Clock, SystemClock};
     use crate::extent_map::ExtentMap;
     use crate::node::{AttrDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind};
-    use crate::operations::read_write::write_core;
     use crate::storage::Storage;
+    use crate::test_utils::FsTestExt;
     use std::time::SystemTime;
 
     #[test]
@@ -1037,7 +1037,7 @@ mod tests {
         // Perform 50 sequential 1-byte writes in live
         for i in 0..50u64 {
             let byte = vec![(i % 256) as u8];
-            write_core(&fs, ino, &byte, i as i64).unwrap();
+            fs.write_at(ino, &byte, i as i64).unwrap();
         }
 
         // Verify that live extent map coalesced the sequential writes in memory
@@ -1139,7 +1139,7 @@ mod tests {
 
             // A single contiguous write many times larger than the cap.
             let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
-            write_core(&fs, ino, &payload, 0).unwrap();
+            fs.write_at(ino, &payload, 0).unwrap();
             fs.quiesce().unwrap();
 
             {
@@ -1226,7 +1226,7 @@ mod tests {
         let ino = attr.ino;
 
         let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251 + 1) as u8).collect();
-        write_core(&fs, ino, &payload, 0).unwrap();
+        fs.write_at(ino, &payload, 0).unwrap();
 
         // Flush first, so the data is a durable `Disk` extent in `base` and the punch below
         // lands in a fresh, higher layer - the case that actually needs masking.
@@ -1313,7 +1313,7 @@ mod tests {
         let attr = crate::operations::read_write::create_core(&fs, 1, "t.bin", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
         let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251 + 1) as u8).collect();
-        write_core(&fs, ino, &payload, 0).unwrap();
+        fs.write_at(ino, &payload, 0).unwrap();
 
         // Flush so the data is durable in `base` and the truncates below land in a layer
         // above it - the case where masking actually has to do something.
@@ -1369,7 +1369,7 @@ mod tests {
         let fs = InMemoryFS::new();
         let attr = crate::operations::read_write::create_core(&fs, 1, "short.bin", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
-        write_core(&fs, ino, &[0xAB; 100], 0).unwrap();
+        fs.write_at(ino, &[0xAB; 100], 0).unwrap();
 
         crate::operations::read_write::punch_hole_core(&fs, ino, 4096, 4096).unwrap();
         assert_eq!(fs.get_attr(ino).unwrap().size, 100, "punch past EOF must not extend");
@@ -1458,12 +1458,12 @@ mod tests {
 
         // Write 100 bytes to file1 in gen 1
         let data1 = vec![0xAA; 100];
-        crate::operations::read_write::write_core(&fs, ino1, &data1, 0).unwrap();
+        fs.write_at(ino1, &data1, 0).unwrap();
         fs.quiesce().unwrap();
 
         // Overwrite 40 bytes of file1 (offset 0..40)
         let overwrite_data = vec![0xBB; 40];
-        crate::operations::read_write::write_core(&fs, ino1, &overwrite_data, 0).unwrap();
+        fs.write_at(ino1, &overwrite_data, 0).unwrap();
         fs.quiesce().unwrap();
 
         // Export summary snapshot (seals active gen 1 into manifest and leaves gen 2 unopened)
@@ -1519,18 +1519,18 @@ mod tests {
 
         let file1_attr =
             crate::operations::read_write::create_core(&fs, gletscher_ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, file1_attr.ino, &[1, 2, 3, 4], 0).unwrap();
+        fs.write_at(file1_attr.ino, &[1, 2, 3, 4], 0).unwrap();
 
         let file2_attr =
             crate::operations::read_write::create_core(&fs, gletscher_ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, file2_attr.ino, &[5, 6, 7, 8], 0).unwrap();
+        fs.write_at(file2_attr.ino, &[5, 6, 7, 8], 0).unwrap();
 
         let sub_attr = crate::operations::dir::mkdir_core(&fs, gletscher_ino, "sub", 0o755, 1000, 1000).unwrap();
         let sub_ino = sub_attr.ino;
 
         let file3_attr =
             crate::operations::read_write::create_core(&fs, sub_ino, "file3.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, file3_attr.ino, &[9, 10, 11, 12], 0).unwrap();
+        fs.write_at(file3_attr.ino, &[9, 10, 11, 12], 0).unwrap();
 
         // Flush creation to disk and seal active generation 1
         fs.quiesce().unwrap();
@@ -1601,7 +1601,7 @@ mod tests {
         // 2. Create /keep/shared.txt (inode N, nlink 1) and write data
         let file_attr =
             crate::operations::read_write::create_core(&fs, keep_attr.ino, "shared.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, file_attr.ino, b"persistent shared content", 0).unwrap();
+        fs.write_at(file_attr.ino, b"persistent shared content", 0).unwrap();
 
         // 3. Create hard link /Gletscher/shared_link.txt -> inode N (nlink becomes 2)
         let link_attr =
@@ -1708,7 +1708,7 @@ mod tests {
         // Create a file, write data, then sync
         let f = crate::operations::read_write::create_core(&fs, 1, "unlinked.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = f.ino;
-        crate::operations::read_write::write_core(&fs, ino, b"unlinked content", 0).unwrap();
+        fs.write_at(ino, b"unlinked content", 0).unwrap();
         fs.quiesce().unwrap();
 
         // Open the file so open_counts > 0
@@ -1718,7 +1718,7 @@ mod tests {
         crate::operations::links::unlink_core(&fs, 1, "unlinked.txt").unwrap();
 
         // Write more data while unlinked, then sync log
-        crate::operations::read_write::write_core(&fs, ino, b" more content", 16).unwrap();
+        fs.write_at(ino, b" more content", 16).unwrap();
         fs.quiesce().unwrap();
 
         // Close the handle: drops open_count to 0 and tombstones the node in live
@@ -1764,7 +1764,7 @@ mod tests {
         // Create file and write 100 bytes (0xAA)
         let file_attr = crate::operations::read_write::create_core(&fs, 1, "data.bin", 0o644, 0, 1000, 1000).unwrap();
         let ino = file_attr.ino;
-        crate::operations::read_write::write_core(&fs, ino, &[0xAA; 100], 0).unwrap();
+        fs.write_at(ino, &[0xAA; 100], 0).unwrap();
 
         // Truncate down to 20 bytes
         let now = clock.now();
@@ -1823,14 +1823,14 @@ mod tests {
         // 1. Create file in batch 1
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = f.ino;
-        crate::operations::read_write::write_core(&fs, ino, &[0x11; 50], 0).unwrap();
+        fs.write_at(ino, &[0x11; 50], 0).unwrap();
 
         // Freeze into flushing queue (batch 1)
         fs.freeze_now();
         assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 1);
 
         // 2. Overwrite in batch 2 (live layer)
-        crate::operations::read_write::write_core(&fs, ino, &[0x22; 20], 10).unwrap();
+        fs.write_at(ino, &[0x22; 20], 10).unwrap();
 
         // Freeze into flushing queue (batch 2)
         fs.freeze_now();
@@ -1895,7 +1895,7 @@ mod tests {
         // together past `max_log_size`: the drain has to roll between them.
         for name in ["a.bin", "b.bin", "c.bin"] {
             let file = crate::operations::read_write::create_core(&fs, 1, name, 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, file.ino, &[7u8; 40 * 1024], 0).unwrap();
+            fs.write_at(file.ino, &[7u8; 40 * 1024], 0).unwrap();
             assert!(fs.freeze_now());
         }
 
@@ -1943,14 +1943,14 @@ mod tests {
 
         // 1. First batch: write data to file1 and flush (populates gen 1 past header size)
         let f1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f1.ino, b"initial payload", 0).unwrap();
+        fs.write_at(f1.ino, b"initial payload", 0).unwrap();
         // Inject permission error on opening 000002.log to simulate I/O failure when rolling
         fault_storage.fail_on_file("000002.log", std::io::ErrorKind::PermissionDenied);
         let _ = fs.quiesce();
 
         // 2. Second batch: write data to file2
         let f2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f2.ino, b"second payload", 0).unwrap();
+        fs.write_at(f2.ino, b"second payload", 0).unwrap();
 
         // 3. Attempt flush - should fail with I/O error on roll creation
         let flush_res = fs.quiesce();
@@ -1965,7 +1965,7 @@ mod tests {
 
         // Live operations continue working smoothly
         let f3 = crate::operations::read_write::create_core(&fs, 1, "file3.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f3.ino, b"third payload", 0).unwrap();
+        fs.write_at(f3.ino, b"third payload", 0).unwrap();
 
         // 5. Restore normal write access by clearing injected fault
         fault_storage.clear_fail_on_file("000002.log");
@@ -2034,7 +2034,7 @@ mod tests {
         for i in 1..=2 {
             let name = format!("init_{}.txt", i);
             let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f.ino, b"initial payload", 0).unwrap();
+            fs.write_at(f.ino, b"initial payload", 0).unwrap();
             initial_inos.push(f.ino);
         }
         fs.quiesce().unwrap();
@@ -2047,7 +2047,7 @@ mod tests {
             let name = format!("batch2_file_{}.bin", i);
             let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
             let payload = vec![(i as u8) * 0x11; 128];
-            crate::operations::read_write::write_core(&fs, f.ino, &payload, 0).unwrap();
+            fs.write_at(f.ino, &payload, 0).unwrap();
             batch2_inos.push((f.ino, payload));
         }
 
@@ -2143,7 +2143,7 @@ mod tests {
         for i in 0..3u8 {
             let name = format!("file_{}.bin", i);
             let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, f.ino, &vec![i; 4096], 0).unwrap();
+            fs.write_at(f.ino, &vec![i; 4096], 0).unwrap();
         }
         let dir = crate::operations::dir::mkdir_core(&fs, 1, "dir", 0o755, 1000, 1000).unwrap();
         crate::operations::read_write::create_core(&fs, dir.ino, "inner.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -2231,14 +2231,14 @@ mod tests {
             .ino;
 
         let start_data = vec![0xABu8; 100];
-        crate::operations::read_write::write_core(&fs, ino, &start_data, 0).unwrap();
+        fs.write_at(ino, &start_data, 0).unwrap();
 
         // 5 GiB hole length (> 32-bit: 5 * 1024 * 1024 * 1024 = 5,368,709,120 > 4,294,967,295)
         let hole_len: u64 = 5 * 1024 * 1024 * 1024;
         let end_offset: u64 = 100 + hole_len;
 
         let end_data = vec![0xCDu8; 100];
-        crate::operations::read_write::write_core(&fs, ino, &end_data, end_offset as i64).unwrap();
+        fs.write_at(ino, &end_data, end_offset as i64).unwrap();
 
         crate::operations::read_write::punch_hole_core(&fs, ino, 100, hole_len).unwrap();
 
@@ -2490,7 +2490,7 @@ mod tests {
         let file = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
 
         // 1. Write 100 bytes to hit max_buffer_size threshold
-        crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 100], 0).unwrap();
+        fs.write_at(file.ino, &[0xAA; 100], 0).unwrap();
 
         // Automatic threshold triggered begin_flush()!
         // In unmounted environment without background flusher, threshold trigger flushes inline,
@@ -2500,7 +2500,7 @@ mod tests {
 
         // Now simulate active background flusher with queued batch:
         // Populate live with 60 bytes
-        crate::operations::read_write::write_core(&fs, file.ino, &[0xBB; 60], 100).unwrap();
+        fs.write_at(file.ino, &[0xBB; 60], 100).unwrap();
         assert_eq!(fs.staged_bytes(), 60);
         assert_eq!(fs.staged_ops(), 1);
 
@@ -2514,7 +2514,7 @@ mod tests {
         assert_eq!(fs.flushing_ops(), 1);
 
         // Subsequent write arriving while batch 1 is in flushing queue
-        crate::operations::read_write::write_core(&fs, file.ino, &[0xCC; 20], 160).unwrap();
+        fs.write_at(file.ino, &[0xCC; 20], 160).unwrap();
         // Should NOT trigger another begin_flush()! Queue depth must remain 1
         assert_eq!(fs.flush_queue_depth(), 1);
         assert_eq!(fs.staged_bytes(), 20);
@@ -2523,7 +2523,7 @@ mod tests {
         assert_eq!(fs.flushing_ops(), 1);
 
         // Another small write
-        crate::operations::read_write::write_core(&fs, file.ino, &[0xDD; 20], 180).unwrap();
+        fs.write_at(file.ino, &[0xDD; 20], 180).unwrap();
         assert_eq!(fs.flush_queue_depth(), 1);
         assert_eq!(fs.staged_bytes(), 40);
         assert_eq!(fs.staged_ops(), 2);
@@ -2548,18 +2548,18 @@ mod tests {
         let file = crate::operations::read_write::create_core(&fs, 1, "bounded.bin", 0o644, 0, 1000, 1000).unwrap();
 
         // Populate batch 1
-        crate::operations::read_write::write_core(&fs, file.ino, &[0x11; 30], 0).unwrap();
+        fs.write_at(file.ino, &[0x11; 30], 0).unwrap();
         assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 1);
 
         // Populate batch 2
-        crate::operations::read_write::write_core(&fs, file.ino, &[0x22; 40], 30).unwrap();
+        fs.write_at(file.ino, &[0x22; 40], 30).unwrap();
         assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
 
         // Queue is now full (len == max_flush_queue_depth == 2).
         // Populate live with batch 3 candidates
-        crate::operations::read_write::write_core(&fs, file.ino, &[0x33; 50], 70).unwrap();
+        fs.write_at(file.ino, &[0x33; 50], 70).unwrap();
         assert_eq!(fs.staged_bytes(), 50);
         assert_eq!(fs.staged_ops(), 1);
 
@@ -2610,20 +2610,20 @@ mod tests {
         assert_eq!(fs.flushing_bytes(), 0);
 
         // Populate batch 1: 60 bytes
-        crate::operations::read_write::write_core(&fs, file.ino, &[0x11; 60], 0).unwrap();
+        fs.write_at(file.ino, &[0x11; 60], 0).unwrap();
         assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 1);
         assert_eq!(fs.flushing_bytes(), 60);
 
         // Populate batch 2: 40 bytes (total 100 bytes == max_flush_queue_bytes)
-        crate::operations::read_write::write_core(&fs, file.ino, &[0x22; 40], 60).unwrap();
+        fs.write_at(file.ino, &[0x22; 40], 60).unwrap();
         assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
         assert_eq!(fs.flushing_bytes(), 100);
 
         // Queue is now saturated on byte capacity (100 >= 100).
         // Populate live with batch 3 candidates: 30 bytes
-        crate::operations::read_write::write_core(&fs, file.ino, &[0x33; 30], 100).unwrap();
+        fs.write_at(file.ino, &[0x33; 30], 100).unwrap();
         assert_eq!(fs.staged_bytes(), 30);
         assert_eq!(fs.staged_ops(), 1);
 
@@ -2677,14 +2677,14 @@ mod tests {
         assert_eq!(fs.flushing_ops(), 0);
 
         // Populate batch 1: 1 op
-        crate::operations::read_write::write_core(&fs, file.ino, &[0x11; 10], 0).unwrap();
+        fs.write_at(file.ino, &[0x11; 10], 0).unwrap();
         assert_eq!(fs.staged_ops(), 1);
         assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 1);
         assert_eq!(fs.flushing_ops(), 1);
 
         // Populate batch 2: 1 op -> total 2 ops == max_flush_queue_ops
-        crate::operations::read_write::write_core(&fs, file.ino, &[0x22; 10], 10).unwrap();
+        fs.write_at(file.ino, &[0x22; 10], 10).unwrap();
         assert_eq!(fs.staged_ops(), 1);
         assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2);
@@ -2692,7 +2692,7 @@ mod tests {
 
         // Queue is now saturated on op capacity (2 >= 2).
         // Populate live with batch 3 candidates: 1 op
-        crate::operations::read_write::write_core(&fs, file.ino, &[0x33; 10], 20).unwrap();
+        fs.write_at(file.ino, &[0x33; 10], 20).unwrap();
         assert_eq!(fs.staged_ops(), 1);
 
         // begin_flush must return false because flushing_ops >= max_flush_queue_ops
@@ -2743,7 +2743,7 @@ mod tests {
         fs.max_staged_ops = 10;
 
         let file = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 50], 0).unwrap();
+        fs.write_at(file.ino, &[0xAA; 50], 0).unwrap();
 
         // Perform flush
         fs.quiesce().unwrap();
@@ -2757,7 +2757,7 @@ mod tests {
         );
 
         // Populate live with 20 bytes (below threshold of 100 bytes / 10 ops)
-        crate::operations::read_write::write_core(&fs, file.ino, &[0xBB; 20], 50).unwrap();
+        fs.write_at(file.ino, &[0xBB; 20], 50).unwrap();
         assert_eq!(fs.staged_bytes(), 20);
         assert_eq!(fs.staged_ops(), 1);
 
@@ -2803,7 +2803,7 @@ mod tests {
         let fs = Arc::new(InMemoryFS::with_clock_and_log(clock.clone(), Some(writer.clone())));
 
         let file = crate::operations::read_write::create_core(&fs, 1, "test_fsync.bin", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, file.ino, b"waiter data", 0).unwrap();
+        fs.write_at(file.ino, b"waiter data", 0).unwrap();
 
         // Rollover under lock
         let completion = fs
@@ -2873,7 +2873,7 @@ mod tests {
             fs.flusher.set_background_for_tests(true);
 
             let file = crate::operations::read_write::create_core(&fs, 1, "r.bin", 0o644, 0, 1000, 1000).unwrap();
-            crate::operations::read_write::write_core(&fs, file.ino, b"payload", 0).unwrap();
+            fs.write_at(file.ino, b"payload", 0).unwrap();
 
             match reason {
                 // Reached through `fsync` and `fsyncdir` respectively, which differ only in
@@ -2937,13 +2937,13 @@ mod tests {
         fs.flusher.set_background_for_tests(true);
 
         let file = crate::operations::read_write::create_core(&fs, 1, "saturate.bin", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, file.ino, b"batch 1", 0).unwrap();
+        fs.write_at(file.ino, b"batch 1", 0).unwrap();
         assert!(fs.freeze_now());
-        crate::operations::read_write::write_core(&fs, file.ino, b"batch 2", 7).unwrap();
+        fs.write_at(file.ino, b"batch 2", 7).unwrap();
         assert!(fs.freeze_now());
         assert_eq!(fs.flush_queue_depth(), 2, "queue is saturated at max depth 2");
 
-        crate::operations::read_write::write_core(&fs, file.ino, b"live data", 14).unwrap();
+        fs.write_at(file.ino, b"live data", 14).unwrap();
         assert_eq!(fs.staged_bytes(), 9);
 
         // The completion belongs to `live`, so fsync can take it without a batch existing
@@ -3092,15 +3092,15 @@ mod tests {
 
         // Stage 3 batches manually
         let f1 = crate::operations::read_write::create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f1.ino, b"batch 1 data", 0).unwrap();
+        fs.write_at(f1.ino, b"batch 1 data", 0).unwrap();
         fs.freeze_now();
 
         let f2 = crate::operations::read_write::create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f2.ino, b"batch 2 data", 0).unwrap();
+        fs.write_at(f2.ino, b"batch 2 data", 0).unwrap();
         fs.freeze_now();
 
         let f3 = crate::operations::read_write::create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f3.ino, b"batch 3 data", 0).unwrap();
+        fs.write_at(f3.ino, b"batch 3 data", 0).unwrap();
         fs.freeze_now();
 
         assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 3);
@@ -3166,15 +3166,15 @@ mod tests {
 
         // Stage 3 batches manually
         let f1 = crate::operations::read_write::create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f1.ino, b"batch 1 data", 0).unwrap();
+        fs.write_at(f1.ino, b"batch 1 data", 0).unwrap();
         fs.freeze_now();
 
         let f2 = crate::operations::read_write::create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f2.ino, b"batch 2 data", 0).unwrap();
+        fs.write_at(f2.ino, b"batch 2 data", 0).unwrap();
         fs.freeze_now();
 
         let f3 = crate::operations::read_write::create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f3.ino, b"batch 3 data", 0).unwrap();
+        fs.write_at(f3.ino, b"batch 3 data", 0).unwrap();
         fs.freeze_now();
 
         assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 3);
@@ -3251,15 +3251,15 @@ mod tests {
 
         // Stage 3 batches manually
         let f1 = crate::operations::read_write::create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f1.ino, b"batch 1 data", 0).unwrap();
+        fs.write_at(f1.ino, b"batch 1 data", 0).unwrap();
         fs.freeze_now();
 
         let f2 = crate::operations::read_write::create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f2.ino, b"batch 2 data", 0).unwrap();
+        fs.write_at(f2.ino, b"batch 2 data", 0).unwrap();
         fs.freeze_now();
 
         let f3 = crate::operations::read_write::create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f3.ino, &vec![0x42; 70 * 1024], 0).unwrap();
+        fs.write_at(f3.ino, &vec![0x42; 70 * 1024], 0).unwrap();
         fs.freeze_now();
 
         assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 3);
@@ -3338,7 +3338,7 @@ mod tests {
         let fs = Arc::new(fs);
 
         let f1 = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f1.ino, b"hello world", 0).unwrap();
+        fs.write_at(f1.ino, b"hello world", 0).unwrap();
         fs.freeze_now();
 
         // Retrieve the frozen batch's completion handle

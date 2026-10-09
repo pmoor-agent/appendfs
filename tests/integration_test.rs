@@ -2,6 +2,7 @@
 #![allow(unsafe_code)]
 mod common;
 use appendfs::Clock;
+use appendfs::FsTestExt;
 use appendfs::storage::{MemoryStorage, OsStorage, Storage};
 use common::{TestMount, wait_until};
 use std::fs;
@@ -993,7 +994,7 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
         let dir_attr = appendfs::operations::dir::mkdir_core(&fs, 1, "testdir", 0o755, 1000, 1000).unwrap();
         let file_attr =
             appendfs::operations::read_write::create_core(&fs, dir_attr.ino, "data.txt", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, file_attr.ino, b"hello lazy log", 0).unwrap();
+        fs.write_at(file_attr.ino, b"hello lazy log", 0).unwrap();
 
         // Flush & unmount
         fs.quiesce().unwrap();
@@ -1177,7 +1178,7 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
     // 1. Populate valid filesystem tree
     let d = appendfs::operations::dir::mkdir_core(&fs, 1, "sub", 0o755, 1000, 1000).unwrap();
     let f1 = appendfs::operations::read_write::create_core(&fs, d.ino, "hello.txt", 0o644, 0, 1000, 1000).unwrap();
-    appendfs::operations::read_write::write_core(&fs, f1.ino, b"integrity test data", 0).unwrap();
+    fs.write_at(f1.ino, b"integrity test data", 0).unwrap();
     let _l = appendfs::operations::links::link_core(&fs, f1.ino, 1, "hardlink.txt").unwrap();
 
     fs.quiesce().unwrap();
@@ -2452,7 +2453,7 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
         let file_attr =
             appendfs::operations::read_write::create_core(&fs, 1, "confidential.txt", 0o600, 0, 1000, 1000).unwrap();
         let secret = b"TOP_SECRET_CREDENTIALS_AND_PAYLOAD_987654321";
-        appendfs::operations::read_write::write_core(&fs, file_attr.ino, secret, 0).unwrap();
+        fs.write_at(file_attr.ino, secret, 0).unwrap();
 
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
@@ -2560,7 +2561,7 @@ fn test_tampered_record_header_is_rejected_not_served() {
         fs.log_writer = Some(writer);
 
         let attr = appendfs::operations::read_write::create_core(&fs, 1, "secret.txt", 0o600, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, attr.ino, secret, 0).unwrap();
+        fs.write_at(attr.ino, secret, 0).unwrap();
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
         attr.ino
@@ -2830,7 +2831,7 @@ fn test_compressed_volume_round_trips_and_saves_space() {
             fs.log_writer = Some(writer);
 
             let attr = appendfs::operations::read_write::create_core(&fs, 1, "text.log", 0o644, 0, 1000, 1000).unwrap();
-            appendfs::operations::read_write::write_core(&fs, attr.ino, &payload, 0).unwrap();
+            fs.write_at(attr.ino, &payload, 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
             attr.ino
@@ -2912,7 +2913,7 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
             );
             fs.log_writer = Some(writer);
             let attr = appendfs::operations::read_write::create_core(&fs, 1, "big.txt", 0o644, 0, 1000, 1000).unwrap();
-            appendfs::operations::read_write::write_core(&fs, attr.ino, &payload, 0).unwrap();
+            fs.write_at(attr.ino, &payload, 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
         }
@@ -2987,14 +2988,14 @@ fn test_periodic_summary_generation_on_log_rolls() {
         // Generation 1: write file1 (1000 bytes). Total log size becomes ~1100 bytes (>= 1000).
         let file1_data = vec![0x11u8; 1000];
         let a1 = appendfs::operations::read_write::create_core(&fs, 1, "file1.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a1.ino, &file1_data, 0).unwrap();
+        fs.write_at(a1.ino, &file1_data, 0).unwrap();
         fs.quiesce().unwrap();
 
         // Generation 2: write file2 (1000 bytes). Gen 1 reached limit, causing roll to gen 2!
         // Roll 1: gen 1 is sealed. generations_since_last_summary becomes 1 (< 2). No summary yet.
         let file2_data = vec![0x22u8; 1000];
         let a2 = appendfs::operations::read_write::create_core(&fs, 1, "file2.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a2.ino, &file2_data, 0).unwrap();
+        fs.write_at(a2.ino, &file2_data, 0).unwrap();
         fs.quiesce().unwrap();
 
         assert!(
@@ -3007,7 +3008,7 @@ fn test_periodic_summary_generation_on_log_rolls() {
         // 000002.summary MUST be emitted!
         let file3_data = vec![0x33u8; 1000];
         let a3 = appendfs::operations::read_write::create_core(&fs, 1, "file3.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a3.ino, &file3_data, 0).unwrap();
+        fs.write_at(a3.ino, &file3_data, 0).unwrap();
         fs.quiesce().unwrap();
 
         assert!(
@@ -3018,7 +3019,7 @@ fn test_periodic_summary_generation_on_log_rolls() {
         // Generation 4: write file4 (1000 bytes) in gen 3.
         let file4_data = vec![0x44u8; 1000];
         let a4 = appendfs::operations::read_write::create_core(&fs, 1, "file4.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a4.ino, &file4_data, 0).unwrap();
+        fs.write_at(a4.ino, &file4_data, 0).unwrap();
         fs.quiesce().unwrap();
 
         // Simulate sudden crash: do NOT call sync_and_export_summary()!
@@ -3044,21 +3045,11 @@ fn test_periodic_summary_generation_on_log_rolls() {
     assert!(names.contains(&"file4.bin".to_string()));
 
     let f1_ino = recovered_fs.lookup_child(1, "file1.bin").unwrap();
-    let fh1 = appendfs::operations::read_write::open_core(&recovered_fs, f1_ino, libc::O_RDONLY as u32).unwrap();
-    let buf1 = appendfs::operations::read_write::read_core(&recovered_fs, f1_ino, fh1, 0, 1000)
-        .unwrap()
-        .into_bytes()
-        .unwrap();
-    appendfs::operations::read_write::release_core(&recovered_fs, f1_ino, fh1).unwrap();
+    let buf1 = recovered_fs.read_at(f1_ino, 0, 1000).unwrap();
     assert_eq!(buf1, vec![0x11u8; 1000]);
 
     let f4_ino = recovered_fs.lookup_child(1, "file4.bin").unwrap();
-    let fh4 = appendfs::operations::read_write::open_core(&recovered_fs, f4_ino, libc::O_RDONLY as u32).unwrap();
-    let buf4 = appendfs::operations::read_write::read_core(&recovered_fs, f4_ino, fh4, 0, 1000)
-        .unwrap()
-        .into_bytes()
-        .unwrap();
-    appendfs::operations::read_write::release_core(&recovered_fs, f4_ino, fh4).unwrap();
+    let buf4 = recovered_fs.read_at(f4_ino, 0, 1000).unwrap();
     assert_eq!(buf4, vec![0x44u8; 1000]);
 }
 
@@ -3092,25 +3083,25 @@ fn test_periodic_summary_generation_by_bytes() {
 
         // 1. Write file1 (1000 bytes). Gen 1.
         let a1 = appendfs::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a1.ino, &vec![1u8; 1000], 0).unwrap();
+        fs.write_at(a1.ino, &vec![1u8; 1000], 0).unwrap();
         fs.quiesce().unwrap();
 
         // 2. Write file2 (1000 bytes). Rolls to gen 2. bytes_since = 1000 (< 2500). No summary.
         let a2 = appendfs::operations::read_write::create_core(&fs, 1, "f2.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a2.ino, &vec![2u8; 1000], 0).unwrap();
+        fs.write_at(a2.ino, &vec![2u8; 1000], 0).unwrap();
         fs.quiesce().unwrap();
         assert!(!storage.exists("000001.summary"));
 
         // 3. Write file3 (1000 bytes). Rolls to gen 3. bytes_since = 2000 (< 2500). No summary.
         let a3 = appendfs::operations::read_write::create_core(&fs, 1, "f3.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a3.ino, &vec![3u8; 1000], 0).unwrap();
+        fs.write_at(a3.ino, &vec![3u8; 1000], 0).unwrap();
         fs.quiesce().unwrap();
         assert!(!storage.exists("000002.summary"));
 
         // 4. Write file4 (1000 bytes). Rolls to gen 4. bytes_since = 3000 (>= 2500).
         // 000003.summary must be emitted!
         let a4 = appendfs::operations::read_write::create_core(&fs, 1, "f4.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a4.ino, &vec![4u8; 1000], 0).unwrap();
+        fs.write_at(a4.ino, &vec![4u8; 1000], 0).unwrap();
         fs.quiesce().unwrap();
         assert!(
             storage.exists("000003.summary"),
@@ -3164,7 +3155,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
         fs.log_writer = Some(writer);
 
         let a1 = appendfs::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a1.ino, &vec![1u8; 1000], 0).unwrap();
+        fs.write_at(a1.ino, &vec![1u8; 1000], 0).unwrap();
         fs.quiesce().unwrap();
 
         // Export summary for gen 1
@@ -3173,12 +3164,12 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
 
         // Gen 2: write 1000 bytes in f2.bin, causing roll to gen 2
         let a2 = appendfs::operations::read_write::create_core(&fs, 1, "f2.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a2.ino, &vec![2u8; 1000], 0).unwrap();
+        fs.write_at(a2.ino, &vec![2u8; 1000], 0).unwrap();
         fs.quiesce().unwrap();
 
         // Gen 3: write 1000 bytes in f3.bin, causing roll to gen 3
         let a3 = appendfs::operations::read_write::create_core(&fs, 1, "f3.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a3.ino, &vec![3u8; 1000], 0).unwrap();
+        fs.write_at(a3.ino, &vec![3u8; 1000], 0).unwrap();
         // Drop fs and writer to release lock, then remove 000003.summary (emitted on clean drop) to simulate crash
         drop(fs);
     }
@@ -3234,7 +3225,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
 
     // Write file4 in gen 4 (1000 bytes). Gen 4 is opened and committed.
     let a4 = appendfs::operations::read_write::create_core(&recovered_fs, 1, "f4.bin", 0o644, 0, 1000, 1000).unwrap();
-    appendfs::operations::read_write::write_core(&recovered_fs, a4.ino, &vec![4u8; 1000], 0).unwrap();
+    recovered_fs.write_at(a4.ino, &vec![4u8; 1000], 0).unwrap();
     recovered_fs.quiesce().unwrap();
 
     // Now write file5 in gen 5 (1000 bytes), which forces gen 4 to roll (gen 4 reached limit 1000).
@@ -3242,7 +3233,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
     // bytes_since was 2000 (recovered) + 1000 (gen 4) = 3000 >= 2500!
     // 000004.summary MUST be emitted!
     let a5 = appendfs::operations::read_write::create_core(&recovered_fs, 1, "f5.bin", 0o644, 0, 1000, 1000).unwrap();
-    appendfs::operations::read_write::write_core(&recovered_fs, a5.ino, &vec![5u8; 1000], 0).unwrap();
+    recovered_fs.write_at(a5.ino, &vec![5u8; 1000], 0).unwrap();
     recovered_fs.quiesce().unwrap();
 
     assert!(
@@ -3282,7 +3273,7 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
         fs.log_writer = Some(writer);
 
         let a1 = appendfs::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a1.ino, &vec![1u8; 1000], 0).unwrap();
+        fs.write_at(a1.ino, &vec![1u8; 1000], 0).unwrap();
         fs.quiesce().unwrap();
 
         fs.export_summary(storage.as_ref()).unwrap();
@@ -3290,12 +3281,12 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
 
         // Gen 2
         let a2 = appendfs::operations::read_write::create_core(&fs, 1, "f2.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a2.ino, &vec![2u8; 1000], 0).unwrap();
+        fs.write_at(a2.ino, &vec![2u8; 1000], 0).unwrap();
         fs.quiesce().unwrap();
 
         // Gen 3
         let a3 = appendfs::operations::read_write::create_core(&fs, 1, "f3.bin", 0o644, 0, 1000, 1000).unwrap();
-        appendfs::operations::read_write::write_core(&fs, a3.ino, &vec![3u8; 1000], 0).unwrap();
+        fs.write_at(a3.ino, &vec![3u8; 1000], 0).unwrap();
 
         drop(fs);
     }
@@ -3332,12 +3323,12 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
 
     // Write file4 in gen 4
     let a4 = appendfs::operations::read_write::create_core(&recovered_fs, 1, "f4.bin", 0o644, 0, 1000, 1000).unwrap();
-    appendfs::operations::read_write::write_core(&recovered_fs, a4.ino, &vec![4u8; 1000], 0).unwrap();
+    recovered_fs.write_at(a4.ino, &vec![4u8; 1000], 0).unwrap();
     recovered_fs.quiesce().unwrap();
 
     // Write file5 in gen 5 (rolls gen 4). gens_since becomes 2 (recovered) + 1 (gen 4) = 3 >= 3!
     let a5 = appendfs::operations::read_write::create_core(&recovered_fs, 1, "f5.bin", 0o644, 0, 1000, 1000).unwrap();
-    appendfs::operations::read_write::write_core(&recovered_fs, a5.ino, &vec![5u8; 1000], 0).unwrap();
+    recovered_fs.write_at(a5.ino, &vec![5u8; 1000], 0).unwrap();
     recovered_fs.quiesce().unwrap();
 
     assert!(

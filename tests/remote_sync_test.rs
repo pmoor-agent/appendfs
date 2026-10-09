@@ -1,12 +1,12 @@
 use appendfs::CheckOptions;
 use appendfs::Clock;
 use appendfs::FsError;
-use appendfs::InMemoryFS;
+use appendfs::FsTestExt;
 use appendfs::Storage;
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{VolumeHeader, VolumeKey};
 use appendfs::log::{LogFileCache, LogWriter, init_volume, init_volume_with_clock};
-use appendfs::operations::read_write::{create_core, open_core, read_core, release_core, write_core};
+use appendfs::operations::read_write::{create_core, open_core, release_core};
 use appendfs::remote::bootstrap_from_remote;
 use appendfs::remote::worker::{cross_copy_file, cross_copy_summary, upload_storage_file};
 use appendfs::remote::{
@@ -22,13 +22,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::TempDir;
-
-fn read_test(fs: &InMemoryFS, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, FsError> {
-    let fh = open_core(fs, ino, libc::O_RDONLY as u32)?;
-    let res = read_core(fs, ino, fh, offset as i64, size);
-    let _ = release_core(fs, ino, fh);
-    res.and_then(|r| r.into_bytes().ok_or(FsError::EIO))
-}
 
 #[test]
 fn test_remote_replication_and_authenticated_md5_ledger() {
@@ -57,7 +50,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     let file1_attr = create_core(&fs, root, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
     let file_ino = file1_attr.ino;
     let content1 = b"Generation 1 payload: The quick brown fox jumps over the lazy dog";
-    write_core(&fs, file_ino, content1, 0).unwrap();
+    fs.write_at(file_ino, content1, 0).unwrap();
     fs.quiesce().unwrap();
 
     // Force roll to generation 2 (seals gen 1)
@@ -69,7 +62,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     let file2_attr = create_core(&fs, root, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
     let file2_ino = file2_attr.ino;
     let content2 = b"Generation 2 payload: All good things come to an end";
-    write_core(&fs, file2_ino, content2, 0).unwrap();
+    fs.write_at(file2_ino, content2, 0).unwrap();
     fs.quiesce().unwrap();
 
     // Export summary snapshot (computes and populates sealed generation 1 MD5 into manifest!)
@@ -179,7 +172,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     let file_attr = create_core(&fs, 1, "archival.dat", 0o644, 0, 1000, 1000).unwrap();
     let ino = file_attr.ino;
     let original_bytes: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
-    write_core(&fs, ino, &original_bytes, 0).unwrap();
+    fs.write_at(ino, &original_bytes, 0).unwrap();
     fs.quiesce().unwrap();
 
     // Roll to generation 2
@@ -219,7 +212,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     // Read back archival.dat from the filesystem:
     // Local file is GONE, so TieredStorageReader should fetch 1MB aligned block from remote,
     // cache it in memory block cache, and return exact bytes!
-    let read_back = read_test(&fs, ino, 0, original_bytes.len()).unwrap();
+    let read_back = fs.read_at(ino, 0, original_bytes.len()).unwrap();
     assert_eq!(
         read_back, original_bytes,
         "Sparse remote extent read matched original bytes bit-for-bit!"
@@ -233,7 +226,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
 
     // Second read hits in-memory decrypted cache and block cache directly (even if remote goes down!)
     failing_remote.fail_next_n_requests(10);
-    let read_back2 = read_test(&fs, ino, 500, 100).unwrap();
+    let read_back2 = fs.read_at(ino, 500, 100).unwrap();
     assert_eq!(read_back2, &original_bytes[500..600]);
 }
 
@@ -256,7 +249,7 @@ fn test_disaster_recovery_bootstrap_from_remote() {
 
     let file_attr = create_core(&fs, 1, "important.txt", 0o644, 0, 1000, 1000).unwrap();
     let ino = file_attr.ino;
-    write_core(&fs, ino, b"disaster recovery data", 0).unwrap();
+    fs.write_at(ino, b"disaster recovery data", 0).unwrap();
     fs.quiesce().unwrap();
 
     let summary_file = fs.export_summary(storage.as_ref()).unwrap();
@@ -307,7 +300,7 @@ fn test_read_only_remote_and_cloud_forking() {
     // Write file in generation 1
     let file_attr = create_core(&fs, 1, "base.txt", 0o644, 0, 1000, 1000).unwrap();
     let ino = file_attr.ino;
-    write_core(&fs, ino, b"upstream base file contents", 0).unwrap();
+    fs.write_at(ino, b"upstream base file contents", 0).unwrap();
     fs.quiesce().unwrap();
 
     // Roll to generation 2
@@ -395,7 +388,7 @@ fn test_bootstrap_rebuilds_encrypted_active_log_from_parts() {
 
     // Two batches, each shipped as its own part of the still-active generation 1.
     let file = create_core(&fs_arc, 1, "active.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs_arc, file.ino, b"first part ", 0).unwrap();
+    fs_arc.write_at(file.ino, b"first part ", 0).unwrap();
     fs_arc.quiesce().unwrap();
     appendfs::remote::RemoteReplicationWorker::run_cycle(
         &fs_arc,
@@ -405,7 +398,7 @@ fn test_bootstrap_rebuilds_encrypted_active_log_from_parts() {
         &mut uploaded_parts,
     )
     .unwrap();
-    write_core(&fs_arc, file.ino, b"second part", 11).unwrap();
+    fs_arc.write_at(file.ino, b"second part", 11).unwrap();
     fs_arc.quiesce().unwrap();
     last_part_sync = std::time::SystemTime::UNIX_EPOCH;
     appendfs::remote::RemoteReplicationWorker::run_cycle(
@@ -481,7 +474,9 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     // 1. Write first chunk of active data
     let file1_attr = create_core(&fs_arc, 1, "active_file.txt", 0o644, 0, 1000, 1000).unwrap();
     let ino = file1_attr.ino;
-    write_core(&fs_arc, ino, b"Part 0 slice: hello appendfs active sync!", 0).unwrap();
+    fs_arc
+        .write_at(ino, b"Part 0 slice: hello appendfs active sync!", 0)
+        .unwrap();
     fs_arc.quiesce().unwrap();
 
     // Run sync cycle -> uploads 000001.part0000.log!
@@ -503,7 +498,9 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     assert!(part0.unwrap().size > 0);
 
     // 2. Write second chunk of active data
-    write_core(&fs_arc, ino, b"Part 1 slice: more mutations appended!", 100).unwrap();
+    fs_arc
+        .write_at(ino, b"Part 1 slice: more mutations appended!", 100)
+        .unwrap();
     fs_arc.quiesce().unwrap();
 
     last_part_sync = std::time::SystemTime::UNIX_EPOCH; // reset timer to force next upload
@@ -688,7 +685,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     let file_attr = create_core(&fs, root, "nfs_file.txt", 0o644, 0, 1000, 1000).unwrap();
     let file_ino = file_attr.ino;
     let payload = b"Data that will replicate to NFS NAS share and be read tier-cached!";
-    write_core(&fs, file_ino, payload, 0).unwrap();
+    fs.write_at(file_ino, payload, 0).unwrap();
     fs.quiesce().unwrap();
 
     // Force roll to generation 2 (seals generation 1)
@@ -747,7 +744,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     // Read back nfs_file.txt from the filesystem:
     // Local 000001.log is GONE, so TieredStorageReader should fetch 1MB aligned block from NFS remote,
     // cache it in block cache, and return exact bytes!
-    let read_back = read_test(&fs, file_ino, 0, payload.len()).unwrap();
+    let read_back = fs.read_at(file_ino, 0, payload.len()).unwrap();
     assert_eq!(
         read_back, payload,
         "Sparse NFS remote extent read matched original payload bit-for-bit!"
@@ -783,7 +780,7 @@ fn test_local_read_populates_block_cache_before_purge() {
     let file1_attr = create_core(&fs, root, "hot_file.txt", 0o644, 0, 1000, 1000).unwrap();
     let file1_ino = file1_attr.ino;
     let payload1 = b"Hot file content that will be pre-warmed into block cache from local disk";
-    write_core(&fs, file1_ino, payload1, 0).unwrap();
+    fs.write_at(file1_ino, payload1, 0).unwrap();
     fs.quiesce().unwrap();
 
     // 2. Force roll to generation 2 (seals generation 1)
@@ -796,7 +793,7 @@ fn test_local_read_populates_block_cache_before_purge() {
     let file2_attr = create_core(&fs, root, "active_file.txt", 0o644, 0, 1000, 1000).unwrap();
     let file2_ino = file2_attr.ino;
     let payload2 = b"Active generation content that reads directly without block caching";
-    write_core(&fs, file2_ino, payload2, 0).unwrap();
+    fs.write_at(file2_ino, payload2, 0).unwrap();
     fs.quiesce().unwrap();
 
     // 4. Attach LogFileCache with MemoryBlockCache (NO remotes configured!), caching local reads
@@ -818,7 +815,7 @@ fn test_local_read_populates_block_cache_before_purge() {
 
     // 5. Read sealed generation 1 file while 000001.log is STILL in storage:
     // Should read from storage AND pre-warm into block cache!
-    let read_sealed = read_test(&fs, file1_ino, 0, payload1.len()).unwrap();
+    let read_sealed = fs.read_at(file1_ino, 0, payload1.len()).unwrap();
     assert_eq!(read_sealed, payload1);
 
     // Block 0 of generation 1 MUST now be cached!
@@ -826,7 +823,7 @@ fn test_local_read_populates_block_cache_before_purge() {
 
     // 6. Read active generation 2 file:
     // Must NOT write to block cache because active generation avoids partial block caching!
-    let read_active = read_test(&fs, file2_ino, 0, payload2.len()).unwrap();
+    let read_active = fs.read_at(file2_ino, 0, payload2.len()).unwrap();
     assert_eq!(read_active, payload2);
     assert!(block_cache.read_block("000002", 0).unwrap().is_none());
 
@@ -839,7 +836,7 @@ fn test_local_read_populates_block_cache_before_purge() {
 
     // 9. Read sealed file again:
     // 000001.log is GONE, NO remotes exist, but read MUST succeed directly from block cache!
-    let read_cached_after_purge = read_test(&fs, file1_ino, 0, payload1.len()).unwrap();
+    let read_cached_after_purge = fs.read_at(file1_ino, 0, payload1.len()).unwrap();
     assert_eq!(
         read_cached_after_purge, payload1,
         "Read succeeded directly from pre-warmed block cache after local log was purged!"
@@ -866,7 +863,7 @@ fn test_local_read_skips_block_cache_by_default() {
 
     let ino = create_core(&fs, 1, "file.txt", 0o644, 0, 1000, 1000).unwrap().ino;
     let payload = b"Sealed content read straight from the local log";
-    write_core(&fs, ino, payload, 0).unwrap();
+    fs.write_at(ino, payload, 0).unwrap();
     fs.quiesce().unwrap();
 
     let sealed = writer.force_roll(&*clock).unwrap().unwrap();
@@ -882,14 +879,14 @@ fn test_local_read_skips_block_cache_by_default() {
     fs.log_cache = Some(log_cache.clone());
 
     // The sealed log is still local, so it is read directly and nothing is copied into the cache.
-    assert_eq!(read_test(&fs, ino, 0, payload.len()).unwrap(), payload);
+    assert_eq!(fs.read_at(ino, 0, payload.len()).unwrap(), payload);
     assert!(block_cache.read_block("000001", 0).unwrap().is_none());
 
     // Once it is purged there is no second copy to fall back on, and no remote either.
     log_cache.decrypted_cache.clear();
     storage.remove_file("000001.log").unwrap();
     log_cache.invalidate(1);
-    assert!(read_test(&fs, ino, 0, payload.len()).is_err());
+    assert!(fs.read_at(ino, 0, payload.len()).is_err());
 }
 
 #[test]
@@ -915,7 +912,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     let file_attr = create_core(&fs, root, "archived.txt", 0o644, 0, 1000, 1000).unwrap();
     let file_ino = file_attr.ino;
     let payload = b"Remote data that should be fetched from NAS before falling back to S3";
-    write_core(&fs, file_ino, payload, 0).unwrap();
+    fs.write_at(file_ino, payload, 0).unwrap();
     fs.quiesce().unwrap();
 
     // 2. Roll to generation 2 (seals generation 1)
@@ -974,7 +971,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     fs.log_cache = Some(log_cache.clone());
 
     // 7. Perform read: should query NAS first, succeed, and NOT touch S3!
-    let read1 = read_test(&fs, file_ino, 0, payload.len()).unwrap();
+    let read1 = fs.read_at(file_ino, 0, payload.len()).unwrap();
     assert_eq!(read1, payload);
 
     assert_eq!(
@@ -991,7 +988,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     nas_failing.fail_next_n_requests(1);
 
     // 9. Perform read: NAS fails, so it fails over to S3!
-    let read2 = read_test(&fs, file_ino, 0, payload.len()).unwrap();
+    let read2 = fs.read_at(file_ino, 0, payload.len()).unwrap();
     assert_eq!(read2, payload);
 
     assert_eq!(counting_nas_front.range_reads(), 2, "NAS was tried first and failed");
@@ -1020,7 +1017,7 @@ fn test_latency_remote_store_in_tiered_reading() {
 
     let file_attr = create_core(&fs, 1, "latency_test.dat", 0o644, 0, 1000, 1000).unwrap();
     let payload = b"Testing latency injection on tiered remote store reads";
-    write_core(&fs, file_attr.ino, payload, 0).unwrap();
+    fs.write_at(file_attr.ino, payload, 0).unwrap();
     fs.quiesce().unwrap();
 
     let sealed = writer.force_roll(&*clock).unwrap().unwrap();
@@ -1057,7 +1054,7 @@ fn test_latency_remote_store_in_tiered_reading() {
 
     // 1st read: misses cache, queries latency_store, takes >= 19ms
     let start1 = Instant::now();
-    let read1 = read_test(&fs, file_attr.ino, 0, payload.len()).unwrap();
+    let read1 = fs.read_at(file_attr.ino, 0, payload.len()).unwrap();
     let elapsed1 = start1.elapsed();
     assert_eq!(read1, payload);
     assert!(
@@ -1069,7 +1066,7 @@ fn test_latency_remote_store_in_tiered_reading() {
 
     // 2nd read: served directly from cache, near instantaneous (< 10ms)
     let start2 = Instant::now();
-    let read2 = read_test(&fs, file_attr.ino, 0, payload.len()).unwrap();
+    let read2 = fs.read_at(file_attr.ino, 0, payload.len()).unwrap();
     let elapsed2 = start2.elapsed();
     assert_eq!(read2, payload);
     assert!(
@@ -1140,7 +1137,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
 
     // 3. Write data, roll log, and run replication cycle
     let file = create_core(&fs_arc, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs_arc, file.ino, b"data before roll", 0).unwrap();
+    fs_arc.write_at(file.ino, b"data before roll", 0).unwrap();
     fs_arc.quiesce().unwrap();
 
     let sealed = writer.force_roll(&*clock).unwrap().unwrap();
@@ -1164,10 +1161,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     let fh = open_core(&fs_arc, remotes_ino, libc::O_RDONLY as u32).unwrap();
 
     // 5. Read .remotes content
-    let content_bytes = read_core(&fs_arc, remotes_ino, fh, 0, 4096)
-        .unwrap()
-        .into_bytes()
-        .unwrap();
+    let content_bytes = fs_arc.read_blocking(remotes_ino, fh, 0, 4096).unwrap();
     let content_str = String::from_utf8(content_bytes).unwrap();
 
     assert!(content_str.contains("=== Remote Status (Volume Head Generation: 2) ==="));
@@ -1187,7 +1181,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     // 6. Release file handle
     release_core(&fs_arc, remotes_ino, fh).unwrap();
     assert_eq!(
-        read_core(&fs_arc, remotes_ino, fh, 0, 4096),
+        fs_arc.read_blocking(remotes_ino, fh, 0, 4096),
         Err(FsError::EBADF),
         "Reading from released handle must return EBADF"
     );
@@ -1308,7 +1302,9 @@ fn test_event_driven_immediate_replication_on_log_roll() {
 
     // Write data to active log
     let file1 = create_core(&fs_arc, 1, "test_file.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs_arc, file1.ino, b"Data to seal into generation 1", 0).unwrap();
+    fs_arc
+        .write_at(file1.ino, b"Data to seal into generation 1", 0)
+        .unwrap();
     fs_arc.quiesce().unwrap();
 
     // Force roll generation 1 -> 2. This seals generation 1 and notifies the worker via Condvar!
@@ -1360,7 +1356,7 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
 
     // Write data to active log
     let file1 = create_core(&fs_arc, 1, "audit_test.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs_arc, file1.ino, b"Audit test data payload", 0).unwrap();
+    fs_arc.write_at(file1.ino, b"Audit test data payload", 0).unwrap();
     fs_arc.quiesce().unwrap();
 
     // Seal generation 1
@@ -1475,7 +1471,7 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     // Write file in generation 1
     let root = 1u64;
     let file_attr = create_core(&fs, root, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, file_attr.ino, b"data to replicate and prune", 0).unwrap();
+    fs.write_at(file_attr.ino, b"data to replicate and prune", 0).unwrap();
     fs.quiesce().unwrap();
 
     fs.export_summary(storage.as_ref()).unwrap();
@@ -1564,7 +1560,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     // Write file A in generation 1
     let file_a = create_core(&fs, 1, "file_a.txt", 0o644, 0, 1000, 1000).unwrap();
     let payload_a = b"Generation 1: Data for file A that will be pruned locally";
-    write_core(&fs, file_a.ino, payload_a, 0).unwrap();
+    fs.write_at(file_a.ino, payload_a, 0).unwrap();
     fs.quiesce().unwrap();
 
     // Roll to generation 2 (sealing gen 1)
@@ -1582,7 +1578,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     clock.advance(std::time::Duration::from_secs(60));
     let file_b = create_core(&fs, 1, "file_b.txt", 0o644, 0, 1000, 1000).unwrap();
     let payload_b = b"Generation 2: Data for file B";
-    write_core(&fs, file_b.ino, payload_b, 0).unwrap();
+    fs.write_at(file_b.ino, payload_b, 0).unwrap();
     fs.quiesce().unwrap();
 
     // Roll to generation 3 (sealing gen 2) and export summary 2
@@ -1658,11 +1654,11 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
 
     // Read file_a (written in gen 1, which was purged locally!):
     // Should fetch from mock_remote via TieredStorageReader and return exact payload
-    let read_a = read_test(&fs_latest, file_a.ino, 0, payload_a.len()).unwrap();
+    let read_a = fs_latest.read_at(file_a.ino, 0, payload_a.len()).unwrap();
     assert_eq!(read_a, payload_a);
 
     // Read file_b (written in gen 2, also purged locally!):
-    let read_b = read_test(&fs_latest, file_b.ino, 0, payload_b.len()).unwrap();
+    let read_b = fs_latest.read_at(file_b.ino, 0, payload_b.len()).unwrap();
     assert_eq!(read_b, payload_b);
 
     // =========================================================================
@@ -1715,7 +1711,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     );
 
     // Reading file_a from the historical past mount fetches from remote and succeeds!
-    let read_past_a = read_test(&fs_past, file_a.ino, 0, payload_a.len()).unwrap();
+    let read_past_a = fs_past.read_at(file_a.ino, 0, payload_a.len()).unwrap();
     assert_eq!(read_past_a, payload_a);
 
     // =========================================================================
@@ -1753,7 +1749,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
 
     assert!(fs_gen1.lookup_child(1, "file_a.txt").is_some());
     assert!(fs_gen1.lookup_child(1, "file_b.txt").is_none());
-    let read_gen1_a = read_test(&fs_gen1, file_a.ino, 0, payload_a.len()).unwrap();
+    let read_gen1_a = fs_gen1.read_at(file_a.ino, 0, payload_a.len()).unwrap();
     assert_eq!(read_gen1_a, payload_a);
 }
 
@@ -1785,7 +1781,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         let filename = format!("file_{}.txt", gen_idx);
         let file = create_core(&fs_arc, 1, &filename, 0o644, 0, 1000, 1000).unwrap();
         let payload = format!("Payload for generation {}", gen_idx);
-        write_core(&fs_arc, file.ino, payload.as_bytes(), 0).unwrap();
+        fs_arc.write_at(file.ino, payload.as_bytes(), 0).unwrap();
         fs_arc.quiesce().unwrap();
 
         // Roll and export summary
@@ -1940,7 +1936,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     // Part C: Test that failing list_objects skips remote without falling back to head_object
     // =========================================================================
     let file4 = create_core(&fs_arc, 1, "file_4.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs_arc, file4.ino, b"Payload for generation 4", 0).unwrap();
+    fs_arc.write_at(file4.ino, b"Payload for generation 4", 0).unwrap();
     fs_arc.quiesce().unwrap();
 
     let sealed = writer.force_roll(&*clock).unwrap().unwrap();
@@ -2125,7 +2121,9 @@ fn test_per_remote_upload_partial_logs_behavior() {
     // 1. Write first chunk of active data
     let file1_attr = create_core(&fs_arc, 1, "active_doc.txt", 0o644, 0, 1000, 1000).unwrap();
     let ino = file1_attr.ino;
-    write_core(&fs_arc, ino, b"Chunk 0: real-time mutations for NFS only!", 0).unwrap();
+    fs_arc
+        .write_at(ino, b"Chunk 0: real-time mutations for NFS only!", 0)
+        .unwrap();
     fs_arc.quiesce().unwrap();
 
     // Run replication cycle
@@ -2156,7 +2154,7 @@ fn test_per_remote_upload_partial_logs_behavior() {
     }
 
     // 2. Write second chunk of active data
-    write_core(&fs_arc, ino, b"Chunk 1: more mutations appended!", 100).unwrap();
+    fs_arc.write_at(ino, b"Chunk 1: more mutations appended!", 100).unwrap();
     fs_arc.quiesce().unwrap();
 
     last_part_sync = std::time::SystemTime::UNIX_EPOCH;
@@ -2399,7 +2397,7 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
     // 1. Write an active part in generation 1 and sync it
     let root = 1u64;
     let file_attr = create_core(&fs, root, "test_file.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, file_attr.ino, b"Active part data before seal", 0).unwrap();
+    fs.write_at(file_attr.ino, b"Active part data before seal", 0).unwrap();
     fs.quiesce().unwrap();
 
     let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
@@ -2577,7 +2575,7 @@ fn test_write_only_glacier_remote_replication_and_prune_safety() {
     // 2. Perform write in active generation 1
     let file1_attr = create_core(&fs_arc, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
     let ino = file1_attr.ino;
-    write_core(&fs_arc, ino, b"data-for-active-part", 0).unwrap();
+    fs_arc.write_at(ino, b"data-for-active-part", 0).unwrap();
     fs_arc.quiesce().unwrap();
 
     let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
@@ -2650,7 +2648,7 @@ fn test_write_only_glacier_remote_replication_and_prune_safety() {
 
     let iso_fs_arc = Arc::new(iso_fs);
     let iso_file_attr = create_core(&iso_fs_arc, 1, "important.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&iso_fs_arc, iso_file_attr.ino, b"crucial data", 0).unwrap();
+    iso_fs_arc.write_at(iso_file_attr.ino, b"crucial data", 0).unwrap();
     iso_fs_arc.quiesce().unwrap();
     let iso_sealed = iso_writer.force_roll(&*clock).unwrap().unwrap();
     iso_fs_arc.manifest.write().unwrap().record_sealed_log(iso_sealed);
@@ -2746,7 +2744,7 @@ fn test_prune_rule_multi_tier_lifecycle_with_glacier() {
 
     // Create file and seal generation 1
     let file1_attr = create_core(&fs_arc, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs_arc, file1_attr.ino, b"multi-tier prune data", 0).unwrap();
+    fs_arc.write_at(file1_attr.ino, b"multi-tier prune data", 0).unwrap();
     fs_arc.quiesce().unwrap();
     let sealed = writer.force_roll(&*clock).unwrap().unwrap();
     fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
@@ -2817,21 +2815,21 @@ fn test_shutdown_drain_syncs_latest_sealed_log_and_skips_earlier_backlog() {
 
     // Gen 1:
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f1.ino, b"data 1", 0).unwrap();
+    fs.write_at(f1.ino, b"data 1", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed1);
 
     // Gen 2:
     let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f2.ino, b"data 2", 0).unwrap();
+    fs.write_at(f2.ino, b"data 2", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed2);
 
     // Gen 3:
     let f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f3.ino, b"data 3", 0).unwrap();
+    fs.write_at(f3.ino, b"data 3", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed3 = writer.force_roll(&*clock).unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed3);
@@ -2877,7 +2875,7 @@ fn test_shutdown_drain_prunes_eligible_local_logs() {
     fs.set_storage(storage.clone());
 
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f1.ino, b"data 1", 0).unwrap();
+    fs.write_at(f1.ino, b"data 1", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed1);
@@ -2926,7 +2924,7 @@ fn test_shutdown_drain_replicates_only_missing_latest_sealed_log_and_summary() {
 
     // Gen 1:
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f1.ino, b"data 1", 0).unwrap();
+    fs.write_at(f1.ino, b"data 1", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
     let sealed1_md5 = sealed1.md5;
@@ -2934,7 +2932,7 @@ fn test_shutdown_drain_replicates_only_missing_latest_sealed_log_and_summary() {
 
     // Gen 2:
     let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f2.ino, b"data 2", 0).unwrap();
+    fs.write_at(f2.ino, b"data 2", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed2);
@@ -2979,7 +2977,7 @@ fn test_shutdown_drain_syncs_latest_summary_and_skips_earlier_summaries() {
 
     // Gen 1:
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f1.ino, b"data 1", 0).unwrap();
+    fs.write_at(f1.ino, b"data 1", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed1);
@@ -2988,7 +2986,7 @@ fn test_shutdown_drain_syncs_latest_summary_and_skips_earlier_summaries() {
 
     // Gen 2:
     let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f2.ino, b"data 2", 0).unwrap();
+    fs.write_at(f2.ino, b"data 2", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed2);
@@ -2997,7 +2995,7 @@ fn test_shutdown_drain_syncs_latest_summary_and_skips_earlier_summaries() {
 
     // Gen 3:
     let f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f3.ino, b"data 3", 0).unwrap();
+    fs.write_at(f3.ino, b"data 3", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed3 = writer.force_roll(&*clock).unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed3);
@@ -3050,14 +3048,14 @@ fn test_worker_syncs_only_latest_summary_cross_copy() {
     fs.set_storage(storage.clone());
 
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f1.ino, b"data 1", 0).unwrap();
+    fs.write_at(f1.ino, b"data 1", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed1);
     let sum1 = fs.export_summary(storage.as_ref()).unwrap();
 
     let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
-    write_core(&fs, f2.ino, b"data 2", 0).unwrap();
+    fs.write_at(f2.ino, b"data 2", 0).unwrap();
     fs.quiesce().unwrap();
     let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed2);
@@ -3115,7 +3113,7 @@ fn test_replication_worker_active_round_interrupted_on_stop() {
     // Create 3 sealed logs
     for i in 1..=3 {
         let file = create_core(&fs, 1, &format!("f{}.txt", i), 0o644, 0, 1000, 1000).unwrap();
-        write_core(&fs, file.ino, &[b'X'; 50000], 0).unwrap();
+        fs.write_at(file.ino, &[b'X'; 50000], 0).unwrap();
         fs.quiesce().unwrap();
         let sealed = writer.force_roll(&*clock).unwrap().unwrap();
         fs.manifest.write().unwrap().record_sealed_log(sealed);
@@ -3192,7 +3190,8 @@ fn test_pre_synced_remote_reflects_up_to_date_status_without_lockstep_lag() {
     let root = 1u64;
     for g in 1..=5 {
         let file_attr = create_core(&fs, root, &format!("file_{}.txt", g), 0o644, 0, 1000, 1000).unwrap();
-        write_core(&fs, file_attr.ino, format!("Content for gen {}", g).as_bytes(), 0).unwrap();
+        fs.write_at(file_attr.ino, format!("Content for gen {}", g).as_bytes(), 0)
+            .unwrap();
         fs.quiesce().unwrap();
 
         let sealed = writer.force_roll(&*clock).unwrap().unwrap();
@@ -3379,7 +3378,8 @@ fn test_prioritized_replication_rw_and_low_lag_replicates_before_archive_backlog
     let root = 1u64;
     for g in 1..=4 {
         let file_attr = create_core(&fs, root, &format!("f_{}.txt", g), 0o644, 0, 1000, 1000).unwrap();
-        write_core(&fs, file_attr.ino, format!("Content {}", g).as_bytes(), 0).unwrap();
+        fs.write_at(file_attr.ino, format!("Content {}", g).as_bytes(), 0)
+            .unwrap();
         fs.quiesce().unwrap();
 
         let sealed = writer.force_roll(&*clock).unwrap().unwrap();

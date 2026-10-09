@@ -291,8 +291,9 @@ mod tests {
     use crate::clock::{Clock, SystemClock};
     use crate::fs::InMemoryFS;
     use crate::log::LogWriter;
-    use crate::operations::read_write::{create_core, write_core};
+    use crate::operations::read_write::create_core;
     use crate::storage::Storage;
+    use crate::test_utils::FsTestExt;
 
     fn test_fs() -> Arc<InMemoryFS> {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
@@ -313,7 +314,7 @@ mod tests {
 
     fn stage_a_write(fs: &InMemoryFS, name: &str) {
         let file = create_core(fs, 1, name, 0o644, 0, 1000, 1000).unwrap();
-        write_core(fs, file.ino, b"payload", 0).unwrap();
+        fs.write_at(file.ino, b"payload", 0).unwrap();
     }
 
     #[test]
@@ -849,17 +850,17 @@ mod tests {
 
         // Stage batch 1
         let f1 = crate::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f1.ino, b"batch 1", 0).unwrap();
+        fs.write_at(f1.ino, b"batch 1", 0).unwrap();
         fs.freeze_now();
 
         // Stage batch 2
         let f2 = crate::operations::read_write::create_core(&fs, 1, "f2.bin", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f2.ino, b"batch 2", 0).unwrap();
+        fs.write_at(f2.ino, b"batch 2", 0).unwrap();
         fs.freeze_now();
 
         // Stage batch 3
         let f3 = crate::operations::read_write::create_core(&fs, 1, "f3.bin", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f3.ino, b"batch 3", 0).unwrap();
+        fs.write_at(f3.ino, b"batch 3", 0).unwrap();
         fs.freeze_now();
 
         fs.run_flush_cycle().unwrap();
@@ -897,7 +898,7 @@ mod tests {
 
         // In the non-coalescing case (1 batch), wait time must be strictly Duration::ZERO
         let f4 = crate::operations::read_write::create_core(&fs, 1, "f4.bin", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::write_core(&fs, f4.ino, b"batch 4", 0).unwrap();
+        fs.write_at(f4.ino, b"batch 4", 0).unwrap();
         fs.freeze_now();
         fs.run_flush_cycle().unwrap();
 
