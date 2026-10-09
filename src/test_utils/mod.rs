@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 mod test_fs;
 
-pub use test_fs::{SnapshotNode, TestFS, TestFSBuilder};
+pub use test_fs::{SnapshotNode, TestFS, TestFSBuilder, open_volume};
 
 /// Blocking, handle-managing shortcuts for driving an `InMemoryFS` from tests.
 ///

@@ -19,6 +19,7 @@ use crate::remote::{
 use crate::shim::{FileAttr, FileType};
 use crate::storage::{FaultStorage, MemoryStorage, Storage};
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
@@ -160,7 +161,7 @@ impl TestFSBuilder {
         }
 
         let mut test_fs = TestFS {
-            fs: open_volume(&storage, &self.clock, &self.volume_key, self.max_log_size),
+            fs: open_volume(&storage, &self.clock, &self.volume_key, self.max_log_size).expect("open test volume"),
             storage,
             fault,
             remotes,
@@ -176,26 +177,25 @@ impl TestFSBuilder {
     }
 }
 
-/// Recovers the volume in `storage` and opens its next generation for writing.
-#[track_caller]
-fn open_volume(
+/// Recovers the volume in `storage` and opens its next generation for writing, as a
+/// read-write mount does.
+///
+/// Fails if recovery fails or another writer still holds the volume's lock.
+pub fn open_volume(
     storage: &Arc<dyn Storage>,
     clock: &Arc<dyn Clock>,
     volume_key: &Arc<VolumeKey>,
     max_log_size: u64,
-) -> InMemoryFS {
+) -> io::Result<InMemoryFS> {
     let mut fs = recover_fs(
         Arc::clone(storage),
         RecoveryTarget::Latest,
         Arc::clone(clock),
         Arc::clone(volume_key),
-    )
-    .expect("recover test volume");
-    let writer = fs
-        .next_log_writer(Arc::clone(storage), max_log_size)
-        .expect("open test volume log writer");
+    )?;
+    let writer = fs.next_log_writer(Arc::clone(storage), max_log_size)?;
     fs.attach_log_writer(Arc::new(writer));
-    fs
+    Ok(fs)
 }
 
 fn remote_name(index: usize) -> String {
@@ -310,7 +310,7 @@ impl TestFS {
         drop(fs);
 
         let mut reopened = TestFS {
-            fs: open_volume(&storage, &clock, &volume_key, max_log_size),
+            fs: open_volume(&storage, &clock, &volume_key, max_log_size).expect("reopen test volume"),
             storage,
             fault,
             remotes,
