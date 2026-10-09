@@ -722,17 +722,14 @@ pub struct FsInnerGuard<'a> {
     guard: ActionGuard<'a, FsInner>,
     fs: &'a InMemoryFS,
     mutation_occurred: bool,
-    first_staged: bool,
 }
 
 impl<'a> FsInnerGuard<'a> {
     /// Records a mutation of `additional_bytes`, increments staged operation count by 1,
     /// and flags that a mutation occurred in this lock session.
     pub fn record_mutation(&mut self, additional_bytes: usize) {
-        let first = self.guard.live_staged_at.is_none();
         self.guard.record_mutation(additional_bytes, self.fs.clock.monotonic());
         self.mutation_occurred = true;
-        self.first_staged |= first;
     }
 
     /// Parks a task to be executed immediately after the mutex lock is released.
@@ -788,9 +785,6 @@ impl<'a> Drop for FsInnerGuard<'a> {
                 let fs = self.fs;
                 self.guard.defer(move || fs.wake_flusher());
             }
-        } else if self.first_staged && self.fs.flusher.is_background() {
-            let fs = self.fs;
-            self.guard.defer(move || fs.wake_flusher());
         }
         self.fs.sync_pushback_saturation(&self.guard);
     }
@@ -1002,7 +996,6 @@ impl InMemoryFS {
             guard: self.inner.lock(tag).unwrap(),
             fs: self,
             mutation_occurred: false,
-            first_staged: false,
         }
     }
 
