@@ -52,6 +52,9 @@ pub enum SnapshotNode {
 
 /// Configures a [`TestFS`]. Every option has a default, so `TestFS::builder().build()` is a
 /// plaintext, in-memory volume on the system clock.
+///
+/// Setup failures panic rather than return an error, so the panicking entry points carry
+/// `#[track_caller]` and report the test line that asked for the volume.
 pub struct TestFSBuilder {
     clock: Arc<dyn Clock>,
     storage: Option<Arc<dyn Storage>>,
@@ -110,6 +113,7 @@ impl TestFSBuilder {
         self
     }
 
+    #[track_caller]
     pub fn build(self) -> TestFS {
         let base = self.storage.unwrap_or_else(|| Arc::new(MemoryStorage::new()));
         let (storage, fault) = if self.fault_injection {
@@ -173,6 +177,7 @@ impl TestFSBuilder {
 }
 
 /// Recovers the volume in `storage` and opens its next generation for writing.
+#[track_caller]
 fn open_volume(
     storage: &Arc<dyn Storage>,
     clock: &Arc<dyn Clock>,
@@ -259,6 +264,7 @@ impl TestFS {
 
     /// Shuts down cleanly - sealing the active generation if remotes should receive it, and
     /// exporting a summary - then recovers the volume into a fresh instance.
+    #[track_caller]
     pub fn clean_remount(self) -> Self {
         if !self.remotes.is_empty() {
             let _ = self.fs.force_roll_active_log();
@@ -272,6 +278,7 @@ impl TestFS {
     ///
     /// Inode numbers handed out to operations that never became durable are not reused
     /// afterwards, so a test's model of the tree stays unambiguous.
+    #[track_caller]
     pub fn unclean_crash(self) -> Self {
         let next_inode = self.fs.next_inode.load(Ordering::SeqCst);
         let _ = self.fs.quiesce();
@@ -280,6 +287,7 @@ impl TestFS {
         recovered
     }
 
+    #[track_caller]
     fn reopen(self) -> Self {
         let TestFS {
             mut fs,
