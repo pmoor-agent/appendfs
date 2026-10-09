@@ -29,4 +29,4 @@ pub use summary::{
     init_volume_with_clock_and_uids, latest_summary_file, latest_summary_filename, summary_filename,
     summary_filename_with_revision,
 };
-pub use writer::{LogCheckpoint, LogWriter};
+pub use writer::{LogCheckpoint, LogPosition, LogWriter};

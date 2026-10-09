@@ -1084,9 +1084,9 @@ impl InMemoryFS {
         // own roll reports it (see `next_generation`), which is a far better place to fail
         // than a silent wrap back to generation 0 here.
         let base_next = manifest_max.max(summary_gen).saturating_add(1);
-        match self.log_writer.as_ref() {
-            Some(w) if w.is_open() => base_next.max(w.generation().saturating_add(1)),
-            Some(w) => base_next.max(w.generation()),
+        match self.log_writer.as_ref().map(|w| w.position()) {
+            Some(p) if p.is_open => base_next.max(p.generation.saturating_add(1)),
+            Some(p) => base_next.max(p.generation),
             None => base_next,
         }
     }

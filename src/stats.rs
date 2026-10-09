@@ -734,9 +734,10 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     let mut out = String::new();
 
     // 1. Volume & Manifest Info
+    let position = fs.log_writer.as_ref().map(|w| w.position());
     let (head_gen, next_gen, total_gens, total_disk_bytes) = {
         let manifest = fs.manifest.read().unwrap();
-        let head = fs.log_writer.as_ref().filter(|w| w.is_open()).map(|w| w.generation());
+        let head = position.filter(|p| p.is_open).map(|p| p.generation);
         let total_gens = manifest.logs.len();
         let total_disk: u64 = manifest.logs.iter().map(|l| l.total_bytes).sum();
         let next_gen = fs.next_generation_locked(&manifest);
@@ -775,7 +776,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
             head,
             crate::log::log_filename(head)
         ));
-    } else if fs.log_writer.as_ref().is_some_and(|w| !w.is_open()) {
+    } else if position.is_some() {
         out.push_str("  Active Generation:  None (lazy / unopened)\n");
     } else {
         out.push_str("  Active Generation:  None (read-only / detached log writer)\n");
