@@ -517,19 +517,13 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
 fn test_active_log_part_ships_only_synced_bytes() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let remote = Arc::new(MockRemoteStore::new());
     let mut registry = RemoteRegistry::new();
