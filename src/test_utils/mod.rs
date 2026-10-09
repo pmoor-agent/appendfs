@@ -5,6 +5,10 @@ use crate::operations::read_write::{fsync_response, open_core, read_response, re
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod test_fs;
+
+pub use test_fs::{SnapshotNode, TestFS, TestFSBuilder};
+
 /// Blocking, handle-managing shortcuts for driving an `InMemoryFS` from tests.
 ///
 /// Production code reaches the filesystem through the FUSE entry points, which hand back

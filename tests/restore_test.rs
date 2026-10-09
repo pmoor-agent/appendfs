@@ -1,11 +1,10 @@
 use appendfs::compat::CompatClock;
-use appendfs::log::init_volume_with_clock_and_uids;
 use appendfs::operations::dir::mkdir_core;
 use appendfs::operations::read_write::{
     FUSE_SET_ATTR_MODE, create_core, open_core, release_core, setattr_core, write_handle_core,
 };
 use appendfs::storage::OsStorage;
-use appendfs::{Clock, InMemoryFS, LogWriter, Storage, VolumeHeader, VolumeKey};
+use appendfs::{Clock, Storage, TestFS, VolumeKey};
 
 use std::fs;
 use std::path::PathBuf;
@@ -23,33 +22,11 @@ fn test_python_restore_with_readonly_file_and_directory() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(std::io::Error::other)
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(vol_dir);
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .build();
 
     // Batch 1:
     // Create readonly_file.txt, write initial data, chmod 0444
@@ -159,33 +136,11 @@ fn test_python_restore_across_log_rollover() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(std::io::Error::other)
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(vol_dir);
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .build();
 
     // Create directories
     let d1 = mkdir_core(&fs, 1, "eth", 0o755, 1000, 1000).unwrap();
@@ -271,33 +226,11 @@ fn test_python_restore_file_rename() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(std::io::Error::other)
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(vol_dir);
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .build();
 
     // Create file as temp.txt, write data
     let file = create_core(&fs, 1, "temp.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -349,33 +282,11 @@ fn test_python_restore_rsync_style_write_across_rollover_and_rename() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(std::io::Error::other)
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(vol_dir);
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .build();
 
     // Directory hierarchy
     let d1 = mkdir_core(&fs, 1, "eth", 0o755, 1000, 1000).unwrap();
@@ -462,33 +373,11 @@ fn test_python_restore_directory_rename_and_move() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(std::io::Error::other)
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(vol_dir);
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .build();
 
     // Create dirA, dirB, and nested file dirA/child.txt
     let dir_a = mkdir_core(&fs, 1, "dirA", 0o755, 1000, 1000).unwrap();
@@ -541,33 +430,11 @@ fn test_python_restore_overwrite_rename() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(std::io::Error::other)
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(vol_dir);
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .build();
 
     // Create file1 and file2
     let f1 = create_core(&fs, 1, "source.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -623,33 +490,11 @@ fn test_python_restore_hardlinks_and_unlink() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(std::io::Error::other)
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(vol_dir);
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .build();
 
     // Create file
     let f = create_core(&fs, 1, "original.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -716,33 +561,11 @@ fn test_python_restore_hardlinks_same_name_in_different_dirs() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(std::io::Error::other)
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(vol_dir);
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .build();
 
     // Create dir1 and dir2
     let d1 = mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
@@ -822,33 +645,11 @@ fn test_python_restore_directory_overwrite_rename() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(std::io::Error::other)
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(vol_dir);
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .build();
 
     // Create dir_a with file inside
     let dir_a = mkdir_core(&fs, 1, "dir_a", 0o755, 1000, 1000).unwrap();
@@ -902,33 +703,11 @@ fn test_python_restore_sparse_hole_and_expansion() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .map_err(std::io::Error::other)
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer);
-    fs.set_log_dir(vol_dir);
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .build();
 
     // Create file
     let file = create_core(&fs, 1, "sparse.bin", 0o644, 0, 1000, 1000).unwrap();
@@ -1004,32 +783,13 @@ fn test_python_restore_rejects_record_after_seal() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            10_000,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(vol_dir);
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .max_log_size(10_000)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
     fs.quiesce().unwrap();
@@ -1103,32 +863,13 @@ fn test_python_restore_rejects_seal_record_count_mismatch() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    init_volume_with_clock_and_uids(
-        storage.clone(),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-        clock.clone(),
-        1000,
-        1000,
-    )
-    .unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            10_000,
-            1,
-            VolumeKey::plaintext_arc(),
-        )
-        .unwrap(),
-    );
-
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-    fs.volume_header = VolumeHeader::plaintext();
-    fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(vol_dir);
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .max_log_size(10_000)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
     fs.quiesce().unwrap();
