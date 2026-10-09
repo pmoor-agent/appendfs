@@ -120,7 +120,9 @@ mod tests {
     use crate::error::FsError;
     use crate::operations::dir::{iter_dir_entries, list_dir_core};
     use crate::operations::links::{rename_core, unlink_core};
-    use crate::operations::read_write::{create_core, fallocate_core, setattr_core};
+    use crate::operations::read_write::{
+        create_core, fallocate_core, open_core, release_core, setattr_core, write_handle_core,
+    };
     use crate::test_utils::FsTestExt;
 
     #[test]
@@ -257,8 +259,12 @@ mod tests {
         fs.register_remote_status();
         let v_ino = fs.virtual_files.get_ino_by_name(".remotes").unwrap();
 
-        // 1. Writes are rejected with EPERM
-        assert_eq!(fs.write_at(v_ino, b"mutate", 0), Err(FsError::EPERM));
+        // 1. Opening for writing is refused, and a write that arrives on a read-only handle
+        //    anyway is rejected with EPERM
+        assert_eq!(fs.write_at(v_ino, b"mutate", 0), Err(FsError::EACCES));
+        let fh = open_core(&fs, v_ino, libc::O_RDONLY as u32).unwrap();
+        assert_eq!(write_handle_core(&fs, v_ino, fh, b"mutate", 0), Err(FsError::EPERM));
+        release_core(&fs, v_ino, fh).unwrap();
 
         // 2. Setattr is rejected with EPERM
         assert_eq!(
@@ -316,7 +322,7 @@ mod tests {
 
         // 9. Status virtual file has identical mutation protections
         let status_ino = fs.virtual_files.get_ino_by_name(".status").unwrap();
-        assert_eq!(fs.write_at(status_ino, b"mutate", 0), Err(FsError::EPERM));
+        assert_eq!(fs.write_at(status_ino, b"mutate", 0), Err(FsError::EACCES));
         assert_eq!(unlink_core(&fs, 1, ".status"), Err(FsError::EPERM));
         assert_eq!(rename_core(&fs, 1, ".status", 1, "renamed.txt"), Err(FsError::EPERM));
     }

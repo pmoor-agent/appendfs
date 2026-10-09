@@ -1,5 +1,5 @@
 use crate::error::FsError;
-use crate::fs::{FlushReason, InMemoryFS, is_virtual_ino};
+use crate::fs::{FlushReason, InMemoryFS};
 use crate::operations::dir::fsyncdir_response;
 use crate::operations::read_write::{fsync_response, open_core, read_response, release_core, write_handle_core};
 use std::thread;
@@ -32,11 +32,6 @@ pub trait FsTestExt {
 
 impl FsTestExt for InMemoryFS {
     fn write_at(&self, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
-        // Opening a virtual file for writing fails with EACCES; report what a write on an
-        // already-open virtual handle would.
-        if is_virtual_ino(ino) {
-            return Err(FsError::EPERM);
-        }
         let fh = open_core(self, ino, libc::O_RDWR as u32)?;
         let res = write_handle_core(self, ino, fh, buf, offset);
         let _ = release_core(self, ino, fh);
