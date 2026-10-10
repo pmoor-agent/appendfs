@@ -1,16 +1,16 @@
-//! A test volume: an `InMemoryFS` together with the storage, clock and remotes behind it.
+//! A test volume: an `AppendFs` together with the storage, clock and remotes behind it.
 //!
-//! [`TestFS::builder`] initializes a volume and opens it the way a real mount does
-//! (`init_volume`, then `recover_fs`, then [`InMemoryFS::next_log_writer`]), so tests run
+//! [`TestFs::builder`] initializes a volume and opens it the way a real mount does
+//! (`init_volume`, then `recover_fs`, then [`AppendFs::next_log_writer`]), so tests run
 //! against the same assembly as production rather than a hand-built approximation of it.
-//! [`TestFS::clean_remount`] and [`TestFS::unclean_crash`] reopen the same storage the
+//! [`TestFs::clean_remount`] and [`TestFs::unclean_crash`] reopen the same storage the
 //! same way.
 
 use crate::FsTestExt;
 use crate::clock::{Clock, SystemClock};
 use crate::crypto::{VolumeHeader, VolumeKey};
 use crate::error::FsError;
-use crate::fs::InMemoryFS;
+use crate::fs::AppendFs;
 use crate::log::{LogFileCache, RecoveryTarget, init_volume_with_clock_and_uids, recover_fs};
 use crate::remote::{
     BlockCache, FailingRemoteStore, LatencyRemoteStore, MemoryBlockCache, MockRemoteStore, PruneExpr, RemoteReadTarget,
@@ -25,7 +25,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-/// Per-inode snapshot entry produced by `TestFS::get_tree_snapshot` - built entirely
+/// Per-inode snapshot entry produced by `TestFs::get_tree_snapshot` - built entirely
 /// from the same core handlers real FUSE dispatch uses (`getattr_core`, `list_dir_core`,
 /// `readlink_core`, `FsTestExt::read_blocking`), never by reading `fs.inodes` directly.
 #[derive(Debug, Clone)]
@@ -51,12 +51,12 @@ pub enum SnapshotNode {
     },
 }
 
-/// Configures a [`TestFS`]. Every option has a default, so `TestFS::builder().build()` is a
+/// Configures a [`TestFs`]. Every option has a default, so `TestFs::builder().build()` is a
 /// plaintext, in-memory volume on the system clock.
 ///
 /// Setup failures panic rather than return an error, so the panicking entry points carry
 /// `#[track_caller]` and report the test line that asked for the volume.
-pub struct TestFSBuilder {
+pub struct TestFsBuilder {
     clock: Arc<dyn Clock>,
     storage: Option<Arc<dyn Storage>>,
     fault_injection: bool,
@@ -67,7 +67,7 @@ pub struct TestFSBuilder {
     remotes: usize,
 }
 
-impl TestFSBuilder {
+impl TestFsBuilder {
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
@@ -80,7 +80,7 @@ impl TestFSBuilder {
         self
     }
 
-    /// Routes all volume I/O through a `FaultStorage`, kept in [`TestFS::fault`], so a test
+    /// Routes all volume I/O through a `FaultStorage`, kept in [`TestFs::fault`], so a test
     /// can make writes fail at chosen moments.
     pub fn fault_injection(mut self) -> Self {
         self.fault_injection = true;
@@ -115,7 +115,7 @@ impl TestFSBuilder {
     }
 
     #[track_caller]
-    pub fn build(self) -> TestFS {
+    pub fn build(self) -> TestFs {
         let base = self.storage.unwrap_or_else(|| Arc::new(MemoryStorage::new()));
         let (storage, fault) = if self.fault_injection {
             let fault = Arc::new(FaultStorage::new(base));
@@ -160,7 +160,7 @@ impl TestFSBuilder {
             block_cache = Some(Arc::new(MemoryBlockCache::new(50 * 1024 * 1024)) as Arc<dyn BlockCache>);
         }
 
-        let mut test_fs = TestFS {
+        let mut test_fs = TestFs {
             fs: open_volume(&storage, &self.clock, &self.volume_key, self.max_log_size).expect("open test volume"),
             storage,
             fault,
@@ -186,7 +186,7 @@ pub fn open_volume(
     clock: &Arc<dyn Clock>,
     volume_key: &Arc<VolumeKey>,
     max_log_size: u64,
-) -> io::Result<InMemoryFS> {
+) -> io::Result<AppendFs> {
     let mut fs = recover_fs(
         Arc::clone(storage),
         RecoveryTarget::Latest,
@@ -210,14 +210,14 @@ fn remote_read_priority(index: usize) -> u32 {
 /// live in memory unless a test supplies its own storage.
 const LOG_DIR: &str = "/memory";
 
-pub struct TestFS {
-    pub fs: InMemoryFS,
+pub struct TestFs {
+    pub fs: AppendFs,
     pub storage: Arc<dyn Storage>,
-    /// Present only for volumes built with [`TestFSBuilder::fault_injection`]; the handle
+    /// Present only for volumes built with [`TestFsBuilder::fault_injection`]; the handle
     /// used to inject and clear write failures. Survives remounts and crashes so faults can
     /// be injected repeatedly across a run.
     pub fault: Option<Arc<FaultStorage>>,
-    /// The remotes as the volume sees them; empty unless built with [`TestFSBuilder::remotes`].
+    /// The remotes as the volume sees them; empty unless built with [`TestFsBuilder::remotes`].
     pub remotes: Vec<Arc<FailingRemoteStore>>,
     pub latency_remotes: Vec<Arc<LatencyRemoteStore>>,
     pub memory_remotes: Vec<Arc<MockRemoteStore>>,
@@ -227,9 +227,9 @@ pub struct TestFS {
     max_log_size: u64,
 }
 
-impl TestFS {
-    pub fn builder() -> TestFSBuilder {
-        TestFSBuilder {
+impl TestFs {
+    pub fn builder() -> TestFsBuilder {
+        TestFsBuilder {
             clock: Arc::new(SystemClock),
             storage: None,
             fault_injection: false,
@@ -289,7 +289,7 @@ impl TestFS {
 
     #[track_caller]
     fn reopen(self) -> Self {
-        let TestFS {
+        let TestFs {
             mut fs,
             storage,
             fault,
@@ -309,7 +309,7 @@ impl TestFS {
         fs.log_writer = None;
         drop(fs);
 
-        let mut reopened = TestFS {
+        let mut reopened = TestFs {
             fs: open_volume(&storage, &clock, &volume_key, max_log_size).expect("reopen test volume"),
             storage,
             fault,

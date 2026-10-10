@@ -1,14 +1,14 @@
 use crate::error::FsError;
 #[cfg(any(test, feature = "testing"))]
 use crate::fs::find_parent_inode;
-use crate::fs::{DirHandle, InMemoryFS};
+use crate::fs::{AppendFs, DirHandle};
 use crate::node::{AttrDelta, DirectoryDelta, NodeDelta};
 use crate::shim::{DeferredResult, DirEntry, DirEntryPlus, FileAttr, FileType, FuseResponse, RequestContext};
 use crate::sync::OpTag;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-pub fn lookup_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FileAttr, FsError> {
+pub fn lookup_core(fs: &AppendFs, parent: u64, name: &str) -> Result<FileAttr, FsError> {
     log::trace!("lookup(parent={}, name={})", parent, name);
     if name.len() > 255 {
         return Err(FsError::ENAMETOOLONG);
@@ -36,11 +36,11 @@ pub fn lookup_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FileAttr,
     fs.get_attr_locked(&inner, child_ino).ok_or(FsError::ENOENT)
 }
 
-pub fn lookup_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
+pub fn lookup_response(fs: &AppendFs, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
     lookup_core(fs, parent, name).map(FuseResponse::entry)
 }
 
-pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, FsError> {
+pub fn list_dir_core(fs: &AppendFs, ino: u64) -> Result<Vec<(String, u64)>, FsError> {
     let inner = fs.inner.lock(OpTag::ReadDir).unwrap();
     inner.check_shutdown(false)?;
     let attr = fs.get_attr_locked(&inner, ino).ok_or(FsError::ENOENT)?;
@@ -97,7 +97,7 @@ pub fn iter_dir_entries_with_parent<'a>(
 
 #[cfg(any(test, feature = "testing"))]
 pub fn iter_dir_entries<'a>(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     entries: &'a [(String, u64)],
     offset: i64,
@@ -110,7 +110,7 @@ pub fn iter_dir_entries<'a>(
     iter_dir_entries_with_parent(ino, dotdot_ino, entries, offset)
 }
 
-pub fn opendir_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> {
+pub fn opendir_core(fs: &AppendFs, ino: u64, flags: u32) -> Result<u64, FsError> {
     fs.with_inner(OpTag::OpenDir, |inner| {
         inner.check_shutdown(false)?;
         let attr = fs.get_attr_locked(inner, ino).ok_or(FsError::ENOENT)?;
@@ -138,18 +138,12 @@ pub fn opendir_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsErro
     })
 }
 
-pub fn opendir_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
+pub fn opendir_response(fs: &AppendFs, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
     opendir_core(fs, ino, flags)
         .map(|fh| FuseResponse::open(fh, /* direct_io = */ false, /* keep_cache = */ false))
 }
 
-pub fn readdir_entries(
-    fs: &InMemoryFS,
-    ino: u64,
-    _size: usize,
-    offset: i64,
-    fh: u64,
-) -> Result<Vec<DirEntry>, FsError> {
+pub fn readdir_entries(fs: &AppendFs, ino: u64, _size: usize, offset: i64, fh: u64) -> Result<Vec<DirEntry>, FsError> {
     log::trace!("readdir(ino={}, offset={}, fh={})", ino, offset, fh);
     fs.with_inner(OpTag::ReadDir, |inner| {
         inner.check_shutdown(false)?;
@@ -175,7 +169,7 @@ pub fn readdir_entries(
 }
 
 pub fn readdirplus_entries(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     _size: usize,
     offset: i64,
@@ -206,7 +200,7 @@ pub fn readdirplus_entries(
 }
 
 pub fn readdir_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     size: usize,
     offset: i64,
@@ -216,7 +210,7 @@ pub fn readdir_response(
 }
 
 pub fn readdirplus_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     size: usize,
     offset: i64,
@@ -225,14 +219,7 @@ pub fn readdirplus_response(
     readdirplus_entries(fs, ino, size, offset, fh).map(|entries| FuseResponse::readdirplus(entries, size))
 }
 
-pub fn mkdir_core(
-    fs: &InMemoryFS,
-    parent: u64,
-    name: &str,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-) -> Result<FileAttr, FsError> {
+pub fn mkdir_core(fs: &AppendFs, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> Result<FileAttr, FsError> {
     fs.with_inner(OpTag::Mkdir, |inner| {
         inner.check_shutdown(true)?;
         let now = fs.clock.now();
@@ -305,7 +292,7 @@ pub fn mkdir_core(
 }
 
 pub fn mkdir_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ctx: RequestContext,
     parent: u64,
     name: &str,
@@ -314,7 +301,7 @@ pub fn mkdir_response(
     mkdir_core(fs, parent, name, mode, ctx.uid, ctx.gid).map(FuseResponse::entry)
 }
 
-pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), FsError> {
+pub fn rmdir_core(fs: &AppendFs, parent: u64, name: &str) -> Result<(), FsError> {
     fs.with_inner(OpTag::Rmdir, |inner| {
         inner.check_shutdown(true)?;
         let now = fs.clock.now();
@@ -355,19 +342,19 @@ pub fn rmdir_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), FsErro
     })
 }
 
-pub fn rmdir_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
+pub fn rmdir_response(fs: &AppendFs, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
     rmdir_core(fs, parent, name).map(|()| FuseResponse::ok())
 }
 
-pub fn releasedir_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), FsError> {
+pub fn releasedir_core(fs: &AppendFs, ino: u64, fh: u64) -> Result<(), FsError> {
     fs.release_dir_handle(fh, ino)
 }
 
-pub fn releasedir_response(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
+pub fn releasedir_response(fs: &AppendFs, ino: u64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
     releasedir_core(fs, ino, fh).map(|()| FuseResponse::ok())
 }
 
-pub fn fsyncdir_response(fs: &InMemoryFS, ino: u64, datasync: bool) -> DeferredResult<FuseResponse<'static>> {
+pub fn fsyncdir_response(fs: &AppendFs, ino: u64, datasync: bool) -> DeferredResult<FuseResponse<'static>> {
     log::trace!("fsyncdir(ino={}, datasync={})", ino, datasync);
     crate::operations::read_write::fsync_response(fs, 0, 0, crate::fs::FlushReason::Fsyncdir)
 }
@@ -375,11 +362,11 @@ pub fn fsyncdir_response(fs: &InMemoryFS, ino: u64, datasync: bool) -> DeferredR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_directory_nlink_tracking_across_mkdir_rmdir_and_rename() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         // Initial root (inode 1) starts with nlink 2
         assert_eq!(fs.get_attr(1).unwrap().nlink, 2);
 
@@ -419,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_lookup_core_single_lock_acquisition_tagged_lookup() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
 
         let pre_stats = fs.inner.op_stats();
@@ -453,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_list_dir_core_single_lock_acquisition_tagged_readdir() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let _ = mkdir_core(&fs, 1, "sub1", 0o755, 1000, 1000).unwrap();
 
         let pre_stats = fs.inner.op_stats();
@@ -478,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_directory_name_length_boundaries() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
 
         // 255-byte name should succeed for mkdir
         let name_255 = "d".repeat(255);

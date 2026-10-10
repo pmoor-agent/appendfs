@@ -1,6 +1,6 @@
 use crate::crypto::VolumeKey;
 use crate::extent_map::ExtentMap;
-use crate::fs::InMemoryFS;
+use crate::fs::AppendFs;
 use crate::node::{Node, NodeKind};
 use crate::storage::{BufferedStorageWriter, Storage, StorageReader, StorageWriter, WriteMode};
 use crate::sync::OpTag;
@@ -377,7 +377,7 @@ pub fn init_volume_with_clock_uids_and_iv(
         }
     }
 
-    let fs = InMemoryFS::with_clock_and_uids(clock.clone(), uid, gid);
+    let fs = AppendFs::with_clock_and_uids(clock.clone(), uid, gid);
     let snapshot = fs.inner.lock(OpTag::Flush).unwrap().snapshot_all();
     let manifest = crate::log::LogManifest::new();
 

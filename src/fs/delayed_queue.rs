@@ -428,7 +428,7 @@ impl Drop for DelayedResponseQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_asymptotic_delay_curve() {
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_delayed_queue_wake_stalled_waiter_on_batch_commit() {
-        let mut fs = TestFS::builder().build().fs;
+        let mut fs = TestFs::builder().build().fs;
         fs.max_buffer_size = 1000;
         fs.max_flush_queue_depth = 1;
 
@@ -560,7 +560,7 @@ mod tests {
 
         let mock_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let adv_clock = Arc::new(AdvancingClock::new(mock_time));
-        let mut fs = TestFS::builder().clock(adv_clock.clone()).build().fs;
+        let mut fs = TestFs::builder().clock(adv_clock.clone()).build().fs;
         fs.max_buffer_size = 1000;
         fs.max_flush_queue_depth = 1;
 

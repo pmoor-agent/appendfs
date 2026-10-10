@@ -3,7 +3,7 @@
 mod common;
 use appendfs::Clock;
 use appendfs::FsTestExt;
-use appendfs::TestFS;
+use appendfs::TestFs;
 use appendfs::storage::{MemoryStorage, OsStorage, Storage};
 use common::{TestMount, wait_until};
 use std::fs;
@@ -427,7 +427,7 @@ fn test_log_rolling() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     // Create a LogWriter with a tiny max_log_size of 512 bytes to force rolling
-    let TestFS { fs: fs_instance, .. } = TestFS::builder()
+    let TestFs { fs: fs_instance, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .max_log_size(512)
@@ -519,7 +519,7 @@ fn test_summary_single_file_export_and_recovery() {
     let log_path = log_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let TestFS { fs: fs_instance, .. } = TestFS::builder().storage(storage.clone()).clock(clock.clone()).build();
+    let TestFs { fs: fs_instance, .. } = TestFs::builder().storage(storage.clone()).clock(clock.clone()).build();
 
     let mount_dir = tempfile::Builder::new()
         .prefix("appendfs_summary_mount_")
@@ -648,7 +648,7 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     // 1KB max log size to trigger rolling across writes
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .max_log_size(1000)
@@ -960,7 +960,7 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
     let log_path = dir.path();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    let TestFS { mut fs, .. } = TestFS::builder().storage(storage.clone()).build();
+    let TestFs { mut fs, .. } = TestFs::builder().storage(storage.clone()).build();
     // Set threshold to 10 operations
     fs.max_staged_ops = 10;
 
@@ -993,7 +993,7 @@ fn test_background_flusher_in_mount_session() {
     let log_path = dir.path();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    let TestFS { mut fs, .. } = TestFS::builder().storage(storage.clone()).build();
+    let TestFs { mut fs, .. } = TestFs::builder().storage(storage.clone()).build();
     // Set 1-second flush interval and high op threshold so automatic threshold does not trigger
     fs.max_staged_ops = 10_000;
     fs.flush_interval.store(1, std::sync::atomic::Ordering::SeqCst);
@@ -1027,7 +1027,7 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
     let log_path = dir.path();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    let TestFS { fs, .. } = TestFS::builder().storage(storage.clone()).build();
+    let TestFs { fs, .. } = TestFs::builder().storage(storage.clone()).build();
 
     // 1. Populate valid filesystem tree
     let d = appendfs::operations::dir::mkdir_core(&fs, 1, "sub", 0o755, 1000, 1000).unwrap();
@@ -1510,7 +1510,7 @@ fn test_special_file_types_and_recovery() {
     let log_path = log_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let TestFS { fs: fs_instance, .. } = TestFS::builder().storage(storage.clone()).clock(clock.clone()).build();
+    let TestFs { fs: fs_instance, .. } = TestFs::builder().storage(storage.clone()).clock(clock.clone()).build();
 
     let mount_dir = tempfile::Builder::new().prefix("appendfs_spec_mnt_").tempdir().unwrap();
     let mut mount = TestMount::mount_custom(log_dir, mount_dir, fs_instance, false);
@@ -1697,7 +1697,7 @@ fn test_xattr_fuse_crud_and_crash_recovery() {
     let log_path = log_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let TestFS { fs: fs_instance, .. } = TestFS::builder().storage(storage.clone()).clock(clock.clone()).build();
+    let TestFs { fs: fs_instance, .. } = TestFs::builder().storage(storage.clone()).clock(clock.clone()).build();
 
     let mount_dir = tempfile::Builder::new()
         .prefix("appendfs_xattr_mnt_")
@@ -1794,7 +1794,7 @@ fn test_xattr_on_directories_and_special_files() {
     let log_path = log_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let TestFS { fs: fs_instance, .. } = TestFS::builder().storage(storage.clone()).clock(clock.clone()).build();
+    let TestFs { fs: fs_instance, .. } = TestFs::builder().storage(storage.clone()).clock(clock.clone()).build();
 
     let mount_dir = tempfile::Builder::new()
         .prefix("appendfs_xattr_dir_mnt_")
@@ -1847,7 +1847,7 @@ fn test_directory_nlink_tracking_and_recovery() {
     let log_path = log_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let TestFS { fs: fs_instance, .. } = TestFS::builder().storage(storage.clone()).clock(clock.clone()).build();
+    let TestFs { fs: fs_instance, .. } = TestFs::builder().storage(storage.clone()).clock(clock.clone()).build();
 
     let mount_dir = tempfile::Builder::new()
         .prefix("appendfs_dir_nlink_mnt_")
@@ -1916,7 +1916,7 @@ fn test_special_permission_bits_live_folded_and_recovery() {
         .unwrap();
     let log_path = log_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2055,7 +2055,7 @@ fn test_fallocate_punch_hole_zero_range_and_recovery() {
     let log_path = log_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    let TestFS { fs: fs_instance, .. } = TestFS::builder().storage(storage.clone()).clock(clock.clone()).build();
+    let TestFs { fs: fs_instance, .. } = TestFs::builder().storage(storage.clone()).clock(clock.clone()).build();
 
     let mount_dir = tempfile::Builder::new()
         .prefix("appendfs_fallocate_mnt_")
@@ -2543,7 +2543,7 @@ fn test_export_refuses_a_mismatched_header_and_key() {
 
     // Swapping in an encrypted key behind the plaintext volume's back leaves the header
     // saying plaintext - the pairing this guard exists to catch.
-    let mut fs = TestFS::builder().storage(storage.clone()).build().fs;
+    let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
     fs.volume_key = std::sync::Arc::new(key);
 
     let err = fs.export_summary(storage.as_ref()).unwrap_err();
@@ -3843,9 +3843,9 @@ fn test_mount_fails_when_init_cannot_claim_the_volume_lock() {
     fs::set_permissions(mount_dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let mount_path = mount_dir.path().to_str().unwrap().to_string();
 
-    let TestFS {
+    let TestFs {
         fs: fs_instance, fault, ..
-    } = TestFS::builder()
+    } = TestFs::builder()
         .storage(Arc::new(OsStorage::new(log_dir.path())))
         .fault_injection()
         .build();

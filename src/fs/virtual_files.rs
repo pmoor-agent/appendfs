@@ -1,4 +1,4 @@
-use crate::fs::InMemoryFS;
+use crate::fs::AppendFs;
 use crate::shim::{FileAttr, FileType};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +11,7 @@ use std::time::SystemTime;
 pub const VIRTUAL_INO_BASE: u64 = 0xFFFF_FFFF_0000_0001;
 
 /// Dynamic content generator for a virtual file.
-pub type VirtualFileGenerator = Arc<dyn Fn(&InMemoryFS) -> String + Send + Sync>;
+pub type VirtualFileGenerator = Arc<dyn Fn(&AppendFs) -> String + Send + Sync>;
 
 /// Registration entry for a virtual file.
 pub struct VirtualFileEntry {
@@ -48,7 +48,7 @@ impl VirtualFileRegistry {
     /// Registers a new virtual file in the root directory.
     pub fn register<F>(&self, name: impl Into<String>, generator: F) -> u64
     where
-        F: Fn(&InMemoryFS) -> String + Send + Sync + 'static,
+        F: Fn(&AppendFs) -> String + Send + Sync + 'static,
     {
         let name = name.into();
         let mut name_map = self.name_to_ino.write().unwrap();
@@ -83,7 +83,7 @@ impl VirtualFileRegistry {
     }
 
     /// Generates content for a virtual file by inode.
-    pub fn generate_content(&self, ino: u64, fs: &InMemoryFS) -> Option<String> {
+    pub fn generate_content(&self, ino: u64, fs: &AppendFs) -> Option<String> {
         let idx = *self.ino_to_idx.read().unwrap().get(&ino)?;
         let entries = self.entries.read().unwrap();
         let entry = entries.get(idx)?;
@@ -124,7 +124,7 @@ mod tests {
         create_core, fallocate_core, open_core, release_core, setattr_core, write_handle_core,
     };
     use crate::test_utils::FsTestExt;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_virtual_file_registry_crud() {
@@ -140,7 +140,7 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0], (".status".to_string(), ino));
 
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let content = registry.generate_content(ino, &fs).unwrap();
         assert_eq!(content, "status: ok\n");
     }
@@ -149,7 +149,7 @@ mod tests {
     fn test_virtual_file_handle_lifecycle_and_snapshot_isolation() {
         use std::sync::atomic::AtomicUsize;
 
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let call_count = Arc::new(AtomicUsize::new(0));
         let count_clone = Arc::clone(&call_count);
 
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_root_directory_pagination_with_virtual_files() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         fs.register_remote_status();
 
         // Register two additional virtual files (along with default .remotes)
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_virtual_files_mutation_protection() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         fs.register_remote_status();
         let v_ino = fs.virtual_files.get_ino_by_name(".remotes").unwrap();
 
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn test_remotes_virtual_file_formatting_and_telemetry() {
         // A read-only mount has no log writer, so it reports no head generation.
-        let mut read_only = TestFS::builder().build().fs;
+        let mut read_only = TestFs::builder().build().fs;
         read_only.log_writer = None;
         read_only.set_read_only();
         read_only.register_remote_status();
@@ -344,7 +344,7 @@ mod tests {
         assert!(initial_status.contains("Volume Head Generation: None (read-only / detached log writer)"));
 
         // A read-write mount writes generation 1 next.
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         fs.register_remote_status();
         let v_ino = fs.lookup_child(1, ".remotes").unwrap();
 

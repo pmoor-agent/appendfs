@@ -3,7 +3,7 @@ use appendfs::crypto::VolumeKey;
 use appendfs::log::RecoveryTarget;
 use appendfs::storage::{OsStorage, Storage};
 use appendfs::test_utils::open_volume;
-use appendfs::{InMemoryFS, TestFS};
+use appendfs::{AppendFs, TestFs};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
@@ -43,17 +43,17 @@ impl TestMount {
     pub fn new_rw() -> Self {
         let log_dir = tempfile::Builder::new().prefix("appendfs_log_").tempdir().unwrap();
         let mount_dir = tempfile::Builder::new().prefix("appendfs_mnt_").tempdir().unwrap();
-        let TestFS { fs, .. } = TestFS::builder()
+        let TestFs { fs, .. } = TestFs::builder()
             .storage(Arc::new(OsStorage::new(log_dir.path())))
             .build();
         Self::mount_custom(log_dir, mount_dir, fs, false)
     }
 
-    /// Mounts an existing or custom `InMemoryFS` onto a new temporary mount point.
+    /// Mounts an existing or custom `AppendFs` onto a new temporary mount point.
     pub fn mount_custom(
         log_dir: tempfile::TempDir,
         mount_dir: tempfile::TempDir,
-        fs: InMemoryFS,
+        fs: AppendFs,
         read_only: bool,
     ) -> Self {
         let mount_path = mount_dir.path().to_path_buf();

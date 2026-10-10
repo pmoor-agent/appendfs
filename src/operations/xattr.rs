@@ -1,5 +1,5 @@
 use crate::error::FsError;
-use crate::fs::{InMemoryFS, is_virtual_ino};
+use crate::fs::{AppendFs, is_virtual_ino};
 use crate::node::AttrDelta;
 use crate::shim::FuseResponse;
 use crate::sync::OpTag;
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 pub const XATTR_NAME_MAX: usize = 255;
 pub const XATTR_SIZE_MAX: usize = 65536;
 
-pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, FsError> {
+pub fn getxattr_core(fs: &AppendFs, ino: u64, name: &str, size: usize) -> Result<FuseResponse<'static>, FsError> {
     let inner = fs.inner.lock(OpTag::Xattr).unwrap();
     inner.check_shutdown(false)?;
     if fs.get_attr_locked(&inner, ino).is_none() {
@@ -30,7 +30,7 @@ pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Resu
 }
 
 pub fn setxattr_core(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     name: &str,
     value: &[u8],
@@ -77,7 +77,7 @@ pub fn setxattr_core(
     })
 }
 
-pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResponse<'static>, FsError> {
+pub fn listxattr_core(fs: &AppendFs, ino: u64, size: usize) -> Result<FuseResponse<'static>, FsError> {
     let inner = fs.inner.lock(OpTag::Xattr).unwrap();
     inner.check_shutdown(false)?;
     if fs.get_attr_locked(&inner, ino).is_none() {
@@ -108,7 +108,7 @@ pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<FuseResp
     }
 }
 
-pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
+pub fn removexattr_core(fs: &AppendFs, ino: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
     if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
     }
@@ -146,11 +146,11 @@ pub use setxattr_core as setxattr_response;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_xattr_basic_crud_and_size_query() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
 
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_xattr_create_and_replace_flags() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "flags.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
 
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_xattr_multiple_attributes_deterministic_order() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "multi.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
 
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_xattr_single_lock_acquisition_tagged_xattr() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
         setxattr_core(&fs, ino, "user.tag", b"v1", 0).unwrap();

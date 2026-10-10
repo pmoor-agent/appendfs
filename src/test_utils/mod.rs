@@ -1,5 +1,5 @@
 use crate::error::FsError;
-use crate::fs::{FlushReason, InMemoryFS};
+use crate::fs::{AppendFs, FlushReason};
 use crate::operations::dir::fsyncdir_response;
 use crate::operations::read_write::{fsync_response, open_core, read_response, release_core, write_handle_core};
 use std::thread;
@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 mod test_fs;
 
-pub use test_fs::{SnapshotNode, TestFS, TestFSBuilder, open_volume};
+pub use test_fs::{SnapshotNode, TestFs, TestFsBuilder, open_volume};
 
-/// Blocking, handle-managing shortcuts for driving an `InMemoryFS` from tests.
+/// Blocking, handle-managing shortcuts for driving an `AppendFs` from tests.
 ///
 /// Production code reaches the filesystem through the FUSE entry points, which hand back
 /// deferred replies and expect the caller to manage file handles. Tests usually just want
@@ -34,7 +34,7 @@ pub trait FsTestExt {
     fn fsyncdir_blocking(&self, ino: u64) -> Result<(), FsError>;
 }
 
-impl FsTestExt for InMemoryFS {
+impl FsTestExt for AppendFs {
     fn write_at(&self, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
         let fh = open_core(self, ino, libc::O_RDWR as u32)?;
         let res = write_handle_core(self, ino, fh, buf, offset);

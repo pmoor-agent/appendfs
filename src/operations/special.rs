@@ -1,12 +1,12 @@
 use crate::error::FsError;
 use crate::extent_map::ExtentMap;
-use crate::fs::InMemoryFS;
+use crate::fs::AppendFs;
 use crate::node::{AttrDelta, FileDelta, NodeDelta, SpecialDelta};
 use crate::shim::{FileAttr, FileType, FuseResponse, RequestContext};
 use crate::sync::OpTag;
 
 pub fn mknod_core(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     parent: u64,
     name: &str,
     mode: u32,
@@ -109,7 +109,7 @@ pub fn mknod_core(
 }
 
 pub fn mknod_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ctx: RequestContext,
     parent: u64,
     name: &str,
@@ -123,12 +123,12 @@ pub fn mknod_response(
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
     use std::sync::Arc;
 
     #[test]
     fn test_mknod_special_file_types() {
-        let fs = TestFS::builder().clock(Arc::new(SystemClock)).build().fs;
+        let fs = TestFs::builder().clock(Arc::new(SystemClock)).build().fs;
 
         // 1. Create a FIFO
         let fifo_attr = mknod_core(&fs, 1, "test_fifo", libc::S_IFIFO | 0o644, 0, 1000, 1000).unwrap();
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_mknod_name_length_boundaries() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
 
         let name_255 = "p".repeat(255);
         let name_256 = "p".repeat(256);

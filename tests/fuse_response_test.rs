@@ -1,4 +1,4 @@
-use appendfs::TestFS;
+use appendfs::TestFs;
 use appendfs::clock::MockClock;
 use appendfs::error::FsError;
 use appendfs::operations::dir::{
@@ -133,7 +133,7 @@ fn test_fuse_response_constructors() {
 #[test]
 fn test_all_fuse_response_handlers() {
     let clock = Arc::new(MockClock(mock_time()));
-    let fs = TestFS::builder().clock(clock).build().fs;
+    let fs = TestFs::builder().clock(clock).build().fs;
 
     // 1. getattr
     let attr_res = getattr_response(&fs, 1);
@@ -350,8 +350,8 @@ fn test_deferred_result_mechanics() {
 #[test]
 fn test_filesystem_trait_all_methods() {
     let clock = Arc::new(MockClock(mock_time()));
-    let in_memory_fs = TestFS::builder().clock(clock).build().fs;
-    let fs: &dyn Filesystem = &in_memory_fs;
+    let append_fs = TestFs::builder().clock(clock).build().fs;
+    let fs: &dyn Filesystem = &append_fs;
     let ctx = RequestContext {
         uid: 1000,
         gid: 1000,
@@ -522,7 +522,7 @@ fn test_filesystem_trait_all_methods() {
 
 #[test]
 fn test_open_cache_flags_and_timeout_delineation() {
-    let fs = TestFS::builder().build().fs;
+    let fs = TestFs::builder().build().fs;
 
     // Create a regular file
     let ctx = RequestContext::new(1000, 1000, 0);
@@ -590,7 +590,7 @@ fn test_cold_read_deferred_threadpool_execution() {
 
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(appendfs::clock::SystemClock);
-    let mut fs = TestFS::builder()
+    let mut fs = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .build()

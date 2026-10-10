@@ -5,7 +5,7 @@
 //! trailing `FlushCommit` confirming atomic persistence. Recovery replays `LogEntryDelta`
 //! records directly onto `base`, guaranteeing identical state transitions across crash recovery.
 
-use super::{FlushReason, FsInner, InMemoryFS, ShutdownState};
+use super::{AppendFs, FlushReason, FsInner, ShutdownState};
 use crate::error::FsError;
 use crate::extent_map::{Extent, ExtentMap, StagedBuffer};
 use crate::log::{GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode};
@@ -118,7 +118,7 @@ fn collect_staged_runs(extents: &ExtentMap, max_extent_size: usize) -> Vec<Stage
     runs
 }
 
-impl InMemoryFS {
+impl AppendFs {
     // --- Flush & Fold Pipelines ---
 
     /// Whether staged mutations in `live` have reached `max_buffer_size` or `max_staged_ops`.
@@ -585,7 +585,7 @@ impl InMemoryFS {
     /// Asks for a flush cycle: wakes the background thread, or runs one here in inline mode.
     ///
     /// Returns without waiting for the cycle to finish. Callers that need the queue drained
-    /// want [`InMemoryFS::quiesce`].
+    /// want [`AppendFs::quiesce`].
     pub(crate) fn wake_flusher(&self) {
         if self.flusher.is_background() {
             self.flusher.notify();
@@ -923,12 +923,12 @@ mod tests {
     use crate::node::{AttrDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind};
     use crate::storage::Storage;
     use crate::test_utils::FsTestExt;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
     use std::time::SystemTime;
 
     #[test]
     fn test_init_fails_before_starting_anything_if_it_cannot_claim_the_lock() {
-        let t = TestFS::builder().fault_injection().build();
+        let t = TestFs::builder().fault_injection().build();
         let fault = t.fault.unwrap();
         let fs = Arc::new(t.fs);
 
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn test_flush_coalesces_micro_writes_into_single_base_range_entry() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage).build().fs;
+        let fs = TestFs::builder().storage(storage).build().fs;
 
         let ino = fs.allocate_inode();
         fs.with_inner_for_tests(|inner| {
@@ -1090,7 +1090,7 @@ mod tests {
                 )
             };
 
-            let mut fs = TestFS::builder()
+            let mut fs = TestFs::builder()
                 .storage(Arc::clone(&storage))
                 .volume(volume_header, Arc::clone(&volume_key))
                 .build()
@@ -1185,7 +1185,7 @@ mod tests {
     #[test]
     fn test_punched_hole_masks_flushed_data_and_survives_recovery() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "holey.bin", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
@@ -1262,7 +1262,7 @@ mod tests {
     #[test]
     fn test_successive_truncates_keep_masking_the_full_discarded_range() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "t.bin", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
@@ -1320,7 +1320,7 @@ mod tests {
     /// past the end is a no-op.
     #[test]
     fn test_punch_hole_is_clamped_to_eof() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "short.bin", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
         fs.write_at(ino, &[0xAB; 100], 0).unwrap();
@@ -1340,7 +1340,7 @@ mod tests {
     #[test]
     fn test_directory_parent_tracking_across_mkdir_rename_and_flush() {
         let clock = Arc::new(crate::clock::MockClock(SystemTime::UNIX_EPOCH));
-        let fs = TestFS::builder().clock(clock).build().fs;
+        let fs = TestFs::builder().clock(clock).build().fs;
 
         // Root inode 1 parent is 1
         assert_eq!(fs.get_parent_dir_inode(1), Some(1));
@@ -1382,7 +1382,7 @@ mod tests {
     fn test_generation_live_stats_and_manifest_lifecycle() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -1447,7 +1447,7 @@ mod tests {
     fn test_rm_rf_directory_tree_emits_unlinks_for_all_children_and_recovers_cleanly() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -1521,7 +1521,7 @@ mod tests {
     fn test_hardlink_survives_rm_rf_of_other_parent_directory() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -1590,7 +1590,7 @@ mod tests {
     fn test_automatic_flush_triggers_on_staged_thresholds() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let mut fs = TestFS::builder()
+        let mut fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -1618,7 +1618,7 @@ mod tests {
     fn test_unlinked_open_file_does_not_resurrect_on_recovery() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -1667,7 +1667,7 @@ mod tests {
     fn test_truncate_down_then_extend_across_flush_boundary() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(clock.clone()).build().fs;
 
         // Create file and write 100 bytes (0xAA)
         let file_attr = crate::operations::read_write::create_core(&fs, 1, "data.bin", 0o644, 0, 1000, 1000).unwrap();
@@ -1726,7 +1726,7 @@ mod tests {
     #[test]
     fn test_multi_batch_flushing_queue_and_layer_resolution() {
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().clock(clock.clone()).build().fs;
+        let fs = TestFs::builder().clock(clock.clone()).build().fs;
 
         // 1. Create file in batch 1
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -1779,7 +1779,7 @@ mod tests {
     fn test_shutdown_drain_rolls_without_leaving_an_empty_generation() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock)
             .max_log_size(50 * 1024)
@@ -1814,7 +1814,7 @@ mod tests {
         let storage = Arc::new(fault_storage.clone());
         let clock = Arc::new(SystemClock);
         // Set tiny max_log_size (50 bytes) so the next flush rolls to 000002.log
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .max_log_size(50)
@@ -1896,7 +1896,7 @@ mod tests {
         let fault_storage = crate::storage::FaultStorage::new(mem);
         let storage = Arc::new(fault_storage.clone());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -1999,7 +1999,7 @@ mod tests {
             crate::compress::Compression::Zstd,
         )
         .unwrap();
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(Arc::new(clock.clone()))
             .volume(header, Arc::new(key))
@@ -2075,7 +2075,7 @@ mod tests {
     fn test_extent_map_hole_larger_than_32_bits() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -2196,8 +2196,8 @@ mod tests {
     }
 
     #[test]
-    fn test_in_memory_fs_destroy_drains_async_ops() {
-        let fs = Arc::new(TestFS::builder().build().fs);
+    fn test_appendfs_destroy_drains_async_ops() {
+        let fs = Arc::new(TestFs::builder().build().fs);
         assert_eq!(fs.in_flight_async_ops(), 0);
 
         let guard = fs.begin_async_op();
@@ -2223,8 +2223,8 @@ mod tests {
     }
 
     #[test]
-    fn test_in_memory_fs_destroy_drains_read_only() {
-        let fs = Arc::new(TestFS::builder().build().fs);
+    fn test_appendfs_destroy_drains_read_only() {
+        let fs = Arc::new(TestFs::builder().build().fs);
         fs.set_read_only();
         let guard = fs.begin_async_op();
 
@@ -2255,7 +2255,7 @@ mod tests {
     fn test_destroy_on_read_only_mount_does_not_export_a_summary() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().storage(storage.clone()).clock(clock).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).clock(clock).build().fs;
 
         // Staged and flushed before the mount goes read-only, so the writer is genuinely open -
         // the export path is reachable and only the read-only entry state suppresses it.
@@ -2279,7 +2279,7 @@ mod tests {
     fn test_destroy_on_read_write_mount_exports_a_final_summary() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().storage(storage.clone()).clock(clock).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).clock(clock).build().fs;
         crate::operations::read_write::create_core(&fs, 1, "rw.bin", 0o644, 0, 1000, 1000).unwrap();
 
         let summaries_before = summary_count(storage.as_ref());
@@ -2304,7 +2304,7 @@ mod tests {
     fn test_staged_accounting_reset_on_begin_flush_prevents_spurious_batches() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let mut fs = TestFS::builder()
+        let mut fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -2368,7 +2368,7 @@ mod tests {
 
     #[test]
     fn test_freeze_live_bounded_by_max_flush_queue_depth() {
-        let mut fs = TestFS::builder().build().fs;
+        let mut fs = TestFs::builder().build().fs;
         fs.max_flush_queue_depth = 2;
 
         let file = crate::operations::read_write::create_core(&fs, 1, "bounded.bin", 0o644, 0, 1000, 1000).unwrap();
@@ -2423,7 +2423,7 @@ mod tests {
 
     #[test]
     fn test_freeze_live_bounded_by_max_flush_queue_bytes() {
-        let mut fs = TestFS::builder().build().fs;
+        let mut fs = TestFs::builder().build().fs;
         fs.max_flush_queue_depth = 10;
         fs.max_flush_queue_bytes = 100;
 
@@ -2491,7 +2491,7 @@ mod tests {
 
     #[test]
     fn test_freeze_live_bounded_by_max_flush_queue_ops() {
-        let mut fs = TestFS::builder().build().fs;
+        let mut fs = TestFs::builder().build().fs;
         fs.max_flush_queue_depth = 10;
         fs.max_flush_queue_ops = 2;
 
@@ -2553,7 +2553,7 @@ mod tests {
     fn test_quiesce_folds_batches_and_mid_drain_freeze_is_threshold_gated() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let mut fs = TestFS::builder()
+        let mut fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -2609,7 +2609,7 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let fs = Arc::new(
-            TestFS::builder()
+            TestFs::builder()
                 .storage(storage.clone())
                 .clock(clock.clone())
                 .build()
@@ -2664,7 +2664,7 @@ mod tests {
         ] {
             let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
             let clock = Arc::new(SystemClock);
-            let mut fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
+            let mut fs = TestFs::builder().storage(storage).clock(clock.clone()).build().fs;
             // Only the threshold case should trip on its own.
             fs.max_buffer_size = if reason == FlushReason::Threshold {
                 1
@@ -2721,7 +2721,7 @@ mod tests {
     fn test_rollover_for_fsync_under_saturation_registers_without_blocking() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let mut fs_inst = TestFS::builder()
+        let mut fs_inst = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -2782,7 +2782,7 @@ mod tests {
     fn test_flush_log_emits_normalized_directory_deltas() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -2864,7 +2864,7 @@ mod tests {
     fn test_flush_coalesces_multiple_queued_batches() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let mut fs = TestFS::builder()
+        let mut fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -2929,7 +2929,7 @@ mod tests {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let fault_storage = Arc::new(crate::storage::FaultStorage::new(mem_storage.clone()));
         let clock = Arc::new(SystemClock);
-        let mut fs = TestFS::builder()
+        let mut fs = TestFs::builder()
             .storage(fault_storage.clone())
             .clock(clock.clone())
             .build()
@@ -3009,7 +3009,7 @@ mod tests {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let fault_storage = Arc::new(crate::storage::FaultStorage::new(mem_storage.clone()));
         let clock = Arc::new(SystemClock);
-        let mut fs = TestFS::builder()
+        let mut fs = TestFs::builder()
             .storage(fault_storage.clone())
             .clock(clock.clone())
             .build()
@@ -3088,7 +3088,7 @@ mod tests {
     fn test_coalesce_batch_waiters_notified_on_sync_before_fold() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let mut fs = TestFS::builder().storage(storage).clock(clock).build().fs;
+        let mut fs = TestFs::builder().storage(storage).clock(clock).build().fs;
         fs.max_coalesce_batches = 2;
         let fs = Arc::new(fs);
 

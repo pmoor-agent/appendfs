@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use crate::error::FsError;
-use crate::fs::InMemoryFS;
+use crate::fs::AppendFs;
 use crate::log::{LogWriter, init_volume_with_clock_and_uids};
 use crate::operations::dir::mkdir_core;
 #[cfg(any(test, feature = "testing"))]
@@ -19,7 +19,7 @@ use crate::storage::{OsStorage, Storage};
 use crate::test_utils::FsTestExt;
 use crate::{VolumeHeader, VolumeKey};
 
-fn compat_write(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
+fn compat_write(fs: &AppendFs, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
     let fh = open_core(fs, ino, libc::O_RDWR as u32)?;
     let res = write_handle_core(fs, ino, fh, buf, offset);
     let _ = release_core(fs, ino, fh);
@@ -288,7 +288,7 @@ pub fn compat_regrown_full() -> Vec<u8> {
 /// Populates the canonical compatibility filesystem tree on `fs` across 3 distinct flush cycles.
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
-pub fn populate_compat_tree(fs: &InMemoryFS, clock: &CompatClock) -> Result<(), FsError> {
+pub fn populate_compat_tree(fs: &AppendFs, clock: &CompatClock) -> Result<(), FsError> {
     // --- BATCH 1: Initial directories, partial file write, and initial xattr ---
     clock.set_offset(10);
     let dir_empty = mkdir_core(fs, 1, "dir_empty", 0o755, 1000, 1000)?;
@@ -723,7 +723,7 @@ fn create_canonical_encrypted_compat_volume(out_dir: &Path, config: CompatFixtur
         .with_compression(config.compression()),
     );
 
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
+    let mut fs = AppendFs::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
     fs.volume_header = volume_header;
     fs.volume_key = volume_key_arc.clone();
     fs.deterministic_summary_iv = Some(COMPAT_SUMMARY_1_IV);
@@ -783,7 +783,7 @@ fn create_canonical_plaintext_compat_volume(out_dir: &Path, config: CompatFixtur
         .with_compression(config.compression()),
     );
 
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
+    let mut fs = AppendFs::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
     fs.volume_header = volume_header;
     fs.log_writer = Some(writer);
     fs.set_log_dir(out_dir);
@@ -834,7 +834,7 @@ pub fn create_canonical_compat_volume(out_dir: &Path, config: CompatFixtureConfi
 }
 
 /// Helper to navigate and locate an inode by relative POSIX path.
-pub fn lookup_path(fs: &InMemoryFS, path: &str) -> Option<u64> {
+pub fn lookup_path(fs: &AppendFs, path: &str) -> Option<u64> {
     let mut current = 1u64; // Inode 1 is root directory
     for seg in path.trim_start_matches('/').split('/') {
         if seg.is_empty() {
@@ -851,7 +851,7 @@ pub fn lookup_path(fs: &InMemoryFS, path: &str) -> Option<u64> {
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
 #[cfg(any(test, feature = "testing"))]
-pub fn verify_compat_tree(fs: &InMemoryFS) {
+pub fn verify_compat_tree(fs: &AppendFs) {
     // 1. Root directory (Inode 1)
     let root_attr = fs.get_attr(1).expect("root directory must exist");
     assert_eq!(root_attr.file_type, FileType::Directory);

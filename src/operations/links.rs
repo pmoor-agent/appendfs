@@ -1,10 +1,10 @@
 use crate::error::FsError;
-use crate::fs::{InMemoryFS, is_virtual_ino};
+use crate::fs::{AppendFs, is_virtual_ino};
 use crate::node::{AttrDelta, NodeDelta, SymlinkDelta};
 use crate::shim::{FileAttr, FileType, FuseResponse, RequestContext};
 use crate::sync::OpTag;
 
-pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), FsError> {
+pub fn unlink_core(fs: &AppendFs, parent: u64, name: &str) -> Result<(), FsError> {
     fs.with_inner(OpTag::Unlink, |inner| {
         inner.check_shutdown(true)?;
         let now = fs.clock.now();
@@ -50,12 +50,12 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), FsErr
     })
 }
 
-pub fn unlink_response(fs: &InMemoryFS, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
+pub fn unlink_response(fs: &AppendFs, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
     unlink_core(fs, parent, name).map(|()| FuseResponse::ok())
 }
 
 pub fn symlink_core(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     parent: u64,
     name: &str,
     target: &str,
@@ -124,7 +124,7 @@ pub fn symlink_core(
 }
 
 pub fn symlink_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ctx: RequestContext,
     link: &str,
     parent: u64,
@@ -133,7 +133,7 @@ pub fn symlink_response(
     symlink_core(fs, parent, name, link, ctx.uid, ctx.gid).map(FuseResponse::entry)
 }
 
-pub fn readlink_core(fs: &InMemoryFS, ino: u64) -> Result<String, FsError> {
+pub fn readlink_core(fs: &AppendFs, ino: u64) -> Result<String, FsError> {
     log::trace!("readlink(ino={})", ino);
     fs.with_inner(OpTag::ReadLink, |inner| {
         inner.check_shutdown(false)?;
@@ -141,13 +141,13 @@ pub fn readlink_core(fs: &InMemoryFS, ino: u64) -> Result<String, FsError> {
     })
 }
 
-pub fn readlink_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, FsError> {
+pub fn readlink_response(fs: &AppendFs, ino: u64) -> Result<FuseResponse<'static>, FsError> {
     readlink_core(fs, ino).map(FuseResponse::readlink)
 }
 
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
-pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), FsError> {
+pub fn rename_core(fs: &AppendFs, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), FsError> {
     fs.with_inner(OpTag::Rename, |inner| {
         inner.check_shutdown(true)?;
         let now = fs.clock.now();
@@ -298,7 +298,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
 }
 
 pub fn rename_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     parent: u64,
     name: &str,
     newparent: u64,
@@ -307,7 +307,7 @@ pub fn rename_response(
     rename_core(fs, parent, name, newparent, newname).map(|()| FuseResponse::ok())
 }
 
-pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Result<FileAttr, FsError> {
+pub fn link_core(fs: &AppendFs, ino: u64, newparent: u64, newname: &str) -> Result<FileAttr, FsError> {
     fs.with_inner(OpTag::Link, |inner| {
         inner.check_shutdown(true)?;
         let now = fs.clock.now();
@@ -353,23 +353,18 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
     })
 }
 
-pub fn link_response(
-    fs: &InMemoryFS,
-    ino: u64,
-    newparent: u64,
-    newname: &str,
-) -> Result<FuseResponse<'static>, FsError> {
+pub fn link_response(fs: &AppendFs, ino: u64, newparent: u64, newname: &str) -> Result<FuseResponse<'static>, FsError> {
     link_core(fs, ino, newparent, newname).map(FuseResponse::entry)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_link_operations_name_length_boundaries() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let file = crate::operations::read_write::create_core(&fs, 1, "orig.txt", 0o644, 0, 1000, 1000).unwrap();
 
         let name_255 = "l".repeat(255);
