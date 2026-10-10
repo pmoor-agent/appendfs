@@ -1117,11 +1117,12 @@ mod tests {
     use super::*;
     use crate::sync::OpTag;
     use crate::test_utils::FsTestExt;
+    use crate::test_utils::TestFS;
     use std::sync::Arc;
 
     #[test]
     fn test_volume_stats_formatting() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let stats = VolumeStats::collect(&fs);
         assert_eq!(stats.total_inodes, 1);
         assert_eq!(stats.directory_count, 1);
@@ -1139,7 +1140,7 @@ mod tests {
         use crate::node::{InodeMeta, Node, NodeKind};
         use std::time::SystemTime;
 
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let now = SystemTime::UNIX_EPOCH;
 
         let mut extent_map = ExtentMap::new();
@@ -1297,7 +1298,7 @@ mod tests {
 
     #[test]
     fn test_format_runtime_status_fresh_fs() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let status = format_runtime_status(&fs);
 
         assert!(status.contains("=== appendfs Runtime Status ==="));
@@ -1317,7 +1318,7 @@ mod tests {
         assert!(status.contains("Staged Operations:  0"));
 
         assert!(status.contains("[Cache]"));
-        assert!(status.contains("Decrypted Records:  Disabled"));
+        assert!(status.contains("Decrypted Records:  0 B / "));
         assert!(status.contains("Block Cache:        Disabled"));
 
         assert!(status.contains("[Handles & Locks]"));
@@ -1483,7 +1484,7 @@ mod tests {
 
     #[test]
     fn test_format_runtime_status_single_lock_acquisition() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let before_stats_count = fs
             .inner
             .op_stats()
@@ -1515,7 +1516,7 @@ mod tests {
         use crate::operations::links::{symlink_core, unlink_core};
         use crate::operations::read_write::create_core;
 
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         // Base state: 1 root directory
         let counts = fs.inode_counts();
         assert_eq!(counts.total_active(), 1);
@@ -1585,7 +1586,7 @@ mod tests {
     fn test_format_runtime_status_many_inodes_performance() {
         use crate::operations::read_write::create_core;
 
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         for i in 0..1_000 {
             let name = format!("file_{}.dat", i);
             create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
@@ -1619,7 +1620,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
 
-        let fs = Arc::new(InMemoryFS::new());
+        let fs = Arc::new(TestFS::builder().build().fs);
         let stop = Arc::new(AtomicBool::new(false));
         let fs_writer = Arc::clone(&fs);
         let stop_writer = Arc::clone(&stop);

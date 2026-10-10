@@ -923,6 +923,7 @@ mod tests {
     use crate::node::{AttrDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind};
     use crate::storage::Storage;
     use crate::test_utils::FsTestExt;
+    use crate::test_utils::TestFS;
     use std::time::SystemTime;
 
     #[test]
@@ -1366,7 +1367,7 @@ mod tests {
     /// past the end is a no-op.
     #[test]
     fn test_punch_hole_is_clamped_to_eof() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "short.bin", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
         fs.write_at(ino, &[0xAB; 100], 0).unwrap();
@@ -1386,7 +1387,7 @@ mod tests {
     #[test]
     fn test_directory_parent_tracking_across_mkdir_rename_and_flush() {
         let clock = Arc::new(crate::clock::MockClock(SystemTime::UNIX_EPOCH));
-        let fs = InMemoryFS::with_clock(clock);
+        let fs = TestFS::builder().clock(clock).build().fs;
 
         // Root inode 1 parent is 1
         assert_eq!(fs.get_parent_dir_inode(1), Some(1));
@@ -1818,7 +1819,7 @@ mod tests {
     #[test]
     fn test_multi_batch_flushing_queue_and_layer_resolution() {
         let clock = Arc::new(SystemClock);
-        let fs = InMemoryFS::with_clock(clock.clone());
+        let fs = TestFS::builder().clock(clock.clone()).build().fs;
 
         // 1. Create file in batch 1
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -2342,7 +2343,7 @@ mod tests {
 
     #[test]
     fn test_in_memory_fs_destroy_drains_async_ops() {
-        let fs = Arc::new(InMemoryFS::new());
+        let fs = Arc::new(TestFS::builder().build().fs);
         assert_eq!(fs.in_flight_async_ops(), 0);
 
         let guard = fs.begin_async_op();
@@ -2369,7 +2370,7 @@ mod tests {
 
     #[test]
     fn test_in_memory_fs_destroy_drains_read_only() {
-        let fs = Arc::new(InMemoryFS::new());
+        let fs = Arc::new(TestFS::builder().build().fs);
         fs.set_read_only();
         let guard = fs.begin_async_op();
 
@@ -2542,7 +2543,7 @@ mod tests {
 
     #[test]
     fn test_freeze_live_bounded_by_max_flush_queue_depth() {
-        let mut fs = InMemoryFS::new();
+        let mut fs = TestFS::builder().build().fs;
         fs.max_flush_queue_depth = 2;
 
         let file = crate::operations::read_write::create_core(&fs, 1, "bounded.bin", 0o644, 0, 1000, 1000).unwrap();
@@ -2597,7 +2598,7 @@ mod tests {
 
     #[test]
     fn test_freeze_live_bounded_by_max_flush_queue_bytes() {
-        let mut fs = InMemoryFS::new();
+        let mut fs = TestFS::builder().build().fs;
         fs.max_flush_queue_depth = 10;
         fs.max_flush_queue_bytes = 100;
 
@@ -2665,7 +2666,7 @@ mod tests {
 
     #[test]
     fn test_freeze_live_bounded_by_max_flush_queue_ops() {
-        let mut fs = InMemoryFS::new();
+        let mut fs = TestFS::builder().build().fs;
         fs.max_flush_queue_depth = 10;
         fs.max_flush_queue_ops = 2;
 

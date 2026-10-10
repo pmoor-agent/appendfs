@@ -196,10 +196,11 @@ impl InMemoryFS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::TestFS;
 
     #[test]
     fn test_dir_handle_snapshot_isolation_and_lifecycle() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
 
         // 1. Create two files under root
         crate::operations::read_write::create_core(&fs, 1, "alpha.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -265,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_file_handle_lifecycle_and_unlinking() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
 
         // 1. Create a file
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -306,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_unified_handle_map_regular_virtual_and_directory() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "data.bin", 0o644, 0, 1000, 1000).unwrap();
         let reg_ino = attr.ino;
         let v_ino = fs.lookup_child(1, ".status").expect(".status must exist");

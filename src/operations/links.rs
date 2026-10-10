@@ -365,10 +365,11 @@ pub fn link_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::TestFS;
 
     #[test]
     fn test_link_operations_name_length_boundaries() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let file = crate::operations::read_write::create_core(&fs, 1, "orig.txt", 0o644, 0, 1000, 1000).unwrap();
 
         let name_255 = "l".repeat(255);

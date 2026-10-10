@@ -660,10 +660,11 @@ mod tests {
     use crate::extent_map::{Extent, ExtentMap};
     use crate::fs::{FlushBatch, WriteArena};
     use crate::test_utils::FsTestExt;
+    use crate::test_utils::TestFS;
 
     #[test]
     fn test_get_attr_across_layers() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
 
         // 1. Create file1 in live -> freeze to flushing -> fold to base
         let attr1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -694,7 +695,7 @@ mod tests {
 
     #[test]
     fn test_plan_read_file_data_staged_and_holes() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
         fs.write_at(attr.ino, &[0xAA; 100], 0).unwrap();
         crate::operations::read_write::fallocate_core(
@@ -731,7 +732,7 @@ mod tests {
 
     #[test]
     fn test_plan_read_out_of_bounds() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "empty.bin", 0o644, 0, 1000, 1000).unwrap();
         let plan = fs.plan_read_file_data(attr.ino, 100, 50).unwrap();
         assert_eq!(plan.total_len, 0);
@@ -744,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_plan_read_handle_virtual_file() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         fs.register_runtime_status();
 
         let status_ino = crate::fs::VIRTUAL_INO_BASE;
@@ -772,7 +773,7 @@ mod tests {
         use crate::node::{FileDelta, InodeMeta};
         use std::time::SystemTime;
 
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "layers.bin", 0o644, 0, 1000, 1000).unwrap();
 
@@ -1140,7 +1141,7 @@ mod tests {
         // Calling default_read_parallelism again returns the identical memoized value
         assert_eq!(default_read_parallelism(), default);
 
-        let mut fs = InMemoryFS::new();
+        let mut fs = TestFS::builder().build().fs;
         // Default is 0 (auto-detect)
         assert_eq!(fs.read_parallelism, 0);
         assert!(fs.read_pool.read().unwrap().is_none());
