@@ -1235,7 +1235,7 @@ mod tests {
         let writer = LogWriter::create(
             storage.clone(),
             1,
-            &clock,
+            Arc::new(clock),
             crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
             VolumeKey::plaintext_arc(),
@@ -1297,7 +1297,7 @@ mod tests {
         let writer = LogWriter::create(
             storage.clone(),
             1,
-            &clock,
+            Arc::new(clock),
             crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
             VolumeKey::plaintext_arc(),
@@ -1619,7 +1619,7 @@ mod tests {
         let writer = LogWriter::create(
             storage.clone(),
             1,
-            &clock,
+            Arc::new(clock),
             crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
             VolumeKey::plaintext_arc(),
@@ -1679,7 +1679,7 @@ mod tests {
         let writer = LogWriter::create(
             storage.clone(),
             1,
-            &clock,
+            Arc::new(clock),
             crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
             Arc::new(vol_key.clone()),
@@ -1722,7 +1722,7 @@ mod tests {
         let writer = LogWriter::create(
             storage.clone(),
             1,
-            &clock,
+            Arc::new(clock),
             crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
             VolumeKey::plaintext_arc(),

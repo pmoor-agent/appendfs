@@ -710,15 +710,16 @@ fn create_canonical_encrypted_compat_volume(out_dir: &Path, config: CompatFixtur
     // 2. Open log writer for generation 1 with deterministic clock, volume encryption key, and compression
     // Lazy, so the fixed key salts are in place before the first file is created.
     let writer = Arc::new(
-        LogWriter::create_lazy_with_clock(
+        LogWriter::create_lazy(
             storage.clone(),
             1,
-            clock.as_ref(),
+            clock.clone(),
             crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
             volume_key_arc.clone(),
         )
         .map_err(io::Error::other)?
+        .with_first_created_at(clock.now())
         .with_key_salts(compat_key_salt)
         .with_compression(config.compression()),
     );
@@ -770,15 +771,16 @@ fn create_canonical_plaintext_compat_volume(out_dir: &Path, config: CompatFixtur
     // 2. Open log writer for generation 1 with deterministic clock and compression
     // Lazy, so the fixed key salts are in place before the first file is created.
     let writer = Arc::new(
-        LogWriter::create_lazy_with_clock(
+        LogWriter::create_lazy(
             storage.clone(),
             1,
-            clock.as_ref(),
+            clock.clone(),
             crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
             volume_key_arc.clone(),
         )
         .map_err(io::Error::other)?
+        .with_first_created_at(clock.now())
         .with_key_salts(compat_key_salt)
         .with_compression(config.compression()),
     );

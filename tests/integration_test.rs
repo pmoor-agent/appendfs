@@ -1177,6 +1177,7 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
     let writer1 = appendfs::LogWriter::create_lazy(
         storage.clone(),
         1,
+        std::sync::Arc::new(appendfs::SystemClock),
         appendfs::cli::DEFAULT_MAX_LOG_SIZE,
         1,
         appendfs::VolumeKey::plaintext_arc(),
@@ -1189,6 +1190,7 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
     let err = appendfs::LogWriter::create_lazy(
         storage.clone(),
         1,
+        std::sync::Arc::new(appendfs::SystemClock),
         appendfs::cli::DEFAULT_MAX_LOG_SIZE,
         1,
         appendfs::VolumeKey::plaintext_arc(),
@@ -1226,6 +1228,7 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
                 let res = appendfs::LogWriter::create_lazy(
                     storage.clone(),
                     1,
+                    std::sync::Arc::new(appendfs::SystemClock),
                     appendfs::cli::DEFAULT_MAX_LOG_SIZE,
                     1,
                     appendfs::VolumeKey::plaintext_arc(),

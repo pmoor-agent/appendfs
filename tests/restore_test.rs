@@ -795,7 +795,7 @@ fn test_python_restore_rejects_record_after_seal() {
     fs.quiesce().unwrap();
 
     // Seal gen 1 cleanly
-    writer.seal_active(clock.as_ref()).unwrap();
+    writer.seal_active().unwrap();
     fs.log_writer = None;
     drop(fs);
     drop(writer);
@@ -875,7 +875,7 @@ fn test_python_restore_rejects_seal_record_count_mismatch() {
     fs.quiesce().unwrap();
 
     // Seal gen 1 cleanly
-    writer.seal_active(clock.as_ref()).unwrap();
+    writer.seal_active().unwrap();
     fs.log_writer = None;
     drop(fs);
     drop(writer);
