@@ -572,25 +572,14 @@ impl InMemoryFS {
 mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
-    use crate::log::LogWriter;
     use crate::storage::Storage;
+    use crate::test_utils::TestFS;
 
     #[test]
     fn test_exists_below_live_sees_a_tombstone_frozen_out_of_live() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create(
-                storage,
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        let fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.quiesce().unwrap();
@@ -617,18 +606,7 @@ mod tests {
     fn test_attr_update_does_not_resurrect_a_tombstoned_inode() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create(
-                storage,
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        let fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         // Fold it into `base`, so the lower layers still describe the inode after deletion.
@@ -662,18 +640,7 @@ mod tests {
     fn test_normalize_directory_deltas_touch_and_rm_same_batch() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create(
-                storage,
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+        let fs = TestFS::builder().storage(storage).clock(clock).build().fs;
 
         // Create and immediately unlink in the same batch
         let _attr = crate::operations::read_write::create_core(&fs, 1, "temp.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -716,18 +683,7 @@ mod tests {
     fn test_normalize_directory_deltas_self_canceling_rename() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create(
-                storage,
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+        let fs = TestFS::builder().storage(storage).clock(clock).build().fs;
 
         // Create file.txt and fold into base
         let attr = crate::operations::read_write::create_core(&fs, 1, "file.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -777,18 +733,7 @@ mod tests {
     fn test_normalize_directory_deltas_chained_rename() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create(
-                storage,
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+        let fs = TestFS::builder().storage(storage).clock(clock).build().fs;
 
         // Create a.txt and fold into base
         let attr = crate::operations::read_write::create_core(&fs, 1, "a.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -826,18 +771,7 @@ mod tests {
     fn test_normalize_directory_deltas_across_flushing_batches() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create(
-                storage,
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+        let fs = TestFS::builder().storage(storage).clock(clock).build().fs;
 
         // Batch 1: create file1.txt and flush (which folds into base)
         let _attr = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -867,18 +801,7 @@ mod tests {
     fn test_normalize_directory_deltas_across_multiple_unflushed_batches() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create(
-                storage,
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+        let fs = TestFS::builder().storage(storage).clock(clock).build().fs;
 
         // Initial setup in base: base has root (ino 1) containing "existing.txt"
         let existing_attr =

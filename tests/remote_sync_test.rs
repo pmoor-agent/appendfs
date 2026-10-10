@@ -2159,9 +2159,9 @@ fn test_unsealed_manifest_logs_are_synced_and_pruned() {
     }
 
     // 3. Mount log writer for gen 2 and export summary covering gen 1
-    let gen2_writer =
-        Arc::new(LogWriter::create(storage.clone(), 2, &*clock, 10_000_000, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(gen2_writer);
+    let gen2_writer = fs.next_log_writer(storage.clone(), 10_000_000).unwrap();
+    assert_eq!(gen2_writer.generation(), 2);
+    fs.attach_log_writer(Arc::new(gen2_writer));
     let exported = fs.export_summary(storage.as_ref()).unwrap();
     assert_eq!(exported, "000001.summary");
 
