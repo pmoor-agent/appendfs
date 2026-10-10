@@ -1062,6 +1062,7 @@ impl AppendFs {
         let writer = LogWriter::create_lazy(
             storage,
             self.next_generation(),
+            Arc::clone(&self.clock),
             max_log_size,
             self.last_batch_id.load(Ordering::SeqCst) + 1,
             Arc::clone(&self.volume_key),

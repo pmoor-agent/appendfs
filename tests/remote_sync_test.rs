@@ -49,7 +49,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     fs.quiesce().unwrap();
 
     // Force roll to generation 2 (seals gen 1)
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs.manifest.write().unwrap().record_sealed_log(sealed);
 
@@ -164,7 +164,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     fs.quiesce().unwrap();
 
     // Roll to generation 2
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs.manifest.write().unwrap().record_sealed_log(sealed);
     fs.export_summary(storage.as_ref()).unwrap();
@@ -281,7 +281,7 @@ fn test_read_only_remote_and_cloud_forking() {
     fs.quiesce().unwrap();
 
     // Roll to generation 2
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs.manifest.write().unwrap().record_sealed_log(sealed);
     let summary_file = fs.export_summary(storage.as_ref()).unwrap();
@@ -486,7 +486,7 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     );
 
     // 3. Roll generation: seals generation 1 into generation 2!
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.export_summary(storage.as_ref()).unwrap();
@@ -643,7 +643,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     fs.quiesce().unwrap();
 
     // Force roll to generation 2 (seals generation 1)
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     let sealed_md5 = sealed.md5;
     fs.manifest.write().unwrap().record_sealed_log(sealed);
@@ -732,7 +732,7 @@ fn test_local_read_populates_block_cache_before_purge() {
     fs.quiesce().unwrap();
 
     // 2. Force roll to generation 2 (seals generation 1)
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs.manifest.write().unwrap().record_sealed_log(sealed);
     fs.export_summary(storage.as_ref()).unwrap();
@@ -808,7 +808,7 @@ fn test_local_read_skips_block_cache_by_default() {
     fs.write_at(ino, payload, 0).unwrap();
     fs.quiesce().unwrap();
 
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed);
 
     let block_cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
@@ -852,7 +852,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     fs.quiesce().unwrap();
 
     // 2. Roll to generation 2 (seals generation 1)
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs.manifest.write().unwrap().record_sealed_log(sealed);
     fs.export_summary(storage.as_ref()).unwrap();
@@ -951,7 +951,7 @@ fn test_latency_remote_store_in_tiered_reading() {
     fs.write_at(file_attr.ino, payload, 0).unwrap();
     fs.quiesce().unwrap();
 
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs.manifest.write().unwrap().record_sealed_log(sealed);
     fs.export_summary(storage.as_ref()).unwrap();
@@ -1063,7 +1063,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     fs_arc.write_at(file.ino, b"data before roll", 0).unwrap();
     fs_arc.quiesce().unwrap();
 
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.export_summary(storage.as_ref()).unwrap();
@@ -1225,7 +1225,7 @@ fn test_event_driven_immediate_replication_on_log_roll() {
     fs_arc.quiesce().unwrap();
 
     // Force roll generation 1 -> 2. This seals generation 1 and notifies the worker via Condvar!
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.notify_replication();
@@ -1271,7 +1271,7 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     fs_arc.quiesce().unwrap();
 
     // Seal generation 1
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
 
@@ -1466,7 +1466,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
 
     // Roll to generation 2 (sealing gen 1)
     clock.advance(std::time::Duration::from_secs(60));
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs.manifest.write().unwrap().record_sealed_log(sealed);
     let summary1 = fs.export_summary(storage.as_ref()).unwrap();
@@ -1484,7 +1484,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
 
     // Roll to generation 3 (sealing gen 2) and export summary 2
     clock.advance(std::time::Duration::from_secs(60));
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 2);
     fs.manifest.write().unwrap().record_sealed_log(sealed);
     let summary2 = fs.export_summary(storage.as_ref()).unwrap();
@@ -1679,7 +1679,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         fs_arc.quiesce().unwrap();
 
         // Roll and export summary
-        let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+        let sealed = writer.force_roll().unwrap().unwrap();
         assert_eq!(sealed.generation, gen_idx);
         fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
         fs_arc.sync_and_export_summary().unwrap();
@@ -1833,7 +1833,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     fs_arc.write_at(file4.ino, b"Payload for generation 4", 0).unwrap();
     fs_arc.quiesce().unwrap();
 
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 4);
     fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.sync_and_export_summary().unwrap();
@@ -2066,7 +2066,7 @@ fn test_per_remote_upload_partial_logs_behavior() {
     );
 
     // 3. Roll generation: seals gen 1 into gen 2 and exports summary
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.export_summary(storage.as_ref()).unwrap();
@@ -2133,7 +2133,7 @@ fn test_unsealed_manifest_logs_are_synced_and_pruned() {
     init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
 
     // 1. Write an unsealed log file (generation 1) without an OpCode::Seal record
-    let writer = LogWriter::create(storage.clone(), 1, &*clock, 10_000_000, 1, volume_key.clone()).unwrap();
+    let writer = LogWriter::create(storage.clone(), 1, clock.clone(), 10_000_000, 1, volume_key.clone()).unwrap();
     writer
         .append_raw_for_test(appendfs::log::OpCode::InodeDelta, 1, b"unsealed record payload")
         .unwrap();
@@ -2313,7 +2313,7 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
     );
 
     // 2. Force roll to generation 2 (seals generation 1)
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     fs_arc.export_summary(storage.as_ref()).unwrap();
@@ -2478,7 +2478,7 @@ fn test_write_only_glacier_remote_replication_and_prune_safety() {
     );
 
     // 4. Seal generation 1 and roll to generation 2
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     assert_eq!(sealed.generation, 1);
     fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     let summary_file = fs_arc.export_summary(storage.as_ref()).unwrap();
@@ -2521,7 +2521,7 @@ fn test_write_only_glacier_remote_replication_and_prune_safety() {
     let iso_file_attr = create_core(&iso_fs_arc, 1, "important.txt", 0o644, 0, 1000, 1000).unwrap();
     iso_fs_arc.write_at(iso_file_attr.ino, b"crucial data", 0).unwrap();
     iso_fs_arc.quiesce().unwrap();
-    let iso_sealed = iso_writer.force_roll(&*clock).unwrap().unwrap();
+    let iso_sealed = iso_writer.force_roll().unwrap().unwrap();
     iso_fs_arc.manifest.write().unwrap().record_sealed_log(iso_sealed);
     let _ = iso_fs_arc.export_summary(isolated_storage.as_ref()).unwrap();
 
@@ -2611,7 +2611,7 @@ fn test_prune_rule_multi_tier_lifecycle_with_glacier() {
     let file1_attr = create_core(&fs_arc, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
     fs_arc.write_at(file1_attr.ino, b"multi-tier prune data", 0).unwrap();
     fs_arc.quiesce().unwrap();
-    let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed = writer.force_roll().unwrap().unwrap();
     fs_arc.manifest.write().unwrap().record_sealed_log(sealed);
     let _ = fs_arc.export_summary(storage.as_ref()).unwrap();
 
@@ -2676,21 +2676,21 @@ fn test_shutdown_drain_syncs_latest_sealed_log_and_skips_earlier_backlog() {
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f1.ino, b"data 1", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed1 = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed1);
 
     // Gen 2:
     let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f2.ino, b"data 2", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed2 = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed2);
 
     // Gen 3:
     let f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f3.ino, b"data 3", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed3 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed3 = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed3);
 
     let summary = fs.export_summary(storage.as_ref()).unwrap();
@@ -2730,7 +2730,7 @@ fn test_shutdown_drain_prunes_eligible_local_logs() {
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f1.ino, b"data 1", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed1 = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed1);
 
     let summary = fs.export_summary(storage.as_ref()).unwrap();
@@ -2773,7 +2773,7 @@ fn test_shutdown_drain_replicates_only_missing_latest_sealed_log_and_summary() {
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f1.ino, b"data 1", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed1 = writer.force_roll().unwrap().unwrap();
     let sealed1_md5 = sealed1.md5;
     fs.manifest.write().unwrap().record_sealed_log(sealed1);
 
@@ -2781,7 +2781,7 @@ fn test_shutdown_drain_replicates_only_missing_latest_sealed_log_and_summary() {
     let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f2.ino, b"data 2", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed2 = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed2);
 
     let summary = fs.export_summary(storage.as_ref()).unwrap();
@@ -2820,7 +2820,7 @@ fn test_shutdown_drain_syncs_latest_summary_and_skips_earlier_summaries() {
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f1.ino, b"data 1", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed1 = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed1);
     let sum1 = fs.export_summary(storage.as_ref()).unwrap();
     assert_eq!(sum1, "000001.summary");
@@ -2829,7 +2829,7 @@ fn test_shutdown_drain_syncs_latest_summary_and_skips_earlier_summaries() {
     let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f2.ino, b"data 2", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed2 = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed2);
     let sum2 = fs.export_summary(storage.as_ref()).unwrap();
     assert_eq!(sum2, "000002.summary");
@@ -2838,7 +2838,7 @@ fn test_shutdown_drain_syncs_latest_summary_and_skips_earlier_summaries() {
     let f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f3.ino, b"data 3", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed3 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed3 = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed3);
     let sum3 = fs.export_summary(storage.as_ref()).unwrap();
     assert_eq!(sum3, "000003.summary");
@@ -2885,14 +2885,14 @@ fn test_worker_syncs_only_latest_summary_cross_copy() {
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f1.ino, b"data 1", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed1 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed1 = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed1);
     let sum1 = fs.export_summary(storage.as_ref()).unwrap();
 
     let f2 = create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f2.ino, b"data 2", 0).unwrap();
     fs.quiesce().unwrap();
-    let sealed2 = writer.force_roll(&*clock).unwrap().unwrap();
+    let sealed2 = writer.force_roll().unwrap().unwrap();
     fs.manifest.write().unwrap().record_sealed_log(sealed2);
     let sum2 = fs.export_summary(storage.as_ref()).unwrap();
 
@@ -2944,7 +2944,7 @@ fn test_replication_worker_active_round_interrupted_on_stop() {
         let file = create_core(&fs, 1, &format!("f{}.txt", i), 0o644, 0, 1000, 1000).unwrap();
         fs.write_at(file.ino, &[b'X'; 50000], 0).unwrap();
         fs.quiesce().unwrap();
-        let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+        let sealed = writer.force_roll().unwrap().unwrap();
         fs.manifest.write().unwrap().record_sealed_log(sealed);
     }
     fs.export_summary(storage.as_ref()).unwrap();
@@ -3016,7 +3016,7 @@ fn test_pre_synced_remote_reflects_up_to_date_status_without_lockstep_lag() {
             .unwrap();
         fs.quiesce().unwrap();
 
-        let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+        let sealed = writer.force_roll().unwrap().unwrap();
         assert_eq!(sealed.generation, g);
         fs.manifest.write().unwrap().record_sealed_log(sealed);
         fs.export_summary(storage.as_ref()).unwrap();
@@ -3197,7 +3197,7 @@ fn test_prioritized_replication_rw_and_low_lag_replicates_before_archive_backlog
             .unwrap();
         fs.quiesce().unwrap();
 
-        let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+        let sealed = writer.force_roll().unwrap().unwrap();
         assert_eq!(sealed.generation, g);
         fs.manifest.write().unwrap().record_sealed_log(sealed);
         fs.export_summary(storage.as_ref()).unwrap();

@@ -3123,7 +3123,7 @@ mod tests {
                 LogWriter::create(
                     storage.clone(),
                     g,
-                    &*clock,
+                    clock.clone(),
                     crate::cli::DEFAULT_MAX_LOG_SIZE,
                     g as u64 * 1000,
                     VolumeKey::plaintext_arc(),

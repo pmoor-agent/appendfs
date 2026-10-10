@@ -1196,7 +1196,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     let writer = LogWriter::create(
         storage.clone(),
         1,
-        &clock,
+        Arc::new(clock),
         appendfs::cli::DEFAULT_MAX_LOG_SIZE,
         1,
         appendfs::VolumeKey::plaintext_arc(),
@@ -1286,7 +1286,7 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     let writer = LogWriter::create(
         storage.clone(),
         1,
-        &clock,
+        Arc::new(clock),
         appendfs::cli::DEFAULT_MAX_LOG_SIZE,
         1,
         appendfs::VolumeKey::plaintext_arc(),
@@ -1331,7 +1331,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     let writer = LogWriter::create(
         storage.clone(),
         1,
-        &clock,
+        Arc::new(clock),
         appendfs::cli::DEFAULT_MAX_LOG_SIZE,
         1,
         appendfs::VolumeKey::plaintext_arc(),

@@ -475,7 +475,7 @@ mod tests {
             LogWriter::create(
                 storage.clone(),
                 1,
-                &*clock,
+                clock.clone(),
                 crate::cli::DEFAULT_MAX_LOG_SIZE,
                 1,
                 VolumeKey::plaintext_arc(),
@@ -556,7 +556,7 @@ mod tests {
             LogWriter::create(
                 storage.clone(),
                 1,
-                &*clock,
+                clock.clone(),
                 crate::cli::DEFAULT_MAX_LOG_SIZE,
                 1,
                 VolumeKey::plaintext_arc(),
@@ -569,7 +569,7 @@ mod tests {
             .unwrap();
         writer1.flush().unwrap();
         assert_eq!(writer1.last_batch_id(), 1);
-        writer1.seal_active(&*clock).unwrap();
+        writer1.seal_active().unwrap();
         drop(writer1);
 
         // Writer 2 starts at batch 3 (simulating a dropped/missing batch 2)
@@ -577,7 +577,7 @@ mod tests {
             LogWriter::create(
                 storage.clone(),
                 2,
-                &*clock,
+                clock.clone(),
                 crate::cli::DEFAULT_MAX_LOG_SIZE,
                 3,
                 VolumeKey::plaintext_arc(),
@@ -627,7 +627,7 @@ mod tests {
             LogWriter::create(
                 storage.clone(),
                 1,
-                &*clock,
+                clock.clone(),
                 crate::cli::DEFAULT_MAX_LOG_SIZE,
                 1,
                 VolumeKey::plaintext_arc(),
@@ -693,7 +693,7 @@ mod tests {
             LogWriter::create(
                 storage.clone(),
                 1,
-                &*clock,
+                clock.clone(),
                 crate::cli::DEFAULT_MAX_LOG_SIZE,
                 1,
                 VolumeKey::plaintext_arc(),
@@ -759,7 +759,7 @@ mod tests {
         fs.quiesce().unwrap();
 
         // Roll to generation 2 (this seals gen 1 with OpCode::Seal)
-        let sealed = writer.force_roll(&*clock).unwrap().unwrap();
+        let sealed = writer.force_roll().unwrap().unwrap();
         assert_eq!(sealed.generation, 1);
         fs.manifest.write().unwrap().record_sealed_log(sealed);
 
@@ -813,7 +813,8 @@ mod tests {
         drop(writer);
 
         // Now simulate gen 2 being created after crash recovery without sealing gen 1
-        let writer2 = LogWriter::create(storage.clone(), 2, &*clock, 10_000, 2, VolumeKey::plaintext_arc()).unwrap();
+        let writer2 =
+            LogWriter::create(storage.clone(), 2, clock.clone(), 10_000, 2, VolumeKey::plaintext_arc()).unwrap();
         let mut fs2 = AppendFs::with_clock_and_uids(clock.clone(), 1000, 1000);
         fs2.log_writer = Some(Arc::new(writer2));
         fs2.set_storage(storage.clone());
@@ -861,7 +862,7 @@ mod tests {
 
         crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
         fs.quiesce().unwrap();
-        writer.seal_active(&*clock).unwrap();
+        writer.seal_active().unwrap();
         drop(fs);
         drop(writer);
 
@@ -931,7 +932,7 @@ mod tests {
         fs.quiesce().unwrap();
 
         // Seal gen 1 with record_count = 3 (1 dir delta + 1 attr delta + 1 FlushCommit)
-        let _ = writer.seal_active(&*clock).unwrap();
+        let _ = writer.seal_active().unwrap();
         fs.log_writer = None;
         drop(fs);
         drop(writer);
@@ -1032,7 +1033,7 @@ mod tests {
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000001.summary"));
 
-            let _ = writer.seal_active(&*clock).unwrap();
+            let _ = writer.seal_active().unwrap();
         }
 
         // Phase 2: create fs at gen 2, write file2, export summary
@@ -1041,7 +1042,7 @@ mod tests {
                 LogWriter::create(
                     storage.clone(),
                     2,
-                    &*clock,
+                    clock.clone(),
                     crate::cli::DEFAULT_MAX_LOG_SIZE,
                     2,
                     VolumeKey::plaintext_arc(),
@@ -1058,7 +1059,7 @@ mod tests {
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000002.summary"));
 
-            let _ = writer.seal_active(&*clock).unwrap();
+            let _ = writer.seal_active().unwrap();
         }
 
         // Corrupt 000002.summary body
@@ -1107,7 +1108,7 @@ mod tests {
             batch_gen1 = fs.log_writer.as_ref().unwrap().last_batch_id();
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000001.summary"));
-            let _ = writer.seal_active(&*clock).unwrap();
+            let _ = writer.seal_active().unwrap();
         }
 
         // Gen 2: batch 2, time 2000
@@ -1117,7 +1118,7 @@ mod tests {
                 LogWriter::create(
                     storage.clone(),
                     2,
-                    &*clock,
+                    clock.clone(),
                     crate::cli::DEFAULT_MAX_LOG_SIZE,
                     batch_gen1 + 1,
                     VolumeKey::plaintext_arc(),
@@ -1133,7 +1134,7 @@ mod tests {
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000002.summary"));
-            let _ = writer.seal_active(&*clock).unwrap();
+            let _ = writer.seal_active().unwrap();
         }
 
         // Keep 000002.summary's header intact (so read_header succeeds with last_batch_id > batch_gen1
@@ -1211,7 +1212,7 @@ mod tests {
             r1_bytes[len - 32..].copy_from_slice(&new_checksum);
             mem_storage.insert_file("000001_r1.summary", r1_bytes);
 
-            let _ = writer.seal_active(&*clock).unwrap();
+            let _ = writer.seal_active().unwrap();
             fs.log_writer = None;
         }
 

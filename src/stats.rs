@@ -1354,11 +1354,7 @@ mod tests {
     fn test_format_runtime_status_with_active_writer() {
         let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::SystemClock);
         let fs = TestFs::builder().clock(clock.clone()).build().fs;
-        fs.log_writer
-            .as_ref()
-            .unwrap()
-            .open_if_unopened(clock.as_ref())
-            .unwrap();
+        fs.log_writer.as_ref().unwrap().open_if_unopened().unwrap();
         let status = format_runtime_status(&fs);
         assert!(status.contains("Active Generation:  1 (000001.log)"));
         assert!(status.contains("Next Generation:    2 (000002.log)"));

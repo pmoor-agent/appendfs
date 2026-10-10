@@ -255,7 +255,7 @@ impl AppendFs {
     /// Also runs during the shutdown drain, so a large backlog is still split across
     /// generations; the successor is left lazy, so the drain never leaves an empty one behind.
     fn roll_log(&self, writer: &LogWriter) -> std::io::Result<()> {
-        let Some(sealed_info) = writer.roll_if_needed(&*self.clock)? else {
+        let Some(sealed_info) = writer.roll_if_needed()? else {
             return Ok(());
         };
         let sealed_gen = sealed_info.generation;
@@ -425,7 +425,7 @@ impl AppendFs {
                 }
 
                 // Lazily open the active log file using the injected clock if unopened.
-                writer.open_if_unopened(&*self.clock)?;
+                writer.open_if_unopened()?;
 
                 self.flush_coalesced_group(writer, candidates)?;
 
@@ -635,7 +635,7 @@ impl AppendFs {
         // Excludes the flusher for the roll itself. C3 moves age-based rolling into the
         // flusher's idle tick, at which point this exclusion goes away with it.
         self.flusher.run_locked(|| {
-            let Some(sealed_info) = writer.force_roll(&*self.clock)? else {
+            let Some(sealed_info) = writer.force_roll()? else {
                 return Ok(None);
             };
             self.manifest.write().unwrap().record_sealed_log(sealed_info.clone());
@@ -781,7 +781,7 @@ impl AppendFs {
 
         // Seal the active generation before taking the summary snapshot
         if let Some(ref writer) = self.log_writer
-            && let Some(sealed_info) = writer.seal_active(self.clock.as_ref())?
+            && let Some(sealed_info) = writer.seal_active()?
         {
             self.manifest.write().unwrap().record_sealed_log(sealed_info);
         }
@@ -2007,7 +2007,7 @@ mod tests {
             .fs;
         // Open the log file up front, so the injected sync failure hits the batch rather than
         // the new file's header.
-        fs.log_writer.as_ref().unwrap().open_if_unopened(&clock).unwrap();
+        fs.log_writer.as_ref().unwrap().open_if_unopened().unwrap();
 
         for i in 0..3u8 {
             let name = format!("file_{}.bin", i);
@@ -2935,7 +2935,7 @@ mod tests {
             .build()
             .fs;
         let writer = fs.log_writer.clone().unwrap();
-        writer.open_if_unopened(&*clock).unwrap();
+        writer.open_if_unopened().unwrap();
         let initial_offset = writer.current_offset();
         fs.max_coalesce_batches = 3;
 

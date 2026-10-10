@@ -471,6 +471,10 @@ pub struct LogWriter {
     /// [`LogWriter::with_compression`] rather than passed to every constructor, which would
     /// reintroduce the telescoping shape this module deliberately avoids.
     compression: crate::compress::Compression,
+    /// Stamps each generation file's creation time and drives `max_log_age`. Held here so a
+    /// lazily opened generation - including the successor of a roll - is stamped by the
+    /// volume's clock, never the wall clock.
+    clock: Arc<dyn Clock>,
     lock: Option<Box<dyn crate::storage::StorageLock>>,
 }
 
@@ -489,7 +493,7 @@ impl LogWriter {
     pub fn create(
         storage: Arc<dyn Storage>,
         generation: u32,
-        clock: &dyn Clock,
+        clock: Arc<dyn Clock>,
         max_log_size: u64,
         start_batch_id: u64,
         volume_key: Arc<VolumeKey>,
@@ -506,15 +510,17 @@ impl LogWriter {
             max_log_age: None,
             keying,
             compression: crate::compress::Compression::None,
+            clock,
             lock: Some(lock),
         })
     }
 
     /// Creates a lazy log writer backed by a custom `Storage` instance. The generation file
-    /// is not created until the first append or roll.
+    /// is not created until the first append or roll, and is stamped with `clock`'s time then.
     pub fn create_lazy(
         storage: Arc<dyn Storage>,
         generation: u32,
+        clock: Arc<dyn Clock>,
         max_log_size: u64,
         start_batch_id: u64,
         volume_key: Arc<VolumeKey>,
@@ -533,36 +539,24 @@ impl LogWriter {
             max_log_age: None,
             keying: FileKeying::random(volume_key),
             compression: crate::compress::Compression::None,
+            clock,
             lock: Some(lock),
         })
     }
 
-    /// Creates a lazy log writer with an injected clock whose initial creation timestamp
-    /// is used when the active log file is eventually opened.
-    pub fn create_lazy_with_clock(
-        storage: Arc<dyn Storage>,
-        generation: u32,
-        clock: &dyn Clock,
-        max_log_size: u64,
-        start_batch_id: u64,
-        volume_key: Arc<VolumeKey>,
-    ) -> io::Result<Self> {
-        let lock = storage.acquire_exclusive_lock()?;
-        let active_state = ActiveLogState::Unopened {
-            generation,
-            created_at: Some(clock.now()),
-        };
-        Ok(Self {
-            position: Mutex::new(active_state.position()),
-            active_state: Mutex::new(active_state),
-            batch_id: AtomicU64::new(start_batch_id),
-            storage,
-            max_log_size,
-            max_log_age: None,
-            keying: FileKeying::random(volume_key),
-            compression: crate::compress::Compression::None,
-            lock: Some(lock),
-        })
+    /// Stamps the first generation with `created_at` instead of the clock's time when it is
+    /// eventually opened. No effect unless the writer is still unopened.
+    ///
+    /// For the fixture generator, whose clock moves between batches but whose first log file
+    /// must carry the volume's creation time. Crate-private for the same reason as
+    /// [`LogWriter::with_key_salts`].
+    pub(crate) fn with_first_created_at(self, created_at: std::time::SystemTime) -> Self {
+        if let Ok(mut state) = self.active_state.lock()
+            && let ActiveLogState::Unopened { created_at: first, .. } = &mut *state
+        {
+            *first = Some(created_at);
+        }
+        self
     }
 
     /// Sets the maximum duration an active generation log can remain open before rolling.
@@ -632,7 +626,7 @@ impl LogWriter {
     /// Returns the open active file, lazily creating it if the writer is unopened.
     fn active_file<'a>(&self, state: &'a mut ActiveLogState) -> io::Result<&'a mut ActiveLogFile> {
         if let ActiveLogState::Unopened { generation, created_at } = *state {
-            let c_time = created_at.unwrap_or_else(std::time::SystemTime::now);
+            let c_time = created_at.unwrap_or_else(|| self.clock.now());
             *state = ActiveLogState::Open(open_generation_file(&self.storage, &self.keying, generation, c_time)?);
             self.publish(state);
         }
@@ -645,7 +639,7 @@ impl LogWriter {
     /// Seals the active generation if it has reached `max_log_size` or `max_log_age`, leaving
     /// its successor lazy (unopened) until [`LogWriter::open_if_unopened`] has something to
     /// write to it. Returns the sealed `LogFileInfo` if a rollover occurred.
-    pub fn roll_if_needed(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
+    pub fn roll_if_needed(&self) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -656,25 +650,25 @@ impl LogWriter {
         let size_exceeded = active.current_offset >= self.max_log_size;
         let age_exceeded = self
             .max_log_age
-            .is_some_and(|max_age| clock.now().duration_since(active.created_at).unwrap_or_default() >= max_age);
+            .is_some_and(|max_age| self.clock.now().duration_since(active.created_at).unwrap_or_default() >= max_age);
         if !size_exceeded && !age_exceeded {
             return Ok(None);
         }
-        let res = seal_into_lazy(&mut state, clock);
+        let res = seal_into_lazy(&mut state, &*self.clock);
         self.publish(&state);
         res
     }
 
     /// Ensures that the active log file is open. If it is currently lazy/unopened,
-    /// opens it using the provided clock.
-    pub fn open_if_unopened(&self, clock: &dyn Clock) -> io::Result<()> {
+    /// opens it, stamped with the writer's clock.
+    pub fn open_if_unopened(&self) -> io::Result<()> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
 
         if let ActiveLogState::Unopened { generation, created_at } = *state {
-            let c_time = created_at.unwrap_or_else(|| clock.now());
+            let c_time = created_at.unwrap_or_else(|| self.clock.now());
             let active_file = open_generation_file(&self.storage, &self.keying, generation, c_time)?;
             *state = ActiveLogState::Open(active_file);
             self.publish(&state);
@@ -685,7 +679,7 @@ impl LogWriter {
 
     /// Forcefully rolls the active generation file to `generation + 1` if it has committed data,
     /// returning the sealed `LogFileInfo`.
-    pub fn force_roll(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
+    pub fn force_roll(&self) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -712,7 +706,7 @@ impl LogWriter {
         };
 
         let next_gen = next_generation(active.generation)?;
-        let res = match seal_and_open_next(active, &self.storage, &self.keying, clock, "Force-rolled") {
+        let res = match seal_and_open_next(active, &self.storage, &self.keying, &*self.clock, "Force-rolled") {
             Ok((next_active, sealed_info)) => {
                 *state = ActiveLogState::Open(next_active);
                 Ok(Some(sealed_info))
@@ -732,12 +726,12 @@ impl LogWriter {
     /// If the active log file is currently open and has committed data, syncs and seals it,
     /// transitioning writer state to `Unopened { generation: next_gen, created_at: None }`.
     /// Returns the sealed `LogFileInfo` if sealed.
-    pub fn seal_active(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
+    pub fn seal_active(&self) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        let res = seal_into_lazy(&mut state, clock);
+        let res = seal_into_lazy(&mut state, &*self.clock);
         self.publish(&state);
         res
     }
@@ -1003,7 +997,7 @@ mod tests {
         let writer = LogWriter::create(
             storage.clone(),
             1,
-            &clock,
+            Arc::new(clock),
             DEFAULT_MAX_LOG_SIZE,
             1,
             VolumeKey::plaintext_arc(),
@@ -1022,7 +1016,14 @@ mod tests {
         let mem: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let ro_storage: Arc<dyn Storage> = Arc::new(crate::storage::ReadOnlyStorage::new(mem));
 
-        let res = LogWriter::create_lazy(ro_storage, 1, DEFAULT_MAX_LOG_SIZE, 1, VolumeKey::plaintext_arc());
+        let res = LogWriter::create_lazy(
+            ro_storage,
+            1,
+            Arc::new(SystemClock),
+            DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        );
         assert!(res.is_err(), "LogWriter creation must fail on ReadOnlyStorage");
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
@@ -1031,7 +1032,7 @@ mod tests {
     fn test_append_data_never_rolls_mid_batch() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 30, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, Arc::new(clock), 30, 1, VolumeKey::plaintext_arc()).unwrap();
 
         for _ in 0..5 {
             let (gen_num, _, _) = writer.append_data(1, b"0123456789").unwrap();
@@ -1044,12 +1045,12 @@ mod tests {
     fn test_roll_if_needed_rolls_between_batches() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 40, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, Arc::new(clock), 40, 1, VolumeKey::plaintext_arc()).unwrap();
 
         writer.append_data(1, b"0123456789").unwrap();
         assert_eq!(writer.generation(), 1);
 
-        writer.roll_if_needed(&clock).unwrap();
+        writer.roll_if_needed().unwrap();
         assert_eq!(writer.generation(), 2);
 
         let (gen_num, _, _) = writer.append_data(2, b"0123456789").unwrap();
@@ -1063,7 +1064,7 @@ mod tests {
         let writer = LogWriter::create(
             storage.clone(),
             1,
-            &clock,
+            Arc::new(clock),
             crate::cli::DEFAULT_MAX_LOG_SIZE,
             1,
             VolumeKey::plaintext_arc(),
@@ -1090,24 +1091,30 @@ mod tests {
     #[test]
     fn test_lazy_log_writer_creates_no_file_until_first_write() {
         let storage = Arc::new(MemoryStorage::new());
-        let clock = SystemClock;
-        let writer =
-            LogWriter::create_lazy(storage.clone(), 1, DEFAULT_MAX_LOG_SIZE, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer = LogWriter::create_lazy(
+            storage.clone(),
+            1,
+            Arc::new(SystemClock),
+            DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         assert!(!writer.is_open());
         assert_eq!(writer.generation(), 1);
         assert!(!storage.exists("000001.log"));
 
         // Nothing to seal, and rolling is not what opens a lazy generation.
-        assert_eq!(writer.roll_if_needed(&clock).unwrap(), None);
+        assert_eq!(writer.roll_if_needed().unwrap(), None);
         assert!(!writer.is_open());
         assert!(!storage.exists("000001.log"));
 
-        writer.open_if_unopened(&clock).unwrap();
+        writer.open_if_unopened().unwrap();
         assert!(writer.is_open());
         assert!(storage.exists("000001.log"));
 
-        let no_roll = writer.roll_if_needed(&clock).unwrap();
+        let no_roll = writer.roll_if_needed().unwrap();
         assert_eq!(no_roll, None);
     }
 
@@ -1116,7 +1123,8 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let mock_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let clock = crate::clock::MockClock(mock_time);
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 100, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer =
+            LogWriter::create(storage.clone(), 1, Arc::new(clock), 100, 1, VolumeKey::plaintext_arc()).unwrap();
 
         writer.append_data(1, b"first record payload").unwrap();
         writer
@@ -1126,7 +1134,7 @@ mod tests {
         writer.flush().unwrap();
 
         // Roll to generation 2 -> returns sealed LogFileInfo
-        let roll_res = writer.roll_if_needed(&clock).unwrap();
+        let roll_res = writer.roll_if_needed().unwrap();
         let sealed_info = roll_res.unwrap();
         assert_eq!(sealed_info.version, crate::log::record::CURRENT_VERSION);
         assert!(sealed_info.is_sealed());
@@ -1163,7 +1171,7 @@ mod tests {
         let writer = LogWriter::create(
             storage.clone(),
             1,
-            &clock,
+            Arc::new(clock.clone()),
             DEFAULT_MAX_LOG_SIZE,
             1,
             VolumeKey::plaintext_arc(),
@@ -1177,7 +1185,7 @@ mod tests {
 
         // No user records yet: current_offset <= FILE_HEADER_SIZE, so roll_if_needed does not roll
         clock.advance(std::time::Duration::from_secs(3601));
-        let rolled = writer.roll_if_needed(&clock).unwrap();
+        let rolled = writer.roll_if_needed().unwrap();
         assert!(rolled.is_none());
         assert_eq!(writer.generation(), 1);
 
@@ -1185,7 +1193,7 @@ mod tests {
         writer.append_data(10, b"some data").unwrap();
 
         // Aged out now: rolls, seals generation 1, and leaves generation 2 in lazy mode
-        let rolled = writer.roll_if_needed(&clock).unwrap();
+        let rolled = writer.roll_if_needed().unwrap();
         assert!(rolled.is_some());
         let sealed_info = rolled.unwrap();
         assert_eq!(sealed_info.generation, 1);
@@ -1203,7 +1211,7 @@ mod tests {
 
         // Additional age-checks while lazy must do nothing and not create files
         clock.advance(std::time::Duration::from_secs(3600 * 24 * 7));
-        assert!(writer.roll_if_needed(&clock).unwrap().is_none());
+        assert!(writer.roll_if_needed().unwrap().is_none());
         assert!(!writer.is_open());
         assert!(!storage.exists("000002.log"));
 
@@ -1221,24 +1229,53 @@ mod tests {
     fn test_seal_active_seals_and_switches_to_lazy() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 1000, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer =
+            LogWriter::create(storage.clone(), 1, Arc::new(clock), 1000, 1, VolumeKey::plaintext_arc()).unwrap();
 
         // When nothing written, seal_active returns None
-        assert!(writer.seal_active(&clock).unwrap().is_none());
+        assert!(writer.seal_active().unwrap().is_none());
 
         writer.append_data(1, b"active data").unwrap();
-        let sealed = writer.seal_active(&clock).unwrap().unwrap();
+        let sealed = writer.seal_active().unwrap().unwrap();
         assert_eq!(sealed.generation, 1);
         assert_ne!(sealed.md5, [0u8; 16]);
         assert_eq!(writer.generation(), 2);
         assert!(!writer.is_open());
     }
 
+    /// A generation reopened lazily - here by a direct append after a seal, without the
+    /// flusher's `open_if_unopened` - is stamped with the writer's clock, not the wall clock.
+    #[test]
+    fn test_lazily_reopened_generation_is_stamped_by_the_writer_clock() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock =
+            crate::clock::AdvancingClock::new(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            Arc::new(clock.clone()),
+            1000,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        writer.append_data(1, b"generation 1").unwrap();
+        writer.seal_active().unwrap().unwrap();
+        assert!(!writer.is_open());
+
+        clock.advance(std::time::Duration::from_secs(60));
+        writer.append_data(1, b"generation 2").unwrap();
+
+        let reader = LogReader::open(storage.as_ref(), "000002.log", VolumeKey::plaintext_arc()).unwrap();
+        assert_eq!(reader.file_header().created_at, clock.now());
+    }
+
     #[test]
     fn test_batch_checkpoint_and_rollback_restores_batch_id() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 1000, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer =
+            LogWriter::create(storage.clone(), 1, Arc::new(clock), 1000, 1, VolumeKey::plaintext_arc()).unwrap();
 
         // Checkpoint before batch starts at batch_id = 1
         let checkpoint1 = writer.checkpoint();
@@ -1269,7 +1306,15 @@ mod tests {
     fn test_multiple_independent_checkpoints() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 10000, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            Arc::new(clock),
+            10000,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         // Checkpoint A (before batch 1)
         let cp_a = writer.checkpoint();
@@ -1309,7 +1354,15 @@ mod tests {
     fn test_append_serialized_direct() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 10000, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            Arc::new(clock),
+            10000,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
         struct TestMetadata {
@@ -1343,9 +1396,16 @@ mod tests {
     fn test_append_data_slices_optimistic_compression() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 100000, 1, VolumeKey::plaintext_arc())
-            .unwrap()
-            .with_compression(crate::compress::Compression::Zstd);
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            Arc::new(clock),
+            100000,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap()
+        .with_compression(crate::compress::Compression::Zstd);
 
         // Highly compressible repetitive data
         let chunk1 = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -1393,7 +1453,8 @@ mod tests {
     fn test_position_does_not_wait_on_log_io() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = Arc::new(LogWriter::create(storage, 1, &clock, 100_000, 1, VolumeKey::plaintext_arc()).unwrap());
+        let writer =
+            Arc::new(LogWriter::create(storage, 1, Arc::new(clock), 100_000, 1, VolumeKey::plaintext_arc()).unwrap());
 
         // Holding the state lock stands in for a write or sync that is stuck on the disk.
         let _in_progress = writer.active_state.lock().unwrap();
@@ -1421,8 +1482,15 @@ mod tests {
     fn test_position_tracks_open_sync_rollback_and_seal() {
         let fault = Arc::new(crate::storage::FaultStorage::new(Arc::new(MemoryStorage::new())));
         let clock = SystemClock;
-        let writer =
-            LogWriter::create_lazy(fault.clone(), 1, DEFAULT_MAX_LOG_SIZE, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer = LogWriter::create_lazy(
+            fault.clone(),
+            1,
+            Arc::new(SystemClock),
+            DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         let unopened = LogPosition {
             generation: 1,
             is_open: false,
@@ -1457,7 +1525,7 @@ mod tests {
         assert_eq!(writer.position().synced_offset, synced);
 
         // The successor is published only once the seal has finished.
-        writer.seal_active(&clock).unwrap().unwrap();
+        writer.seal_active().unwrap().unwrap();
         assert_eq!(
             writer.position(),
             LogPosition {
