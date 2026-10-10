@@ -1323,7 +1323,14 @@ impl RemoteReplicationWorker {
         // 1. Summaries, and especially the latest summary snapshot, are strictly pinned and never pruned locally.
         // 2. Active log writer generation cannot be pruned.
         // 3. Uncovered logs (generation > last_summary_gen) cannot be pruned.
-        // 4. Local summary covering the log generation must exist on disk.
+        // 4. Local summary covering the log generation must exist on disk (including revisioned summaries).
+        let local_has_covering_summary = storage.list_files().unwrap_or_default().into_iter().any(|f| {
+            crate::log::manifest::parse_summary_filename(&f).is_some_and(|(gen_num, _)| gen_num >= last_summary_gen)
+        });
+        if !local_has_covering_summary {
+            return;
+        }
+
         let mut candidates = Vec::new();
         for log_entry in &manifest.logs {
             let gen_num = log_entry.generation;
@@ -1336,10 +1343,6 @@ impl RemoteReplicationWorker {
 
             // Invariant 2: Cannot prune local log if no local summary covers it
             if gen_num > last_summary_gen {
-                continue;
-            }
-            let summary_file = format!("{:06}.summary", last_summary_gen);
-            if !storage.exists(&summary_file) {
                 continue;
             }
 

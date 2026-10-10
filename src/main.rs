@@ -1,13 +1,13 @@
 #![cfg_attr(not(test), deny(clippy::too_many_lines))]
 use appendfs::cli::{
     Cli, Commands, DumpArgs, FsckArgs, InitArgs, MountArgs, MountCommonArgs, MountRoArgs, RemoteAddArgs,
-    RemoteCommands, RemoteListArgs, RemoteRmArgs, RemoteSubcommandArgs, StatsArgs,
+    RemoteCommands, RemoteListArgs, RemoteRmArgs, RemoteSubcommandArgs, RemovePassphraseArgs, StatsArgs,
 };
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{
-    CipherSuite, KeySource, MasterKey, VolumeHeader, VolumeKey, generate_random_16, prompt_passphrase,
+    CipherSuite, CryptoError, KeySource, MasterKey, VolumeHeader, VolumeKey, generate_random_16, prompt_passphrase,
 };
-use appendfs::log::SummaryReader;
+use appendfs::log::{SummaryReader, SummarySnapshot, export_summary, parse_summary_filename};
 use appendfs::storage::{OsStorage, Storage};
 use appendfs::{
     CheckOptions, VolumeStats, check_fs_integrity, check_remote_integrity, dump_file, init_volume, latest_summary_file,
@@ -236,6 +236,7 @@ fn main() {
         Commands::Dump(args) => cmd_dump(args),
         Commands::Fsck(args) => cmd_fsck(args),
         Commands::Remote(subargs) => cmd_remote(subargs),
+        Commands::RemovePassphrase(args) => cmd_remove_passphrase(args),
     }
 }
 
@@ -264,6 +265,7 @@ fn default_volume_log(command: &Commands) -> Option<PathBuf> {
         Commands::MountRo(args) => (args.log_dir.clone(), false),
         Commands::Stats(args) => (args.log_dir.clone(), false),
         Commands::Fsck(args) => (args.log_dir.clone(), false),
+        Commands::RemovePassphrase(args) => (args.log_dir.clone(), false),
         // `dump` names a log file rather than a volume, so log beside it.
         Commands::Dump(args) => (args.file.parent()?.to_path_buf(), false),
         Commands::Remote(sub) => match sub.command {
@@ -1045,6 +1047,239 @@ fn cmd_remote_list(list_args: RemoteListArgs) {
                     sc_str
                 );
             }
+        }
+    }
+}
+
+fn cmd_remove_passphrase(args: RemovePassphraseArgs) {
+    if !args.log_dir.exists() {
+        eprintln!(
+            "Log directory '{}' does not exist.\nRun 'appendfs init {}' to create a new volume first.",
+            args.log_dir.display(),
+            args.log_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    if args.new_key_file.exists() {
+        eprintln!(
+            "Error: Output key file '{}' already exists; refusing to overwrite.",
+            args.new_key_file.display()
+        );
+        std::process::exit(1);
+    }
+
+    if args.key_file.as_deref() == Some(&args.new_key_file) {
+        eprintln!("Error: Output key file cannot be the same as the input key file.");
+        std::process::exit(1);
+    }
+
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
+    let _lock = match storage.acquire_exclusive_lock() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Error: Failed to acquire volume lock: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let summary_file = match latest_summary_file(storage.as_ref()) {
+        Ok(Some(sf)) => sf,
+        Ok(None) => {
+            eprintln!(
+                "No appendfs volume found in '{}' (directory contains no summary files).\nRun 'appendfs init {}' to create a new volume first.",
+                args.log_dir.display(),
+                args.log_dir.display()
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error reading log directory '{}': {}", args.log_dir.display(), e);
+            std::process::exit(1);
+        }
+    };
+
+    let volume_header = match SummaryReader::read_volume_header(storage.as_ref(), &summary_file) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Error: Failed to read volume header from '{}': {}", summary_file, e);
+            std::process::exit(1);
+        }
+    };
+
+    let (master_key, volume_key) = resolve_master_key_for_passphrase_removal(&args, &volume_header);
+
+    write_new_secret_key_file(&args.new_key_file, &master_key);
+    export_new_summary_revision(storage.as_ref(), &summary_file, &volume_header, &volume_key);
+
+    println!("Passphrase removed successfully.");
+    println!("New secret key written to: {}", args.new_key_file.display());
+    println!(
+        "The volume can now be unlocked with: appendfs mount {} --key-file {}",
+        args.log_dir.display(),
+        args.new_key_file.display()
+    );
+}
+
+fn resolve_master_key_for_passphrase_removal(
+    args: &RemovePassphraseArgs,
+    volume_header: &VolumeHeader,
+) -> (MasterKey, Arc<VolumeKey>) {
+    if volume_header.cipher == CipherSuite::None {
+        eprintln!("Error: Volume is not encrypted; remove-passphrase only applies to encrypted volumes.");
+        std::process::exit(1);
+    }
+
+    if !volume_header.key_source.needs_passphrase() {
+        eprintln!(
+            "Error: Volume is unlocked by: {}. It does not use a passphrase.",
+            volume_header.key_source
+        );
+        std::process::exit(1);
+    }
+
+    if volume_header.key_source.needs_key_file() && args.key_file.is_none() {
+        eprintln!(
+            "Error: Volume is unlocked by: {}. Pass --key-file to unlock it.",
+            volume_header.key_source
+        );
+        std::process::exit(1);
+    }
+
+    if args.key_file.is_some() && !volume_header.key_source.needs_key_file() {
+        eprintln!(
+            "Error: Volume is unlocked by: {}. It does not use a key file, so --key-file does not apply.",
+            volume_header.key_source
+        );
+        std::process::exit(1);
+    }
+
+    let passphrase = match prompt_passphrase(&format!("Enter passphrase for volume '{}': ", args.log_dir.display())) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: Could not prompt for passphrase: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let master_key = match (args.key_file.as_deref(), volume_header.key_source) {
+        (Some(kf), KeySource::KeyFileAndPassphrase) => {
+            match MasterKey::from_file_and_passphrase(kf, &passphrase, &volume_header.kdf_salt) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        (None, KeySource::Passphrase) => match MasterKey::from_passphrase(&passphrase, &volume_header.kdf_salt) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Error: Key derivation error: {}", e);
+                std::process::exit(1);
+            }
+        },
+        _ => unreachable!(),
+    };
+
+    let volume_key = match volume_header.unlock(&master_key) {
+        Ok(vk) => Arc::new(vk),
+        Err(CryptoError::WrongKey) => {
+            eprintln!("Error: Incorrect passphrase or key file.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: Failed to unlock volume: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    (master_key, volume_key)
+}
+
+fn write_new_secret_key_file(path: &Path, master_key: &MasterKey) {
+    let hex_key = hex::encode(master_key.key);
+    let res = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        writeln!(file, "{}", hex_key)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = res {
+        eprintln!("Error: Failed to write new secret key file '{}': {}", path.display(), e);
+        std::process::exit(1);
+    }
+}
+
+fn export_new_summary_revision(
+    storage: &dyn Storage,
+    summary_file: &str,
+    volume_header: &VolumeHeader,
+    volume_key: &Arc<VolumeKey>,
+) {
+    let (gen_num, rev_num) = match parse_summary_filename(summary_file) {
+        Some((g, r)) => (g, r),
+        None => {
+            eprintln!("Error: Invalid summary filename '{}'", summary_file);
+            std::process::exit(1);
+        }
+    };
+
+    let reader = match SummaryReader::open(storage, summary_file, volume_key.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: Failed to open latest summary '{}': {}", summary_file, e);
+            std::process::exit(1);
+        }
+    };
+
+    let inodes = match reader.read_all_inodes() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("Error: Failed to read inodes from summary '{}': {}", summary_file, e);
+            std::process::exit(1);
+        }
+    };
+    let manifest = reader.manifest.clone();
+
+    let mut new_volume_header = volume_header.clone();
+    new_volume_header.key_source = KeySource::KeyFile;
+    new_volume_header.kdf_salt = [0u8; 16];
+
+    let new_rev = match rev_num.checked_add(1) {
+        Some(r) => r,
+        None => {
+            eprintln!("Error: Summary revision overflow for generation {}", gen_num);
+            std::process::exit(1);
+        }
+    };
+
+    let snapshot = SummarySnapshot {
+        inodes: &inodes,
+        manifest: &manifest,
+        volume_header: &new_volume_header,
+        generation: gen_num,
+        revision: new_rev,
+        last_batch_id: reader.header.last_batch_id,
+        next_inode: reader.header.next_inode,
+        created_at: reader.header.created_at,
+    };
+
+    match export_summary(&snapshot, storage, volume_key) {
+        Ok(new_file) => {
+            println!("Exported new summary revision: {}", new_file);
+        }
+        Err(e) => {
+            eprintln!("Error: Failed to export updated summary revision: {}", e);
+            std::process::exit(1);
         }
     }
 }

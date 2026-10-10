@@ -43,7 +43,11 @@ impl TieredStorageReader {
         remotes: impl IntoIterator<Item = impl Into<RemoteReadTarget>>,
         block_cache: Arc<dyn BlockCache>,
     ) -> Self {
-        let mut remotes: Vec<RemoteReadTarget> = remotes.into_iter().map(Into::into).collect();
+        let mut remotes: Vec<RemoteReadTarget> = remotes
+            .into_iter()
+            .map(Into::into)
+            .filter(|r| r.mode.is_readable())
+            .collect();
         remotes.sort_by(|a, b| (a.priority, &a.name).cmp(&(b.priority, &b.name)));
         let coalescer = Arc::clone(block_cache.coalescer());
         Self {

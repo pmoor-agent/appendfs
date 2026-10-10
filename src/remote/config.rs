@@ -473,7 +473,8 @@ impl RemoteRegistry {
                     .get(name)
                     .cloned()
                     .unwrap_or_else(|| cfg.build_store());
-                let mut target = crate::remote::RemoteReadTarget::new(name.clone(), store, cfg.read_priority);
+                let mut target =
+                    crate::remote::RemoteReadTarget::new(name.clone(), store, cfg.read_priority).with_mode(cfg.mode);
                 if let Some(max) = cfg.max_concurrent_reads.filter(|&m| m > 0) {
                     let mut lim_guard = self.limiters.lock().unwrap();
                     let limiter = lim_guard

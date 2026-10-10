@@ -94,6 +94,9 @@ pub enum Commands {
     Fsck(FsckArgs),
     /// Manage remote S3-compatible replication targets
     Remote(RemoteSubcommandArgs),
+    /// Remove passphrase from an encrypted volume and emit a standalone secret key file
+    #[command(name = "remove-passphrase")]
+    RemovePassphrase(RemovePassphraseArgs),
 }
 
 #[derive(Args, Debug)]
@@ -586,6 +589,24 @@ impl FsckArgs {
             None
         }
     }
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RemovePassphraseArgs {
+    /// Volume log directory containing the appendfs volume
+    pub log_dir: PathBuf,
+
+    /// Path to current 32-byte hex key file (required when volume uses a key file)
+    #[arg(long = "key-file")]
+    pub key_file: Option<PathBuf>,
+
+    /// Path to write the new secret key file without passphrase requirement
+    #[arg(long = "new-key-file", alias = "out-key-file")]
+    pub new_key_file: PathBuf,
+
+    /// Prompt for an encryption passphrase to unlock the volume
+    #[arg(long = "passphrase", default_value_t = false)]
+    pub passphrase: bool,
 }
 
 /// Parses a 64-bit integer seed from decimal or hexadecimal format (e.g. `12345` or `0x1a2b`).

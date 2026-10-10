@@ -1078,3 +1078,307 @@ fn test_cli_stats_and_dump_extension_breakdown() {
         .expect("stats must contain '--- Inode Breakdown ---'");
     assert_eq!(&dump_str[dump_idx..], &stats_str[stats_idx..]);
 }
+
+#[test]
+fn test_cli_remove_passphrase_workflow() {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let temp_dir = TempDir::new().unwrap();
+    let vol_dir = temp_dir.path().join("vol");
+    let key_file = temp_dir.path().join("old_key.hex");
+    let new_key_file = temp_dir.path().join("new_key.hex");
+
+    // Create a 64-hex old key file
+    let key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    std::fs::write(&key_file, format!("{}\n", key_hex)).unwrap();
+
+    let passphrase = "correct horse battery staple";
+
+    // 1. Initialize volume with --key-file and --passphrase
+    let mut init_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "init",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            "--passphrase",
+            vol_dir.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn appendfs init");
+
+    {
+        let mut stdin = init_child.stdin.take().expect("get stdin");
+        writeln!(stdin, "{}", passphrase).unwrap();
+        writeln!(stdin, "{}", passphrase).unwrap();
+    }
+    let init_out = init_child.wait_with_output().expect("wait init");
+    assert!(
+        init_out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    // 2. Mount the volume with 2FA credentials and populate non-empty data
+    let mount_dir = temp_dir.path().join("mnt");
+    std::fs::create_dir_all(&mount_dir).unwrap();
+    let initial_dev = std::fs::metadata(&mount_dir).unwrap().dev();
+
+    let mut mount_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "mount",
+            "-f",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            "--passphrase",
+            vol_dir.to_str().unwrap(),
+            mount_dir.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn appendfs mount");
+
+    {
+        let mut stdin = mount_child.stdin.take().expect("get stdin");
+        writeln!(stdin, "{}", passphrase).unwrap();
+    }
+
+    // Wait for FUSE mount
+    let mut mounted = false;
+    for _ in 0..100 {
+        if let Ok(meta) = std::fs::metadata(&mount_dir)
+            && meta.dev() != initial_dev
+        {
+            mounted = true;
+            break;
+        }
+        if let Ok(Some(status)) = mount_child.try_wait() {
+            panic!("mount exited prematurely with: {:?}", status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(mounted, "timed out waiting for mount");
+
+    // Populate data: directories, nested files with data
+    let sub_dir = mount_dir.join("sub_dir");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    let hello_file = sub_dir.join("hello.txt");
+    std::fs::write(&hello_file, b"Hello world from encrypted volume!").unwrap();
+
+    let data_file = mount_dir.join("data.bin");
+    let test_bytes = vec![0xABu8; 64 * 1024];
+    std::fs::write(&data_file, &test_bytes).unwrap();
+
+    // Unmount cleanly via SIGINT
+    unsafe {
+        libc::kill(mount_child.id() as libc::pid_t, libc::SIGINT);
+    }
+    assert!(mount_child.wait().unwrap().success());
+
+    // Clean unmount flushes and exports 000001.summary with the non-empty inode tree
+    assert!(vol_dir.join("000001.summary").exists());
+
+    // Verify stats requires passphrase before removal
+    let stats_without_pass = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "stats",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            vol_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run stats");
+    assert!(!stats_without_pass.status.success());
+
+    // 3. Test remove-passphrase while volume is locked
+    {
+        let storage: std::sync::Arc<dyn appendfs::storage::Storage> =
+            std::sync::Arc::new(appendfs::storage::OsStorage::new(&vol_dir));
+        let _lock = storage.acquire_exclusive_lock().expect("acquire lock");
+
+        let locked_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+            .args([
+                "remove-passphrase",
+                "--key-file",
+                key_file.to_str().unwrap(),
+                "--new-key-file",
+                new_key_file.to_str().unwrap(),
+                vol_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run remove-passphrase while locked");
+        assert!(!locked_out.status.success());
+        let err = String::from_utf8_lossy(&locked_out.stderr);
+        assert!(
+            err.contains("already locked") || err.contains("volume lock"),
+            "unexpected err: {}",
+            err
+        );
+        assert!(!new_key_file.exists());
+    }
+
+    // 4. Test remove-passphrase with wrong passphrase fails cleanly
+    {
+        let mut wrong_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+            .args([
+                "remove-passphrase",
+                "--key-file",
+                key_file.to_str().unwrap(),
+                "--new-key-file",
+                new_key_file.to_str().unwrap(),
+                vol_dir.to_str().unwrap(),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn remove-passphrase");
+
+        {
+            let mut stdin = wrong_child.stdin.take().expect("get stdin");
+            writeln!(stdin, "wrong passphrase").unwrap();
+        }
+        let wrong_out = wrong_child.wait_with_output().expect("wait remove-passphrase");
+        assert!(!wrong_out.status.success());
+        let err = String::from_utf8_lossy(&wrong_out.stderr);
+        assert!(
+            err.contains("Incorrect passphrase or key file"),
+            "unexpected err: {}",
+            err
+        );
+        assert!(!new_key_file.exists());
+    }
+
+    // 5. Run remove-passphrase successfully on the populated volume
+    let mut remove_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remove-passphrase",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            "--new-key-file",
+            new_key_file.to_str().unwrap(),
+            vol_dir.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn remove-passphrase");
+
+    {
+        let mut stdin = remove_child.stdin.take().expect("get stdin");
+        writeln!(stdin, "{}", passphrase).unwrap();
+    }
+    let remove_out = remove_child.wait_with_output().expect("wait remove-passphrase");
+    assert!(
+        remove_out.status.success(),
+        "remove-passphrase failed: {}",
+        String::from_utf8_lossy(&remove_out.stderr)
+    );
+
+    // Verify new key file exists and has 0400 permissions
+    assert!(new_key_file.exists());
+    #[cfg(unix)]
+    {
+        let perms = std::fs::metadata(&new_key_file).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o400, "expected 0400 permissions");
+    }
+
+    // Verify summary revision was created for the latest summary (000001_r1.summary)
+    assert!(vol_dir.join("000001_r1.summary").exists());
+
+    // 6. Verify stats now succeeds with ONLY --key-file and reflects populated inodes
+    let stats_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "stats",
+            "--key-file",
+            new_key_file.to_str().unwrap(),
+            vol_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run stats");
+    assert!(
+        stats_out.status.success(),
+        "stats failed: {}",
+        String::from_utf8_lossy(&stats_out.stderr)
+    );
+    let stats_str = String::from_utf8_lossy(&stats_out.stdout);
+    assert!(stats_str.contains("Unlocked by:   Key file"));
+    assert!(
+        stats_str.contains("4 (2 directories, 2 regular files, 0 symlinks)"),
+        "expected non-empty summary with 4 inodes, got: {}",
+        stats_str
+    );
+
+    // Verify stats with --passphrase now fails because volume no longer uses a passphrase
+    let stats_pass = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "stats",
+            "--key-file",
+            new_key_file.to_str().unwrap(),
+            "--passphrase",
+            vol_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run stats with passphrase");
+    assert!(!stats_pass.status.success());
+    let err = String::from_utf8_lossy(&stats_pass.stderr);
+    assert!(err.contains("It does not use a passphrase"));
+
+    // 7. Verify fsck succeeds on the populated volume with the new key file
+    let fsck_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "fsck",
+            "--key-file",
+            new_key_file.to_str().unwrap(),
+            vol_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run fsck");
+    assert!(
+        fsck_out.status.success(),
+        "fsck failed: {}",
+        String::from_utf8_lossy(&fsck_out.stderr)
+    );
+
+    // 8. Remount with ONLY --key-file and verify identical file data is read back
+    let mut remount_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "mount",
+            "-f",
+            "--key-file",
+            new_key_file.to_str().unwrap(),
+            vol_dir.to_str().unwrap(),
+            mount_dir.to_str().unwrap(),
+        ])
+        .spawn()
+        .expect("spawn appendfs remount");
+
+    let mut remounted = false;
+    for _ in 0..100 {
+        if let Ok(meta) = std::fs::metadata(&mount_dir)
+            && meta.dev() != initial_dev
+        {
+            remounted = true;
+            break;
+        }
+        if let Ok(Some(status)) = remount_child.try_wait() {
+            panic!("remount exited prematurely with: {:?}", status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(remounted, "timed out waiting for remount");
+
+    let read_hello = std::fs::read(&hello_file).unwrap();
+    assert_eq!(read_hello, b"Hello world from encrypted volume!");
+    let read_data = std::fs::read(&data_file).unwrap();
+    assert_eq!(read_data, test_bytes);
+
+    unsafe {
+        libc::kill(remount_child.id() as libc::pid_t, libc::SIGINT);
+    }
+    assert!(remount_child.wait().unwrap().success());
+}

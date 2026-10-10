@@ -2,7 +2,7 @@ use appendfs::FsTestExt;
 use appendfs::compat::CompatClock;
 use appendfs::operations::read_write::{FUSE_SET_ATTR_MODE, setattr_core, write_handle_core};
 use appendfs::storage::OsStorage;
-use appendfs::{Clock, Storage, TestFs, VolumeKey};
+use appendfs::{Clock, Storage, TestFs, VolumeHeader, VolumeKey};
 
 use std::fs;
 use std::path::PathBuf;
@@ -940,4 +940,120 @@ fn test_python_restore_rejects_seal_record_count_mismatch() {
         "expected seal count mismatch error, got: {}",
         stderr
     );
+}
+
+#[test]
+fn test_python_restore_after_remove_passphrase() {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
+    if !script_path.is_file() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let vol_dir = temp.path().join("vol");
+    std::fs::create_dir_all(&vol_dir).unwrap();
+
+    let old_key_file = temp.path().join("old_key.hex");
+    let new_key_file = temp.path().join("new_key.hex");
+    let raw_key = [0x42u8; 32];
+    std::fs::write(&old_key_file, format!("{}\n", hex::encode(raw_key))).unwrap();
+
+    let passphrase = "my-test-passphrase";
+    let salt = [0x77u8; 16];
+
+    let master = appendfs::crypto::MasterKey::from_file_and_passphrase(&old_key_file, passphrase, &salt).unwrap();
+    let (volume_header, volume_key) = VolumeHeader::new_encrypted(
+        &master,
+        salt,
+        appendfs::crypto::KeySource::KeyFileAndPassphrase,
+        appendfs::compress::Compression::None,
+    )
+    .unwrap();
+
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&vol_dir));
+    let clock = Arc::new(CompatClock::new());
+    let TestFs { fs, .. } = TestFs::builder()
+        .storage(storage)
+        .clock(clock.clone())
+        .root_owner(1000, 1000)
+        .volume(volume_header, Arc::new(volume_key))
+        .build();
+
+    // Create directories and files to populate a non-empty summary
+    let dir = fs.make_dir(1, "test_dir", 0o755).unwrap();
+    let file = fs.create_file(dir, "test_file.txt", 0o644).unwrap();
+    let fh = fs.open_file(file, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, file, fh, b"Restored content after remove-passphrase!", 0).unwrap();
+    fs.release_file(file, fh).unwrap();
+
+    let root_file = fs.create_file(1, "second_file.txt", 0o644).unwrap();
+    let r_fh = fs.open_file(root_file, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, root_file, r_fh, b"Second file in non-empty summary", 0).unwrap();
+    fs.release_file(root_file, r_fh).unwrap();
+
+    // Flush mutations and export a populated 000001.summary
+    fs.sync_and_export_summary().unwrap();
+    drop(fs);
+    assert!(vol_dir.join("000001.summary").exists());
+
+    // Run remove-passphrase CLI command
+    use std::io::Write;
+    let mut remove_cmd = std::process::Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remove-passphrase",
+            "--key-file",
+            old_key_file.to_str().unwrap(),
+            "--new-key-file",
+            new_key_file.to_str().unwrap(),
+            vol_dir.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn remove-passphrase");
+
+    {
+        let mut stdin = remove_cmd.stdin.take().expect("get stdin");
+        writeln!(stdin, "{}", passphrase).unwrap();
+    }
+    let remove_res = remove_cmd.wait_with_output().expect("wait remove-passphrase");
+    assert!(
+        remove_res.status.success(),
+        "remove-passphrase failed: {}",
+        String::from_utf8_lossy(&remove_res.stderr)
+    );
+
+    // Verify revision was created for the populated summary
+    assert!(vol_dir.join("000001_r1.summary").exists());
+
+    // Now restore using scripts/restore.py with ONLY --key-file
+    let dest_temp = tempfile::tempdir().unwrap();
+    let dest_path = dest_temp.path();
+
+    let output = std::process::Command::new("python3")
+        .arg(&script_path)
+        .arg(&vol_dir)
+        .arg(dest_path)
+        .arg("--key-file")
+        .arg(&new_key_file)
+        .output()
+        .expect("execute python3");
+
+    assert!(
+        output.status.success(),
+        "restore.py failed on converted volume:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let restored_file = dest_path.join("test_dir/test_file.txt");
+    assert!(restored_file.is_file(), "restored file does not exist");
+    let content = std::fs::read_to_string(&restored_file).unwrap();
+    assert_eq!(content, "Restored content after remove-passphrase!");
+
+    let restored_second = dest_path.join("second_file.txt");
+    assert!(restored_second.is_file(), "restored second file does not exist");
+    let content_second = std::fs::read_to_string(&restored_second).unwrap();
+    assert_eq!(content_second, "Second file in non-empty summary");
 }
