@@ -585,7 +585,7 @@ fn test_open_cache_flags_and_timeout_delineation() {
 #[test]
 fn test_cold_read_deferred_threadpool_execution() {
     use appendfs::FsTestExt;
-    use appendfs::operations::read_write::{create_core, open_core};
+    use appendfs::operations::read_write::open_core;
     use appendfs::storage::MemoryStorage;
 
     let storage = Arc::new(MemoryStorage::new());
@@ -596,13 +596,13 @@ fn test_cold_read_deferred_threadpool_execution() {
         .build()
         .fs;
 
-    let file = create_core(&fs, 1, "deferred_read.txt", 0o644, 0, 1000, 1000).unwrap();
-    let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
+    let file = fs.create_file(1, "deferred_read.txt", 0o644).unwrap();
+    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
     let payload = b"cold read deferred threadpool test".to_vec();
-    fs.write_at(file.ino, &payload, 0).unwrap();
+    fs.write_at(file, &payload, 0).unwrap();
 
     // 1. In-memory read before flush: must be 100% in-memory and immediately Ready
-    let in_mem_res = read_response(&fs, file.ino, fh, 0, payload.len());
+    let in_mem_res = read_response(&fs, file, fh, 0, payload.len());
     assert!(in_mem_res.is_ready());
     assert_eq!(in_mem_res.wait().unwrap().into_bytes().unwrap(), payload);
 
@@ -611,7 +611,7 @@ fn test_cold_read_deferred_threadpool_execution() {
     fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
 
     // 3. Cold read with absent pool (default): must execute synchronously and be immediately Ready
-    let cold_sync = read_response(&fs, file.ino, fh, 0, payload.len());
+    let cold_sync = read_response(&fs, file, fh, 0, payload.len());
     assert!(cold_sync.is_ready());
     assert_eq!(cold_sync.wait().unwrap().into_bytes().unwrap(), payload);
 
@@ -619,7 +619,7 @@ fn test_cold_read_deferred_threadpool_execution() {
     fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
     fs.set_read_parallelism(4);
     fs.enable_read_pool();
-    let cold_async = read_response(&fs, file.ino, fh, 0, payload.len());
+    let cold_async = read_response(&fs, file, fh, 0, payload.len());
     assert!(cold_async.is_deferred());
 
     let final_res = cold_async.wait().unwrap();

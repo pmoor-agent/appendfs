@@ -2031,11 +2031,11 @@ mod tests {
         let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         // Create dir, file, symlink, hardlink
-        let d = crate::operations::dir::mkdir_core(&fs, 1, "mydir", 0o755, 1000, 1000).unwrap();
-        let f = crate::operations::read_write::create_core(&fs, d.ino, "file.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f.ino, b"hello integrity checker", 0).unwrap();
-        let _s = crate::operations::links::symlink_core(&fs, 1, "link_to_file", "mydir/file.txt", 1000, 1000).unwrap();
-        let _h = crate::operations::links::link_core(&fs, f.ino, 1, "hardlink.txt").unwrap();
+        let d = fs.make_dir(1, "mydir", 0o755).unwrap();
+        let f = fs.create_file(d, "file.txt", 0o644).unwrap();
+        fs.write_at(f, b"hello integrity checker", 0).unwrap();
+        let _s = fs.make_symlink(1, "link_to_file", "mydir/file.txt").unwrap();
+        let _h = crate::operations::links::link_core(&fs, f, 1, "hardlink.txt").unwrap();
 
         fs.quiesce().unwrap();
 
@@ -2073,9 +2073,8 @@ mod tests {
         let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         for i in 0..3 {
-            let f =
-                crate::operations::read_write::create_core(&fs, 1, &format!("f{}", i), 0o644, 0, 1000, 1000).unwrap();
-            fs.write_at(f.ino, &vec![b'x'; 1000 * (i + 1)], 0).unwrap();
+            let f = fs.create_file(1, &format!("f{}", i), 0o644).unwrap();
+            fs.write_at(f, &vec![b'x'; 1000 * (i + 1)], 0).unwrap();
         }
         fs.quiesce().unwrap();
 
@@ -2138,13 +2137,13 @@ mod tests {
         let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
         fs.set_storage(storage);
 
-        let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+        let f = fs.create_file(1, "test.txt", 0o644).unwrap();
         fs.quiesce().unwrap();
 
         // Corrupt nlink on test.txt in base (set nlink to 5 instead of 1)
         {
             let mut inner = fs.inner.lock_for_tests().unwrap();
-            let node_arc = inner.base.get_mut(&f.ino).unwrap();
+            let node_arc = inner.base.get_mut(&f).unwrap();
             let mut node = (**node_arc).clone();
             node.meta.nlink = 5;
             *node_arc = Arc::new(node);
@@ -2153,7 +2152,7 @@ mod tests {
         let report = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
         assert!(!report.is_clean());
         let issue = report.issues.iter().find(|i| i.code == "NLINK_MISMATCH").unwrap();
-        assert_eq!(issue.inode, Some(f.ino));
+        assert_eq!(issue.inode, Some(f));
     }
 
     #[test]
@@ -2208,15 +2207,15 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
-        let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f.ino, b"small payload", 0).unwrap();
+        let f = fs.create_file(1, "test.txt", 0o644).unwrap();
+        fs.write_at(f, b"small payload", 0).unwrap();
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
 
         // Inject extent pointing past manifest total_bytes in log generation 1
         {
             let mut inner = fs.inner.lock_for_tests().unwrap();
-            let node_arc = inner.base.get_mut(&f.ino).unwrap();
+            let node_arc = inner.base.get_mut(&f).unwrap();
             let mut node = (**node_arc).clone();
             if let NodeKind::File { extent_map, size } = &mut node.kind {
                 *size = 50_000_000;
@@ -2251,14 +2250,14 @@ mod tests {
         let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
         fs.set_storage(storage);
 
-        let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f.ino, b"small payload", 0).unwrap();
+        let f = fs.create_file(1, "test.txt", 0o644).unwrap();
+        fs.write_at(f, b"small payload", 0).unwrap();
         fs.quiesce().unwrap();
 
         // Inject extent with record_size smaller than RECORD_HEADER_SIZE (32 bytes)
         {
             let mut inner = fs.inner.lock_for_tests().unwrap();
-            let node_arc = inner.base.get_mut(&f.ino).unwrap();
+            let node_arc = inner.base.get_mut(&f).unwrap();
             let mut node = (**node_arc).clone();
             if let NodeKind::File { extent_map, .. } = &mut node.kind {
                 extent_map.insert(
@@ -2293,14 +2292,14 @@ mod tests {
         let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
         fs.set_storage(storage);
 
-        let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f.ino, b"small payload", 0).unwrap();
+        let f = fs.create_file(1, "test.txt", 0o644).unwrap();
+        fs.write_at(f, b"small payload", 0).unwrap();
         fs.quiesce().unwrap();
 
         // Inject extent with record_size 0 at record_log_offset 0 (which previously caused underflow in planner)
         {
             let mut inner = fs.inner.lock_for_tests().unwrap();
-            let node_arc = inner.base.get_mut(&f.ino).unwrap();
+            let node_arc = inner.base.get_mut(&f).unwrap();
             let mut node = (**node_arc).clone();
             if let NodeKind::File { extent_map, .. } = &mut node.kind {
                 extent_map.insert(0, crate::extent_map::Extent::new_disk(1, 0, 0, 0, 10));
@@ -2423,15 +2422,15 @@ mod tests {
         let storage = Arc::new(crate::storage::MemoryStorage::new());
         let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
-        let f = crate::operations::read_write::create_core(&fs, 1, "data.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f.ino, b"original clean payload bytes", 0).unwrap();
+        let f = fs.create_file(1, "data.txt", 0o644).unwrap();
+        fs.write_at(f, b"original clean payload bytes", 0).unwrap();
         fs.quiesce().unwrap();
 
         // 1. Initial check must be clean
         let record_offset = {
             let inner = fs.inner.lock_for_tests().unwrap();
             let base = &inner.base;
-            let node_arc = base.get(&f.ino).unwrap();
+            let node_arc = base.get(&f).unwrap();
             let node = node_arc.as_ref();
             if let NodeKind::File { extent_map, .. } = &node.kind {
                 let entry = extent_map.iter().next().unwrap().1;
@@ -2508,9 +2507,9 @@ mod tests {
         // Create 8 files of ~300 KiB each so data spans across ~3 distinct 1 MiB blocks
         for i in 0..8 {
             let name = format!("file_{}.txt", i);
-            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
+            let f = fs.create_file(1, &name, 0o644).unwrap();
             let payload = vec![(i as u8) + 1; 300_000];
-            fs.write_at(f.ino, &payload, 0).unwrap();
+            fs.write_at(f, &payload, 0).unwrap();
         }
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
@@ -2536,18 +2535,18 @@ mod tests {
         // In Block 0, create 4 small files (~10 KiB each)
         for i in 0..4 {
             let name = format!("blk0_file_{}.txt", i);
-            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
-            fs.write_at(f.ino, &vec![b'A' + i; 10_000], 0).unwrap();
+            let f = fs.create_file(1, &name, 0o644).unwrap();
+            fs.write_at(f, &vec![b'A' + i; 10_000], 0).unwrap();
         }
         // Write a 1.5 MiB file to advance into block 1 and block 2
-        let filler = crate::operations::read_write::create_core(&fs, 1, "filler.bin", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(filler.ino, &vec![b'X'; 1_500_000], 0).unwrap();
+        let filler = fs.create_file(1, "filler.bin", 0o644).unwrap();
+        fs.write_at(filler, &vec![b'X'; 1_500_000], 0).unwrap();
 
         // In block 2, create 3 small files
         for i in 0..3 {
             let name = format!("blk2_file_{}.txt", i);
-            let f = crate::operations::read_write::create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
-            fs.write_at(f.ino, &vec![b'B' + i; 10_000], 0).unwrap();
+            let f = fs.create_file(1, &name, 0o644).unwrap();
+            fs.write_at(f, &vec![b'B' + i; 10_000], 0).unwrap();
         }
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
@@ -2630,8 +2629,8 @@ mod tests {
         let storage = Arc::new(crate::storage::MemoryStorage::new());
         let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
-        let f = crate::operations::read_write::create_core(&fs, 1, "cloud_file.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f.ino, b"cloud data content verification", 0).unwrap();
+        let f = fs.create_file(1, "cloud_file.txt", 0o644).unwrap();
+        fs.write_at(f, b"cloud data content verification", 0).unwrap();
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
 
@@ -2729,10 +2728,8 @@ mod tests {
 
         // 100 files of 300 KB each: ~29 blocks, with records straddling most block boundaries.
         for i in 0..100 {
-            let f =
-                crate::operations::read_write::create_core(&fs, 1, &format!("dist_{}.txt", i), 0o644, 0, 1000, 1000)
-                    .unwrap();
-            fs.write_at(f.ino, &vec![0xAA; 300_000], 0).unwrap();
+            let f = fs.create_file(1, &format!("dist_{}.txt", i), 0o644).unwrap();
+            fs.write_at(f, &vec![0xAA; 300_000], 0).unwrap();
         }
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
@@ -2820,10 +2817,8 @@ mod tests {
         // Create 20 files of 1 MiB each across 20 distinct blocks
         let chunk = vec![0x42u8; 1024 * 1024];
         for i in 1..=20 {
-            let file =
-                crate::operations::read_write::create_core(&fs, 1, &format!("file_{}.dat", i), 0o644, 0, 1000, 1000)
-                    .unwrap();
-            fs.write_at(file.ino, &chunk, 0).unwrap();
+            let file = fs.create_file(1, &format!("file_{}.dat", i), 0o644).unwrap();
+            fs.write_at(file, &chunk, 0).unwrap();
         }
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
@@ -2853,8 +2848,8 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
-        let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(file.ino, b"hello world data", 0).unwrap();
+        let file = fs.create_file(1, "test.txt", 0o644).unwrap();
+        fs.write_at(file, b"hello world data", 0).unwrap();
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
 
@@ -2947,8 +2942,8 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
-        let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(file.ino, b"crucial data that must not rot", 0).unwrap();
+        let file = fs.create_file(1, "test.txt", 0o644).unwrap();
+        fs.write_at(file, b"crucial data that must not rot", 0).unwrap();
         fs.quiesce().unwrap();
         fs.export_summary(storage.as_ref()).unwrap();
 
@@ -3142,16 +3137,12 @@ mod tests {
             fs.log_writer = Some(writer);
             fs.set_storage(storage.clone());
 
-            let f1 =
-                crate::operations::read_write::create_core(&fs, 1, &format!("gen{}_f1.bin", g), 0o644, 0, 1000, 1000)
-                    .unwrap();
-            fs.write_at(f1.ino, &vec![g as u8; 100_000], 0).unwrap();
+            let f1 = fs.create_file(1, &format!("gen{}_f1.bin", g), 0o644).unwrap();
+            fs.write_at(f1, &vec![g as u8; 100_000], 0).unwrap();
 
-            let f2 =
-                crate::operations::read_write::create_core(&fs, 1, &format!("gen{}_f2.bin", g), 0o644, 0, 1000, 1000)
-                    .unwrap();
+            let f2 = fs.create_file(1, &format!("gen{}_f2.bin", g), 0o644).unwrap();
             // Advance offset into block 1 (> 1 MiB)
-            fs.write_at(f2.ino, &vec![g as u8 + 10; 1_200_000], 0).unwrap();
+            fs.write_at(f2, &vec![g as u8 + 10; 1_200_000], 0).unwrap();
 
             fs.quiesce().unwrap();
             let file_len = storage.file_len(&crate::log::log_filename(g)).unwrap();

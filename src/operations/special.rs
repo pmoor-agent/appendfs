@@ -123,6 +123,7 @@ pub fn mknod_response(
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
+    use crate::test_utils::FsTestExt;
     use crate::test_utils::TestFs;
     use std::sync::Arc;
 
@@ -183,7 +184,7 @@ mod tests {
 
         // 256-byte FIFO fails with ENAMETOOLONG
         assert_eq!(
-            mknod_core(&fs, 1, &name_256, libc::S_IFIFO | 0o644, 0, 1000, 1000),
+            fs.make_node(1, &name_256, libc::S_IFIFO | 0o644, 0),
             Err(FsError::ENAMETOOLONG)
         );
     }

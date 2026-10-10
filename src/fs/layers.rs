@@ -667,47 +667,47 @@ mod tests {
         let fs = TestFs::builder().build().fs;
 
         // 1. Create file1 in live -> freeze to flushing -> fold to base
-        let attr1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino1 = fs.create_file(1, "file1.txt", 0o644).unwrap();
         fs.freeze_now();
         fs.fold_flushing_into_base();
 
         // 2. Create file2 in live -> freeze to flushing (stays in flushing)
-        let attr2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino2 = fs.create_file(1, "file2.txt", 0o644).unwrap();
         fs.freeze_now();
 
         // 3. Create file3 in live (stays in live)
-        let attr3 = crate::operations::read_write::create_core(&fs, 1, "file3.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino3 = fs.create_file(1, "file3.txt", 0o644).unwrap();
 
         // 4. Create and unlink file4 (tombstoned)
-        let attr4 = crate::operations::read_write::create_core(&fs, 1, "file4.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino4 = fs.create_file(1, "file4.txt", 0o644).unwrap();
         crate::operations::links::unlink_core(&fs, 1, "file4.txt").unwrap();
 
         // Verify root, file1, file2, file3 are present with matching attributes
         assert!(fs.get_attr(1).is_some());
-        assert_eq!(fs.get_attr(attr1.ino).unwrap().ino, attr1.ino);
-        assert_eq!(fs.get_attr(attr2.ino).unwrap().ino, attr2.ino);
-        assert_eq!(fs.get_attr(attr3.ino).unwrap().ino, attr3.ino);
+        assert_eq!(fs.get_attr(ino1).unwrap().ino, ino1);
+        assert_eq!(fs.get_attr(ino2).unwrap().ino, ino2);
+        assert_eq!(fs.get_attr(ino3).unwrap().ino, ino3);
 
         // Tombstoned inode 4 and non-existent inode 999 must NOT be present
-        assert!(fs.get_attr(attr4.ino).is_none());
+        assert!(fs.get_attr(ino4).is_none());
         assert!(fs.get_attr(999).is_none());
     }
 
     #[test]
     fn test_plan_read_file_data_staged_and_holes() {
         let fs = TestFs::builder().build().fs;
-        let attr = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(attr.ino, &[0xAA; 100], 0).unwrap();
+        let ino = fs.create_file(1, "test.bin", 0o644).unwrap();
+        fs.write_at(ino, &[0xAA; 100], 0).unwrap();
         crate::operations::read_write::fallocate_core(
             &fs,
-            attr.ino,
+            ino,
             libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
             40,
             20,
         )
         .unwrap();
 
-        let plan = fs.plan_read_file_data(attr.ino, 0, 100).unwrap();
+        let plan = fs.plan_read_file_data(ino, 0, 100).unwrap();
         assert_eq!(plan.total_len, 100);
         assert!(!plan.has_cold_slices);
         assert_eq!(plan.slices.len(), 3);
@@ -733,8 +733,8 @@ mod tests {
     #[test]
     fn test_plan_read_out_of_bounds() {
         let fs = TestFs::builder().build().fs;
-        let attr = crate::operations::read_write::create_core(&fs, 1, "empty.bin", 0o644, 0, 1000, 1000).unwrap();
-        let plan = fs.plan_read_file_data(attr.ino, 100, 50).unwrap();
+        let ino = fs.create_file(1, "empty.bin", 0o644).unwrap();
+        let plan = fs.plan_read_file_data(ino, 100, 50).unwrap();
         assert_eq!(plan.total_len, 0);
         assert!(!plan.has_cold_slices);
         assert!(plan.slices.is_empty());
@@ -775,7 +775,7 @@ mod tests {
 
         let fs = TestFs::builder().build().fs;
 
-        let attr = crate::operations::read_write::create_core(&fs, 1, "layers.bin", 0o644, 0, 1000, 1000).unwrap();
+        let ino = fs.create_file(1, "layers.bin", 0o644).unwrap();
 
         // 1. Base layer: Disk extent at 0..100
         let shared_disk = Extent::new_disk(1, 1024, 137, 0, 100);
@@ -783,7 +783,7 @@ mod tests {
         base_range.insert(0, shared_disk);
         let mut base_map = HashMap::new();
         base_map.insert(
-            attr.ino,
+            ino,
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
                 kind: NodeKind::File {
@@ -798,7 +798,7 @@ mod tests {
         let mut flushing_batch = HashMap::new();
         let mut f_delta = FileDelta::default();
         f_delta.extents.insert(20, Extent::new_zero(20));
-        flushing_batch.insert(attr.ino, EntryDelta::Node(NodeDelta::File(f_delta)));
+        flushing_batch.insert(ino, EntryDelta::Node(NodeDelta::File(f_delta)));
         fs.inner
             .lock_for_tests()
             .unwrap()
@@ -824,14 +824,14 @@ mod tests {
             .lock_for_tests()
             .unwrap()
             .live
-            .insert(attr.ino, EntryDelta::Node(NodeDelta::File(live_delta)));
+            .insert(ino, EntryDelta::Node(NodeDelta::File(live_delta)));
 
         // Now plan read from 0..100:
         // - 0..20: from Base (Disk)
         // - 20..30: from Flushing (Zero)
         // - 30..50: from Live (Memory)
         // - 50..100: from Base (Disk)
-        let plan = fs.plan_read_file_data(attr.ino, 0, 100).unwrap();
+        let plan = fs.plan_read_file_data(ino, 0, 100).unwrap();
         assert_eq!(plan.total_len, 100);
         assert!(plan.has_cold_slices);
         assert_eq!(plan.slices.len(), 4);
@@ -877,14 +877,14 @@ mod tests {
 
         let fs = TestFs::builder().build().fs;
 
-        let attr = crate::operations::read_write::create_core(&fs, 1, "cached.bin", 0o644, 0, 1000, 1000).unwrap();
+        let ino = fs.create_file(1, "cached.bin", 0o644).unwrap();
 
         let shared_disk = Extent::new_disk(1, 1024, 137, 0, 100);
         let mut base_range = ExtentMap::new();
         base_range.insert(0, shared_disk);
         let mut base_map = HashMap::new();
         base_map.insert(
-            attr.ino,
+            ino,
             Arc::new(Node {
                 meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
                 kind: NodeKind::File {
@@ -894,7 +894,7 @@ mod tests {
             }),
         );
         fs.inner.lock_for_tests().unwrap().base = base_map;
-        fs.inner.lock_for_tests().unwrap().live.remove(&attr.ino);
+        fs.inner.lock_for_tests().unwrap().live.remove(&ino);
 
         let cached_bytes = Arc::new(vec![0xCC; 100]);
         fs.log_cache
@@ -902,7 +902,7 @@ mod tests {
             .unwrap()
             .insert_cached_record(1, 1024, Arc::clone(&cached_bytes));
 
-        let plan = fs.plan_read_file_data(attr.ino, 0, 100).unwrap();
+        let plan = fs.plan_read_file_data(ino, 0, 100).unwrap();
         assert_eq!(plan.total_len, 100);
         assert!(!plan.has_cold_slices);
         assert_eq!(plan.slices.len(), 1);
@@ -926,8 +926,7 @@ mod tests {
             .build()
             .fs;
 
-        let attr =
-            crate::operations::read_write::create_core(&fs, 1, "multi_extent.bin", 0o644, 0, 1000, 1000).unwrap();
+        let ino = fs.create_file(1, "multi_extent.bin", 0o644).unwrap();
 
         // Write 4 separate extents, flushing between each so they land in distinct log batches/generations
         let data1 = vec![0x11u8; 200];
@@ -935,22 +934,22 @@ mod tests {
         let data3 = vec![0x33u8; 200];
         let data4 = vec![0x44u8; 200];
 
-        fs.write_at(attr.ino, &data1, 0).unwrap();
+        fs.write_at(ino, &data1, 0).unwrap();
         fs.quiesce().unwrap();
 
-        fs.write_at(attr.ino, &data2, 200).unwrap();
+        fs.write_at(ino, &data2, 200).unwrap();
         fs.quiesce().unwrap();
 
-        fs.write_at(attr.ino, &data3, 400).unwrap();
+        fs.write_at(ino, &data3, 400).unwrap();
         fs.quiesce().unwrap();
 
-        fs.write_at(attr.ino, &data4, 600).unwrap();
+        fs.write_at(ino, &data4, 600).unwrap();
         fs.quiesce().unwrap();
 
         // Clear decrypted record cache to force actual cold disk decoding
         fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
 
-        let plan = fs.plan_read_file_data(attr.ino, 0, 800).unwrap();
+        let plan = fs.plan_read_file_data(ino, 0, 800).unwrap();
         assert_eq!(plan.total_len, 800);
         assert!(plan.has_cold_slices);
         assert!(plan.slices.len() >= 4);
@@ -1086,15 +1085,15 @@ mod tests {
             .build()
             .fs;
 
-        let attr = crate::operations::read_write::create_core(&fs, 1, "single_cold.bin", 0o644, 0, 1000, 1000).unwrap();
+        let ino = fs.create_file(1, "single_cold.bin", 0o644).unwrap();
         let payload = vec![0xEFu8; 1024];
-        fs.write_at(attr.ino, &payload, 0).unwrap();
+        fs.write_at(ino, &payload, 0).unwrap();
         fs.quiesce().unwrap();
 
         // Evict from decrypted cache to force single cold disk direct read
         fs.log_cache.as_ref().unwrap().decrypted_cache.clear();
 
-        let plan = fs.plan_read_file_data(attr.ino, 0, 1024).unwrap();
+        let plan = fs.plan_read_file_data(ino, 0, 1024).unwrap();
         assert_eq!(plan.slices.len(), 1);
         assert!(plan.has_cold_slices);
 
