@@ -1725,13 +1725,9 @@ pub fn check_volume(
     storage: Arc<dyn crate::storage::Storage>,
     options: &CheckOptions,
     volume_key: Arc<crate::crypto::VolumeKey>,
+    clock: Arc<dyn crate::clock::Clock>,
 ) -> std::io::Result<IntegrityReport> {
-    let fs = crate::log::recover_fs(
-        storage,
-        crate::log::RecoveryTarget::Latest,
-        std::sync::Arc::new(crate::clock::SystemClock),
-        volume_key,
-    )?;
+    let fs = crate::log::recover_fs(storage, crate::log::RecoveryTarget::Latest, clock, volume_key)?;
     Ok(check_fs_integrity(&fs, None, options, None, None))
 }
 
@@ -2043,7 +2039,13 @@ mod tests {
 
         fs.quiesce().unwrap();
 
-        let report = check_volume(storage, &CheckOptions::full_data(), VolumeKey::plaintext_arc()).unwrap();
+        let report = check_volume(
+            storage,
+            &CheckOptions::full_data(),
+            VolumeKey::plaintext_arc(),
+            std::sync::Arc::new(crate::clock::SystemClock),
+        )
+        .unwrap();
         assert!(report.is_clean(), "Report must be clean: {:?}", report.issues);
         assert_eq!(report.error_count(), 0);
         assert_eq!(report.orphaned_inodes.len(), 0);
@@ -2097,6 +2099,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -2160,6 +2163,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -2321,6 +2325,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -2373,6 +2378,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -2457,6 +2463,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -2573,6 +2580,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -3105,6 +3113,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 

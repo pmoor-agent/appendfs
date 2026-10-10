@@ -1335,6 +1335,7 @@ mod tests {
             storage.clone(),
             &crate::crypto::VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 

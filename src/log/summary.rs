@@ -318,18 +318,12 @@ pub fn export_summary_with_iv(
     Ok(filename)
 }
 
-/// Initializes a fresh, empty appendfs volume on a `Storage` instance.
-/// Creates `000000.summary` containing the root directory (inode 1) and an initial LogManifest.
+/// Initializes a fresh, empty appendfs volume on a `Storage` instance, with its root
+/// directory owned by the invoking user and timestamped by `clock`.
+///
+/// Creates `000000.summary` containing the root directory (inode 1) and an initial
+/// LogManifest.
 pub fn init_volume(
-    storage: Arc<dyn Storage>,
-    volume_key: &VolumeKey,
-    volume_header: crate::crypto::VolumeHeader,
-) -> io::Result<String> {
-    init_volume_with_clock(storage, volume_key, volume_header, Arc::new(crate::clock::SystemClock))
-}
-
-/// Initializes a volume whose root directory is owned by the invoking user.
-pub fn init_volume_with_clock(
     storage: Arc<dyn Storage>,
     volume_key: &VolumeKey,
     volume_header: crate::crypto::VolumeHeader,
@@ -883,6 +877,7 @@ mod tests {
             storage.clone(),
             &crate::crypto::VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -919,6 +914,7 @@ mod tests {
             storage.clone(),
             &crate::crypto::VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -953,7 +949,13 @@ mod tests {
         .unwrap();
         let expected_id = header.volume_id;
 
-        init_volume(storage.clone(), &key, header).unwrap();
+        init_volume(
+            storage.clone(),
+            &key,
+            header,
+            std::sync::Arc::new(crate::clock::SystemClock),
+        )
+        .unwrap();
 
         // The point of keeping this blob in plaintext: identify the volume and validate a
         // key before any body decryption is attempted.
@@ -991,6 +993,7 @@ mod tests {
             storage.clone(),
             &crate::crypto::VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -1076,6 +1079,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -1108,7 +1112,13 @@ mod tests {
         )
         .unwrap();
 
-        init_volume(storage.clone(), &key, header).unwrap();
+        init_volume(
+            storage.clone(),
+            &key,
+            header,
+            std::sync::Arc::new(crate::clock::SystemClock),
+        )
+        .unwrap();
 
         let reader = SummaryReader::open(storage.as_ref(), "000000.summary", Arc::new(key)).unwrap();
         assert_eq!(reader.footer.entry_count, 1);
@@ -1123,6 +1133,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -1162,7 +1173,13 @@ mod tests {
         )
         .unwrap();
 
-        init_volume(storage.clone(), &key, header).unwrap();
+        init_volume(
+            storage.clone(),
+            &key,
+            header,
+            std::sync::Arc::new(crate::clock::SystemClock),
+        )
+        .unwrap();
 
         // Tamper with uncompressed_len, the last field of SummaryHeader. Derived from
         // SUMMARY_HEADER_SIZE rather than hardcoded, so it follows the header's layout.
@@ -1190,6 +1207,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -1220,6 +1238,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 

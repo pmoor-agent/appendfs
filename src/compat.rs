@@ -212,8 +212,13 @@ pub fn generate_compat_dump_files(dir: &Path, volume_key: Option<&VolumeKey>) ->
 /// Generates golden `fsck-report.txt` file for the canonical volume in `dir`.
 pub fn generate_compat_fsck_report(dir: &Path, volume_key: Arc<VolumeKey>) -> io::Result<()> {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(dir));
-    let report = crate::check::check_volume(storage, &crate::check::CheckOptions::full_data(), volume_key)
-        .map_err(io::Error::other)?;
+    let report = crate::check::check_volume(
+        storage,
+        &crate::check::CheckOptions::full_data(),
+        volume_key,
+        Arc::new(CompatClock::new()),
+    )
+    .map_err(io::Error::other)?;
     let report_text = report.format_report(None, false);
     fs::write(dir.join(COMPAT_FSCK_REPORT_FILENAME), report_text)?;
     Ok(())
