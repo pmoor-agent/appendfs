@@ -1,6 +1,9 @@
-use appendfs::InMemoryFS;
-use appendfs::crypto::{VolumeHeader, VolumeKey};
+use appendfs::clock::{Clock, SystemClock};
+use appendfs::crypto::VolumeKey;
 use appendfs::log::RecoveryTarget;
+use appendfs::storage::{OsStorage, Storage};
+use appendfs::test_utils::open_volume;
+use appendfs::{InMemoryFS, TestFS};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
@@ -39,37 +42,10 @@ impl TestMount {
     /// Creates and mounts a new initialized volume with default in-memory filesystem in RW mode.
     pub fn new_rw() -> Self {
         let log_dir = tempfile::Builder::new().prefix("appendfs_log_").tempdir().unwrap();
-        let log_path = log_dir.path().to_path_buf();
-        let storage: Arc<dyn appendfs::storage::Storage> = Arc::new(appendfs::storage::OsStorage::new(&log_path));
-        appendfs::init_volume(storage.clone(), &VolumeKey::plaintext(), VolumeHeader::plaintext()).unwrap();
-
         let mount_dir = tempfile::Builder::new().prefix("appendfs_mnt_").tempdir().unwrap();
-        let mount_path = mount_dir.path().to_path_buf();
-        fs::set_permissions(&mount_path, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let mut fs = appendfs::log::recover_fs(
-            storage.clone(),
-            appendfs::RecoveryTarget::Latest,
-            Arc::new(appendfs::SystemClock),
-            appendfs::VolumeKey::plaintext_arc(),
-        )
-        .unwrap();
-        let latest_gen = appendfs::find_latest_generation_in_storage(storage.as_ref());
-        let next_gen = latest_gen + 1;
-        let start_batch_id = fs.last_batch_id.load(Ordering::SeqCst) + 1;
-        let writer = Arc::new(
-            appendfs::LogWriter::create_lazy(
-                storage,
-                next_gen,
-                appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-                start_batch_id,
-                VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        fs.log_writer = Some(writer);
-        fs.set_log_dir(&log_path);
-
+        let TestFS { fs, .. } = TestFS::builder()
+            .storage(Arc::new(OsStorage::new(log_dir.path())))
+            .build();
         Self::mount_custom(log_dir, mount_dir, fs, false)
     }
 
@@ -141,36 +117,20 @@ impl TestMount {
     /// Remounts in RW mode on the same mount path.
     pub fn remount_rw(&mut self) {
         self.unmount();
-        let storage: Arc<dyn appendfs::storage::Storage> = Arc::new(appendfs::storage::OsStorage::new(&self.log_path));
-        let mut fs = appendfs::log::recover_fs(
-            storage.clone(),
-            appendfs::RecoveryTarget::Latest,
-            Arc::new(appendfs::SystemClock),
-            appendfs::VolumeKey::plaintext_arc(),
-        )
-        .unwrap();
-        let next_gen = appendfs::find_latest_generation_in_storage(storage.as_ref()) + 1;
-        let start_batch_id = fs.last_batch_id.load(Ordering::SeqCst) + 1;
-        let mut writer_res = None;
+        let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&self.log_path));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let key = VolumeKey::plaintext_arc();
+        // The previous session may still be letting go of the volume lock.
+        let mut opened = None;
         let acquired = appendfs::wait_until(
             || {
-                let res = appendfs::LogWriter::create_lazy(
-                    storage.clone(),
-                    next_gen,
-                    appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-                    start_batch_id,
-                    VolumeKey::plaintext_arc(),
-                );
-                let ok = res.is_ok();
-                writer_res = Some(res);
-                ok
+                opened = open_volume(&storage, &clock, &key, appendfs::cli::DEFAULT_MAX_LOG_SIZE).ok();
+                opened.is_some()
             },
             Duration::from_millis(500),
         );
-        assert!(acquired, "Failed to acquire log writer on remount_rw");
-        let writer = Arc::new(writer_res.unwrap().unwrap());
-        fs.log_writer = Some(writer);
-        fs.set_log_dir(&self.log_path);
+        assert!(acquired, "Failed to reopen the volume for writing on remount_rw");
+        let fs = opened.unwrap();
 
         let initial_dev = fs::metadata(&self.mount_path).unwrap().dev();
         let mount_path_clone = self.mount_path.clone();
