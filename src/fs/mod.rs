@@ -1378,6 +1378,7 @@ pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::test_utils::FsTestExt;
+    use crate::test_utils::TestFS;
 
     #[test]
     fn test_flush_reason_display_honors_width() {
@@ -1391,7 +1392,7 @@ mod tests {
 
     #[test]
     fn test_fs_inner_guard_mutation_tracking() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         {
             let guard = fs.lock_inner_for_tests();
             assert!(!guard.mutation_occurred());
@@ -1417,9 +1418,11 @@ mod tests {
 
     #[test]
     fn test_fs_inner_guard_drop_auto_freeze_on_threshold() {
-        let mut fs = InMemoryFS::new();
+        let mut fs = TestFS::builder().build().fs;
         fs.max_buffer_size = 50;
         fs.max_staged_ops = 5;
+        // Pose as a mounted filesystem, so nothing drains the queue behind our backs.
+        fs.flusher.set_background_for_tests(true);
 
         let file = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
         // File creation recorded name.len() = 8
@@ -1449,7 +1452,7 @@ mod tests {
             1_700_000_000,
             0,
         )));
-        let fs = InMemoryFS::with_clock(clock.clone());
+        let fs = TestFS::builder().clock(clock.clone()).build().fs;
         assert!(!fs.track_atime, "track_atime should default to false");
 
         let file = crate::operations::read_write::create_core(&fs, 1, "atime_test.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -1471,7 +1474,7 @@ mod tests {
         );
 
         // Now test with track_atime = true
-        let mut fs_with_atime = InMemoryFS::with_clock(clock.clone());
+        let mut fs_with_atime = TestFS::builder().clock(clock.clone()).build().fs;
         fs_with_atime.track_atime = true;
         let file2 =
             crate::operations::read_write::create_core(&fs_with_atime, 1, "atime2.txt", 0o644, 0, 1000, 1000).unwrap();

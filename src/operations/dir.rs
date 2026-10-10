@@ -375,10 +375,11 @@ pub fn fsyncdir_response(fs: &InMemoryFS, ino: u64, datasync: bool) -> DeferredR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::TestFS;
 
     #[test]
     fn test_directory_nlink_tracking_across_mkdir_rmdir_and_rename() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         // Initial root (inode 1) starts with nlink 2
         assert_eq!(fs.get_attr(1).unwrap().nlink, 2);
 
@@ -418,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_lookup_core_single_lock_acquisition_tagged_lookup() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
 
         let pre_stats = fs.inner.op_stats();
@@ -452,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_list_dir_core_single_lock_acquisition_tagged_readdir() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let _ = mkdir_core(&fs, 1, "sub1", 0o755, 1000, 1000).unwrap();
 
         let pre_stats = fs.inner.op_stats();
@@ -477,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_directory_name_length_boundaries() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
 
         // 255-byte name should succeed for mkdir
         let name_255 = "d".repeat(255);

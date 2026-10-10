@@ -807,10 +807,11 @@ pub fn setlk_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::TestFS;
 
     #[test]
     fn test_flock_shared_concurrent_and_exclusive_exclusion() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
 
@@ -860,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_posix_range_locking_and_conflicts() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
 

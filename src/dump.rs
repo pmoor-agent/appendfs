@@ -1221,6 +1221,7 @@ mod tests {
     use crate::clock::{Clock, SystemClock};
     use crate::log::LogWriter;
     use crate::storage::OsStorage;
+    use crate::test_utils::TestFS;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -1323,7 +1324,6 @@ mod tests {
     #[test]
     fn test_dump_summary_file_summary_and_verbosity_levels() {
         use crate::extent_map::{Extent, ExtentMap};
-        use crate::fs::InMemoryFS;
         use crate::log::LogManifest;
         use crate::log::summary::{SummarySnapshot, export_summary, init_volume};
         use crate::node::{InodeMeta, Node, NodeKind};
@@ -1348,7 +1348,7 @@ mod tests {
         assert!(dump_v0.contains("VERIFIED"));
 
         // Create an InMemoryFS with fragmented files
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let now = SystemClock.now();
 
         // Create directory /docs (inode 2)

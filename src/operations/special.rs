@@ -123,11 +123,12 @@ pub fn mknod_response(
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
+    use crate::test_utils::TestFS;
     use std::sync::Arc;
 
     #[test]
     fn test_mknod_special_file_types() {
-        let fs = InMemoryFS::with_clock(Arc::new(SystemClock));
+        let fs = TestFS::builder().clock(Arc::new(SystemClock)).build().fs;
 
         // 1. Create a FIFO
         let fifo_attr = mknod_core(&fs, 1, "test_fifo", libc::S_IFIFO | 0o644, 0, 1000, 1000).unwrap();
@@ -171,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_mknod_name_length_boundaries() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
 
         let name_255 = "p".repeat(255);
         let name_256 = "p".repeat(256);

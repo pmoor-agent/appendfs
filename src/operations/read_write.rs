@@ -602,6 +602,7 @@ mod tests {
     use super::*;
     use crate::fs::InMemoryFS;
     use crate::test_utils::FsTestExt;
+    use crate::test_utils::TestFS;
     use crate::{LogWriter, Storage, SystemClock};
 
     fn file_with(fs: &InMemoryFS, contents: &[u8]) -> u64 {
@@ -612,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_fallocate_mode_dispatch() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let ino = file_with(&fs, &[0xAB; 512]);
 
         // Modes that shift file contents are refused outright. Silently ignoring the flag
@@ -650,7 +651,7 @@ mod tests {
     #[test]
     fn test_fallocate_zero_range_honours_keep_size() {
         // Without KEEP_SIZE, zeroing past EOF grows the file.
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let ino = file_with(&fs, &[0xCD; 512]);
         fallocate_core(&fs, ino, libc::FALLOC_FL_ZERO_RANGE, 256, 512).unwrap();
         assert_eq!(fs.get_attr(ino).unwrap().size, 768);
@@ -659,7 +660,7 @@ mod tests {
         assert!(data[256..].iter().all(|&b| b == 0));
 
         // With KEEP_SIZE it zeroes the live part without extending.
-        let fs2 = InMemoryFS::new();
+        let fs2 = TestFS::builder().build().fs;
         let ino2 = file_with(&fs2, &[0xCD; 512]);
         fallocate_core(
             &fs2,
@@ -681,7 +682,7 @@ mod tests {
 
     #[test]
     fn test_fallocate_rejected_on_read_only_mount() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let ino = file_with(&fs, &[0xEF; 128]);
         fs.set_read_only();
         assert_eq!(
@@ -693,7 +694,7 @@ mod tests {
 
     #[test]
     fn test_setattr_and_fallocate_single_lock_acquisition() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let ino = file_with(&fs, &[0xAA; 1024]);
 
         // 1. setattr_core: mode and size change
@@ -824,7 +825,7 @@ mod tests {
 
     #[test]
     fn test_file_create_name_length_boundaries() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
 
         // 255-byte name should succeed for create
         let name_255 = "f".repeat(255);

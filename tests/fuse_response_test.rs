@@ -1,6 +1,6 @@
+use appendfs::TestFS;
 use appendfs::clock::MockClock;
 use appendfs::error::FsError;
-use appendfs::fs::InMemoryFS;
 use appendfs::operations::dir::{
     lookup_response, mkdir_response, opendir_response, releasedir_response, rmdir_response,
 };
@@ -133,7 +133,7 @@ fn test_fuse_response_constructors() {
 #[test]
 fn test_all_fuse_response_handlers() {
     let clock = Arc::new(MockClock(mock_time()));
-    let fs = InMemoryFS::with_clock(clock);
+    let fs = TestFS::builder().clock(clock).build().fs;
 
     // 1. getattr
     let attr_res = getattr_response(&fs, 1);
@@ -350,7 +350,7 @@ fn test_deferred_result_mechanics() {
 #[test]
 fn test_filesystem_trait_all_methods() {
     let clock = Arc::new(MockClock(mock_time()));
-    let in_memory_fs = InMemoryFS::with_clock(clock);
+    let in_memory_fs = TestFS::builder().clock(clock).build().fs;
     let fs: &dyn Filesystem = &in_memory_fs;
     let ctx = RequestContext {
         uid: 1000,
@@ -522,7 +522,7 @@ fn test_filesystem_trait_all_methods() {
 
 #[test]
 fn test_open_cache_flags_and_timeout_delineation() {
-    let fs = InMemoryFS::new();
+    let fs = TestFS::builder().build().fs;
 
     // Create a regular file
     let ctx = RequestContext::new(1000, 1000, 0);

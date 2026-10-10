@@ -124,6 +124,7 @@ mod tests {
         create_core, fallocate_core, open_core, release_core, setattr_core, write_handle_core,
     };
     use crate::test_utils::FsTestExt;
+    use crate::test_utils::TestFS;
 
     #[test]
     fn test_virtual_file_registry_crud() {
@@ -139,7 +140,7 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0], (".status".to_string(), ino));
 
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let content = registry.generate_content(ino, &fs).unwrap();
         assert_eq!(content, "status: ok\n");
     }
@@ -148,7 +149,7 @@ mod tests {
     fn test_virtual_file_handle_lifecycle_and_snapshot_isolation() {
         use std::sync::atomic::AtomicUsize;
 
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         let call_count = Arc::new(AtomicUsize::new(0));
         let count_clone = Arc::clone(&call_count);
 
@@ -192,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_root_directory_pagination_with_virtual_files() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         fs.register_remote_status();
 
         // Register two additional virtual files (along with default .remotes)
@@ -255,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_virtual_files_mutation_protection() {
-        let fs = InMemoryFS::new();
+        let fs = TestFS::builder().build().fs;
         fs.register_remote_status();
         let v_ino = fs.virtual_files.get_ino_by_name(".remotes").unwrap();
 
