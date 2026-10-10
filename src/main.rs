@@ -1,11 +1,15 @@
 #![cfg_attr(not(test), deny(clippy::too_many_lines))]
 use appendfs::cli::{
-    Cli, Commands, DumpArgs, FsckArgs, InitArgs, MountArgs, MountCommonArgs, MountRoArgs, RemoteAddArgs,
-    RemoteCommands, RemoteListArgs, RemoteRmArgs, RemoteSubcommandArgs, RemovePassphraseArgs, StatsArgs,
+    Cli, Commands, DumpArgs, FsckArgs, InitArgs, KeyChangePassphraseArgs, KeyCommands, KeyInitArgs, KeySubcommandArgs,
+    MountArgs, MountCommonArgs, MountRoArgs, RemoteAddArgs, RemoteCommands, RemoteListArgs, RemoteRmArgs,
+    RemoteSubcommandArgs, RemovePassphraseArgs, StatsArgs,
 };
 use appendfs::clock::SystemClock;
+use appendfs::crypto::key_file::{DEFAULT_ARGON2_ITERATIONS, DEFAULT_ARGON2_MEMORY_KIB, DEFAULT_ARGON2_PARALLELISM};
 use appendfs::crypto::{
-    CipherSuite, CryptoError, KeySource, MasterKey, VolumeHeader, VolumeKey, generate_random_16, prompt_passphrase,
+    CipherSuite, CryptoError, KeySource, MasterKey, VolumeHeader, VolumeKey, decrypt_pem_key, encrypt_key_to_pem,
+    format_unencrypted_pem_key, generate_random_16, is_pem_encrypted_key, is_pem_unencrypted_key, parse_hex_key,
+    parse_pem_unencrypted_key, prompt_passphrase, write_key_file_atomic,
 };
 use appendfs::log::{SummaryReader, SummarySnapshot, export_summary, parse_summary_filename};
 use appendfs::storage::{OsStorage, Storage};
@@ -15,10 +19,11 @@ use appendfs::{
 };
 
 use clap::Parser;
+use rand::RngCore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 fn load_remote_registry(storage: &dyn Storage) -> appendfs::remote::RemoteRegistry {
     match appendfs::remote::RemoteRegistry::load_from_storage(storage) {
@@ -237,6 +242,7 @@ fn main() {
         Commands::Fsck(args) => cmd_fsck(args),
         Commands::Remote(subargs) => cmd_remote(subargs),
         Commands::RemovePassphrase(args) => cmd_remove_passphrase(args),
+        Commands::Key(subargs) => cmd_key(subargs),
     }
 }
 
@@ -273,6 +279,7 @@ fn default_volume_log(command: &Commands) -> Option<PathBuf> {
             appendfs::cli::RemoteCommands::Rm(ref a) => (a.log_dir.clone(), false),
             appendfs::cli::RemoteCommands::List(ref a) => (a.log_dir.clone(), false),
         },
+        Commands::Key(_) => return None,
     };
 
     // A mistyped path should not scatter `logs/` directories across the filesystem.
@@ -1321,4 +1328,189 @@ fn print_credential_help(header: &VolumeHeader) {
 
 fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn argon2_params(fast: bool) -> (u32, u32, u32) {
+    if fast {
+        (1024, 1, 1)
+    } else {
+        (
+            DEFAULT_ARGON2_MEMORY_KIB,
+            DEFAULT_ARGON2_ITERATIONS,
+            DEFAULT_ARGON2_PARALLELISM,
+        )
+    }
+}
+
+fn prompt_new_passphrase(prompt: &str, confirm_prompt: &str) -> Result<String, String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        let p1 = prompt_passphrase(prompt).map_err(|e| format!("Could not read passphrase: {}", e))?;
+        if p1.is_empty() {
+            return Ok(p1);
+        }
+        let p2 =
+            prompt_passphrase(confirm_prompt).map_err(|e| format!("Could not read passphrase confirmation: {}", e))?;
+        if p1 != p2 {
+            return Err("Passphrases do not match".to_string());
+        }
+        Ok(p1)
+    } else {
+        prompt_passphrase(prompt).map_err(|e| format!("Could not read passphrase: {}", e))
+    }
+}
+
+fn cmd_key(args: KeySubcommandArgs) {
+    match args.command {
+        KeyCommands::Init(subargs) => cmd_key_init(subargs),
+        KeyCommands::ChangePassphrase(subargs) => cmd_key_change_passphrase(subargs),
+    }
+}
+
+fn cmd_key_init(args: KeyInitArgs) {
+    let output_path = match args.output_path() {
+        Ok(p) => p.clone(),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let mut raw_key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut raw_key);
+
+    let passphrase = match prompt_new_passphrase("Enter passphrase (empty for none): ", "Confirm passphrase: ") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if !passphrase.is_empty() {
+        let (m_cost, t_cost, p_cost) = argon2_params(args.fast);
+        let pem = match encrypt_key_to_pem(&raw_key, &passphrase, m_cost, t_cost, p_cost) {
+            Ok(pem) => pem,
+            Err(e) => {
+                eprintln!("Error encrypting key file: {}", e);
+                std::process::exit(1);
+            }
+        };
+        raw_key.zeroize();
+
+        if let Err(e) = write_key_file_atomic(&output_path, pem.as_bytes()) {
+            eprintln!("Error writing key file '{}': {}", output_path.display(), e);
+            std::process::exit(1);
+        }
+
+        println!("Generated passphrase-encrypted key file: {}", output_path.display());
+    } else {
+        let pem = format_unencrypted_pem_key(&raw_key);
+        raw_key.zeroize();
+        if let Err(e) = write_key_file_atomic(&output_path, pem.as_bytes()) {
+            eprintln!("Error writing key file '{}': {}", output_path.display(), e);
+            std::process::exit(1);
+        }
+
+        println!("Generated unencrypted key file: {}", output_path.display());
+    }
+}
+
+fn read_and_unlock_key_file(key_path: &Path) -> Result<([u8; 32], bool), String> {
+    let content =
+        std::fs::read(key_path).map_err(|e| format!("Error reading key file '{}': {}", key_path.display(), e))?;
+
+    let is_encrypted = is_pem_encrypted_key(&content);
+    let raw_key = if is_encrypted {
+        let pem_str = std::str::from_utf8(&content)
+            .map_err(|_| format!("Error: Key file '{}' contains invalid UTF-8.", key_path.display()))?;
+
+        let old_passphrase = prompt_passphrase(&format!(
+            "Enter current passphrase for key file '{}': ",
+            key_path.display()
+        ))
+        .map_err(|e| format!("Error reading passphrase: {}", e))?;
+
+        decrypt_pem_key(pem_str, &old_passphrase)
+            .map_err(|e| format!("Error unlocking key file '{}': {}", key_path.display(), e))?
+    } else if is_pem_unencrypted_key(&content) {
+        let pem_str = std::str::from_utf8(&content)
+            .map_err(|_| format!("Error: Key file '{}' contains invalid UTF-8.", key_path.display()))?;
+
+        parse_pem_unencrypted_key(pem_str)
+            .map_err(|e| format!("Error parsing key file '{}': {}", key_path.display(), e))?
+    } else {
+        parse_hex_key(&content)
+            .map_err(|e| format!("Error: Key file '{}' is not a valid key: {}", key_path.display(), e))?
+    };
+
+    Ok((raw_key, is_encrypted))
+}
+
+fn cmd_key_change_passphrase(args: KeyChangePassphraseArgs) {
+    let key_path = match args.key_path() {
+        Ok(p) => p.clone(),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let output_path = args.output_path(&key_path).clone();
+
+    let (mut raw_key, is_encrypted) = match read_and_unlock_key_file(&key_path) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let new_passphrase =
+        match prompt_new_passphrase("Enter new passphrase (empty for none): ", "Confirm new passphrase: ") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+    if !new_passphrase.is_empty() {
+        let (m_cost, t_cost, p_cost) = argon2_params(args.fast);
+        let pem = match encrypt_key_to_pem(&raw_key, &new_passphrase, m_cost, t_cost, p_cost) {
+            Ok(pem) => pem,
+            Err(e) => {
+                eprintln!("Error encrypting key file: {}", e);
+                std::process::exit(1);
+            }
+        };
+        raw_key.zeroize();
+
+        if let Err(e) = write_key_file_atomic(&output_path, pem.as_bytes()) {
+            eprintln!("Error writing key file '{}': {}", output_path.display(), e);
+            std::process::exit(1);
+        }
+
+        if is_encrypted {
+            println!(
+                "Successfully updated passphrase for key file: {}",
+                output_path.display()
+            );
+        } else {
+            println!("Added passphrase protection to key file: {}", output_path.display());
+        }
+    } else {
+        let pem = format_unencrypted_pem_key(&raw_key);
+        raw_key.zeroize();
+
+        if let Err(e) = write_key_file_atomic(&output_path, pem.as_bytes()) {
+            eprintln!("Error writing key file '{}': {}", output_path.display(), e);
+            std::process::exit(1);
+        }
+
+        if is_encrypted {
+            println!("Removed passphrase protection from key file: {}", output_path.display());
+        } else {
+            println!("Key file remains unencrypted: {}", output_path.display());
+        }
+    }
 }

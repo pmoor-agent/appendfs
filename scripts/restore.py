@@ -426,6 +426,130 @@ def read_volume_header_from_summary(summary_path: Path) -> VolumeHeaderInfo:
         )
 
 
+PEM_KEY_HEADER = "-----BEGIN APPENDFS ENCRYPTED KEY-----"
+PEM_KEY_FOOTER = "-----END APPENDFS ENCRYPTED KEY-----"
+PEM_UNENCRYPTED_HEADER = "-----BEGIN APPENDFS KEY-----"
+PEM_UNENCRYPTED_FOOTER = "-----END APPENDFS KEY-----"
+PEM_KEY_AAD = b"APPENDFS-ENCRYPTED-KEY-V1"
+
+
+def load_key_file(key_file_path: str, passphrase: Optional[str] = None) -> bytes:
+    """Loads a 32-byte key from a file, supporting PEM encrypted, PEM unencrypted, or raw 64-character hex."""
+    with open(key_file_path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+
+    if content.startswith(PEM_KEY_HEADER):
+        if not content.endswith(PEM_KEY_FOOTER):
+            raise ValueError(f"Encrypted key file '{key_file_path}' is missing PEM footer")
+
+        inner = content[len(PEM_KEY_HEADER) : -len(PEM_KEY_FOOTER)].strip()
+        headers: Dict[str, str] = {}
+        for line in inner.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                raise ValueError(f"Malformed header line in encrypted key file: {line}")
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+
+        version = int(headers.get("version", "0"))
+        if version != 1:
+            raise ValueError(f"Unsupported key file version {version}; only version 1 is supported")
+
+        cipher_name = headers.get("cipher", "").lower().replace("-", "").replace("_", "")
+        if cipher_name != "chacha20poly1305":
+            raise ValueError(f"Unsupported key file cipher: {headers.get('cipher')}")
+
+        kdf_name = headers.get("kdf", "").lower()
+        if kdf_name != "argon2id":
+            raise ValueError(f"Unsupported key file KDF: {headers.get('kdf')}")
+
+        memory_kib = int(headers.get("argon2-memory", headers.get("memory", "65536")))
+        iterations = int(headers.get("argon2-iterations", headers.get("iterations", "3")))
+        parallelism = int(headers.get("argon2-parallelism", headers.get("parallelism", "1")))
+
+        salt_hex = headers.get("salt")
+        if not salt_hex or len(salt_hex) != 32:
+            raise ValueError("Encrypted key file missing or invalid 'Salt' header (expected 32 hex chars)")
+        salt = bytes.fromhex(salt_hex)
+
+        nonce_hex = headers.get("nonce")
+        if not nonce_hex or len(nonce_hex) != 24:
+            raise ValueError("Encrypted key file missing or invalid 'Nonce' header (expected 24 hex chars)")
+        nonce = bytes.fromhex(nonce_hex)
+
+        body_hex = headers.get("body")
+        if not body_hex or len(body_hex) != 96:
+            raise ValueError("Encrypted key file missing or invalid 'Body' header (expected 96 hex chars)")
+        body = bytes.fromhex(body_hex)
+
+        if passphrase is None:
+            env_pass = os.environ.get("APPENDFS_KEY_PASSPHRASE")
+            if env_pass:
+                passphrase = env_pass
+            else:
+                passphrase = prompt_passphrase(f"Enter passphrase for key file '{key_file_path}': ")
+
+        wrapping_key = argon2.low_level.hash_secret_raw(
+            secret=passphrase.encode("utf-8"),
+            salt=salt,
+            time_cost=iterations,
+            memory_cost=memory_kib,
+            parallelism=parallelism,
+            hash_len=32,
+            type=argon2.low_level.Type.ID,
+        )
+
+        cipher = ChaCha20Poly1305(wrapping_key)
+        try:
+            raw_key = cipher.decrypt(nonce, body, PEM_KEY_AAD)
+        except Exception:
+            raise ValueError(f"Incorrect passphrase or corrupted key file: '{key_file_path}'")
+
+        if len(raw_key) != 32:
+            raise ValueError(f"Decrypted key file has invalid length {len(raw_key)} (expected 32 bytes)")
+        return raw_key
+
+    elif content.startswith(PEM_UNENCRYPTED_HEADER):
+        if not content.endswith(PEM_UNENCRYPTED_FOOTER):
+            raise ValueError(f"Unencrypted key file '{key_file_path}' is missing PEM footer")
+
+        inner = content[len(PEM_UNENCRYPTED_HEADER) : -len(PEM_UNENCRYPTED_FOOTER)].strip()
+        headers: Dict[str, str] = {}
+        for line in inner.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+            else:
+                headers["body"] = line
+
+        version = int(headers.get("version", "0"))
+        if version != 1:
+            raise ValueError(f"Unsupported key file version {version}; only version 1 is supported")
+
+        body_str = headers.get("body") or headers.get("key")
+        if not body_str:
+            raise ValueError(f"Unencrypted key file missing 'Body' header: '{key_file_path}'")
+
+        if len(body_str) == 64:
+            raw_key = bytes.fromhex(body_str)
+        else:
+            raw_key = base64.b64decode(body_str)
+
+        if len(raw_key) != 32:
+            raise ValueError(f"Unencrypted key has invalid length {len(raw_key)} (expected 32 bytes)")
+        return raw_key
+
+    else:
+        if len(content) != 64:
+            raise ValueError(f"Expected 64 hex characters in key file '{key_file_path}', found {len(content)}")
+        return bytes.fromhex(content)
+
+
 def derive_key_from_passphrase_or_file(
     passphrase: Optional[str],
     key_file: Optional[str],
@@ -436,11 +560,7 @@ def derive_key_from_passphrase_or_file(
 ) -> bytes:
     """Derives the 32-byte data encryption key matching AppendFS's MasterKey and VolumeHeader."""
     if key_file and passphrase is not None:
-        with open(key_file, "r") as f:
-            hex_str = f.read().strip()
-        if len(hex_str) != 64:
-            raise ValueError(f"Expected 64 hex characters in key file '{key_file}', found {len(hex_str)}")
-        raw_key = bytes.fromhex(hex_str)
+        raw_key = load_key_file(key_file, passphrase=None)
         material = raw_key + passphrase.encode("utf-8")
         master_key = argon2.low_level.hash_secret_raw(
             secret=material,
@@ -452,11 +572,7 @@ def derive_key_from_passphrase_or_file(
             type=argon2.low_level.Type.ID,
         )
     elif key_file:
-        with open(key_file, "r") as f:
-            hex_str = f.read().strip()
-        if len(hex_str) != 64:
-            raise ValueError(f"Expected 64 hex characters in key file '{key_file}', found {len(hex_str)}")
-        master_key = bytes.fromhex(hex_str)
+        master_key = load_key_file(key_file, passphrase=passphrase)
     elif passphrase is not None:
         master_key = argon2.low_level.hash_secret_raw(
             secret=passphrase.encode("utf-8"),

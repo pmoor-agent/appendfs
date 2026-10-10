@@ -1,6 +1,7 @@
 // Drives the mounted filesystem through raw syscalls that std does not expose.
 #![allow(unsafe_code)]
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 #[test]
@@ -1381,4 +1382,390 @@ fn test_cli_remove_passphrase_workflow() {
         libc::kill(remount_child.id() as libc::pid_t, libc::SIGINT);
     }
     assert!(remount_child.wait().unwrap().success());
+}
+
+fn run_appendfs_with_input(args: &[&str], input: &[u8]) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn appendfs");
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().expect("failed to wait for appendfs")
+}
+
+#[test]
+fn test_cli_key_init_raw_and_permissions() {
+    let temp_dir = TempDir::new().unwrap();
+    let key_file = temp_dir.path().join("raw.key");
+
+    let out = run_appendfs_with_input(&["key", "init", "-o", key_file.to_str().unwrap()], b"\n");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Generated unencrypted key file:"));
+
+    assert!(key_file.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::metadata(&key_file).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o400);
+    }
+
+    let content = std::fs::read_to_string(&key_file).unwrap();
+    assert!(content.contains("-----BEGIN APPENDFS KEY-----"));
+    assert!(content.contains("-----END APPENDFS KEY-----"));
+    let key = appendfs::crypto::parse_pem_unencrypted_key(&content).unwrap();
+    assert_eq!(key.len(), 32);
+}
+
+#[test]
+fn test_cli_key_init_fails_if_parent_dir_missing() {
+    let temp_dir = TempDir::new().unwrap();
+    let key_file = temp_dir.path().join("nonexistent_subdir/raw.key");
+
+    let out = run_appendfs_with_input(&["key", "init", "-o", key_file.to_str().unwrap()], b"\n");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not exist") || stderr.contains("No such file or directory"),
+        "unexpected stderr: {}",
+        stderr
+    );
+    assert!(!key_file.exists());
+}
+
+#[test]
+fn test_cli_key_init_pem_and_permissions() {
+    let temp_dir = TempDir::new().unwrap();
+    let key_file = temp_dir.path().join("enc.key");
+
+    let out = run_appendfs_with_input(
+        &["key", "init", "-o", key_file.to_str().unwrap(), "--fast"],
+        b"my_secret_pass\n",
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Generated passphrase-encrypted key file:"));
+
+    assert!(key_file.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::metadata(&key_file).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o400);
+    }
+
+    let content = std::fs::read_to_string(&key_file).unwrap();
+    assert!(content.contains("-----BEGIN APPENDFS ENCRYPTED KEY-----"));
+    assert!(content.contains("-----END APPENDFS ENCRYPTED KEY-----"));
+
+    // Can decrypt with correct passphrase
+    let key = appendfs::crypto::decrypt_pem_key(&content, "my_secret_pass").unwrap();
+    assert_eq!(key.len(), 32);
+
+    // Fails with wrong passphrase
+    assert!(appendfs::crypto::decrypt_pem_key(&content, "wrong_pass").is_err());
+}
+
+#[test]
+fn test_cli_key_change_passphrase_workflow() {
+    let temp_dir = TempDir::new().unwrap();
+    let key_file = temp_dir.path().join("workflow.key");
+
+    // 1. Init unencrypted PEM key (empty passphrase)
+    let out = run_appendfs_with_input(&["key", "init", "-o", key_file.to_str().unwrap()], b"\n");
+    assert!(out.status.success());
+    let pem_1 = std::fs::read_to_string(&key_file).unwrap();
+    assert!(appendfs::crypto::is_pem_unencrypted_key(pem_1.as_bytes()));
+    let initial_key = appendfs::crypto::parse_pem_unencrypted_key(&pem_1).unwrap();
+
+    // 2. change-passphrase on unencrypted key with empty input: remains unencrypted
+    let out = run_appendfs_with_input(&["key", "change-passphrase", key_file.to_str().unwrap()], b"\n");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("remains unencrypted"));
+    let pem_2 = std::fs::read_to_string(&key_file).unwrap();
+    assert_eq!(
+        appendfs::crypto::parse_pem_unencrypted_key(&pem_2).unwrap(),
+        initial_key
+    );
+
+    // 3. change-passphrase on unencrypted key adding passphrase_one
+    let out = run_appendfs_with_input(
+        &["key", "change-passphrase", key_file.to_str().unwrap(), "--fast"],
+        b"passphrase_one\n",
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Added passphrase protection"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::metadata(&key_file).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o400);
+    }
+
+    let enc_pem_1 = std::fs::read_to_string(&key_file).unwrap();
+    assert!(appendfs::crypto::is_pem_encrypted_key(enc_pem_1.as_bytes()));
+    let decrypted_1 = appendfs::crypto::decrypt_pem_key(&enc_pem_1, "passphrase_one").unwrap();
+    assert_eq!(decrypted_1, initial_key);
+
+    // 4. change-passphrase on encrypted key with WRONG old passphrase must fail
+    let out = run_appendfs_with_input(
+        &["key", "change-passphrase", key_file.to_str().unwrap()],
+        b"wrong_pass\n",
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Error unlocking key file"));
+
+    // 5. change-passphrase from passphrase_one to passphrase_two
+    let out = run_appendfs_with_input(
+        &["key", "change-passphrase", key_file.to_str().unwrap(), "--fast"],
+        b"passphrase_one\npassphrase_two\n",
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Successfully updated passphrase"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::metadata(&key_file).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o400);
+    }
+
+    let enc_pem_2 = std::fs::read_to_string(&key_file).unwrap();
+    assert!(appendfs::crypto::decrypt_pem_key(&enc_pem_2, "passphrase_one").is_err());
+    let decrypted_2 = appendfs::crypto::decrypt_pem_key(&enc_pem_2, "passphrase_two").unwrap();
+    assert_eq!(decrypted_2, initial_key);
+
+    // 6. change-passphrase from passphrase_two to empty (remove passphrase -> PEM unencrypted)
+    let out = run_appendfs_with_input(
+        &["key", "change-passphrase", key_file.to_str().unwrap()],
+        b"passphrase_two\n\n",
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Removed passphrase protection"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::metadata(&key_file).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o400);
+    }
+
+    let final_pem = std::fs::read_to_string(&key_file).unwrap();
+    assert!(appendfs::crypto::is_pem_unencrypted_key(final_pem.as_bytes()));
+    let final_key = appendfs::crypto::parse_pem_unencrypted_key(&final_pem).unwrap();
+    assert_eq!(final_key, initial_key);
+
+    // 7. Verify legacy raw 64-hex key is also accepted by change-passphrase
+    let legacy_key_file = temp_dir.path().join("legacy.key");
+    std::fs::write(&legacy_key_file, format!("{}\n", hex::encode(initial_key))).unwrap();
+    let out = run_appendfs_with_input(
+        &["key", "change-passphrase", legacy_key_file.to_str().unwrap(), "--fast"],
+        b"new_pass_for_legacy\n",
+    );
+    assert!(out.status.success());
+    let upgraded_pem = std::fs::read_to_string(&legacy_key_file).unwrap();
+    assert!(appendfs::crypto::is_pem_encrypted_key(upgraded_pem.as_bytes()));
+    assert_eq!(
+        appendfs::crypto::decrypt_pem_key(&upgraded_pem, "new_pass_for_legacy").unwrap(),
+        initial_key
+    );
+}
+
+#[test]
+fn test_volume_lifecycle_with_encrypted_key_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let key_file = temp_dir.path().join("volume.key");
+    let log_dir = temp_dir.path().join("volume_logs");
+    let mount_dir = temp_dir.path().join("mnt");
+    let restore_dir = temp_dir.path().join("restored");
+
+    std::fs::create_dir_all(&mount_dir).unwrap();
+
+    // 1. Generate encrypted key file
+    let out = run_appendfs_with_input(
+        &["key", "init", "-o", key_file.to_str().unwrap(), "--fast"],
+        b"secret_pass_1\n",
+    );
+    assert!(out.status.success());
+
+    // 2. Initialize volume with this key file
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .env("APPENDFS_KEY_PASSPHRASE", "secret_pass_1")
+        .args([
+            "init",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            log_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Stats with correct passphrase succeeds
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .env("APPENDFS_KEY_PASSPHRASE", "secret_pass_1")
+        .args([
+            "stats",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            log_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Stats with wrong passphrase fails
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .env("APPENDFS_KEY_PASSPHRASE", "wrong_pass")
+        .args([
+            "stats",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            log_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+
+    // 3. Mount volume in background daemon, write some files, unmount
+    let mount_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .env("APPENDFS_KEY_PASSPHRASE", "secret_pass_1")
+        .args([
+            "mount",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            log_dir.to_str().unwrap(),
+            mount_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        mount_out.status.success(),
+        "mount failed: {}",
+        String::from_utf8_lossy(&mount_out.stderr)
+    );
+
+    let test_file = mount_dir.join("test_doc.txt");
+    std::fs::write(&test_file, b"data protected by encrypted key file").unwrap();
+
+    // Unmount
+    assert!(
+        appendfs::wait_until(
+            || matches!(
+                Command::new("fusermount3").args(["-u", mount_dir.to_str().unwrap()]).status(),
+                Ok(s) if s.success()
+            ),
+            std::time::Duration::from_secs(5),
+        ),
+        "failed to unmount"
+    );
+
+    // Wait for background mount daemon to exit and release lock
+    let lock_path = log_dir.join(".lock");
+    {
+        let lock = std::fs::File::open(&lock_path).unwrap();
+        use std::os::unix::io::AsRawFd;
+        let exited = appendfs::wait_until(
+            || unsafe {
+                let res = libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
+                if res == 0 {
+                    libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
+                    true
+                } else {
+                    false
+                }
+            },
+            std::time::Duration::from_secs(10),
+        );
+        assert!(exited, "mount daemon did not release lock");
+    }
+
+    // 4. Change passphrase on key file from secret_pass_1 to secret_pass_2
+    let out = run_appendfs_with_input(
+        &["key", "change-passphrase", key_file.to_str().unwrap(), "--fast"],
+        b"secret_pass_1\nsecret_pass_2\n",
+    );
+    assert!(out.status.success());
+
+    // 5. Mount with secret_pass_2, verify file content
+    let mount_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .env("APPENDFS_KEY_PASSPHRASE", "secret_pass_2")
+        .args([
+            "mount",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            log_dir.to_str().unwrap(),
+            mount_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        mount_out.status.success(),
+        "second mount failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&mount_out.stdout),
+        String::from_utf8_lossy(&mount_out.stderr)
+    );
+
+    let read_back = std::fs::read(&test_file).unwrap();
+    assert_eq!(read_back, b"data protected by encrypted key file");
+
+    assert!(
+        appendfs::wait_until(
+            || matches!(
+                Command::new("fusermount3").args(["-u", mount_dir.to_str().unwrap()]).status(),
+                Ok(s) if s.success()
+            ),
+            std::time::Duration::from_secs(5),
+        ),
+        "failed to unmount second time"
+    );
+
+    {
+        let lock = std::fs::File::open(&lock_path).unwrap();
+        use std::os::unix::io::AsRawFd;
+        let exited = appendfs::wait_until(
+            || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            std::time::Duration::from_secs(10),
+        );
+        assert!(exited, "second mount daemon did not release lock");
+    }
+
+    // 6. Test disaster recovery with Python restore.py
+    let restore_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
+    let out = Command::new("python3")
+        .env("APPENDFS_KEY_PASSPHRASE", "secret_pass_2")
+        .args([
+            restore_script.to_str().unwrap(),
+            log_dir.to_str().unwrap(),
+            restore_dir.to_str().unwrap(),
+            "--key-file",
+            key_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "restore.py failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let restored_file = restore_dir.join("test_doc.txt");
+    assert_eq!(
+        std::fs::read(restored_file).unwrap(),
+        b"data protected by encrypted key file"
+    );
 }
