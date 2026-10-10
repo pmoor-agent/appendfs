@@ -255,6 +255,10 @@ impl OnDiskBlockCache {
                 .open(&tmp_path)?;
             file.write_all(data)?;
             file.flush()?;
+            // Every age this cache compares (eviction order, read touches, stale tmp files) is
+            // measured on `clock`, so the block's mtime must come from it too, not from the OS.
+            // Set after the write, which bumps it; the rename keeps it.
+            file.set_times(FileTimes::new().set_modified(self.clock.now()))?;
             fs::rename(&tmp_path, &target_path)?;
             Ok(())
         })();
@@ -682,10 +686,32 @@ mod tests {
         assert_eq!(cache.read_block("000001_r1", 0).unwrap().unwrap(), r1_data);
     }
 
+    /// A fixed fake start, deliberately far from the wall clock: any file time the cache took
+    /// from the OS instead of its clock would be ~25 years off and break the ordering below.
+    fn fake_clock() -> Arc<crate::clock::AdvancingClock> {
+        Arc::new(crate::clock::AdvancingClock::new(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000),
+        ))
+    }
+
+    #[test]
+    fn test_on_disk_block_cache_stamps_writes_with_its_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = fake_clock();
+        let cache = OnDiskBlockCache::new(dir.path(), 100_000, clock.clone()).unwrap();
+
+        cache.write_block("000001", 0, &[0x42; 100]).unwrap();
+        let mtime = fs::metadata(dir.path().join("000001_000000.bin"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(mtime, clock.now());
+    }
+
     #[test]
     fn test_on_disk_block_cache_tmp_file_pruning_with_clock() {
         let dir = tempfile::tempdir().unwrap();
-        let clock = Arc::new(crate::clock::AdvancingClock::new(SystemTime::now()));
+        let clock = fake_clock();
         let cache = OnDiskBlockCache::new(dir.path(), 100_000, clock.clone()).unwrap();
 
         // Write a valid block
@@ -693,9 +719,15 @@ mod tests {
         cache.write_block("000001", 0, &data).unwrap();
         assert!(dir.path().join("000001_000000.bin").exists());
 
-        // Create an orphaned temporary file
+        // Create an orphaned temporary file, aged on the cache's clock like the files it writes
         let orphaned_tmp = dir.path().join("000001_000001.tmp.12345.1");
         fs::write(&orphaned_tmp, b"incomplete write").unwrap();
+        File::options()
+            .write(true)
+            .open(&orphaned_tmp)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(clock.now()))
+            .unwrap();
         assert!(orphaned_tmp.exists());
 
         // Right now, age < TMP_FILE_MAX_AGE, so pruning will NOT remove it
@@ -716,7 +748,7 @@ mod tests {
     #[test]
     fn test_on_disk_block_cache_lru_touch_on_read() {
         let dir = tempfile::tempdir().unwrap();
-        let clock = Arc::new(crate::clock::AdvancingClock::new(SystemTime::now()));
+        let clock = fake_clock();
         // Capacity for exactly 2 blocks of 1000 bytes
         let cache = OnDiskBlockCache::new(dir.path(), 2500, clock.clone()).unwrap();
 
