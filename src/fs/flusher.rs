@@ -290,26 +290,13 @@ mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
     use crate::fs::InMemoryFS;
-    use crate::log::LogWriter;
     use crate::operations::read_write::create_core;
     use crate::storage::Storage;
     use crate::test_utils::FsTestExt;
+    use crate::test_utils::TestFS;
 
     fn test_fs() -> Arc<InMemoryFS> {
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let clock = SystemClock;
-        let writer = Arc::new(
-            LogWriter::create(
-                storage,
-                1,
-                &clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        Arc::new(InMemoryFS::with_log(writer))
+        Arc::new(TestFS::builder().build().fs)
     }
 
     fn stage_a_write(fs: &InMemoryFS, name: &str) {
@@ -360,19 +347,7 @@ mod tests {
         let clock = Arc::new(crate::clock::AdvancingClock::new(
             std::time::UNIX_EPOCH + Duration::from_secs(1_000_000),
         ));
-        let writer = Arc::new(
-            LogWriter::create(
-                storage.clone(),
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage);
-        fs.log_writer = Some(writer);
+        let fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
 
         let interval = Duration::from_millis(200);
 
@@ -428,19 +403,19 @@ mod tests {
     fn test_idle_cycle_rolls_the_generation_once_it_ages_out() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = crate::clock::AdvancingClock::new(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
-        let writer = Arc::new(
-            LogWriter::create(
-                storage.clone(),
-                1,
-                &clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
+        let mut fs = TestFS::builder()
+            .storage(storage.clone())
+            .clock(Arc::new(clock.clone()))
+            .build()
+            .fs;
+        // Reattach the writer with an age limit, as a mount does from `--max-log-age`.
+        fs.log_writer = None;
+        let writer = fs
+            .next_log_writer(storage.clone(), crate::cli::DEFAULT_MAX_LOG_SIZE)
             .unwrap()
-            .with_max_log_age(Some(Duration::from_secs(3600))),
-        );
-        let fs = InMemoryFS::with_clock_and_log(Arc::new(clock.clone()), Some(writer.clone()));
+            .with_max_log_age(Some(Duration::from_secs(3600)));
+        fs.attach_log_writer(Arc::new(writer));
+        let writer = fs.log_writer.clone().unwrap();
 
         // A batch's worth of data, well under `max_log_size`: only age can roll this.
         stage_a_write(&fs, "aged.bin");
@@ -566,18 +541,7 @@ mod tests {
         let fixed = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let clock = crate::clock::MockClock(fixed);
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let writer = Arc::new(
-            LogWriter::create(
-                storage,
-                1,
-                &clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(Arc::new(clock), Some(writer));
+        let fs = TestFS::builder().storage(storage).clock(Arc::new(clock)).build().fs;
 
         stage_a_write(&fs, "timed.bin");
         fs.quiesce().unwrap();
@@ -610,18 +574,7 @@ mod tests {
             std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         ));
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let writer = Arc::new(
-            LogWriter::create(
-                storage,
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        let fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
 
         stage_a_write(&fs, "queued.bin");
         assert!(fs.freeze_now());
@@ -705,19 +658,7 @@ mod tests {
     #[test]
     fn test_flush_record_disk_bytes_matches_storage_size() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let clock = SystemClock;
-        let writer = Arc::new(
-            LogWriter::create(
-                Arc::clone(&storage),
-                1,
-                &clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_log(writer);
+        let fs = TestFS::builder().storage(storage.clone()).build().fs;
 
         stage_a_write(&fs, "disk_test.bin");
         fs.quiesce().unwrap();
@@ -833,19 +774,7 @@ mod tests {
     fn test_coalesce_flush_records_breakdown_serialize_wait_flush_fold() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create(
-                storage.clone(),
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage);
-        fs.log_writer = Some(writer);
+        let mut fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
         fs.max_coalesce_batches = 3;
 
         // Stage batch 1

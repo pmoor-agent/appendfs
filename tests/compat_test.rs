@@ -20,12 +20,11 @@ use appendfs::compat::{
 };
 use appendfs::operations::read_write::create_core;
 use appendfs::storage::OsStorage;
-use appendfs::{InMemoryFS, LogWriter, RecoveryTarget, Storage, SummaryReader, recover_fs};
+use appendfs::{InMemoryFS, RecoveryTarget, Storage, SummaryReader, recover_fs};
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 fn fixture_v1_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1")
@@ -68,21 +67,10 @@ pub fn verify_recovery_with_latest_summary_missing(fixture_dir: &Path) {
     verify_compat_tree(&fs);
 
     // 2. Verify forward mutability on top of the reconstructed volume
-    let next_gen = appendfs::find_latest_generation_in_storage(storage.as_ref()) + 1;
-    let start_batch_id = fs.last_batch_id.load(Ordering::SeqCst) + 1;
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            next_gen,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            start_batch_id,
-            volume_key,
-        )
-        .unwrap()
-        .with_compression(fs.volume_header.compression),
-    );
-    fs.log_writer = Some(writer);
+    let writer = fs
+        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
+        .unwrap();
+    fs.attach_log_writer(Arc::new(writer));
     fs.set_log_dir(temp_path);
 
     let new_file = create_core(&fs, 1, "new_after_reconstruction.txt", 0o644, 0, 1000, 1000)
@@ -123,21 +111,10 @@ pub fn verify_recovery_from_latest_summary_snapshot(fixture_dir: &Path) {
     verify_compat_tree(&fs);
 
     // 2. Verify forward mutability
-    let next_gen = appendfs::find_latest_generation_in_storage(storage.as_ref()) + 1;
-    let start_batch_id = fs.last_batch_id.load(Ordering::SeqCst) + 1;
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            next_gen,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            start_batch_id,
-            volume_key,
-        )
-        .unwrap()
-        .with_compression(fs.volume_header.compression),
-    );
-    fs.log_writer = Some(writer);
+    let writer = fs
+        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
+        .unwrap();
+    fs.attach_log_writer(Arc::new(writer));
     fs.set_log_dir(temp_path);
 
     let new_file =

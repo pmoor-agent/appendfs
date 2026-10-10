@@ -9,7 +9,7 @@
 mod common;
 use appendfs::FsTestExt;
 use appendfs::InMemoryFS;
-use appendfs::LogWriter;
+use appendfs::TestFS;
 use appendfs::clock::{Clock, SystemClock};
 use appendfs::log::record::DecodedPayload;
 use appendfs::log::{LogReader, SummaryReader, recover_fs};
@@ -652,18 +652,11 @@ fn dump_preserved_repro() {
 fn run_concurrent_stress(seed: u64) {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            &*clock,
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            appendfs::VolumeKey::plaintext_arc(),
-        )
-        .unwrap(),
-    );
-    let mut fs = InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
+    let mut fs = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .build()
+        .fs;
     fs.set_storage(storage.clone());
     // Reads bump atime in memory but are never logged (logging every read would defeat
     // the point of an append-only log), so with atime tracking on, a live instance and

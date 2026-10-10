@@ -1352,42 +1352,21 @@ mod tests {
 
     #[test]
     fn test_format_runtime_status_with_active_writer() {
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::SystemClock);
-        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage.clone());
-        let writer = Arc::new(
-            crate::log::LogWriter::create(
-                storage,
-                5,
-                clock.as_ref(),
-                1024 * 1024,
-                1,
-                Arc::new(crate::crypto::VolumeKey::plaintext()),
-            )
-            .unwrap(),
-        );
-        fs.attach_log_writer(writer);
+        let fs = TestFS::builder().clock(clock.clone()).build().fs;
+        fs.log_writer
+            .as_ref()
+            .unwrap()
+            .open_if_unopened(clock.as_ref())
+            .unwrap();
         let status = format_runtime_status(&fs);
-        assert!(status.contains("Active Generation:  5 (000005.log)"));
-        assert!(status.contains("Next Generation:    6 (000006.log)"));
+        assert!(status.contains("Active Generation:  1 (000001.log)"));
+        assert!(status.contains("Next Generation:    2 (000002.log)"));
     }
 
     #[test]
     fn test_format_runtime_status_with_lazy_writer() {
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::SystemClock);
-        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage.clone());
-        let writer = Arc::new(
-            crate::log::LogWriter::create_lazy(
-                storage,
-                1,
-                1024 * 1024,
-                1,
-                Arc::new(crate::crypto::VolumeKey::plaintext()),
-            )
-            .unwrap(),
-        );
-        fs.attach_log_writer(writer);
+        let fs = TestFS::builder().build().fs;
         let status = format_runtime_status(&fs);
         assert!(status.contains("Active Generation:  None (lazy / unopened)"));
         assert!(status.contains("Next Generation:    1 (000001.log)"));
@@ -1410,8 +1389,7 @@ mod tests {
         use std::sync::Arc;
 
         let storage = Arc::new(MemoryStorage::new());
-        let clock = Arc::new(crate::clock::SystemClock);
-        let mut fs = InMemoryFS::with_clock_and_storage(clock, storage.clone());
+        let mut fs = TestFS::builder().storage(storage.clone()).build().fs;
 
         // Attach LogFileCache with MemoryBlockCache
         let block_cache = Arc::new(MemoryBlockCache::new(10 * 1024 * 1024));
@@ -1937,25 +1915,10 @@ mod tests {
     fn test_format_runtime_status_batch_and_recovery_duration() {
         use crate::clock::{AdvancingClock, Clock};
         use crate::operations::read_write::create_core;
-        use crate::storage::MemoryStorage;
 
         let start_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let clock = Arc::new(AdvancingClock::new(start_time));
-        let storage = Arc::new(MemoryStorage::new());
-        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage.clone());
-
-        let writer = Arc::new(
-            crate::log::LogWriter::create(
-                storage,
-                1,
-                clock.as_ref(),
-                1024 * 1024,
-                1,
-                Arc::new(crate::crypto::VolumeKey::plaintext()),
-            )
-            .unwrap(),
-        );
-        fs.attach_log_writer(writer);
+        let fs = TestFS::builder().clock(clock.clone()).build().fs;
         fs.set_recovered_time(Some(clock.now()));
 
         // Flush a batch

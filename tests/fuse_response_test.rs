@@ -585,30 +585,16 @@ fn test_open_cache_flags_and_timeout_delineation() {
 #[test]
 fn test_cold_read_deferred_threadpool_execution() {
     use appendfs::FsTestExt;
-    use appendfs::crypto::{VolumeHeader, VolumeKey};
-    use appendfs::log::{LogWriter, RecoveryTarget};
     use appendfs::operations::read_write::{create_core, open_core};
     use appendfs::storage::MemoryStorage;
 
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(appendfs::clock::SystemClock);
-    let key = Arc::new(VolumeKey::plaintext());
-    appendfs::log::init_volume(storage.clone(), &key, VolumeHeader::plaintext()).unwrap();
-    let mut fs =
-        appendfs::log::recover_fs(storage.clone(), RecoveryTarget::Latest, clock.clone(), key.clone()).unwrap();
-
-    let writer = Arc::new(
-        LogWriter::create(
-            storage.clone(),
-            1,
-            clock.as_ref(),
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            key.clone(),
-        )
-        .unwrap(),
-    );
-    fs.attach_log_writer(writer);
+    let mut fs = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .build()
+        .fs;
 
     let file = create_core(&fs, 1, "deferred_read.txt", 0o644, 0, 1000, 1000).unwrap();
     let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();

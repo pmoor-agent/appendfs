@@ -1451,6 +1451,7 @@ mod tests {
     use super::*;
     use crate::remote::mock::MockRemoteStore;
     use crate::storage::MemoryStorage;
+    use crate::test_utils::TestFS;
 
     #[test]
     fn test_upload_storage_file_and_cross_copy() {
@@ -1625,8 +1626,7 @@ mod tests {
 
         let start_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let clock = Arc::new(AdvancingClock::new(start_time));
-        let storage = Arc::new(MemoryStorage::new());
-        let fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage);
+        let fs = TestFS::builder().clock(clock.clone()).build().fs;
 
         let mut registry = RemoteRegistry::new();
         let target_cfg = RemoteTargetConfig::new("backup-bucket");

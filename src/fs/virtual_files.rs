@@ -330,32 +330,23 @@ mod tests {
 
     #[test]
     fn test_remotes_virtual_file_formatting_and_telemetry() {
-        let mut fs = InMemoryFS::new();
-        fs.register_remote_status();
-
-        let v_ino = fs.lookup_child(1, ".remotes").unwrap();
-
-        // Check unconfigured default via read_blocking
-        let fh1 = fs.open_file_handle(v_ino, 0);
-        let initial_bytes = fs.read_blocking(v_ino, fh1, 0, 4096).unwrap();
+        // A read-only mount has no log writer, so it reports no head generation.
+        let mut read_only = TestFS::builder().build().fs;
+        read_only.log_writer = None;
+        read_only.set_read_only();
+        read_only.register_remote_status();
+        let v_ino = read_only.lookup_child(1, ".remotes").unwrap();
+        let fh1 = read_only.open_file_handle(v_ino, 0);
+        let initial_bytes = read_only.read_blocking(v_ino, fh1, 0, 4096).unwrap();
         let initial_status = String::from_utf8(initial_bytes).unwrap();
-        fs.release_file_handle(fh1, v_ino).unwrap();
+        read_only.release_file_handle(fh1, v_ino).unwrap();
         assert!(initial_status.contains("No remotes configured."));
         assert!(initial_status.contains("Volume Head Generation: None (read-only / detached log writer)"));
 
-        // Attach active log writer for generation 1
-        let storage = Arc::new(crate::storage::MemoryStorage::new());
-        let writer = Arc::new(
-            crate::log::LogWriter::create_lazy(
-                storage,
-                1,
-                100 * 1024 * 1024,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        fs.attach_log_writer(writer);
+        // A read-write mount writes generation 1 next.
+        let fs = TestFS::builder().build().fs;
+        fs.register_remote_status();
+        let v_ino = fs.lookup_child(1, ".remotes").unwrap();
 
         // Configure remotes
         let mut registry = crate::remote::config::RemoteRegistry::new();

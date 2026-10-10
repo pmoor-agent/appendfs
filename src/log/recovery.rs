@@ -449,6 +449,7 @@ mod tests {
     use crate::clock::{AdvancingClock, SystemClock};
     use crate::log::LogWriter;
     use crate::test_utils::FsTestExt;
+    use crate::test_utils::TestFS;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -744,29 +745,14 @@ mod tests {
     #[test]
     fn test_recovery_verifies_rolled_log_is_sealed() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        crate::init_volume(
-            storage.clone(),
-            &VolumeKey::plaintext(),
-            crate::crypto::VolumeHeader::plaintext(),
-        )
-        .unwrap();
-
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
-        let writer = Arc::new(
-            LogWriter::create(
-                storage.clone(),
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-
-        let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-        fs.log_writer = Some(writer.clone());
-        fs.set_storage(storage.clone());
+        let fs = TestFS::builder()
+            .storage(storage.clone())
+            .clock(clock.clone())
+            .root_owner(1000, 1000)
+            .build()
+            .fs;
+        let writer = fs.log_writer.clone().unwrap();
 
         // Batch 1 into gen 1
         crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
@@ -810,20 +796,15 @@ mod tests {
     fn test_recovery_handles_unsealed_intermediate_log_from_crash() {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
-        crate::init_volume(
-            storage.clone(),
-            &VolumeKey::plaintext(),
-            crate::crypto::VolumeHeader::plaintext(),
-        )
-        .unwrap();
-
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, 10_000, 1, VolumeKey::plaintext_arc()).unwrap());
-
-        let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-        fs.log_writer = Some(writer.clone());
-        fs.set_storage(storage.clone());
+        let mut fs = TestFS::builder()
+            .storage(storage.clone())
+            .clock(clock.clone())
+            .root_owner(1000, 1000)
+            .max_log_size(10_000)
+            .build()
+            .fs;
+        let writer = fs.log_writer.clone().unwrap();
 
         crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
         fs.quiesce().unwrap();
@@ -868,20 +849,15 @@ mod tests {
     fn test_recovery_rejects_record_after_seal() {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
-        crate::init_volume(
-            storage.clone(),
-            &VolumeKey::plaintext(),
-            crate::crypto::VolumeHeader::plaintext(),
-        )
-        .unwrap();
-
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, 10_000, 1, VolumeKey::plaintext_arc()).unwrap());
-
-        let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-        fs.log_writer = Some(writer.clone());
-        fs.set_storage(storage.clone());
+        let fs = TestFS::builder()
+            .storage(storage.clone())
+            .clock(clock.clone())
+            .root_owner(1000, 1000)
+            .max_log_size(10_000)
+            .build()
+            .fs;
+        let writer = fs.log_writer.clone().unwrap();
 
         crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
         fs.quiesce().unwrap();
@@ -941,20 +917,15 @@ mod tests {
     fn test_recovery_rejects_seal_record_count_mismatch() {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
-        crate::init_volume(
-            storage.clone(),
-            &VolumeKey::plaintext(),
-            crate::crypto::VolumeHeader::plaintext(),
-        )
-        .unwrap();
-
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, 10_000, 1, VolumeKey::plaintext_arc()).unwrap());
-
-        let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-        fs.log_writer = Some(writer.clone());
-        fs.set_storage(storage.clone());
+        let mut fs = TestFS::builder()
+            .storage(storage.clone())
+            .clock(clock.clone())
+            .root_owner(1000, 1000)
+            .max_log_size(10_000)
+            .build()
+            .fs;
+        let writer = fs.log_writer.clone().unwrap();
 
         crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
         fs.quiesce().unwrap();
@@ -1042,31 +1013,18 @@ mod tests {
     fn test_recovery_walks_backwards_when_latest_summary_corrupted() {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
-        crate::init_volume(
-            storage.clone(),
-            &VolumeKey::plaintext(),
-            crate::crypto::VolumeHeader::plaintext(),
-        )
-        .unwrap();
 
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
 
         // Phase 1: create fs with writer at gen 1, write file1, export summary
         {
-            let writer = Arc::new(
-                LogWriter::create(
-                    storage.clone(),
-                    1,
-                    &*clock,
-                    crate::cli::DEFAULT_MAX_LOG_SIZE,
-                    1,
-                    VolumeKey::plaintext_arc(),
-                )
-                .unwrap(),
-            );
-            let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-            fs.log_writer = Some(writer.clone());
-            fs.set_storage(storage.clone());
+            let fs = TestFS::builder()
+                .storage(storage.clone())
+                .clock(clock.clone())
+                .root_owner(1000, 1000)
+                .build()
+                .fs;
+            let writer = fs.log_writer.clone().unwrap();
 
             let f1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
             fs.write_at(f1.ino, b"data1", 0).unwrap();
@@ -1128,12 +1086,6 @@ mod tests {
     fn test_targeted_recovery_skips_unneeded_summary_decompression() {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
-        crate::init_volume(
-            storage.clone(),
-            &VolumeKey::plaintext(),
-            crate::crypto::VolumeHeader::plaintext(),
-        )
-        .unwrap();
 
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
 
@@ -1141,20 +1093,13 @@ mod tests {
         let time_gen1 = clock.now();
         let batch_gen1;
         {
-            let writer = Arc::new(
-                LogWriter::create(
-                    storage.clone(),
-                    1,
-                    &*clock,
-                    crate::cli::DEFAULT_MAX_LOG_SIZE,
-                    1,
-                    VolumeKey::plaintext_arc(),
-                )
-                .unwrap(),
-            );
-            let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-            fs.log_writer = Some(writer.clone());
-            fs.set_storage(storage.clone());
+            let fs = TestFS::builder()
+                .storage(storage.clone())
+                .clock(clock.clone())
+                .root_owner(1000, 1000)
+                .build()
+                .fs;
+            let writer = fs.log_writer.clone().unwrap();
 
             let f1 = crate::operations::read_write::create_core(&fs, 1, "target.txt", 0o644, 0, 1000, 1000).unwrap();
             fs.write_at(f1.ino, b"data1", 0).unwrap();
@@ -1230,32 +1175,19 @@ mod tests {
     fn test_recovery_walks_backwards_across_revisions() {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
-        crate::init_volume(
-            storage.clone(),
-            &VolumeKey::plaintext(),
-            crate::crypto::VolumeHeader::plaintext(),
-        )
-        .unwrap();
 
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
 
         // Phase 1: create fs with writer at gen 1, write rev0.txt, export rev 0 summary
         let rev0_summary_bytes;
         {
-            let writer = Arc::new(
-                LogWriter::create(
-                    storage.clone(),
-                    1,
-                    &*clock,
-                    crate::cli::DEFAULT_MAX_LOG_SIZE,
-                    1,
-                    VolumeKey::plaintext_arc(),
-                )
-                .unwrap(),
-            );
-            let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
-            fs.log_writer = Some(writer.clone());
-            fs.set_storage(storage.clone());
+            let mut fs = TestFS::builder()
+                .storage(storage.clone())
+                .clock(clock.clone())
+                .root_owner(1000, 1000)
+                .build()
+                .fs;
+            let writer = fs.log_writer.clone().unwrap();
 
             let f1 = crate::operations::read_write::create_core(&fs, 1, "rev0.txt", 0o644, 0, 1000, 1000).unwrap();
             fs.write_at(f1.ino, b"data0", 0).unwrap();

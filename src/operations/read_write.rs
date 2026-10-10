@@ -603,7 +603,7 @@ mod tests {
     use crate::fs::InMemoryFS;
     use crate::test_utils::FsTestExt;
     use crate::test_utils::TestFS;
-    use crate::{LogWriter, Storage, SystemClock};
+    use crate::{Storage, SystemClock};
 
     fn file_with(fs: &InMemoryFS, contents: &[u8]) -> u64 {
         let attr = create_core(fs, 1, "f.bin", 0o644, 0, 1000, 1000).unwrap();
@@ -763,18 +763,11 @@ mod tests {
     fn test_fsync_single_lock_acquisition() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create(
-                storage.clone(),
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        let fs = TestFS::builder()
+            .storage(storage.clone())
+            .clock(clock.clone())
+            .build()
+            .fs;
         let file = create_core(&fs, 1, "fsync_lock.bin", 0o644, 0, 1000, 1000).unwrap();
         let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
         fs.write_at(file.ino, b"test", 0).unwrap();
@@ -800,18 +793,11 @@ mod tests {
     fn test_fsync_and_fsyncdir() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(
-            LogWriter::create(
-                storage.clone(),
-                1,
-                &*clock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-                crate::crypto::VolumeKey::plaintext_arc(),
-            )
-            .unwrap(),
-        );
-        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        let fs = TestFS::builder()
+            .storage(storage.clone())
+            .clock(clock.clone())
+            .build()
+            .fs;
         let file = create_core(&fs, 1, "fsync.bin", 0o644, 0, 1000, 1000).unwrap();
         let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
         fs.write_at(file.ino, b"fsync test", 0).unwrap();
