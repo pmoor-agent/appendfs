@@ -7,7 +7,7 @@ use appendfs::clock::SystemClock;
 use appendfs::crypto::{
     CipherSuite, KeySource, MasterKey, VolumeHeader, VolumeKey, generate_random_16, prompt_passphrase,
 };
-use appendfs::log::{LogWriter, SummaryReader};
+use appendfs::log::SummaryReader;
 use appendfs::storage::{OsStorage, Storage};
 use appendfs::{
     CheckOptions, VolumeStats, check_fs_integrity, check_remote_integrity, dump_file, init_volume, latest_summary_file,
@@ -42,14 +42,11 @@ struct VolumeHeaderInfo {
 struct OpenVolumeStorage {
     storage: Arc<dyn Storage>,
     volume_key: Arc<VolumeKey>,
-    volume_header: VolumeHeader,
 }
 
 struct OpenVolumeFS {
     fs: appendfs::InMemoryFS,
     storage: Arc<dyn Storage>,
-    volume_key: Arc<VolumeKey>,
-    volume_header: VolumeHeader,
 }
 
 /// Reads the volume header and validates that `log_dir` contains an initialized appendfs volume.
@@ -102,7 +99,6 @@ fn open_volume_storage(
         return Ok(OpenVolumeStorage {
             storage,
             volume_key: Arc::new(VolumeKey::plaintext_with_volume_id(volume_header.volume_id)),
-            volume_header,
         });
     }
 
@@ -169,7 +165,6 @@ fn open_volume_storage(
     Ok(OpenVolumeStorage {
         storage,
         volume_key: Arc::new(volume_key),
-        volume_header,
     })
 }
 
@@ -180,19 +175,10 @@ fn open_volume_fs(
     passphrase_flag: bool,
     target: appendfs::RecoveryTarget,
 ) -> Result<OpenVolumeFS, String> {
-    let OpenVolumeStorage {
-        storage,
-        volume_key,
-        volume_header,
-    } = open_volume_storage(log_dir, key_file, passphrase_flag)?;
-    let fs = recover_fs(storage.clone(), target, Arc::new(SystemClock), volume_key.clone())
+    let OpenVolumeStorage { storage, volume_key } = open_volume_storage(log_dir, key_file, passphrase_flag)?;
+    let fs = recover_fs(storage.clone(), target, Arc::new(SystemClock), volume_key)
         .map_err(|e| format!("Failed to recover volume from '{}': {}", log_dir.display(), e))?;
-    Ok(OpenVolumeFS {
-        fs,
-        storage,
-        volume_key,
-        volume_header,
-    })
+    Ok(OpenVolumeFS { fs, storage })
 }
 
 /// Collects the credentials for a brand new volume, returning the key and the KDF salt to
@@ -470,8 +456,6 @@ fn cmd_mount(args: MountArgs) {
     let OpenVolumeFS {
         fs: mut fs_instance,
         storage,
-        volume_key,
-        volume_header,
     } = match open_volume_fs(
         log_dir,
         args.key_file.as_deref(),
@@ -485,22 +469,14 @@ fn cmd_mount(args: MountArgs) {
         }
     };
 
-    let next_gen = fs_instance.next_generation();
-
-    let start_batch_id = fs_instance.last_batch_id.load(Ordering::SeqCst) + 1;
-
-    // The volume header decides how writes are compressed; it was read back during
-    // recovery, so a mount never has to be told separately.
-    let compression = volume_header.compression;
     // The flusher checks `max_log_age` at the end of every cycle, so this one limit covers
     // both the CLI flag and the remote policy's `max_log_age_secs`; the tighter wins.
     let registry = load_remote_registry(storage.as_ref());
     let max_log_age = appendfs::clock::parse_duration(&args.max_log_age)
         .ok()
         .map(|cli| cli.min(std::time::Duration::from_secs(registry.policy.max_log_age_secs)));
-    let writer = match LogWriter::create_lazy(storage.clone(), next_gen, args.max_log_size, start_batch_id, volume_key)
-    {
-        Ok(w) => Arc::new(w.with_compression(compression).with_max_log_age(max_log_age)),
+    let writer = match fs_instance.next_log_writer(storage.clone(), args.max_log_size) {
+        Ok(w) => Arc::new(w.with_max_log_age(max_log_age)),
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
@@ -543,7 +519,7 @@ fn cmd_mount(args: MountArgs) {
         "Mounting appendfs at '{}' with log-dir '{}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, max-extent-size: {} bytes, read-parallelism: {}, foreground: {})...",
         args.mount_point.display(),
         args.log_dir.display(),
-        next_gen,
+        writer.generation(),
         args.flush_threshold,
         args.flush_threshold_ops,
         args.flush_interval,
@@ -586,15 +562,14 @@ fn cmd_mount_ro(args: MountRoArgs) {
         log_dir.display()
     );
 
-    let OpenVolumeStorage {
-        storage, volume_key, ..
-    } = match open_volume_storage(log_dir, args.key_file.as_deref(), args.passphrase) {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let OpenVolumeStorage { storage, volume_key } =
+        match open_volume_storage(log_dir, args.key_file.as_deref(), args.passphrase) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
 
     let registry = load_remote_registry(storage.as_ref());
     let remote_stores = registry.build_read_stores();
@@ -845,15 +820,14 @@ fn cmd_fsck(args: FsckArgs) {
         std::process::exit(1);
     }
 
-    let OpenVolumeStorage {
-        storage, volume_key, ..
-    } = match open_volume_storage(log_dir, args.key_file.as_deref(), args.passphrase) {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let OpenVolumeStorage { storage, volume_key } =
+        match open_volume_storage(log_dir, args.key_file.as_deref(), args.passphrase) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
 
     let registry = load_remote_registry(storage.as_ref());
     let target_remotes = resolve_fsck_target_remotes(&args, &registry);

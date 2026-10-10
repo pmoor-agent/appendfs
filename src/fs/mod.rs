@@ -1069,6 +1069,23 @@ impl InMemoryFS {
         self.log_writer = Some(writer);
     }
 
+    /// Creates the writer that continues this recovered filesystem's log in `storage`.
+    ///
+    /// The writer starts lazily at the generation after the last recovered one and at the
+    /// batch id after the last replayed one, and encrypts and compresses as the recovered
+    /// volume header says. Getting any of these from somewhere else would reuse a sealed
+    /// generation or batch id, or silently write a compressed volume uncompressed.
+    pub fn next_log_writer(&self, storage: Arc<dyn Storage>, max_log_size: u64) -> std::io::Result<LogWriter> {
+        let writer = LogWriter::create_lazy(
+            storage,
+            self.next_generation(),
+            max_log_size,
+            self.last_batch_id.load(Ordering::SeqCst) + 1,
+            Arc::clone(&self.volume_key),
+        )?;
+        Ok(writer.with_compression(self.volume_header.compression))
+    }
+
     /// Returns the sequence number for the next log generation to be allocated from an already-locked manifest.
     pub fn next_generation_locked(&self, manifest: &crate::log::LogManifest) -> u32 {
         let manifest_max = manifest.latest_generation().unwrap_or(0);

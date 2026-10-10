@@ -3,9 +3,10 @@ use appendfs::Clock;
 use appendfs::FsError;
 use appendfs::FsTestExt;
 use appendfs::Storage;
+use appendfs::TestFS;
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{VolumeHeader, VolumeKey};
-use appendfs::log::{LogFileCache, LogWriter, init_volume, init_volume_with_clock};
+use appendfs::log::{LogFileCache, LogWriter, init_volume_with_clock};
 use appendfs::operations::read_write::{create_core, open_core, release_core};
 use appendfs::remote::bootstrap_from_remote;
 use appendfs::remote::worker::{cross_copy_file, cross_copy_summary, upload_storage_file};
@@ -27,23 +28,17 @@ use tempfile::TempDir;
 fn test_remote_replication_and_authenticated_md5_ledger() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
     // 1. Initialize volume
-    let summary_file = init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    assert_eq!(summary_file, "000000.summary");
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    assert!(storage.exists("000000.summary"));
+    let writer = fs.log_writer.clone().unwrap();
 
-    // 2. Recover InMemoryFS and append records to multiple generations
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    // 2. Append records to multiple generations
 
     // Write file 1 (gen 1)
     let root = 1;
@@ -153,20 +148,13 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
 fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     // Write a large extent across multiple KB in generation 1
     let file_attr = create_core(&fs, 1, "archival.dat", 0o644, 0, 1000, 1000).unwrap();
@@ -236,16 +224,11 @@ fn test_disaster_recovery_bootstrap_from_remote() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
 
     let file_attr = create_core(&fs, 1, "important.txt", 0o644, 0, 1000, 1000).unwrap();
     let ino = file_attr.ino;
@@ -283,19 +266,13 @@ fn test_disaster_recovery_bootstrap_from_remote() {
 fn test_read_only_remote_and_cloud_forking() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     // Write file in generation 1
     let file_attr = create_core(&fs, 1, "base.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -360,17 +337,12 @@ fn test_bootstrap_rebuilds_encrypted_active_log_from_parts() {
     .unwrap();
     let volume_key = Arc::new(key);
 
-    init_volume(storage.clone(), &volume_key, header).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer);
-    fs.set_storage(storage.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .volume(header, volume_key.clone())
+        .build();
 
     let remote = Arc::new(MockRemoteStore::new());
     upload_storage_file(storage.as_ref(), remote.as_ref(), "000000.summary", None).unwrap();
@@ -442,19 +414,13 @@ fn test_bootstrap_rebuilds_encrypted_active_log_from_parts() {
 fn test_active_log_part_sync_and_consolidation_on_seal() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let remote = Arc::new(MockRemoteStore::new());
 
@@ -551,19 +517,13 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
 fn test_active_log_part_ships_only_synced_bytes() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let remote = Arc::new(MockRemoteStore::new());
     let mut registry = RemoteRegistry::new();
@@ -658,19 +618,13 @@ fn test_nfs_local_volume_replication_and_pruning() {
     let nfs_dir = TempDir::new().unwrap();
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
     fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
 
     // Setup RemoteRegistry pointing to a local directory representing an NFS share
@@ -761,19 +715,13 @@ fn test_nfs_local_volume_replication_and_pruning() {
 fn test_local_read_populates_block_cache_before_purge() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     // 1. Write file in generation 1
     let root = 1u64;
@@ -847,19 +795,13 @@ fn test_local_read_populates_block_cache_before_purge() {
 fn test_local_read_skips_block_cache_by_default() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let ino = create_core(&fs, 1, "file.txt", 0o644, 0, 1000, 1000).unwrap().ino;
     let payload = b"Sealed content read straight from the local log";
@@ -893,19 +835,13 @@ fn test_local_read_skips_block_cache_by_default() {
 fn test_remote_read_priority_prefers_lower_priority_remotes() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     // 1. Write file into generation 1
     let root = 1u64;
@@ -1002,18 +938,13 @@ fn test_latency_remote_store_in_tiered_reading() {
 
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let file_attr = create_core(&fs, 1, "latency_test.dat", 0o644, 0, 1000, 1000).unwrap();
     let payload = b"Testing latency injection on tiered remote store reads";
@@ -1083,21 +1014,13 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
 
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-
-    let writer =
-        Arc::new(LogWriter::create_lazy(storage.clone(), 1, 100 * 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(100 * 1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
     fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
 
     // Configure 2 remotes (NAS and S3)
@@ -1269,19 +1192,13 @@ fn test_tiered_storage_reader_coalesces_concurrent_remote_reads() {
 fn test_event_driven_immediate_replication_on_log_roll() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = Arc::new(VolumeKey::plaintext());
 
-    let _summary_file = init_volume(storage.clone(), volume_key.as_ref(), VolumeHeader::plaintext()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
     fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
     let fs_arc = Arc::new(fs);
 
@@ -1329,19 +1246,13 @@ fn test_event_driven_immediate_replication_on_log_roll() {
 fn test_audit_interval_skips_confirmed_files_until_audit() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = Arc::new(VolumeKey::plaintext());
 
-    let _summary_file = init_volume(storage.clone(), volume_key.as_ref(), VolumeHeader::plaintext()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
     fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
     let fs_arc = Arc::new(fs);
 
@@ -1456,17 +1367,12 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     // Write file in generation 1
     let root = 1u64;
@@ -1502,8 +1408,8 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
         "last_summary_generation must be seeded from recovered summary file"
     );
 
-    let writer2 = Arc::new(LogWriter::create_lazy(storage.clone(), 2, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    recovered_fs.log_writer = Some(writer2);
+    let writer2 = recovered_fs.next_log_writer(storage.clone(), 1024 * 1024).unwrap();
+    recovered_fs.attach_log_writer(Arc::new(writer2));
     recovered_fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
 
     // Configure remote registry with 0-second retention to test pruning
@@ -1545,17 +1451,12 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     let volume_key = VolumeKey::plaintext_arc();
 
     // 1. Initialize volume with deterministic clock
-    init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     // Write file A in generation 1
     let file_a = create_core(&fs, 1, "file_a.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -1758,21 +1659,14 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     let storage = Arc::new(MemoryStorage::new());
     let start_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     let clock = Arc::new(appendfs::clock::AdvancingClock::new(start_time));
-    let volume_key = VolumeKey::plaintext_arc();
 
     // 1. Initialize volume with clock
-    init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
-
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
     fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
     let fs_arc = Arc::new(fs);
 
@@ -2077,17 +1971,12 @@ fn test_per_remote_upload_partial_logs_behavior() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let nfs_mock = Arc::new(MockRemoteStore::new());
     let s3_raw = Arc::new(MockRemoteStore::new());
@@ -2365,19 +2254,13 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
 
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
     fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
 
     let raw_store = Arc::new(MockRemoteStore::new());
@@ -2529,19 +2412,13 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
 fn test_write_only_glacier_remote_replication_and_prune_safety() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let live_remote = Arc::new(MockRemoteStore::new());
     let glacier_remote = Arc::new(MockRemoteStore::new());
@@ -2633,18 +2510,12 @@ fn test_write_only_glacier_remote_replication_and_prune_safety() {
     // Create a standalone scenario where ONLY glacier has confirmed a sealed file.
     // Since glacier is write-only, prune_local_cache must NOT prune the local file!
     let isolated_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    init_volume(isolated_storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut iso_fs = appendfs::recover_fs(
-        isolated_storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let iso_writer =
-        Arc::new(LogWriter::create_lazy(isolated_storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    iso_fs.log_writer = Some(iso_writer.clone());
-    iso_fs.set_storage(isolated_storage.clone());
+    let TestFS { fs: iso_fs, .. } = TestFS::builder()
+        .storage(isolated_storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let iso_writer = iso_fs.log_writer.clone().unwrap();
 
     let iso_fs_arc = Arc::new(iso_fs);
     let iso_file_attr = create_core(&iso_fs_arc, 1, "important.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -2699,19 +2570,13 @@ fn test_write_only_glacier_remote_replication_and_prune_safety() {
 fn test_prune_rule_multi_tier_lifecycle_with_glacier() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let nfs_remote = Arc::new(MockRemoteStore::new());
     let glacier_remote = Arc::new(MockRemoteStore::new());
@@ -2799,19 +2664,13 @@ fn test_prune_rule_multi_tier_lifecycle_with_glacier() {
 fn test_shutdown_drain_syncs_latest_sealed_log_and_skips_earlier_backlog() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     // Gen 1:
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -2860,19 +2719,13 @@ fn test_shutdown_drain_syncs_latest_sealed_log_and_skips_earlier_backlog() {
 fn test_shutdown_drain_prunes_eligible_local_logs() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f1.ino, b"data 1", 0).unwrap();
@@ -2908,19 +2761,13 @@ fn test_shutdown_drain_prunes_eligible_local_logs() {
 fn test_shutdown_drain_replicates_only_missing_latest_sealed_log_and_summary() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     // Gen 1:
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -2961,19 +2808,13 @@ fn test_shutdown_drain_replicates_only_missing_latest_sealed_log_and_summary() {
 fn test_shutdown_drain_syncs_latest_summary_and_skips_earlier_summaries() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     // Gen 1:
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -3033,19 +2874,13 @@ fn test_shutdown_drain_syncs_latest_summary_and_skips_earlier_summaries() {
 fn test_worker_syncs_only_latest_summary_cross_copy() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
     fs.write_at(f1.ino, b"data 1", 0).unwrap();
@@ -3096,19 +2931,13 @@ fn test_worker_syncs_only_latest_summary_cross_copy() {
 fn test_replication_worker_active_round_interrupted_on_stop() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
-    let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     // Create 3 sealed logs
     for i in 1..=3 {
@@ -3171,21 +3000,14 @@ fn test_pre_synced_remote_reflects_up_to_date_status_without_lockstep_lag() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let mock_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     let clock = Arc::new(appendfs::clock::MockClock(mock_time));
-    let volume_key = VolumeKey::plaintext_arc();
-
-    init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
 
     // Create 5 sealed log generations (1..=5) and active generation 6
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let root = 1u64;
     for g in 1..=5 {
@@ -3359,21 +3181,14 @@ fn test_prioritized_replication_rw_and_low_lag_replicates_before_archive_backlog
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let mock_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     let clock = Arc::new(appendfs::clock::MockClock(mock_time));
-    let volume_key = VolumeKey::plaintext_arc();
-
-    init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
-    let mut fs = appendfs::recover_fs(
-        storage.clone(),
-        appendfs::RecoveryTarget::Latest,
-        clock.clone(),
-        volume_key.clone(),
-    )
-    .unwrap();
 
     // Create 4 sealed log generations (1..=4) and active generation 5
-    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
-    fs.log_writer = Some(writer.clone());
-    fs.set_storage(storage.clone());
+    let TestFS { mut fs, .. } = TestFS::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
 
     let root = 1u64;
     for g in 1..=4 {
