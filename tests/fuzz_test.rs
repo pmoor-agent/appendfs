@@ -4,7 +4,7 @@ use appendfs::log::{LogAttrDelta, LogDirectoryDelta, LogEntryDelta, LogFileDelta
 use appendfs::node::NodeKind;
 use appendfs::storage::{MemoryStorage, Storage};
 use appendfs::{LogWriter, RemoteStore};
-use appendfs::{SnapshotNode, TestFS};
+use appendfs::{SnapshotNode, TestFs};
 use common::TestRng;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,24 +23,24 @@ fn test_differential_fuzzing_and_crash_recovery() {
         // this makes atime/mtime/ctime comparisons across instances exact rather
         // than flaky, so they can be checked at every checkpoint alongside content.
         let clock = AdvancingClock::new(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
-        let fs_baseline = TestFS::builder().clock(Arc::new(clock.clone())).build();
-        let mut fs_micro = TestFS::builder()
+        let fs_baseline = TestFs::builder().clock(Arc::new(clock.clone())).build();
+        let mut fs_micro = TestFs::builder()
             .clock(Arc::new(clock.clone()))
             .max_log_size(256)
             .build();
-        let mut fs_remount = TestFS::builder().clock(Arc::new(clock.clone())).build();
+        let mut fs_remount = TestFs::builder().clock(Arc::new(clock.clone())).build();
         // The crash instance routes its log through a FaultStorage, so each checkpoint can
         // force a mid-flush I/O failure before crashing. Every durability bug found so far
         // (the permanent wedge, mid-batch torn records, the unbounded flush queue) lived in
         // that seam and was invisible to a fuzzer that only ever saw a healthy disk.
-        let mut fs_crash = TestFS::builder()
+        let mut fs_crash = TestFs::builder()
             .clock(Arc::new(clock.clone()))
             .fault_injection()
             .build();
         // The remote instance is backed by N=3 in-memory remotes with latency injection,
         // fault injection, aggressive local log pruning (local_retention = "0s"), and
         // spontaneous file deletion with single-survivor invariants.
-        let mut fs_remote = TestFS::builder()
+        let mut fs_remote = TestFs::builder()
             .clock(Arc::new(clock.clone()))
             .max_log_size(256)
             .remotes(3)
@@ -1392,7 +1392,7 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
 // already dropped. Needs a flush boundary before the truncate so the extent is in `base`.
 #[test]
 fn test_truncate_shrink_then_grow_within_one_batch_survives_crash_recovery() {
-    let fs = TestFS::builder().build();
+    let fs = TestFs::builder().build();
     let ino = fs.create(1, "f.bin", 0o644).unwrap();
     fs.write(ino, 0, &[0xAA; 6]).unwrap();
     fs.fs.quiesce().unwrap();
@@ -1423,7 +1423,7 @@ fn test_truncate_shrink_then_grow_within_one_batch_survives_crash_recovery() {
 // not reproduce that decrement, so live and the log disagree on nlink.
 #[test]
 fn test_rename_onto_own_hardlink_is_a_noop_and_survives_recovery() {
-    let fs = TestFS::builder().build();
+    let fs = TestFs::builder().build();
     let ino = fs.create(1, "f0", 0o644).unwrap();
     fs.write(ino, 0, b"payload").unwrap();
     fs.link(ino, 1, "f1").unwrap();
@@ -1432,7 +1432,7 @@ fn test_rename_onto_own_hardlink_is_a_noop_and_survives_recovery() {
 
     fs.rename(1, "f0", 1, "f1").unwrap();
 
-    let names = |f: &TestFS| -> Vec<String> { f.fs.list_directory(1).unwrap().into_iter().map(|(n, _)| n).collect() };
+    let names = |f: &TestFs| -> Vec<String> { f.fs.list_directory(1).unwrap().into_iter().map(|(n, _)| n).collect() };
     assert_eq!(names(&fs), vec!["f0", "f1"], "both hardlinks must survive");
     assert_eq!(
         fs.fs.get_attr(ino).unwrap().nlink,
@@ -1456,7 +1456,7 @@ fn test_rename_onto_own_hardlink_is_a_noop_and_survives_recovery() {
 // directory that means deleting it outright along with everything under it.
 #[test]
 fn test_rename_into_a_name_freed_by_another_rename_in_the_same_batch() {
-    let fs = TestFS::builder().build();
+    let fs = TestFs::builder().build();
     let a = fs.mkdir(1, "A", 0o755).unwrap();
     let b = fs.mkdir(1, "B", 0o755).unwrap();
     let f = fs.create(b, "payload.txt", 0o644).unwrap();
@@ -1485,7 +1485,7 @@ fn test_rename_into_a_name_freed_by_another_rename_in_the_same_batch() {
 // removal into a Rename, and replay then lands the entry twice.
 #[test]
 fn test_rename_away_and_back_within_one_batch_does_not_duplicate_the_entry() {
-    let fs = TestFS::builder().build();
+    let fs = TestFs::builder().build();
     let d = fs.mkdir(1, "d", 0o755).unwrap();
     let f = fs.create(d, "f", 0o644).unwrap();
     fs.fs.quiesce().unwrap();
@@ -1512,7 +1512,7 @@ fn test_truncate_shrink_then_grow_repro() {
     // then grow back past the shrink point without covering it with a new write -
     // POSIX requires that newly-exposed region to read as zeros (a hole), not
     // whatever was physically there before the shrink.
-    let fs = TestFS::builder().build();
+    let fs = TestFs::builder().build();
     let ino = fs.create(1, "f.txt", 0o644).unwrap();
 
     let full: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
@@ -1536,7 +1536,7 @@ fn test_partial_overwrite_read_repro() {
     // Isolates write-overlap handling from truncate entirely: write 100 bytes, then
     // overwrite just the first 2, then verify the untouched tail [2,100) still reads
     // back as the original content.
-    let fs = TestFS::builder().build();
+    let fs = TestFs::builder().build();
     let ino = fs.create(1, "f.txt", 0o644).unwrap();
 
     let full: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
@@ -1558,7 +1558,7 @@ fn test_partial_read_does_not_corrupt_subsequent_reads() {
     // if it internally clones+trims via a value type whose clone() shares mutable
     // state (SharedExtentState), a PARTIAL read can permanently corrupt the stored
     // extent as a side effect - subsequent, unrelated reads would then see wrong data.
-    let fs = TestFS::builder().build();
+    let fs = TestFs::builder().build();
     let ino = fs.create(1, "f.txt", 0o644).unwrap();
 
     let full: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
@@ -1587,7 +1587,7 @@ fn test_setattr_times_survive_crash_recovery() {
     let fixed_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_100);
     let clock: Arc<dyn Clock> = Arc::new(MockClock(fixed_atime));
 
-    let fs = TestFS::builder().clock(clock).build();
+    let fs = TestFs::builder().clock(clock).build();
     let ino = fs.create(1, "f.txt", 0o644).unwrap();
     fs.setattr(ino, None, None, None, None, Some(fixed_atime), Some(fixed_mtime))
         .unwrap();
@@ -1606,7 +1606,7 @@ fn test_write_mtime_survives_crash_recovery() {
     // not the create time or the setattr's op_time.
     let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     let clock = AdvancingClock::new(start);
-    let fs = TestFS::builder().clock(Arc::new(clock.clone())).build();
+    let fs = TestFs::builder().clock(Arc::new(clock.clone())).build();
 
     let ino = fs.create(1, "f.txt", 0o644).unwrap(); // t=1_700_000_000
     clock.advance(Duration::from_secs(10));
@@ -1635,7 +1635,7 @@ fn test_setattr_size_change_updates_mtime_and_survives_crash_recovery() {
     // stale mtime from whenever it was created/last written, not from the truncate.
     let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     let clock = AdvancingClock::new(start);
-    let fs = TestFS::builder().clock(Arc::new(clock.clone())).build();
+    let fs = TestFs::builder().clock(Arc::new(clock.clone())).build();
 
     let ino = fs.create(1, "f.txt", 0o644).unwrap(); // t=1_700_000_000
     clock.advance(Duration::from_secs(10));
@@ -1688,7 +1688,7 @@ fn test_summary_export_is_deterministic() {
         let mut prng = TestRng::new(seed);
         let start = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let clock = AdvancingClock::new(start);
-        let mut fs = TestFS::builder().clock(Arc::new(clock.clone())).build();
+        let mut fs = TestFs::builder().clock(Arc::new(clock.clone())).build();
         fs.fs.track_atime = false;
 
         let mut entries: Vec<TrackedEntry> = Vec::new();
@@ -1810,7 +1810,7 @@ fn test_summary_export_is_deterministic() {
             }
         }
 
-        // Export a summary from the live instance - InMemoryFS::export_summary flushes
+        // Export a summary from the live instance - AppendFs::export_summary flushes
         // first, so every extent is guaranteed Disk-backed (SharedExtentState refuses to
         // serialize a still-Staged one) before either summary below gets written.
         let _generation = fs.fs.log_writer.as_ref().unwrap().generation();
@@ -1874,7 +1874,7 @@ fn test_summary_export_is_deterministic() {
 
 #[test]
 fn test_read_all_streaming_regular_large_and_virtual() {
-    let fs = TestFS::builder().build();
+    let fs = TestFs::builder().build();
 
     // 1. Empty file
     let empty_ino = fs.create(1, "empty.txt", 0o644).unwrap();

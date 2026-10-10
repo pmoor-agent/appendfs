@@ -1,5 +1,5 @@
 use crate::crypto::LogFileKey;
-use crate::fs::InMemoryFS;
+use crate::fs::AppendFs;
 use crate::log::LogFileCache;
 use crate::log::extent::ExtentState;
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader};
@@ -625,7 +625,7 @@ fn verify_raw_record(
 /// automatically expand the required fetch set to include the full span of blocks needed for complete decryption,
 /// and all live extents completely covered by the resulting block set are verified.
 #[allow(clippy::too_many_lines)]
-pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> VerificationPlan {
+pub fn plan_sampled_verification(fs: &AppendFs, options: &CheckOptions) -> VerificationPlan {
     let base_map = fs.inner.lock(OpTag::Stats).unwrap().base.clone();
     let manifest = fs.manifest.read().unwrap();
     const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
@@ -908,7 +908,7 @@ pub fn plan_sampled_verification(fs: &InMemoryFS, options: &CheckOptions) -> Ver
 /// `progress`, if given, is called as data is read with `(bytes_read, bytes_total)`.
 #[allow(clippy::too_many_lines)]
 pub fn execute_sampled_verification(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     plan: &VerificationPlan,
     log_dir: Option<&Path>,
     report: &mut IntegrityReport,
@@ -1286,11 +1286,11 @@ pub fn execute_sampled_verification(
     report.seed = Some(plan.seed);
 }
 
-/// Runs a read-only filesystem integrity check on the provided `InMemoryFS`.
+/// Runs a read-only filesystem integrity check on the provided `AppendFs`.
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
 pub fn check_fs_integrity(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     log_dir: Option<&Path>,
     options: &CheckOptions,
     plan: Option<&VerificationPlan>,
@@ -2026,13 +2026,13 @@ mod tests {
     use crate::log::LogWriter;
     use crate::node::{InodeMeta, Node, NodeKind};
     use crate::test_utils::FsTestExt;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
     use std::sync::Arc;
 
     #[test]
     fn test_clean_filesystem_integrity_passes() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         // Create dir, file, symlink, hardlink
         let d = crate::operations::dir::mkdir_core(&fs, 1, "mydir", 0o755, 1000, 1000).unwrap();
@@ -2068,7 +2068,7 @@ mod tests {
     #[test]
     fn test_local_data_verification_reports_progress() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         for i in 0..3 {
             let f =
@@ -2132,7 +2132,7 @@ mod tests {
     #[test]
     fn test_nlink_mismatch_detection() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let mut fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
         fs.set_storage(storage);
 
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -2202,7 +2202,7 @@ mod tests {
     #[test]
     fn test_extent_past_manifest_eof_zero_io_detection() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.write_at(f.ino, b"small payload", 0).unwrap();
@@ -2244,7 +2244,7 @@ mod tests {
     #[test]
     fn test_extent_invalid_record_size_detection() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let mut fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
         fs.set_storage(storage);
 
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -2286,7 +2286,7 @@ mod tests {
     #[test]
     fn test_extent_zero_record_size_does_not_panic() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let mut fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
         fs.set_storage(storage);
 
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -2415,7 +2415,7 @@ mod tests {
     #[test]
     fn test_corrupt_log_record_checksum_detected() {
         let storage = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         let f = crate::operations::read_write::create_core(&fs, 1, "data.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.write_at(f.ino, b"original clean payload bytes", 0).unwrap();
@@ -2496,7 +2496,7 @@ mod tests {
     #[test]
     fn test_sampled_verification_fractional_percentage() {
         let storage = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         // Create 8 files of ~300 KiB each so data spans across ~3 distinct 1 MiB blocks
         for i in 0..8 {
@@ -2524,7 +2524,7 @@ mod tests {
     #[test]
     fn test_all_extents_in_fetched_block_are_verified() {
         let storage = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         // In Block 0, create 4 small files (~10 KiB each)
         for i in 0..4 {
@@ -2620,7 +2620,7 @@ mod tests {
         use crate::remote::{RemoteMode, RemoteRegistry, RemoteStore, RemoteTargetConfig};
 
         let storage = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         let f = crate::operations::read_write::create_core(&fs, 1, "cloud_file.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.write_at(f.ino, b"cloud data content verification", 0).unwrap();
@@ -2717,7 +2717,7 @@ mod tests {
         use crate::remote::{RemoteRegistry, RemoteTargetConfig};
 
         let storage = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         // 100 files of 300 KB each: ~29 blocks, with records straddling most block boundaries.
         for i in 0..100 {
@@ -2807,7 +2807,7 @@ mod tests {
     #[test]
     fn test_sampled_verification_random_seed_coverage_accumulation() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         // Create 20 files of 1 MiB each across 20 distinct blocks
         let chunk = vec![0x42u8; 1024 * 1024];
@@ -2843,7 +2843,7 @@ mod tests {
         use crate::remote::{RemoteMode, RemoteRegistry, RemoteTargetConfig};
 
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.write_at(file.ino, b"hello world data", 0).unwrap();
@@ -2937,7 +2937,7 @@ mod tests {
         let local_remote = Arc::new(LocalDirRemoteStore::new(temp_dir.path()));
 
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.write_at(file.ino, b"crucial data that must not rot", 0).unwrap();

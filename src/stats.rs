@@ -1,6 +1,6 @@
 use crate::clock::format_duration;
 use crate::extent_map::Extent;
-use crate::fs::{InMemoryFS, InodeCounts};
+use crate::fs::{AppendFs, InodeCounts};
 use crate::log::LogManifest;
 use crate::log::manifest::GenerationLiveStats;
 use crate::node::{Node, NodeKind};
@@ -387,7 +387,7 @@ impl VolumeStats {
     }
 
     /// Collects volume statistics from an in-memory filesystem state.
-    pub fn collect(fs: &InMemoryFS) -> Self {
+    pub fn collect(fs: &AppendFs) -> Self {
         let snapshot = fs.snapshot_all();
         let manifest = fs.manifest.read().unwrap();
         let counts = InodeCounts::from_nodes(snapshot.values().map(|a| a.as_ref()));
@@ -727,7 +727,7 @@ pub fn format_latency(d: std::time::Duration) -> String {
 /// Formats a complete human-readable report of runtime filesystem statistics and health.
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
-pub fn format_runtime_status(fs: &InMemoryFS) -> String {
+pub fn format_runtime_status(fs: &AppendFs) -> String {
     use std::sync::atomic::Ordering;
 
     let snap = fs.stats_snapshot();
@@ -1117,12 +1117,12 @@ mod tests {
     use super::*;
     use crate::sync::OpTag;
     use crate::test_utils::FsTestExt;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
     use std::sync::Arc;
 
     #[test]
     fn test_volume_stats_formatting() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let stats = VolumeStats::collect(&fs);
         assert_eq!(stats.total_inodes, 1);
         assert_eq!(stats.directory_count, 1);
@@ -1140,7 +1140,7 @@ mod tests {
         use crate::node::{InodeMeta, Node, NodeKind};
         use std::time::SystemTime;
 
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let now = SystemTime::UNIX_EPOCH;
 
         let mut extent_map = ExtentMap::new();
@@ -1298,7 +1298,7 @@ mod tests {
 
     #[test]
     fn test_format_runtime_status_fresh_fs() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let status = format_runtime_status(&fs);
 
         assert!(status.contains("=== appendfs Runtime Status ==="));
@@ -1353,7 +1353,7 @@ mod tests {
     #[test]
     fn test_format_runtime_status_with_active_writer() {
         let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::SystemClock);
-        let fs = TestFS::builder().clock(clock.clone()).build().fs;
+        let fs = TestFs::builder().clock(clock.clone()).build().fs;
         fs.log_writer
             .as_ref()
             .unwrap()
@@ -1366,7 +1366,7 @@ mod tests {
 
     #[test]
     fn test_format_runtime_status_with_lazy_writer() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let status = format_runtime_status(&fs);
         assert!(status.contains("Active Generation:  None (lazy / unopened)"));
         assert!(status.contains("Next Generation:    1 (000001.log)"));
@@ -1389,7 +1389,7 @@ mod tests {
         use std::sync::Arc;
 
         let storage = Arc::new(MemoryStorage::new());
-        let mut fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         // Attach LogFileCache with MemoryBlockCache
         let block_cache = Arc::new(MemoryBlockCache::new(10 * 1024 * 1024));
@@ -1462,7 +1462,7 @@ mod tests {
 
     #[test]
     fn test_format_runtime_status_single_lock_acquisition() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let before_stats_count = fs
             .inner
             .op_stats()
@@ -1494,7 +1494,7 @@ mod tests {
         use crate::operations::links::{symlink_core, unlink_core};
         use crate::operations::read_write::create_core;
 
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         // Base state: 1 root directory
         let counts = fs.inode_counts();
         assert_eq!(counts.total_active(), 1);
@@ -1564,7 +1564,7 @@ mod tests {
     fn test_format_runtime_status_many_inodes_performance() {
         use crate::operations::read_write::create_core;
 
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         for i in 0..1_000 {
             let name = format!("file_{}.dat", i);
             create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
@@ -1598,7 +1598,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
 
-        let fs = Arc::new(TestFS::builder().build().fs);
+        let fs = Arc::new(TestFs::builder().build().fs);
         let stop = Arc::new(AtomicBool::new(false));
         let fs_writer = Arc::clone(&fs);
         let stop_writer = Arc::clone(&stop);
@@ -1918,7 +1918,7 @@ mod tests {
 
         let start_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let clock = Arc::new(AdvancingClock::new(start_time));
-        let fs = TestFS::builder().clock(clock.clone()).build().fs;
+        let fs = TestFs::builder().clock(clock.clone()).build().fs;
         fs.set_recovered_time(Some(clock.now()));
 
         // Flush a batch

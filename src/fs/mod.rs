@@ -1,6 +1,6 @@
 //! In-memory filesystem state and the LSM delta overlay.
 //!
-//! The overlay is layered `base` <- `flushing` <- `live`; see [`InMemoryFS`] for how the
+//! The overlay is layered `base` <- `flushing` <- `live`; see [`AppendFs`] for how the
 //! three relate. This module holds the shared types and the struct itself, with the
 //! behavior split across focused submodules:
 //!
@@ -58,7 +58,7 @@ pub enum ShutdownState {
     #[default]
     Running,
     /// Mutating operations are rejected (`EROFS`); reads still proceed. Set at the start of
-    /// `InMemoryFS::destroy()`, before `live`/`flushing` are drained.
+    /// `AppendFs::destroy()`, before `live`/`flushing` are drained.
     ReadOnly,
     /// Every operation, including reads, is rejected (`EIO`). Set once `live`/`flushing` have
     /// been fully drained and exported, immediately before the flusher thread is stopped.
@@ -440,7 +440,7 @@ pub struct FlushBatch {
     pub commit_timestamp: SystemTime,
 }
 
-/// Consolidated mutable filesystem state protected by `InMemoryFS::inner`.
+/// Consolidated mutable filesystem state protected by `AppendFs::inner`.
 pub struct FsInner {
     /// Resting consolidated state loaded from `.summary` at mount, folded forward over generations.
     pub base: HashMap<u64, Arc<Node>>,
@@ -712,7 +712,7 @@ impl FsInner {
     }
 }
 
-/// An RAII guard for the consolidated filesystem state returned by [`InMemoryFS::lock_inner`].
+/// An RAII guard for the consolidated filesystem state returned by [`AppendFs::lock_inner`].
 ///
 /// Tracks whether mutations occurred during the guard's lifetime. When dropped, if a mutation
 /// occurred and staged thresholds (`max_buffer_size` or `max_staged_ops`) were reached, attempts
@@ -720,7 +720,7 @@ impl FsInner {
 /// flusher until after the mutex is unlocked.
 pub struct FsInnerGuard<'a> {
     guard: ActionGuard<'a, FsInner>,
-    fs: &'a InMemoryFS,
+    fs: &'a AppendFs,
     mutation_occurred: bool,
 }
 
@@ -790,7 +790,7 @@ impl<'a> Drop for FsInnerGuard<'a> {
     }
 }
 
-pub struct InMemoryFS {
+pub struct AppendFs {
     /// Consolidated critical section protecting all in-memory metadata, layer overlay,
     /// file/dir handles, open counts, write arena buffers, and lock manager state.
     pub inner: ActionMutex<FsInner>,
@@ -873,7 +873,7 @@ pub struct InMemoryFS {
     pub deterministic_summary_iv: Option<[u8; 12]>,
 }
 
-impl InMemoryFS {
+impl AppendFs {
     pub fn with_clock_and_uids(clock: Arc<dyn Clock>, uid: u32, gid: u32) -> Self {
         let fs = Self::with_clock(clock.clone());
         let now = clock.now();
@@ -885,7 +885,7 @@ impl InMemoryFS {
 
     /// An empty plaintext volume - just the root directory, owned by the current user - with
     /// no storage and no log writer. Only the constructors below build on it; a usable
-    /// filesystem comes from `recover_fs` (or, in tests, `TestFS::builder()`).
+    /// filesystem comes from `recover_fs` (or, in tests, `TestFs::builder()`).
     fn with_clock(clock: Arc<dyn Clock>) -> Self {
         let mut map = HashMap::new();
         let (uid, gid) = crate::shim::current_uid_gid();
@@ -1329,7 +1329,7 @@ impl InMemoryFS {
     }
 }
 
-impl Drop for InMemoryFS {
+impl Drop for AppendFs {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             // `destroy()` already drains `live`/`flushing` and exports the final summary as
@@ -1341,7 +1341,7 @@ impl Drop for InMemoryFS {
     }
 }
 
-pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
+pub fn find_parent_inode(fs: &AppendFs, child_ino: u64) -> Option<u64> {
     fs.get_parent_dir_inode(child_ino)
 }
 
@@ -1349,7 +1349,7 @@ pub fn find_parent_inode(fs: &InMemoryFS, child_ino: u64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::test_utils::FsTestExt;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_flush_reason_display_honors_width() {
@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn test_fs_inner_guard_mutation_tracking() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         {
             let guard = fs.lock_inner_for_tests();
             assert!(!guard.mutation_occurred());
@@ -1389,7 +1389,7 @@ mod tests {
 
     #[test]
     fn test_fs_inner_guard_drop_auto_freeze_on_threshold() {
-        let mut fs = TestFS::builder().build().fs;
+        let mut fs = TestFs::builder().build().fs;
         fs.max_buffer_size = 50;
         fs.max_staged_ops = 5;
         // Pose as a mounted filesystem, so nothing drains the queue behind our backs.
@@ -1423,7 +1423,7 @@ mod tests {
             1_700_000_000,
             0,
         )));
-        let fs = TestFS::builder().clock(clock.clone()).build().fs;
+        let fs = TestFs::builder().clock(clock.clone()).build().fs;
         assert!(!fs.track_atime, "track_atime should default to false");
 
         let file = crate::operations::read_write::create_core(&fs, 1, "atime_test.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -1445,7 +1445,7 @@ mod tests {
         );
 
         // Now test with track_atime = true
-        let mut fs_with_atime = TestFS::builder().clock(clock.clone()).build().fs;
+        let mut fs_with_atime = TestFs::builder().clock(clock.clone()).build().fs;
         fs_with_atime.track_atime = true;
         let file2 =
             crate::operations::read_write::create_core(&fs_with_atime, 1, "atime2.txt", 0o644, 0, 1000, 1000).unwrap();

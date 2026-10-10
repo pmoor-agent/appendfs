@@ -1,6 +1,6 @@
 //! Tests for FUSE operation categorization, latency tracking, and operational telemetry.
 
-use appendfs::TestFS;
+use appendfs::TestFs;
 use appendfs::clock::{AdvancingClock, MockClock};
 use appendfs::operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics, OpTier};
 use appendfs::shim::{DeferredResult, DeferredToken, FuseResponse, Request};
@@ -97,7 +97,7 @@ fn test_fuse_op_metrics_latency_and_aggregation() {
 #[test]
 fn test_dispatch_reply_synchronous_latency() {
     let clock = Arc::new(AdvancingClock::new(mock_time()));
-    let fs = TestFS::builder().clock(clock.clone()).build().fs;
+    let fs = TestFs::builder().clock(clock.clone()).build().fs;
 
     let req = Request::new_mock();
     let start = fs.clock.monotonic();
@@ -114,7 +114,7 @@ fn test_dispatch_reply_synchronous_latency() {
 #[test]
 fn test_dispatch_reply_deferred_latency() {
     let clock = Arc::new(AdvancingClock::new(mock_time()));
-    let fs = TestFS::builder().clock(clock.clone()).build().fs;
+    let fs = TestFs::builder().clock(clock.clone()).build().fs;
 
     let req = Request::new_mock();
     let (token, receiver) = DeferredToken::new();
@@ -144,7 +144,7 @@ fn test_dispatch_reply_deferred_latency() {
 #[test]
 fn test_runtime_status_fuse_operations_formatting() {
     let clock = Arc::new(MockClock(mock_time()));
-    let fs = TestFS::builder().clock(clock).build().fs;
+    let fs = TestFs::builder().clock(clock).build().fs;
 
     // Fresh FS has no op calls -> no [FUSE Operations] table
     let fresh_status = format_runtime_status(&fs);
@@ -168,7 +168,7 @@ fn test_runtime_status_fuse_operations_formatting() {
 #[test]
 fn test_runtime_status_fuse_operations_throttled_formatting() {
     let clock = Arc::new(AdvancingClock::new(mock_time()));
-    let fs = TestFS::builder().clock(clock.clone()).build().fs;
+    let fs = TestFs::builder().clock(clock.clone()).build().fs;
 
     // Record an unthrottled lookup
     let req1 = Request::new_mock();

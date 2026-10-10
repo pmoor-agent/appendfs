@@ -1,10 +1,10 @@
 //! Staging mutations into `live`, and resolving reads across the whole overlay.
 //!
 //! Mutations only ever touch `live`; the lower layers are immutable until a flush folds
-//! into them. Reads go through [`InMemoryFS::with_layer_stack`], which takes all three
+//! into them. Reads go through [`AppendFs::with_layer_stack`], which takes all three
 //! layer locks in a safe order - see [`super::layers`] for why the order matters.
 
-use super::{FlushBatch, FsInner, InMemoryFS, InodeLayerStack, is_virtual_ino};
+use super::{AppendFs, FlushBatch, FsInner, InodeLayerStack, is_virtual_ino};
 // Only the test-only by-inode read helpers at the bottom of this file return these.
 #[cfg(any(test, feature = "testing"))]
 use super::{ReadPlan, execute_read_plan};
@@ -460,7 +460,7 @@ pub struct InnerStatsSnapshot {
     pub range_lock_count: usize,
 }
 
-impl InMemoryFS {
+impl AppendFs {
     /// Takes a point-in-time snapshot of internal filesystem metrics using a single mutex lock.
     pub fn stats_snapshot(&self) -> InnerStatsSnapshot {
         self.inner.lock(OpTag::Stats).unwrap().stats_snapshot()
@@ -529,7 +529,7 @@ impl InMemoryFS {
     /// Plans a read by inode alone, without an open handle.
     ///
     /// Test-only. Real reads arrive with a file handle and go through
-    /// [`InMemoryFS::plan_read_handle`], which additionally validates the handle and serves
+    /// [`AppendFs::plan_read_handle`], which additionally validates the handle and serves
     /// virtual files; this exists so tests can read an inode without opening it first.
     #[cfg(any(test, feature = "testing"))]
     pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, FsError> {
@@ -556,7 +556,7 @@ impl InMemoryFS {
     }
 
     /// Reads file contents by inode alone, without an open handle. Test-only; see
-    /// [`InMemoryFS::plan_read_file_data`].
+    /// [`AppendFs::plan_read_file_data`].
     #[cfg(any(test, feature = "testing"))]
     pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, FsError> {
         let plan = self.plan_read_file_data(ino, offset, size)?;
@@ -573,13 +573,13 @@ mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
     use crate::storage::Storage;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_exists_below_live_sees_a_tombstone_frozen_out_of_live() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(clock.clone()).build().fs;
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.quiesce().unwrap();
@@ -606,7 +606,7 @@ mod tests {
     fn test_attr_update_does_not_resurrect_a_tombstoned_inode() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(clock.clone()).build().fs;
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         // Fold it into `base`, so the lower layers still describe the inode after deletion.
@@ -640,7 +640,7 @@ mod tests {
     fn test_normalize_directory_deltas_touch_and_rm_same_batch() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().storage(storage).clock(clock).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(clock).build().fs;
 
         // Create and immediately unlink in the same batch
         let _attr = crate::operations::read_write::create_core(&fs, 1, "temp.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -683,7 +683,7 @@ mod tests {
     fn test_normalize_directory_deltas_self_canceling_rename() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().storage(storage).clock(clock).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(clock).build().fs;
 
         // Create file.txt and fold into base
         let attr = crate::operations::read_write::create_core(&fs, 1, "file.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -733,7 +733,7 @@ mod tests {
     fn test_normalize_directory_deltas_chained_rename() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().storage(storage).clock(clock).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(clock).build().fs;
 
         // Create a.txt and fold into base
         let attr = crate::operations::read_write::create_core(&fs, 1, "a.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -771,7 +771,7 @@ mod tests {
     fn test_normalize_directory_deltas_across_flushing_batches() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().storage(storage).clock(clock).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(clock).build().fs;
 
         // Batch 1: create file1.txt and flush (which folds into base)
         let _attr = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -801,7 +801,7 @@ mod tests {
     fn test_normalize_directory_deltas_across_multiple_unflushed_batches() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder().storage(storage).clock(clock).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(clock).build().fs;
 
         // Initial setup in base: base has root (ino 1) containing "existing.txt"
         let existing_attr =

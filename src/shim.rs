@@ -254,8 +254,8 @@ impl Request {
     }
 
     #[inline]
-    pub(crate) fn fs(&self) -> &crate::fs::InMemoryFS {
-        unsafe { &*(self.userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) }
+    pub(crate) fn fs(&self) -> &crate::fs::AppendFs {
+        unsafe { &*(self.userdata as *const std::sync::Arc<crate::fs::AppendFs>) }
     }
 
     pub(crate) fn reply_err(self, err: FsError) {
@@ -1114,7 +1114,7 @@ fn c_str_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
     unsafe { CStr::from_ptr(ptr) }.to_str().ok()
 }
 
-fn handle_op<R>(req: Request, op: FuseOp, f: impl FnOnce(&crate::fs::InMemoryFS) -> R)
+fn handle_op<R>(req: Request, op: FuseOp, f: impl FnOnce(&crate::fs::AppendFs) -> R)
 where
     R: Into<DeferredResult<FuseResponse<'static>>>,
 {
@@ -1336,7 +1336,7 @@ extern "C" fn removexattr_bridge(req: Request, ino: u64, name: *const c_char) {
 
 /// Returns 0, or the errno that `run_fuse_ll` should fail the mount with.
 extern "C" fn init_bridge(userdata: *mut c_void) -> c_int {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::AppendFs>) };
     match fs.init() {
         Ok(()) => 0,
         Err(e) => {
@@ -1347,19 +1347,19 @@ extern "C" fn init_bridge(userdata: *mut c_void) -> c_int {
 }
 
 extern "C" fn destroy_bridge(userdata: *mut c_void) {
-    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::AppendFs>) };
     fs.destroy();
 }
 
-pub fn mount(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), FsError> {
+pub fn mount(args: Vec<String>, fs: crate::fs::AppendFs) -> Result<(), FsError> {
     mount_arc(args, std::sync::Arc::new(fs))
 }
 
-pub fn mount_ro(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), FsError> {
+pub fn mount_ro(args: Vec<String>, fs: crate::fs::AppendFs) -> Result<(), FsError> {
     mount_ro_arc(args, std::sync::Arc::new(fs))
 }
 
-pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), FsError> {
+pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::AppendFs>) -> Result<(), FsError> {
     fs.set_read_only();
     // Injects kernel-level read-only mount option
     args.push("-o".to_string());
@@ -1367,7 +1367,7 @@ pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemor
     mount_arc(args, fs)
 }
 
-pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), FsError> {
+pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::AppendFs>) -> Result<(), FsError> {
     let c_args_owners: Vec<CString> = args.into_iter().map(|arg| CString::new(arg).unwrap()).collect();
 
     let c_args: Vec<*const c_char> = c_args_owners.iter().map(|arg| arg.as_ptr()).collect();
@@ -1417,9 +1417,7 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
     // `run_fuse_ll` before it returns here - so there's nothing left to flush, just this
     // `Box` to drop.
     unsafe {
-        drop(Box::from_raw(
-            raw_userdata as *mut std::sync::Arc<crate::fs::InMemoryFS>,
-        ));
+        drop(Box::from_raw(raw_userdata as *mut std::sync::Arc<crate::fs::AppendFs>));
     }
 
     if code == 0 { Ok(()) } else { Err(FsError(code)) }

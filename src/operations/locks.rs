@@ -1,5 +1,5 @@
 use crate::error::FsError;
-use crate::fs::{FsInner, FsInnerGuard, InMemoryFS};
+use crate::fs::{AppendFs, FsInner, FsInnerGuard};
 use crate::shim::{DeferredResult, DeferredToken, FuseResponse, ShimFlock};
 use crate::sync::OpTag;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -431,12 +431,12 @@ impl LockManager {
     }
 }
 
-pub fn wake_flock_waiters(fs: &InMemoryFS, ino: u64) {
+pub fn wake_flock_waiters(fs: &AppendFs, ino: u64) {
     fs.with_inner(OpTag::Lock, |inner| LockManager::wake_flock_waiters(inner, ino));
 }
 
 pub fn flock_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     fh: u64,
     lock_owner: u64,
@@ -495,7 +495,7 @@ pub fn flock_response(
 }
 
 pub fn getlk_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     fh: u64,
     lock_owner: u64,
@@ -560,14 +560,14 @@ pub(crate) fn grant_range_lock(
     *ranges = new_ranges;
 }
 
-pub fn wake_range_lock_waiters(fs: &InMemoryFS, ino: u64) {
+pub fn wake_range_lock_waiters(fs: &AppendFs, ino: u64) {
     fs.with_inner(OpTag::Lock, |inner| LockManager::wake_range_lock_waiters(inner, ino));
 }
 
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
 pub fn setlk_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     fh: u64,
     lock_owner: u64,
@@ -656,7 +656,7 @@ pub fn setlk_response(
     DeferredResult::deferred(rx)
 }
 
-pub fn flock_core(fs: &InMemoryFS, ino: u64, fh: u64, _lock_owner: u64, op: i32) -> Result<(), FsError> {
+pub fn flock_core(fs: &AppendFs, ino: u64, fh: u64, _lock_owner: u64, op: i32) -> Result<(), FsError> {
     let base_op = op & !libc::LOCK_NB;
 
     if base_op != libc::LOCK_UN && base_op != libc::LOCK_SH && base_op != libc::LOCK_EX {
@@ -732,7 +732,7 @@ fn coalesce_ranges(ranges: &mut Vec<RangeLock>) {
     *ranges = merged;
 }
 
-pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<ShimFlock, FsError> {
+pub fn getlk_core(fs: &AppendFs, ino: u64, fh: u64, lock_owner: u64, lock: ShimFlock) -> Result<ShimFlock, FsError> {
     let inner = fs.inner.lock(OpTag::Lock).unwrap();
     inner.check_shutdown(false)?;
     inner.validate_file_handle(ino, fh)?;
@@ -773,7 +773,7 @@ pub fn getlk_core(fs: &InMemoryFS, ino: u64, fh: u64, lock_owner: u64, lock: Shi
 }
 
 pub fn setlk_core(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     fh: u64,
     lock_owner: u64,
@@ -807,11 +807,11 @@ pub fn setlk_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_flock_shared_concurrent_and_exclusive_exclusion() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
 
@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_posix_range_locking_and_conflicts() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         let ino = attr.ino;
 

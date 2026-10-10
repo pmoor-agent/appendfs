@@ -10,7 +10,7 @@
 //! on the thread that asked for it. Both modes go through the same `wake` / `quiesce` calls,
 //! so no caller has to know which one it is talking to.
 
-use super::{FLUSH_HISTORY_CAPACITY, FlushReason, FlushRecord, FlushStats, InMemoryFS};
+use super::{AppendFs, FLUSH_HISTORY_CAPACITY, FlushReason, FlushRecord, FlushStats};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -45,7 +45,7 @@ struct Wakeup {
     stop: bool,
 }
 
-/// Thread management and cycle serialization for [`InMemoryFS`] flushing.
+/// Thread management and cycle serialization for [`AppendFs`] flushing.
 pub(crate) struct Flusher {
     wakeup: Arc<(Mutex<Wakeup>, Condvar)>,
     /// `Some` once a background thread is running.
@@ -93,8 +93,8 @@ impl Flusher {
     /// `interval` is set, after that long without one. Idempotent.
     ///
     /// The thread holds only a `Weak` reference: an `Arc` here would form a cycle through
-    /// `InMemoryFS::flusher` and keep the filesystem alive forever.
-    pub(crate) fn start(&self, fs: &Arc<InMemoryFS>, interval: Option<Duration>) {
+    /// `AppendFs::flusher` and keep the filesystem alive forever.
+    pub(crate) fn start(&self, fs: &Arc<AppendFs>, interval: Option<Duration>) {
         let mut thread = self.thread.lock().unwrap();
         if thread.is_some() {
             return;
@@ -215,7 +215,7 @@ impl Drop for Flusher {
     }
 }
 
-impl InMemoryFS {
+impl AppendFs {
     /// Evaluates whether staged mutations are due for a periodic flush, executes a cycle
     /// if due or if batches are queued, and returns the duration until the next check.
     pub(crate) fn run_flusher_step(&self, interval: Option<Duration>) -> Option<Duration> {
@@ -255,7 +255,7 @@ impl InMemoryFS {
     }
 }
 
-fn run_background(weak: &Weak<InMemoryFS>, wakeup: &Arc<(Mutex<Wakeup>, Condvar)>, interval: Option<Duration>) {
+fn run_background(weak: &Weak<AppendFs>, wakeup: &Arc<(Mutex<Wakeup>, Condvar)>, interval: Option<Duration>) {
     let (lock, cvar) = &**wakeup;
     let mut delay = interval;
     loop {
@@ -289,17 +289,17 @@ fn run_background(weak: &Weak<InMemoryFS>, wakeup: &Arc<(Mutex<Wakeup>, Condvar)
 mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
-    use crate::fs::InMemoryFS;
+    use crate::fs::AppendFs;
     use crate::operations::read_write::create_core;
     use crate::storage::Storage;
     use crate::test_utils::FsTestExt;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
-    fn test_fs() -> Arc<InMemoryFS> {
-        Arc::new(TestFS::builder().build().fs)
+    fn test_fs() -> Arc<AppendFs> {
+        Arc::new(TestFs::builder().build().fs)
     }
 
-    fn stage_a_write(fs: &InMemoryFS, name: &str) {
+    fn stage_a_write(fs: &AppendFs, name: &str) {
         let file = create_core(fs, 1, name, 0o644, 0, 1000, 1000).unwrap();
         fs.write_at(file.ino, b"payload", 0).unwrap();
     }
@@ -347,7 +347,7 @@ mod tests {
         let clock = Arc::new(crate::clock::AdvancingClock::new(
             std::time::UNIX_EPOCH + Duration::from_secs(1_000_000),
         ));
-        let fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(clock.clone()).build().fs;
 
         let interval = Duration::from_millis(200);
 
@@ -403,7 +403,7 @@ mod tests {
     fn test_idle_cycle_rolls_the_generation_once_it_ages_out() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = crate::clock::AdvancingClock::new(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
-        let mut fs = TestFS::builder()
+        let mut fs = TestFs::builder()
             .storage(storage.clone())
             .clock(Arc::new(clock.clone()))
             .build()
@@ -541,7 +541,7 @@ mod tests {
         let fixed = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let clock = crate::clock::MockClock(fixed);
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage).clock(Arc::new(clock)).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(Arc::new(clock)).build().fs;
 
         stage_a_write(&fs, "timed.bin");
         fs.quiesce().unwrap();
@@ -574,7 +574,7 @@ mod tests {
             std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         ));
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage).clock(clock.clone()).build().fs;
 
         stage_a_write(&fs, "queued.bin");
         assert!(fs.freeze_now());
@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn test_flush_record_disk_bytes_matches_storage_size() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
-        let fs = TestFS::builder().storage(storage.clone()).build().fs;
+        let fs = TestFs::builder().storage(storage.clone()).build().fs;
 
         stage_a_write(&fs, "disk_test.bin");
         fs.quiesce().unwrap();
@@ -774,7 +774,7 @@ mod tests {
     fn test_coalesce_flush_records_breakdown_serialize_wait_flush_fold() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let mut fs = TestFS::builder().storage(storage).clock(clock.clone()).build().fs;
+        let mut fs = TestFs::builder().storage(storage).clock(clock.clone()).build().fs;
         fs.max_coalesce_batches = 3;
 
         // Stage batch 1

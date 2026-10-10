@@ -44,8 +44,8 @@ struct OpenVolumeStorage {
     volume_key: Arc<VolumeKey>,
 }
 
-struct OpenVolumeFS {
-    fs: appendfs::InMemoryFS,
+struct OpenVolumeFs {
+    fs: appendfs::AppendFs,
     storage: Arc<dyn Storage>,
 }
 
@@ -174,11 +174,11 @@ fn open_volume_fs(
     key_file: Option<&Path>,
     passphrase_flag: bool,
     target: appendfs::RecoveryTarget,
-) -> Result<OpenVolumeFS, String> {
+) -> Result<OpenVolumeFs, String> {
     let OpenVolumeStorage { storage, volume_key } = open_volume_storage(log_dir, key_file, passphrase_flag)?;
     let fs = recover_fs(storage.clone(), target, Arc::new(SystemClock), volume_key)
         .map_err(|e| format!("Failed to recover volume from '{}': {}", log_dir.display(), e))?;
-    Ok(OpenVolumeFS { fs, storage })
+    Ok(OpenVolumeFs { fs, storage })
 }
 
 /// Collects the credentials for a brand new volume, returning the key and the KDF salt to
@@ -453,7 +453,7 @@ fn cmd_mount(args: MountArgs) {
         log_dir.display()
     );
 
-    let OpenVolumeFS {
+    let OpenVolumeFs {
         fs: mut fs_instance,
         storage,
     } = match open_volume_fs(
@@ -641,7 +641,7 @@ fn cmd_stats(args: StatsArgs) {
     // even when opening it fails - or before the passphrase prompt appears.
     print_volume_identity(&args.log_dir, &header);
 
-    let OpenVolumeFS { fs, .. } = match open_volume_fs(
+    let OpenVolumeFs { fs, .. } = match open_volume_fs(
         &args.log_dir,
         args.key_file.as_deref(),
         args.passphrase,

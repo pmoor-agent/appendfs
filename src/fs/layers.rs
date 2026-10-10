@@ -2,13 +2,13 @@
 //!
 //! Every read that spans layers goes through [`InodeLayerStack`], which is constructed
 //! while all the relevant layer read locks are held (see
-//! [`InMemoryFS::with_layer_stack`](crate::fs::InMemoryFS::with_layer_stack)) and folds
+//! [`AppendFs::with_layer_stack`](crate::fs::AppendFs::with_layer_stack)) and folds
 //! oldest-to-newest without copying. Reading the layers one lock at a time instead is
 //! unsound: a flush moves a batch strictly downward (`live` -> `flushing` -> `base`) in
 //! two separate lock acquisitions, so a walk that reads an older layer before a newer
 //! one can straddle that move and miss the batch entirely.
 
-use super::InMemoryFS;
+use super::AppendFs;
 use crate::error::FsError;
 use crate::extent_map::Extent;
 use crate::node::{EntryDelta, Node, NodeDelta, NodeKind};
@@ -412,7 +412,7 @@ impl<'a> InodeLayerStack<'a> {
     }
 
     /// Reads file data resolving extents across layers.
-    pub fn read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<Vec<u8>, FsError> {
+    pub fn read_file_data(&self, offset: u64, size: usize, fs: &AppendFs) -> Result<Vec<u8>, FsError> {
         let plan = self.plan_read_file_data(offset, size, fs.log_cache.as_deref())?;
         execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key)
     }
@@ -517,7 +517,7 @@ impl ReadPlan {
     }
 }
 
-/// Core execution helper for [`ReadPlan`] completely decoupled from [`InMemoryFS`].
+/// Core execution helper for [`ReadPlan`] completely decoupled from [`AppendFs`].
 ///
 /// Phase 1: Copies all in-memory slices into `dst_buf` and drops their backing buffers
 /// immediately, allowing staged buffers to be freed before any disk I/O.
@@ -660,11 +660,11 @@ mod tests {
     use crate::extent_map::{Extent, ExtentMap};
     use crate::fs::{FlushBatch, WriteArena};
     use crate::test_utils::FsTestExt;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_get_attr_across_layers() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
 
         // 1. Create file1 in live -> freeze to flushing -> fold to base
         let attr1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn test_plan_read_file_data_staged_and_holes() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
         fs.write_at(attr.ino, &[0xAA; 100], 0).unwrap();
         crate::operations::read_write::fallocate_core(
@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn test_plan_read_out_of_bounds() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "empty.bin", 0o644, 0, 1000, 1000).unwrap();
         let plan = fs.plan_read_file_data(attr.ino, 100, 50).unwrap();
         assert_eq!(plan.total_len, 0);
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_plan_read_handle_virtual_file() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         fs.register_runtime_status();
 
         let status_ino = crate::fs::VIRTUAL_INO_BASE;
@@ -773,7 +773,7 @@ mod tests {
         use crate::node::{FileDelta, InodeMeta};
         use std::time::SystemTime;
 
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "layers.bin", 0o644, 0, 1000, 1000).unwrap();
 
@@ -875,7 +875,7 @@ mod tests {
         use crate::node::InodeMeta;
         use std::time::SystemTime;
 
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "cached.bin", 0o644, 0, 1000, 1000).unwrap();
 
@@ -920,7 +920,7 @@ mod tests {
 
         let storage = Arc::new(MemoryStorage::new());
         let clock = Arc::new(crate::clock::SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -1080,7 +1080,7 @@ mod tests {
 
         let storage = Arc::new(MemoryStorage::new());
         let clock = Arc::new(crate::clock::SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -1111,7 +1111,7 @@ mod tests {
         // Calling default_read_parallelism again returns the identical memoized value
         assert_eq!(default_read_parallelism(), default);
 
-        let mut fs = TestFS::builder().build().fs;
+        let mut fs = TestFs::builder().build().fs;
         // Default is 0 (auto-detect)
         assert_eq!(fs.read_parallelism, 0);
         assert!(fs.read_pool.read().unwrap().is_none());

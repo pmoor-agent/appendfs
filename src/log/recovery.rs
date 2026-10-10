@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use crate::crypto::VolumeKey;
-use crate::fs::InMemoryFS;
+use crate::fs::AppendFs;
 use crate::log::manifest::{parse_log_filename, parse_summary_filename};
 use crate::log::reader::{LogReader, LogRecord};
 use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode, SealPayload};
@@ -35,7 +35,7 @@ pub fn recover_fs(
     target: RecoveryTarget,
     clock: Arc<dyn Clock>,
     volume_key: Arc<VolumeKey>,
-) -> io::Result<InMemoryFS> {
+) -> io::Result<AppendFs> {
     let files = storage.list_files()?;
 
     // 1. Scan for eligible single-file .summary snapshots matching the target.
@@ -134,7 +134,7 @@ pub fn recover_fs(
         .map(|(gen_num, (_, file))| (gen_num, file))
         .collect();
 
-    let mut fs_instance = InMemoryFS::with_clock_storage_and_volume_key(clock, storage.clone(), volume_key.clone());
+    let mut fs_instance = AppendFs::with_clock_storage_and_volume_key(clock, storage.clone(), volume_key.clone());
 
     let mut last_op_time: Option<SystemTime> = None;
     if latest_summary.is_none()
@@ -449,7 +449,7 @@ mod tests {
     use crate::clock::{AdvancingClock, SystemClock};
     use crate::log::LogWriter;
     use crate::test_utils::FsTestExt;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -746,7 +746,7 @@ mod tests {
     fn test_recovery_verifies_rolled_log_is_sealed() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .root_owner(1000, 1000)
@@ -797,7 +797,7 @@ mod tests {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
-        let mut fs = TestFS::builder()
+        let mut fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .root_owner(1000, 1000)
@@ -814,7 +814,7 @@ mod tests {
 
         // Now simulate gen 2 being created after crash recovery without sealing gen 1
         let writer2 = LogWriter::create(storage.clone(), 2, &*clock, 10_000, 2, VolumeKey::plaintext_arc()).unwrap();
-        let mut fs2 = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+        let mut fs2 = AppendFs::with_clock_and_uids(clock.clone(), 1000, 1000);
         fs2.log_writer = Some(Arc::new(writer2));
         fs2.set_storage(storage.clone());
         crate::operations::dir::mkdir_core(&fs2, 1, "dir2", 0o755, 1000, 1000).unwrap();
@@ -850,7 +850,7 @@ mod tests {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .root_owner(1000, 1000)
@@ -918,7 +918,7 @@ mod tests {
         let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
         let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
         let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
-        let mut fs = TestFS::builder()
+        let mut fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .root_owner(1000, 1000)
@@ -1018,7 +1018,7 @@ mod tests {
 
         // Phase 1: create fs with writer at gen 1, write file1, export summary
         {
-            let fs = TestFS::builder()
+            let fs = TestFs::builder()
                 .storage(storage.clone())
                 .clock(clock.clone())
                 .root_owner(1000, 1000)
@@ -1048,7 +1048,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+            let mut fs = AppendFs::with_clock_and_uids(clock.clone(), 1000, 1000);
             fs.log_writer = Some(writer.clone());
             fs.set_storage(storage.clone());
 
@@ -1093,7 +1093,7 @@ mod tests {
         let time_gen1 = clock.now();
         let batch_gen1;
         {
-            let fs = TestFS::builder()
+            let fs = TestFs::builder()
                 .storage(storage.clone())
                 .clock(clock.clone())
                 .root_owner(1000, 1000)
@@ -1124,7 +1124,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+            let mut fs = AppendFs::with_clock_and_uids(clock.clone(), 1000, 1000);
             fs.log_writer = Some(writer.clone());
             fs.set_storage(storage.clone());
 
@@ -1181,7 +1181,7 @@ mod tests {
         // Phase 1: create fs with writer at gen 1, write rev0.txt, export rev 0 summary
         let rev0_summary_bytes;
         {
-            let mut fs = TestFS::builder()
+            let mut fs = TestFs::builder()
                 .storage(storage.clone())
                 .clock(clock.clone())
                 .root_owner(1000, 1000)

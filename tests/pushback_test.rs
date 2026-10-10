@@ -1,4 +1,4 @@
-use appendfs::TestFS;
+use appendfs::TestFs;
 use appendfs::clock::MockClock;
 use appendfs::fs::{DelayedResponseQueue, OpTier};
 use appendfs::sync::OpTag;
@@ -41,7 +41,7 @@ fn test_asymptotic_delay_mathematics() {
 #[test]
 fn test_tier_throttling_decision_logic() {
     let clock = Arc::new(MockClock(mock_time()));
-    let mut fs = TestFS::builder().clock(clock).build().fs;
+    let mut fs = TestFs::builder().clock(clock).build().fs;
     fs.max_buffer_size = 1000;
     fs.max_staged_ops = 100;
     fs.max_flush_queue_depth = 1;
@@ -237,7 +237,7 @@ fn test_fuse_op_declarative_classification_and_metrics() {
 #[test]
 fn test_delayed_response_queue_stall_calculation() {
     let clock = Arc::new(MockClock(mock_time()));
-    let mut fs = TestFS::builder().clock(clock).build().fs;
+    let mut fs = TestFs::builder().clock(clock).build().fs;
     fs.max_buffer_size = 1000;
     fs.max_flush_queue_depth = 1;
 
@@ -336,7 +336,7 @@ fn test_fuse_op_throttled_duration_metrics() {
 #[test]
 fn test_fs_destroy_drains_stalled_waiters_and_completes_cleanly() {
     let clock = Arc::new(MockClock(mock_time()));
-    let mut fs = TestFS::builder().clock(clock).build().fs;
+    let mut fs = TestFs::builder().clock(clock).build().fs;
     fs.max_buffer_size = 1000;
     fs.max_flush_queue_depth = 1;
 
@@ -387,7 +387,7 @@ fn test_fs_destroy_drains_stalled_waiters_and_completes_cleanly() {
 #[test]
 fn test_calculate_throttle_is_completely_lock_free() {
     let clock = Arc::new(MockClock(mock_time()));
-    let mut fs = TestFS::builder().clock(clock).build().fs;
+    let mut fs = TestFs::builder().clock(clock).build().fs;
     fs.max_buffer_size = 1000;
     fs.max_flush_queue_depth = 1;
 

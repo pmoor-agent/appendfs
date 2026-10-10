@@ -20,7 +20,7 @@ use appendfs::compat::{
 };
 use appendfs::operations::read_write::create_core;
 use appendfs::storage::OsStorage;
-use appendfs::{InMemoryFS, RecoveryTarget, Storage, SummaryReader, recover_fs};
+use appendfs::{AppendFs, RecoveryTarget, Storage, SummaryReader, recover_fs};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -232,7 +232,7 @@ const MIN_NEEDLE_BYTES: usize = 4;
 /// Collected by walking the recovered filesystem rather than by listing literals, so
 /// anything added to `create_canonical_compat_volume` later is covered without this test
 /// being touched. Each entry is `(what it is, the bytes)`.
-fn collect_secret_plaintext(fs: &InMemoryFS) -> Vec<(String, Vec<u8>)> {
+fn collect_secret_plaintext(fs: &AppendFs) -> Vec<(String, Vec<u8>)> {
     let mut secrets: Vec<(String, Vec<u8>)> = Vec::new();
     // Paths carry no trailing slash, so the root is the empty string and is displayed as "/".
     let mut pending = vec![(String::new(), 1u64)];

@@ -8,11 +8,11 @@ pub mod statfs;
 pub mod xattr;
 
 use crate::error::FsError;
-use crate::fs::InMemoryFS;
+use crate::fs::AppendFs;
 use crate::shim::{DeferredResult, Filesystem, FuseResponse, RequestContext, ShimFlock};
 use std::time::SystemTime;
 
-impl Filesystem for InMemoryFS {
+impl Filesystem for AppendFs {
     fn lookup(&self, parent: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
         dir::lookup_response(self, parent, name)
     }

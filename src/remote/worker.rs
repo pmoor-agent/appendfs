@@ -1,4 +1,4 @@
-use crate::fs::InMemoryFS;
+use crate::fs::AppendFs;
 use crate::log::summary::{SUMMARY_FOOTER_SIZE, SUMMARY_MAGIC, SummaryFooter};
 use crate::remote::config::{ConfiguredRemote, RemoteMode, RemoteRegistry};
 use crate::remote::{RemoteObject, RemoteStore};
@@ -386,7 +386,7 @@ pub fn compute_contiguous_synced_gen(
 
 /// Formats a complete human-readable report of replication status across all remotes.
 #[allow(clippy::too_many_lines)]
-pub fn format_remotes_status(fs: &InMemoryFS) -> String {
+pub fn format_remotes_status(fs: &AppendFs) -> String {
     let mut out = String::new();
 
     let manifest = fs.manifest.read().unwrap().clone();
@@ -510,7 +510,7 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
 pub struct RemoteReplicationWorker {
     running: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
-    fs: Arc<InMemoryFS>,
+    fs: Arc<AppendFs>,
     registry: Arc<RwLock<RemoteRegistry>>,
     log_dir: PathBuf,
 }
@@ -520,13 +520,13 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 impl RemoteReplicationWorker {
     /// Starts the background replication worker thread with default 60-second interval.
-    pub fn start(fs: Arc<InMemoryFS>, registry: Arc<RwLock<RemoteRegistry>>, log_dir: PathBuf) -> Self {
+    pub fn start(fs: Arc<AppendFs>, registry: Arc<RwLock<RemoteRegistry>>, log_dir: PathBuf) -> Self {
         Self::start_with_interval(fs, registry, log_dir, DEFAULT_POLL_INTERVAL)
     }
 
     /// Starts the background replication worker thread with a configurable maintenance poll interval.
     pub fn start_with_interval(
-        fs: Arc<InMemoryFS>,
+        fs: Arc<AppendFs>,
         registry: Arc<RwLock<RemoteRegistry>>,
         log_dir: PathBuf,
         poll_interval: Duration,
@@ -641,7 +641,7 @@ impl RemoteReplicationWorker {
     }
 
     pub fn run_cycle(
-        fs: &InMemoryFS,
+        fs: &AppendFs,
         registry: &Arc<RwLock<RemoteRegistry>>,
         log_dir: &Path,
         last_part_sync: &mut SystemTime,
@@ -669,7 +669,7 @@ impl RemoteReplicationWorker {
     // TODO(too-many-lines): extract this into smaller units.
     #[allow(clippy::too_many_lines)]
     pub fn run_cycle_with_audit(
-        fs: &InMemoryFS,
+        fs: &AppendFs,
         registry: &Arc<RwLock<RemoteRegistry>>,
         _log_dir: &Path,
         last_part_sync: &mut SystemTime,
@@ -1305,7 +1305,7 @@ impl RemoteReplicationWorker {
     }
 
     fn prune_eligible_local_logs(
-        fs: &InMemoryFS,
+        fs: &AppendFs,
         manifest: &crate::log::LogManifest,
         active_gen: u32,
         policy: &crate::remote::config::ReplicationPolicy,
@@ -1401,7 +1401,7 @@ impl RemoteReplicationWorker {
     ///
     /// Synchronizes the latest sealed log generation and latest summary checkpoint file
     /// to writable remotes, and executes local log eviction / pruning.
-    pub fn drain_on_shutdown(fs: &InMemoryFS, registry: &Arc<RwLock<RemoteRegistry>>) -> io::Result<()> {
+    pub fn drain_on_shutdown(fs: &AppendFs, registry: &Arc<RwLock<RemoteRegistry>>) -> io::Result<()> {
         let latest_sealed_gen = fs.manifest.read().unwrap().latest_generation();
 
         let target_gens: Vec<u32> = match latest_sealed_gen {
@@ -1451,7 +1451,7 @@ mod tests {
     use super::*;
     use crate::remote::mock::MockRemoteStore;
     use crate::storage::MemoryStorage;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_upload_storage_file_and_cross_copy() {
@@ -1626,7 +1626,7 @@ mod tests {
 
         let start_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let clock = Arc::new(AdvancingClock::new(start_time));
-        let fs = TestFS::builder().clock(clock.clone()).build().fs;
+        let fs = TestFs::builder().clock(clock.clone()).build().fs;
 
         let mut registry = RemoteRegistry::new();
         let target_cfg = RemoteTargetConfig::new("backup-bucket");

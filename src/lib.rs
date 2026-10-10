@@ -43,9 +43,9 @@ pub use dump::{dump_file, dump_log_file, dump_log_reader, dump_summary_file, dum
 pub use error::FsError;
 pub use extent_map::{Extent, ExtentEntry, ExtentMap};
 pub use fs::{
-    AsyncOpGuard, AsyncTracker, BatchCompletion, DelayedResponseQueue, FLUSH_HISTORY_CAPACITY, FlushReason,
-    FlushRecord, FlushStats, InMemoryFS, InnerStatsSnapshot, InodeCounts, OpTier, ThrottleDecision,
-    default_read_parallelism, execute_read_plan,
+    AppendFs, AsyncOpGuard, AsyncTracker, BatchCompletion, DelayedResponseQueue, FLUSH_HISTORY_CAPACITY, FlushReason,
+    FlushRecord, FlushStats, InnerStatsSnapshot, InodeCounts, OpTier, ThrottleDecision, default_read_parallelism,
+    execute_read_plan,
 };
 pub use log::{
     ExtentState, LogFileCache, LogReader, LogRecord, LogWriter, RecoveryTarget, SharedExtentState, SummaryFooter,
@@ -80,20 +80,20 @@ pub use storage::{
 };
 pub use sync::{ActionGuard, ActionMutex, OpStatSnapshot, OpTag, PostUnlockQueue};
 #[cfg(any(test, feature = "testing"))]
-pub use test_utils::{FsTestExt, SnapshotNode, TestFS, wait_until};
+pub use test_utils::{FsTestExt, SnapshotNode, TestFs, wait_until};
 
-pub fn mount(args: Vec<String>, fs: InMemoryFS) -> Result<(), FsError> {
+pub fn mount(args: Vec<String>, fs: AppendFs) -> Result<(), FsError> {
     shim::mount(args, fs)
 }
 
-pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<InMemoryFS>) -> Result<(), FsError> {
+pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<AppendFs>) -> Result<(), FsError> {
     shim::mount_arc(args, fs)
 }
 
-pub fn mount_ro(args: Vec<String>, fs: InMemoryFS) -> Result<(), FsError> {
+pub fn mount_ro(args: Vec<String>, fs: AppendFs) -> Result<(), FsError> {
     shim::mount_ro(args, fs)
 }
 
-pub fn mount_ro_arc(args: Vec<String>, fs: std::sync::Arc<InMemoryFS>) -> Result<(), FsError> {
+pub fn mount_ro_arc(args: Vec<String>, fs: std::sync::Arc<AppendFs>) -> Result<(), FsError> {
     shim::mount_ro_arc(args, fs)
 }

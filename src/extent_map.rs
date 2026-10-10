@@ -338,7 +338,7 @@ impl Eq for ExtentMapInner {}
 ///
 /// `ExtentMap` is **thread-compatible** (`Send + Sync`):
 /// - **External Synchronization for Mutation**: When mutable (`&mut self`), such as in the live
-///   staging layer (`inner.live`), it is protected by the `InMemoryFS` inner mutex (`ActionMutex`).
+///   staging layer (`inner.live`), it is protected by the `AppendFs` inner mutex (`ActionMutex`).
 /// - **Concurrent Lock-Free Reads**: All read operations (`query`, `iter`, `len`, `is_empty`) take `&self`
 ///   and perform zero internal mutation (Vector mode binary searches via `partition_point` without
 ///   allocating or promoting).

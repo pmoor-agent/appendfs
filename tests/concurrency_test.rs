@@ -1,15 +1,15 @@
 // Threaded concurrency stress test. Unlike tests/fuzz_test.rs (which is deliberately
 // single-threaded and deterministic, comparing independent FS instances step-by-step),
-// this test hammers a *single shared* InMemoryFS from multiple real OS threads at once,
+// this test hammers a *single shared* AppendFs from multiple real OS threads at once,
 // directly through the same `*_core` functions real FUSE dispatch uses. The goal isn't
 // reproducibility of a specific interleaving - it's shaking out races and lock misuse
 // across the `live` -> `flushing` -> `base` overlay, including against a flusher thread
 // freezing and folding batches underneath the workers, which a single-threaded fuzz test
 // structurally cannot exercise.
 mod common;
+use appendfs::AppendFs;
 use appendfs::FsTestExt;
-use appendfs::InMemoryFS;
-use appendfs::TestFS;
+use appendfs::TestFs;
 use appendfs::clock::{Clock, SystemClock};
 use appendfs::log::record::DecodedPayload;
 use appendfs::log::{LogReader, SummaryReader, recover_fs};
@@ -39,7 +39,7 @@ const DIR_NAMES: [&str; 4] = ["d0", "d1", "d2", "d3"];
 const FILE_NAMES: [&str; 4] = ["f0", "f1", "f2", "f3"];
 const XATTR_NAMES: [&str; 3] = ["user.a", "user.b", "user.c"];
 
-fn pick_entry(fs: &InMemoryFS, dir_ino: u64, rng: &mut TestRng) -> Option<(String, u64)> {
+fn pick_entry(fs: &AppendFs, dir_ino: u64, rng: &mut TestRng) -> Option<(String, u64)> {
     match list_dir_core(fs, dir_ino) {
         Ok(entries) if !entries.is_empty() => {
             let idx = rng.gen_range(0, entries.len() - 1);
@@ -53,7 +53,7 @@ fn pick_entry(fs: &InMemoryFS, dir_ino: u64, rng: &mut TestRng) -> Option<(Strin
 // sometimes a subdirectory discovered inside one of them, so nesting (and therefore
 // multi-hop ancestor walks during directory rename's loop-prevention check) emerges
 // organically as threads race to create/rename/remove entries.
-fn pick_target_dir(fs: &InMemoryFS, shared: &[u64], rng: &mut TestRng) -> u64 {
+fn pick_target_dir(fs: &AppendFs, shared: &[u64], rng: &mut TestRng) -> u64 {
     let base = shared[rng.gen_range(0, shared.len() - 1)];
     if rng.gen_range(0, 1) == 0 {
         return base;
@@ -73,7 +73,7 @@ fn pick_target_dir(fs: &InMemoryFS, shared: &[u64], rng: &mut TestRng) -> u64 {
     base
 }
 
-fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
+fn worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
     let mut rng = TestRng::new(seed);
     for _ in 0..ops_per_thread() {
         let dir_a = pick_target_dir(&fs, &shared_dirs, &mut rng);
@@ -242,7 +242,7 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
 }
 
 /// Dedicated lock worker hammering BSD flock and POSIX range locks across files
-fn lock_worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
+fn lock_worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
     let mut rng = TestRng::new(seed);
     for _ in 0..ops_per_thread() {
         let dir = pick_target_dir(&fs, &shared_dirs, &mut rng);
@@ -359,7 +359,7 @@ fn dump_log_records_for_inode(storage: &dyn Storage, ino: u64) {
 //   - no inode exists in `fs.inodes` that isn't reachable from root (no leaks, and no
 //     cycles disconnected from root - a cycle's members would all show up here as
 //     simultaneously present-but-unreachable)
-fn verify_tree_invariants(fs: &InMemoryFS, storage: &dyn Storage, seed: u64) {
+fn verify_tree_invariants(fs: &AppendFs, storage: &dyn Storage, seed: u64) {
     let mut visited: HashSet<u64> = HashSet::new();
     let mut queue: VecDeque<u64> = VecDeque::new();
     visited.insert(1);
@@ -478,7 +478,7 @@ fn verify_tree_invariants(fs: &InMemoryFS, storage: &dyn Storage, seed: u64) {
     );
 }
 
-// Root (inode 1) is created implicitly at `InMemoryFS` construction, never through a
+// Root (inode 1) is created implicitly at `AppendFs` construction, never through a
 // log record, so nothing in replay ever touches its timestamps - when recovering
 // without a `.summary` file (as this test forces, to exercise a full log replay),
 // `recovery.rs` approximates root's atime/mtime/ctime from the oldest log file's
@@ -503,13 +503,13 @@ use appendfs::storage::{MemoryStorage, OsStorage, Storage};
 
 // After the concurrent stress run, replaying the log from scratch must reproduce
 // byte-for-byte the same filesystem state that's live in memory. This is the property
-// `InMemoryFS::dir_lock` exists to guarantee: every directory-structure mutation
+// `AppendFs::dir_lock` exists to guarantee: every directory-structure mutation
 // stages its log record while still holding that lock, so the log's record order
 // always matches the order those mutations actually landed in memory - no concurrent
 // interleaving between threads can produce a live state the log can't reconstruct.
 // Mirrors tests/fuzz_test.rs's test_summary_export_is_deterministic, but against this
 // test's genuinely concurrent log instead of a single-threaded one.
-fn verify_log_replay_matches_live(fs: &InMemoryFS, storage: Arc<dyn Storage>, seed: u64) {
+fn verify_log_replay_matches_live(fs: &AppendFs, storage: Arc<dyn Storage>, seed: u64) {
     let _generation = fs.log_writer.as_ref().unwrap().generation();
     let written_file = fs
         .export_summary(storage.as_ref())
@@ -652,7 +652,7 @@ fn dump_preserved_repro() {
 fn run_concurrent_stress(seed: u64) {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let mut fs = TestFS::builder()
+    let mut fs = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .build()

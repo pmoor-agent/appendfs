@@ -1,6 +1,6 @@
 use crate::error::FsError;
 use crate::extent_map::{Extent, ExtentMap};
-use crate::fs::{FileHandle, FlushReason, FsInnerGuard, InMemoryFS, execute_read_plan, is_virtual_ino};
+use crate::fs::{AppendFs, FileHandle, FlushReason, FsInnerGuard, execute_read_plan, is_virtual_ino};
 use crate::node::{AttrDelta, EntryDelta, FileDelta, NodeDelta};
 use crate::shim::{
     DeferredCompletion, DeferredResult, DeferredToken, FileAttr, FileType, FuseResponse, RequestContext,
@@ -16,7 +16,7 @@ pub const FUSE_SET_ATTR_SIZE: u32 = 1 << 3;
 pub const FUSE_SET_ATTR_ATIME: u32 = 1 << 4;
 pub const FUSE_SET_ATTR_MTIME: u32 = 1 << 5;
 
-pub fn getattr_core(fs: &InMemoryFS, ino: u64) -> Result<FileAttr, FsError> {
+pub fn getattr_core(fs: &AppendFs, ino: u64) -> Result<FileAttr, FsError> {
     log::trace!("getattr(ino={})", ino);
     fs.with_inner(OpTag::GetAttr, |inner| {
         inner.check_shutdown(false)?;
@@ -24,12 +24,12 @@ pub fn getattr_core(fs: &InMemoryFS, ino: u64) -> Result<FileAttr, FsError> {
     })
 }
 
-pub fn getattr_response(fs: &InMemoryFS, ino: u64) -> Result<FuseResponse<'static>, FsError> {
+pub fn getattr_response(fs: &AppendFs, ino: u64) -> Result<FuseResponse<'static>, FsError> {
     getattr_core(fs, ino).map(FuseResponse::attr)
 }
 
 pub fn read_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     fh: u64,
     offset: i64,
@@ -78,7 +78,7 @@ pub fn read_response(
     DeferredResult::deferred(receiver)
 }
 
-pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> {
+pub fn open_core(fs: &AppendFs, ino: u64, flags: u32) -> Result<u64, FsError> {
     let write_requested = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0;
 
     if is_virtual_ino(ino) {
@@ -136,7 +136,7 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, FsError> 
     }
 }
 
-pub fn open_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
+pub fn open_response(fs: &AppendFs, ino: u64, flags: u32) -> Result<FuseResponse<'static>, FsError> {
     let is_virtual = is_virtual_ino(ino);
     open_core(fs, ino, flags).map(|fh| {
         FuseResponse::open(
@@ -147,7 +147,7 @@ pub fn open_response(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<FuseRespon
     })
 }
 
-pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
+pub fn write_handle_core(fs: &AppendFs, ino: u64, fh: u64, buf: &[u8], offset: i64) -> Result<usize, FsError> {
     log::trace!("write(ino={}, fh={}, len={}, offset={})", ino, fh, buf.len(), offset);
     if is_virtual_ino(ino) {
         return Err(FsError::EPERM);
@@ -197,7 +197,7 @@ pub fn write_handle_core(fs: &InMemoryFS, ino: u64, fh: u64, buf: &[u8], offset:
 }
 
 pub fn write_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     fh: u64,
     buf: &[u8],
@@ -208,7 +208,7 @@ pub fn write_response(
 
 #[allow(clippy::too_many_arguments)]
 pub fn setattr_core(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     mode: u32,
     uid: u32,
@@ -325,7 +325,7 @@ fn punch_hole_locked(
 /// the range from the live delta's extent map - which would leave the layer with no opinion
 /// and let the read fall through to `base`, resurrecting the punched data - it inserts an
 /// explicit `ExtentState::Zero` that masks whatever lies below.
-pub fn punch_hole_core(fs: &InMemoryFS, ino: u64, offset: u64, len: u64) -> Result<(), FsError> {
+pub fn punch_hole_core(fs: &AppendFs, ino: u64, offset: u64, len: u64) -> Result<(), FsError> {
     log::trace!("punch_hole(ino={}, offset={}, len={})", ino, offset, len);
     let now = fs.clock.now();
     fs.with_inner(OpTag::Fallocate, |inner| {
@@ -364,7 +364,7 @@ fn grow_size_locked(inner: &mut FsInnerGuard<'_>, ino: u64, new_size: u64, now: 
 /// alternative is worse: glibc's `posix_fallocate` responds to `EOPNOTSUPP` by writing
 /// zeros over the whole range by hand, so refusing a 1 GiB preallocation would push 1 GiB
 /// of zeros through the write path.
-pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length: i64) -> Result<(), FsError> {
+pub fn fallocate_core(fs: &AppendFs, ino: u64, mode: i32, offset: i64, length: i64) -> Result<(), FsError> {
     log::trace!(
         "fallocate(ino={}, mode=0x{:x}, offset={}, length={})",
         ino,
@@ -424,7 +424,7 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
 }
 
 pub fn fallocate_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     mode: i32,
     offset: i64,
@@ -435,7 +435,7 @@ pub fn fallocate_response(
 
 #[allow(clippy::too_many_arguments)]
 pub fn setattr_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ino: u64,
     mode: u32,
     uid: u32,
@@ -449,7 +449,7 @@ pub fn setattr_response(
 }
 #[allow(clippy::too_many_arguments)]
 fn create_internal(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     parent: u64,
     name: &str,
     mode: u32,
@@ -533,7 +533,7 @@ fn create_internal(
 }
 
 pub fn create_core(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     parent: u64,
     name: &str,
     mode: u32,
@@ -545,7 +545,7 @@ pub fn create_core(
 }
 
 pub fn create_response(
-    fs: &InMemoryFS,
+    fs: &AppendFs,
     ctx: RequestContext,
     parent: u64,
     name: &str,
@@ -570,12 +570,7 @@ impl DeferredCompletion<FuseResponse<'static>> for FsyncDeferred {
     }
 }
 
-pub fn fsync_response(
-    fs: &InMemoryFS,
-    ino: u64,
-    fh: u64,
-    reason: FlushReason,
-) -> DeferredResult<FuseResponse<'static>> {
+pub fn fsync_response(fs: &AppendFs, ino: u64, fh: u64, reason: FlushReason) -> DeferredResult<FuseResponse<'static>> {
     let completion = match fs.rollover_for_fsync(ino, fh, reason) {
         Ok(c) => c,
         Err(e) => return DeferredResult::err(e),
@@ -589,23 +584,23 @@ pub fn fsync_response(
     DeferredResult::deferred(FsyncDeferred(completion))
 }
 
-pub fn release_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), FsError> {
+pub fn release_core(fs: &AppendFs, ino: u64, fh: u64) -> Result<(), FsError> {
     fs.release_file_handle(fh, ino)
 }
 
-pub fn release_response(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
+pub fn release_response(fs: &AppendFs, ino: u64, fh: u64) -> Result<FuseResponse<'static>, FsError> {
     release_core(fs, ino, fh).map(|()| FuseResponse::ok())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::InMemoryFS;
+    use crate::fs::AppendFs;
     use crate::test_utils::FsTestExt;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
     use crate::{Storage, SystemClock};
 
-    fn file_with(fs: &InMemoryFS, contents: &[u8]) -> u64 {
+    fn file_with(fs: &AppendFs, contents: &[u8]) -> u64 {
         let attr = create_core(fs, 1, "f.bin", 0o644, 0, 1000, 1000).unwrap();
         fs.write_at(attr.ino, contents, 0).unwrap();
         attr.ino
@@ -613,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_fallocate_mode_dispatch() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let ino = file_with(&fs, &[0xAB; 512]);
 
         // Modes that shift file contents are refused outright. Silently ignoring the flag
@@ -651,7 +646,7 @@ mod tests {
     #[test]
     fn test_fallocate_zero_range_honours_keep_size() {
         // Without KEEP_SIZE, zeroing past EOF grows the file.
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let ino = file_with(&fs, &[0xCD; 512]);
         fallocate_core(&fs, ino, libc::FALLOC_FL_ZERO_RANGE, 256, 512).unwrap();
         assert_eq!(fs.get_attr(ino).unwrap().size, 768);
@@ -660,7 +655,7 @@ mod tests {
         assert!(data[256..].iter().all(|&b| b == 0));
 
         // With KEEP_SIZE it zeroes the live part without extending.
-        let fs2 = TestFS::builder().build().fs;
+        let fs2 = TestFs::builder().build().fs;
         let ino2 = file_with(&fs2, &[0xCD; 512]);
         fallocate_core(
             &fs2,
@@ -682,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_fallocate_rejected_on_read_only_mount() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let ino = file_with(&fs, &[0xEF; 128]);
         fs.set_read_only();
         assert_eq!(
@@ -694,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_setattr_and_fallocate_single_lock_acquisition() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let ino = file_with(&fs, &[0xAA; 1024]);
 
         // 1. setattr_core: mode and size change
@@ -763,7 +758,7 @@ mod tests {
     fn test_fsync_single_lock_acquisition() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -793,7 +788,7 @@ mod tests {
     fn test_fsync_and_fsyncdir() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
-        let fs = TestFS::builder()
+        let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(clock.clone())
             .build()
@@ -811,7 +806,7 @@ mod tests {
 
     #[test]
     fn test_file_create_name_length_boundaries() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
 
         // 255-byte name should succeed for create
         let name_255 = "f".repeat(255);

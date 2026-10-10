@@ -3,7 +3,7 @@ use appendfs::Clock;
 use appendfs::FsError;
 use appendfs::FsTestExt;
 use appendfs::Storage;
-use appendfs::TestFS;
+use appendfs::TestFs;
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{VolumeHeader, VolumeKey};
 use appendfs::log::{LogFileCache, LogWriter, init_volume_with_clock};
@@ -30,7 +30,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     let clock = Arc::new(SystemClock);
 
     // 1. Initialize volume
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -149,7 +149,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -224,7 +224,7 @@ fn test_disaster_recovery_bootstrap_from_remote() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -267,7 +267,7 @@ fn test_read_only_remote_and_cloud_forking() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -337,7 +337,7 @@ fn test_bootstrap_rebuilds_encrypted_active_log_from_parts() {
     .unwrap();
     let volume_key = Arc::new(key);
 
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -415,7 +415,7 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -518,7 +518,7 @@ fn test_active_log_part_ships_only_synced_bytes() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -619,7 +619,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -716,7 +716,7 @@ fn test_local_read_populates_block_cache_before_purge() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -796,7 +796,7 @@ fn test_local_read_skips_block_cache_by_default() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -836,7 +836,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -939,7 +939,7 @@ fn test_latency_remote_store_in_tiered_reading() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -1015,7 +1015,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(100 * 1024 * 1024)
@@ -1193,7 +1193,7 @@ fn test_event_driven_immediate_replication_on_log_roll() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -1247,7 +1247,7 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -1367,7 +1367,7 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -1451,7 +1451,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     let volume_key = VolumeKey::plaintext_arc();
 
     // 1. Initialize volume with deterministic clock
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -1661,7 +1661,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     let clock = Arc::new(appendfs::clock::AdvancingClock::new(start_time));
 
     // 1. Initialize volume with clock
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -1971,7 +1971,7 @@ fn test_per_remote_upload_partial_logs_behavior() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2255,7 +2255,7 @@ fn test_post_upload_md5_verification_failure_and_recovery() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2413,7 +2413,7 @@ fn test_write_only_glacier_remote_replication_and_prune_safety() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2510,7 +2510,7 @@ fn test_write_only_glacier_remote_replication_and_prune_safety() {
     // Create a standalone scenario where ONLY glacier has confirmed a sealed file.
     // Since glacier is write-only, prune_local_cache must NOT prune the local file!
     let isolated_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let TestFS { fs: iso_fs, .. } = TestFS::builder()
+    let TestFs { fs: iso_fs, .. } = TestFs::builder()
         .storage(isolated_storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2571,7 +2571,7 @@ fn test_prune_rule_multi_tier_lifecycle_with_glacier() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2665,7 +2665,7 @@ fn test_shutdown_drain_syncs_latest_sealed_log_and_skips_earlier_backlog() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2720,7 +2720,7 @@ fn test_shutdown_drain_prunes_eligible_local_logs() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2762,7 +2762,7 @@ fn test_shutdown_drain_replicates_only_missing_latest_sealed_log_and_summary() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2809,7 +2809,7 @@ fn test_shutdown_drain_syncs_latest_summary_and_skips_earlier_summaries() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2875,7 +2875,7 @@ fn test_worker_syncs_only_latest_summary_cross_copy() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -2932,7 +2932,7 @@ fn test_replication_worker_active_round_interrupted_on_stop() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
 
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -3002,7 +3002,7 @@ fn test_pre_synced_remote_reflects_up_to_date_status_without_lockstep_lag() {
     let clock = Arc::new(appendfs::clock::MockClock(mock_time));
 
     // Create 5 sealed log generations (1..=5) and active generation 6
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)
@@ -3183,7 +3183,7 @@ fn test_prioritized_replication_rw_and_low_lag_replicates_before_archive_backlog
     let clock = Arc::new(appendfs::clock::MockClock(mock_time));
 
     // Create 4 sealed log generations (1..=4) and active generation 5
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .max_log_size(1024 * 1024)

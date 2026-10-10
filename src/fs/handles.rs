@@ -6,7 +6,7 @@
 //! paginated `readdir` is isolated from concurrent mutations.
 
 use super::{
-    DirHandle, FileHandle, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource, ShutdownState, execute_read_plan,
+    AppendFs, DirHandle, FileHandle, ReadPlan, ReadSlice, ReadSliceSource, ShutdownState, execute_read_plan,
     is_virtual_ino,
 };
 use crate::error::FsError;
@@ -15,7 +15,7 @@ use crate::operations::locks::LockManager;
 use crate::sync::OpTag;
 use std::sync::Arc;
 
-impl InMemoryFS {
+impl AppendFs {
     // --- POSIX File & Directory Handle Tracking ---
 
     pub fn open_file_handle(&self, ino: u64, flags: u32) -> u64 {
@@ -196,11 +196,11 @@ impl InMemoryFS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
 
     #[test]
     fn test_dir_handle_snapshot_isolation_and_lifecycle() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
 
         // 1. Create two files under root
         crate::operations::read_write::create_core(&fs, 1, "alpha.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_file_handle_lifecycle_and_unlinking() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
 
         // 1. Create a file
         let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_unified_handle_map_regular_virtual_and_directory() {
-        let fs = TestFS::builder().build().fs;
+        let fs = TestFs::builder().build().fs;
         let attr = crate::operations::read_write::create_core(&fs, 1, "data.bin", 0o644, 0, 1000, 1000).unwrap();
         let reg_ino = attr.ino;
         let v_ino = fs.lookup_child(1, ".status").expect(".status must exist");

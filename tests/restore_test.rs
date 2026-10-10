@@ -4,7 +4,7 @@ use appendfs::operations::read_write::{
     FUSE_SET_ATTR_MODE, create_core, open_core, release_core, setattr_core, write_handle_core,
 };
 use appendfs::storage::OsStorage;
-use appendfs::{Clock, Storage, TestFS, VolumeKey};
+use appendfs::{Clock, Storage, TestFs, VolumeKey};
 
 use std::fs;
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ fn test_python_restore_with_readonly_file_and_directory() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -136,7 +136,7 @@ fn test_python_restore_across_log_rollover() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -226,7 +226,7 @@ fn test_python_restore_file_rename() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -282,7 +282,7 @@ fn test_python_restore_rsync_style_write_across_rollover_and_rename() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -373,7 +373,7 @@ fn test_python_restore_directory_rename_and_move() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -430,7 +430,7 @@ fn test_python_restore_overwrite_rename() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -490,7 +490,7 @@ fn test_python_restore_hardlinks_and_unlink() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -561,7 +561,7 @@ fn test_python_restore_hardlinks_same_name_in_different_dirs() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -645,7 +645,7 @@ fn test_python_restore_directory_overwrite_rename() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -703,7 +703,7 @@ fn test_python_restore_sparse_hole_and_expansion() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { fs, .. } = TestFS::builder()
+    let TestFs { fs, .. } = TestFs::builder()
         .storage(storage)
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -783,7 +783,7 @@ fn test_python_restore_rejects_record_after_seal() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .root_owner(1000, 1000)
@@ -863,7 +863,7 @@ fn test_python_restore_rejects_seal_record_count_mismatch() {
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(vol_dir));
     let clock = Arc::new(CompatClock::new());
-    let TestFS { mut fs, .. } = TestFS::builder()
+    let TestFs { mut fs, .. } = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
         .root_owner(1000, 1000)

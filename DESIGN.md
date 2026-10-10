@@ -25,7 +25,7 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 └────────────────────────────────────┬────────────────────────────────────┘
                                      │ FUSE Low-Level Ops & xattrs
 ┌────────────────────────────────────▼────────────────────────────────────┐
-│                             InMemoryFS Engine                           │
+│                              AppendFs Engine                            │
 │  ┌─────────────────────────────────┐   ┌─────────────────────────────┐  │
 │  │ Inode & Directory Metadata Tree │   │ ExtentMap Fragment Allocator│  │
 │  └─────────────────────────────────┘   └─────────────────────────────┘  │
@@ -69,7 +69,7 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 - The generation sequence number guarantees deterministic ordering during recovery, replay, and cloud syncing regardless of system clock skew.
 
 ### 3.2 LSM Delta-Overlay In-Memory Architecture & Flush Semantics
-- `InMemoryFS` organizes in-memory filesystem state into a multi-layered Log-Structured Merge (LSM) overlay:
+- `AppendFs` organizes in-memory filesystem state into a multi-layered Log-Structured Merge (LSM) overlay:
   1. **`base` (`RwLock<HashMap<u64, Arc<Node>>>`):** The resting, fully consolidated filesystem state. Nodes are stored in safe, immutable `Arc<Node>` pointers.
   2. **`flushing` (`RwLock<VecDeque<HashMap<u64, EntryDelta>>>`):** An ordered FIFO queue of frozen snapshot batches waiting to be serialized and committed to disk.
   3. **`live` (`RwLock<HashMap<u64, EntryDelta>>`):** Active in-memory mutations. Operations modify lightweight `EntryDelta` records without locking base nodes.

@@ -1221,7 +1221,7 @@ mod tests {
     use crate::clock::{Clock, SystemClock};
     use crate::log::LogWriter;
     use crate::storage::OsStorage;
-    use crate::test_utils::TestFS;
+    use crate::test_utils::TestFs;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -1347,8 +1347,8 @@ mod tests {
         assert!(dump_v0.contains("Checksum (BLAKE3):"));
         assert!(dump_v0.contains("VERIFIED"));
 
-        // Create an InMemoryFS with fragmented files
-        let fs = TestFS::builder().build().fs;
+        // Create an AppendFs with fragmented files
+        let fs = TestFs::builder().build().fs;
         let now = SystemClock.now();
 
         // Create directory /docs (inode 2)
