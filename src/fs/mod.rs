@@ -31,7 +31,7 @@ pub use overlay::{InnerStatsSnapshot, InodeCounts};
 pub use read_pool::ReadThreadPool;
 pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry, is_virtual_ino};
 
-use crate::clock::{Clock, SystemClock};
+use crate::clock::Clock;
 use crate::error::FsError;
 use crate::log::{LogFileCache, LogManifest, LogWriter};
 use crate::node::{EntryDelta, Node};
@@ -874,14 +874,6 @@ pub struct InMemoryFS {
 }
 
 impl InMemoryFS {
-    pub fn new() -> Self {
-        Self::with_clock(Arc::new(SystemClock))
-    }
-
-    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
-        Self::with_clock_and_log(clock, None)
-    }
-
     pub fn with_clock_and_uids(clock: Arc<dyn Clock>, uid: u32, gid: u32) -> Self {
         let fs = Self::with_clock(clock.clone());
         let now = clock.now();
@@ -891,11 +883,10 @@ impl InMemoryFS {
         fs
     }
 
-    pub fn with_log(log_writer: Arc<LogWriter>) -> Self {
-        Self::with_clock_and_log(Arc::new(SystemClock), Some(log_writer))
-    }
-
-    pub fn with_clock_and_log(clock: Arc<dyn Clock>, log_writer: Option<Arc<LogWriter>>) -> Self {
+    /// An empty plaintext volume - just the root directory, owned by the current user - with
+    /// no storage and no log writer. Only the constructors below build on it; a usable
+    /// filesystem comes from `recover_fs` (or, in tests, `TestFS::builder()`).
+    fn with_clock(clock: Arc<dyn Clock>) -> Self {
         let mut map = HashMap::new();
         let (uid, gid) = crate::shim::current_uid_gid();
         let now = clock.now();
@@ -903,15 +894,7 @@ impl InMemoryFS {
         // Start with only the root directory (Inode 1), which is empty, nlink is 2 (parent entry and '.' link)
         map.insert(1, Arc::new(Node::new_dir(1, 0o755, uid, gid, now)));
 
-        let log_cache = log_writer
-            .as_ref()
-            .map(|w| Arc::new(LogFileCache::with_storage(w.storage().clone())));
-
-        // The writer owns the volume's volume_key; without one this is a plaintext volume.
-        let volume_key = log_writer
-            .as_ref()
-            .map(|w| Arc::clone(w.volume_key()))
-            .unwrap_or_else(|| Arc::new(crate::crypto::VolumeKey::plaintext()));
+        let volume_key = Arc::new(crate::crypto::VolumeKey::plaintext());
 
         let manifest = Arc::new(RwLock::new(LogManifest::new()));
 
@@ -947,8 +930,8 @@ impl InMemoryFS {
             next_inode: AtomicU64::new(2),
             last_batch_id: AtomicU64::new(0),
             clock,
-            log_writer,
-            log_cache,
+            log_writer: None,
+            log_cache: None,
             max_buffer_size: 128 * 1024 * 1024,
             max_staged_ops: crate::cli::DEFAULT_MAX_BUFFER_OPS,
             max_extent_size: crate::cli::DEFAULT_MAX_EXTENT_SIZE,
@@ -1147,12 +1130,6 @@ impl InMemoryFS {
     /// Returns all registered root directory virtual entries `(name, ino)`.
     pub fn list_virtual_entries(&self) -> Vec<(String, u64)> {
         self.virtual_files.list_entries()
-    }
-
-    pub fn with_clock_and_storage(clock: Arc<dyn Clock>, storage: Arc<dyn Storage>) -> Self {
-        let mut fs = Self::with_clock(clock);
-        fs.set_storage(storage);
-        fs
     }
 
     pub fn with_clock_storage_and_volume_key(
@@ -1361,12 +1338,6 @@ impl Drop for InMemoryFS {
             // `destroy` callback - every step it takes checks `ShutdownState` first.
             self.destroy();
         }
-    }
-}
-
-impl Default for InMemoryFS {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

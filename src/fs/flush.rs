@@ -800,8 +800,8 @@ impl InMemoryFS {
         // The header goes into the summary in plaintext while the key encrypts its body, so
         // a pair that disagrees writes a snapshot nothing can reopen - it would advertise
         // itself as unencrypted to `resolve_volume_key` while holding an encrypted body.
-        // Refuse rather than emit one. `InMemoryFS::with_log` can produce such a pair, since
-        // it adopts the writer's key while the header stays at its plaintext default.
+        // Refuse rather than emit one. Both are public fields, so assigning one without the
+        // other (rather than through `set_volume`) can still produce such a pair.
         if self.volume_header.cipher != self.volume_key.cipher() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

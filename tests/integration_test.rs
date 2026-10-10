@@ -2541,19 +2541,10 @@ fn test_export_refuses_a_mismatched_header_and_key() {
     )
     .unwrap();
 
-    // `with_log` adopts the writer's encrypted key while the header stays at its plaintext
-    // default - the pairing this guard exists to catch.
-    let writer = std::sync::Arc::new(
-        appendfs::LogWriter::create_lazy(
-            storage.clone(),
-            1,
-            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            std::sync::Arc::new(key),
-        )
-        .unwrap(),
-    );
-    let fs = appendfs::InMemoryFS::with_log(writer);
+    // Swapping in an encrypted key behind the plaintext volume's back leaves the header
+    // saying plaintext - the pairing this guard exists to catch.
+    let mut fs = TestFS::builder().storage(storage.clone()).build().fs;
+    fs.volume_key = std::sync::Arc::new(key);
 
     let err = fs.export_summary(storage.as_ref()).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
