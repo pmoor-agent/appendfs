@@ -483,7 +483,7 @@ fn verify_tree_invariants(fs: &InMemoryFS, storage: &dyn Storage, seed: u64) {
 // without a `.summary` file (as this test forces, to exercise a full log replay),
 // `recovery.rs` approximates root's atime/mtime/ctime from the oldest log file's
 // header, which only carries second precision (see the comment at
-// `recover_fs_with_clock`'s call to `InMemoryFS::with_clock`). A real `SystemClock`
+// `recover_fs`, where it sets root's times from the oldest log). A real `SystemClock`
 // live timestamp almost never lands on an exact second, so root's timestamps are
 // expected to differ between live and replay - a known, pre-existing, and
 // already-documented lossy-recovery approximation, unrelated to what this comparison
