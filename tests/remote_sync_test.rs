@@ -6,7 +6,7 @@ use appendfs::Storage;
 use appendfs::TestFs;
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{VolumeHeader, VolumeKey};
-use appendfs::log::{LogFileCache, LogWriter, init_volume_with_clock};
+use appendfs::log::{LogFileCache, LogWriter, init_volume};
 use appendfs::operations::read_write::{create_core, open_core, release_core};
 use appendfs::remote::bootstrap_from_remote;
 use appendfs::remote::worker::{cross_copy_file, cross_copy_summary, upload_storage_file};
@@ -2130,7 +2130,7 @@ fn test_unsealed_manifest_logs_are_synced_and_pruned() {
     let clock = Arc::new(appendfs::clock::MockClock(mock_time));
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
 
     // 1. Write an unsealed log file (generation 1) without an OpCode::Seal record
     let writer = LogWriter::create(storage.clone(), 1, clock.clone(), 10_000_000, 1, volume_key.clone()).unwrap();

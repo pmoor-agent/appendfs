@@ -459,6 +459,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -547,6 +548,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -611,6 +613,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 
@@ -677,6 +680,7 @@ mod tests {
             storage.clone(),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
 

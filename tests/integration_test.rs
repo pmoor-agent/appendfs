@@ -726,6 +726,7 @@ fn test_volume_init_mount_and_stats_flow() {
         storage.clone(),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
     )
     .unwrap();
     let summary_path = log_path.join(&summary_filename);
@@ -863,6 +864,7 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
         storage.clone(),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
     )
     .unwrap();
 
@@ -1042,6 +1044,7 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
         storage,
         &appendfs::CheckOptions::full_data(),
         appendfs::VolumeKey::plaintext_arc(),
+        std::sync::Arc::new(appendfs::SystemClock),
     )
     .unwrap();
     assert!(report.is_clean(), "Clean volume must pass check: {:?}", report.issues);
@@ -1163,6 +1166,7 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
         storage.clone(),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
     )
     .unwrap();
 
@@ -2166,6 +2170,7 @@ fn test_recovery_refuses_a_volume_with_no_readable_summary() {
         storage.clone(),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
     )
     .unwrap();
 
@@ -2218,7 +2223,13 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
         appendfs::compress::Compression::None,
     )
     .unwrap();
-    appendfs::log::init_volume(storage.clone(), &volume_key, volume_header).unwrap();
+    appendfs::log::init_volume(
+        storage.clone(),
+        &volume_key,
+        volume_header,
+        std::sync::Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
 
     let unlocked_arc = std::sync::Arc::new(volume_key);
 
@@ -2324,7 +2335,13 @@ fn test_tampered_record_header_is_rejected_not_served() {
     )
     .unwrap();
     let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
-    appendfs::log::init_volume(storage.clone(), &volume_key, volume_header).unwrap();
+    appendfs::log::init_volume(
+        storage.clone(),
+        &volume_key,
+        volume_header,
+        std::sync::Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
 
     let volume_key = std::sync::Arc::new(volume_key);
     let ino = {
@@ -2424,7 +2441,13 @@ fn test_key_source_round_trips_through_the_volume_header() {
         assert_eq!(header.key_source.needs_key_file(), needs_file, "{:?}", source);
         assert_eq!(header.key_source.needs_passphrase(), needs_pass, "{:?}", source);
 
-        appendfs::log::init_volume(storage.clone(), &key, header).unwrap();
+        appendfs::log::init_volume(
+            storage.clone(),
+            &key,
+            header,
+            std::sync::Arc::new(appendfs::SystemClock),
+        )
+        .unwrap();
 
         // The mode must survive the round trip through the plaintext header blob, and be
         // readable without any credential at all - that is what lets a mount know what to
@@ -2440,6 +2463,7 @@ fn test_key_source_round_trips_through_the_volume_header() {
         storage.clone(),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
     )
     .unwrap();
     let read_back = appendfs::log::SummaryReader::read_volume_header(storage.as_ref(), "000000.summary").unwrap();
@@ -2515,7 +2539,13 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
             appendfs::compress::Compression::None,
         )
         .unwrap();
-        appendfs::log::init_volume(storage.clone(), &key, header).unwrap();
+        appendfs::log::init_volume(
+            storage.clone(),
+            &key,
+            header,
+            std::sync::Arc::new(appendfs::SystemClock),
+        )
+        .unwrap();
 
         tamper(&storage, edit);
 
@@ -2577,7 +2607,13 @@ fn test_compressed_volume_round_trips_and_saves_space() {
         let master = MasterKey::new([0x6Bu8; 32]);
         let (header, key) =
             VolumeHeader::new_encrypted(&master, [0x77u8; 16], KeySource::KeyFile, compression).unwrap();
-        appendfs::log::init_volume(storage.clone(), &key, header.clone()).unwrap();
+        appendfs::log::init_volume(
+            storage.clone(),
+            &key,
+            header.clone(),
+            std::sync::Arc::new(appendfs::SystemClock),
+        )
+        .unwrap();
 
         let key = std::sync::Arc::new(key);
         let ino = {
@@ -2649,7 +2685,13 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
         let master = MasterKey::new([0x31u8; 32]);
         let (header, key) =
             VolumeHeader::new_encrypted(&master, [0x32u8; 16], KeySource::KeyFile, compression).unwrap();
-        appendfs::log::init_volume(storage.clone(), &key, header).unwrap();
+        appendfs::log::init_volume(
+            storage.clone(),
+            &key,
+            header,
+            std::sync::Arc::new(appendfs::SystemClock),
+        )
+        .unwrap();
         let key = std::sync::Arc::new(key);
 
         // Highly compressible, and large enough that the compressed log is orders of
@@ -2673,8 +2715,13 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
             fs.export_summary(storage.as_ref()).unwrap();
         }
 
-        let report =
-            appendfs::check_volume(storage.clone(), &appendfs::CheckOptions::full_data(), key.clone()).unwrap();
+        let report = appendfs::check_volume(
+            storage.clone(),
+            &appendfs::CheckOptions::full_data(),
+            key.clone(),
+            std::sync::Arc::new(appendfs::SystemClock),
+        )
+        .unwrap();
         assert!(
             report.is_clean(),
             "{:?} volume reported {} errors: {:?}",
@@ -2689,7 +2736,13 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
         let len = bytes.len();
         storage.insert_file("000001.log", bytes[..len / 2].to_vec());
 
-        let truncated = appendfs::check_volume(storage, &appendfs::CheckOptions::full_data(), key).unwrap();
+        let truncated = appendfs::check_volume(
+            storage,
+            &appendfs::CheckOptions::full_data(),
+            key,
+            std::sync::Arc::new(appendfs::SystemClock),
+        )
+        .unwrap();
         assert!(
             !truncated.is_clean(),
             "{:?}: truncating the log must be detected",
@@ -2708,6 +2761,7 @@ fn test_periodic_summary_generation_on_log_rolls() {
         storage.clone(),
         key.as_ref(),
         appendfs::crypto::VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
     )
     .unwrap();
 
@@ -2807,6 +2861,7 @@ fn test_periodic_summary_generation_by_bytes() {
         storage.clone(),
         key.as_ref(),
         appendfs::crypto::VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
     )
     .unwrap();
 
@@ -2880,6 +2935,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
         storage.clone(),
         key.as_ref(),
         appendfs::crypto::VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
     )
     .unwrap();
 
@@ -2997,6 +3053,7 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
         storage.clone(),
         key.as_ref(),
         appendfs::crypto::VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
     )
     .unwrap();
 

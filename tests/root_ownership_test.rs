@@ -14,7 +14,13 @@ use std::sync::Arc;
 
 fn recovered_root_owner(dir: &std::path::Path) -> (u32, u32) {
     let storage: Arc<dyn appendfs::storage::Storage> = Arc::new(OsStorage::new(dir));
-    appendfs::init_volume(storage.clone(), &VolumeKey::plaintext(), VolumeHeader::plaintext()).unwrap();
+    appendfs::init_volume(
+        storage.clone(),
+        &VolumeKey::plaintext(),
+        VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
 
     let fs = appendfs::recover_fs(
         storage,

@@ -1972,6 +1972,7 @@ mod tests {
             storage.clone(),
             &crate::check::CheckOptions::full_data(),
             crate::crypto::VolumeKey::plaintext_arc(),
+            std::sync::Arc::new(crate::clock::SystemClock),
         )
         .unwrap();
         assert!(report.is_clean(), "Integrity check must be clean: {:?}", report.issues);

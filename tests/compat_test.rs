@@ -470,8 +470,13 @@ pub fn verify_fsck_matches_golden(fixture_dir: &Path) {
         fixture_dir.display()
     );
 
-    let report = appendfs::check::check_volume(storage, &appendfs::check::CheckOptions::full_data(), volume_key)
-        .unwrap_or_else(|e| panic!("fsck failed on fixture {}: {}", fixture_dir.display(), e));
+    let report = appendfs::check::check_volume(
+        storage,
+        &appendfs::check::CheckOptions::full_data(),
+        volume_key,
+        std::sync::Arc::new(appendfs::SystemClock),
+    )
+    .unwrap_or_else(|e| panic!("fsck failed on fixture {}: {}", fixture_dir.display(), e));
     let actual_report = report.format_report(None, false);
     let expected_report = fs::read_to_string(&golden_path)
         .unwrap_or_else(|e| panic!("Failed to read golden fsck report {}: {}", golden_path.display(), e));

@@ -368,7 +368,7 @@ fn cmd_init(args: InitArgs) {
         let volume_id = hex_string(&volume_header.volume_id);
 
         let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
-        match init_volume(storage, &volume_key, volume_header) {
+        match init_volume(storage, &volume_key, volume_header, Arc::new(SystemClock)) {
             Ok(summary_filename) => {
                 println!("Initialized encrypted appendfs volume successfully!");
                 println!("  Log Directory:   {}", args.log_dir.display());
@@ -396,7 +396,7 @@ fn cmd_init(args: InitArgs) {
         let mut volume_header = VolumeHeader::plaintext();
         volume_header.compression = args.compression();
         let volume_id = hex_string(&volume_header.volume_id);
-        match init_volume(storage, &VolumeKey::plaintext(), volume_header) {
+        match init_volume(storage, &VolumeKey::plaintext(), volume_header, Arc::new(SystemClock)) {
             Ok(summary_filename) => {
                 println!("Initialized empty appendfs volume successfully!");
                 println!("  Log Directory:   {}", args.log_dir.display());
