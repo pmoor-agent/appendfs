@@ -1,14 +1,14 @@
 use crate::error::FsError;
 use crate::fs::{AppendFs, FlushReason};
-use crate::operations::dir::{fsyncdir_response, list_dir_core, mkdir_core};
-use crate::operations::links::{readlink_core, symlink_core};
+use crate::operations::dir::{fsyncdir_response, list_dir_core, mkdir_core, opendir_core, releasedir_core, rmdir_core};
+use crate::operations::links::{link_core, readlink_core, rename_core, symlink_core, unlink_core};
 use crate::operations::read_write::{
     FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_SIZE,
-    FUSE_SET_ATTR_UID, create_core, fsync_response, getattr_core, open_core, read_response, release_core, setattr_core,
-    write_handle_core,
+    FUSE_SET_ATTR_UID, create_core, fsync_response, getattr_core, open_core, punch_hole_core, read_response,
+    release_core, setattr_core, write_handle_core,
 };
 use crate::operations::special::mknod_core;
-use crate::operations::xattr::{getxattr_core, listxattr_core};
+use crate::operations::xattr::{getxattr_core, listxattr_core, removexattr_core, setxattr_core};
 use crate::shim::{FileAttr, FileType, FuseResponse};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,8 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// same entry points: they wait for the result, open and release handles around the call,
 /// and act as the owner of the root directory - the user who mounted the volume.
 ///
-/// Operations with nothing to add (unlink, rename, ...) are not repeated here; call their
-/// `_core` function directly.
+/// Every operation a test needs goes through here, so tests share one calling pattern. The
+/// names follow `std::fs` where it has one and avoid the [`Filesystem`](crate::Filesystem)
+/// trait's, so importing both never makes a call ambiguous. Results a FUSE reply would carry
+/// are reduced to what a test compares: an inode number, a handle, or `()`.
 pub trait FsTestExt {
     /// Writes `buf` at `offset` through a read-write handle opened and released around the
     /// call, so the caller does not need one of its own.
@@ -59,8 +61,44 @@ pub trait FsTestExt {
     /// number.
     fn make_node(&self, parent: u64, name: &str, mode: u32, rdev: u32) -> Result<u64, FsError>;
 
+    /// Removes the non-directory entry `name` from `parent`.
+    fn remove_file(&self, parent: u64, name: &str) -> Result<(), FsError>;
+
+    /// Removes the empty directory `name` from `parent`.
+    fn remove_dir(&self, parent: u64, name: &str) -> Result<(), FsError>;
+
+    /// Moves `parent/name` to `newparent/newname`, replacing what is there if allowed.
+    fn rename_entry(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), FsError>;
+
+    /// Adds `newparent/newname` as another name for `ino`.
+    fn hard_link(&self, ino: u64, newparent: u64, newname: &str) -> Result<(), FsError>;
+
+    /// Returns the target a symlink points to.
+    fn symlink_target(&self, ino: u64) -> Result<String, FsError>;
+
+    /// Opens a file handle with `flags`, as `open(2)` would, and returns it.
+    fn open_file(&self, ino: u64, flags: u32) -> Result<u64, FsError>;
+
+    /// Releases a handle returned by [`FsTestExt::open_file`].
+    fn release_file(&self, ino: u64, fh: u64) -> Result<(), FsError>;
+
+    /// Opens a directory handle and returns it.
+    fn open_dir(&self, ino: u64) -> Result<u64, FsError>;
+
+    /// Releases a handle returned by [`FsTestExt::open_dir`].
+    fn release_dir(&self, ino: u64, fh: u64) -> Result<(), FsError>;
+
+    /// Deallocates `len` bytes at `offset`, which then read back as zeros.
+    fn punch_hole(&self, ino: u64, offset: u64, len: u64) -> Result<(), FsError>;
+
     /// Applies the attributes set in `changes`, leaving the rest untouched.
     fn set_attrs(&self, ino: u64, changes: AttrChanges) -> Result<(), FsError>;
+
+    /// Sets an xattr; `flags` takes `XATTR_CREATE` / `XATTR_REPLACE` as `setxattr(2)` does.
+    fn set_xattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<(), FsError>;
+
+    /// Removes an xattr.
+    fn remove_xattr(&self, ino: u64, name: &str) -> Result<(), FsError>;
 
     /// Reads an xattr's value through the real two-phase protocol (query the size, then
     /// fetch with that size), so it exercises the same size/ERANGE path a getxattr(2)
@@ -201,6 +239,54 @@ impl FsTestExt for AppendFs {
     fn make_node(&self, parent: u64, name: &str, mode: u32, rdev: u32) -> Result<u64, FsError> {
         let (uid, gid) = caller(self)?;
         mknod_core(self, parent, name, mode, rdev, uid, gid).map(|attr| attr.ino)
+    }
+
+    fn remove_file(&self, parent: u64, name: &str) -> Result<(), FsError> {
+        unlink_core(self, parent, name)
+    }
+
+    fn remove_dir(&self, parent: u64, name: &str) -> Result<(), FsError> {
+        rmdir_core(self, parent, name)
+    }
+
+    fn rename_entry(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), FsError> {
+        rename_core(self, parent, name, newparent, newname)
+    }
+
+    fn hard_link(&self, ino: u64, newparent: u64, newname: &str) -> Result<(), FsError> {
+        link_core(self, ino, newparent, newname).map(|_| ())
+    }
+
+    fn symlink_target(&self, ino: u64) -> Result<String, FsError> {
+        readlink_core(self, ino)
+    }
+
+    fn open_file(&self, ino: u64, flags: u32) -> Result<u64, FsError> {
+        open_core(self, ino, flags)
+    }
+
+    fn release_file(&self, ino: u64, fh: u64) -> Result<(), FsError> {
+        release_core(self, ino, fh)
+    }
+
+    fn open_dir(&self, ino: u64) -> Result<u64, FsError> {
+        opendir_core(self, ino, 0)
+    }
+
+    fn release_dir(&self, ino: u64, fh: u64) -> Result<(), FsError> {
+        releasedir_core(self, ino, fh)
+    }
+
+    fn punch_hole(&self, ino: u64, offset: u64, len: u64) -> Result<(), FsError> {
+        punch_hole_core(self, ino, offset, len)
+    }
+
+    fn set_xattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<(), FsError> {
+        setxattr_core(self, ino, name, value, flags).map(|_| ())
+    }
+
+    fn remove_xattr(&self, ino: u64, name: &str) -> Result<(), FsError> {
+        removexattr_core(self, ino, name).map(|_| ())
     }
 
     fn set_attrs(&self, ino: u64, changes: AttrChanges) -> Result<(), FsError> {

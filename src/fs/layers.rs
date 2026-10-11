@@ -680,7 +680,7 @@ mod tests {
 
         // 4. Create and unlink file4 (tombstoned)
         let ino4 = fs.create_file(1, "file4.txt", 0o644).unwrap();
-        crate::operations::links::unlink_core(&fs, 1, "file4.txt").unwrap();
+        fs.remove_file(1, "file4.txt").unwrap();
 
         // Verify root, file1, file2, file3 are present with matching attributes
         assert!(fs.get_attr(1).is_some());

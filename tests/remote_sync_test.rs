@@ -7,7 +7,6 @@ use appendfs::TestFs;
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{VolumeHeader, VolumeKey};
 use appendfs::log::{LogFileCache, LogWriter, init_volume};
-use appendfs::operations::read_write::{open_core, release_core};
 use appendfs::remote::bootstrap_from_remote;
 use appendfs::remote::worker::{cross_copy_file, cross_copy_summary, upload_storage_file};
 use appendfs::remote::{
@@ -1076,7 +1075,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     .unwrap();
 
     // 4. Open virtual file handle
-    let fh = open_core(&fs_arc, remotes_ino, libc::O_RDONLY as u32).unwrap();
+    let fh = fs_arc.open_file(remotes_ino, libc::O_RDONLY as u32).unwrap();
 
     // 5. Read .remotes content
     let content_bytes = fs_arc.read_blocking(remotes_ino, fh, 0, 4096).unwrap();
@@ -1097,7 +1096,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     assert!(content_str.contains("Synced Generation:  1 / 1"));
 
     // 6. Release file handle
-    release_core(&fs_arc, remotes_ino, fh).unwrap();
+    fs_arc.release_file(remotes_ino, fh).unwrap();
     assert_eq!(
         fs_arc.read_blocking(remotes_ino, fh, 0, 4096),
         Err(FsError::EBADF),

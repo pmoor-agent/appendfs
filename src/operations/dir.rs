@@ -387,7 +387,7 @@ mod tests {
         assert_eq!(fs.get_attr(d1.ino).unwrap().nlink, 3);
 
         // 4. Move "sub" from "d1" to "d2" -> d1 drops to 2, d2 increases to 3
-        crate::operations::links::rename_core(&fs, d1.ino, "sub", d2.ino, "sub").unwrap();
+        fs.rename_entry(d1.ino, "sub", d2.ino, "sub").unwrap();
         assert_eq!(fs.get_attr(d1.ino).unwrap().nlink, 2);
         assert_eq!(fs.get_attr(d2.ino).unwrap().nlink, 3);
         assert_eq!(fs.get_attr(sub.ino).unwrap().nlink, 2);

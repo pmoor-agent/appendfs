@@ -119,8 +119,8 @@ mod tests {
     use super::*;
     use crate::error::FsError;
     use crate::operations::dir::{iter_dir_entries, list_dir_core};
-    use crate::operations::links::{rename_core, unlink_core};
-    use crate::operations::read_write::{fallocate_core, open_core, release_core, setattr_core, write_handle_core};
+
+    use crate::operations::read_write::{fallocate_core, setattr_core, write_handle_core};
     use crate::test_utils::FsTestExt;
     use crate::test_utils::TestFs;
 
@@ -261,9 +261,9 @@ mod tests {
         // 1. Opening for writing is refused, and a write that arrives on a read-only handle
         //    anyway is rejected with EPERM
         assert_eq!(fs.write_at(v_ino, b"mutate", 0), Err(FsError::EACCES));
-        let fh = open_core(&fs, v_ino, libc::O_RDONLY as u32).unwrap();
+        let fh = fs.open_file(v_ino, libc::O_RDONLY as u32).unwrap();
         assert_eq!(write_handle_core(&fs, v_ino, fh, b"mutate", 0), Err(FsError::EPERM));
-        release_core(&fs, v_ino, fh).unwrap();
+        fs.release_file(v_ino, fh).unwrap();
 
         // 2. Setattr is rejected with EPERM
         assert_eq!(
@@ -284,29 +284,20 @@ mod tests {
         );
 
         // 4. Unlink is rejected with EPERM
-        assert_eq!(unlink_core(&fs, 1, ".remotes"), Err(FsError::EPERM));
+        assert_eq!(fs.remove_file(1, ".remotes"), Err(FsError::EPERM));
 
         // 5. Rename is rejected with EPERM
-        assert_eq!(rename_core(&fs, 1, ".remotes", 1, "renamed.txt"), Err(FsError::EPERM));
+        assert_eq!(fs.rename_entry(1, ".remotes", 1, "renamed.txt"), Err(FsError::EPERM));
 
         // 6. Creating over an existing virtual file returns EEXIST
         assert_eq!(fs.create_file(1, ".remotes", 0o644), Err(FsError::EEXIST));
 
         // 7. Hardlinking a virtual file is rejected with EPERM
-        assert_eq!(
-            crate::operations::links::link_core(&fs, v_ino, 1, "link.txt"),
-            Err(FsError::EPERM)
-        );
+        assert_eq!(fs.hard_link(v_ino, 1, "link.txt"), Err(FsError::EPERM));
 
         // 8. Xattr operations on virtual files are rejected / empty
-        assert_eq!(
-            crate::operations::xattr::setxattr_core(&fs, v_ino, "user.v", b"val", 0),
-            Err(FsError::EPERM)
-        );
-        assert_eq!(
-            crate::operations::xattr::removexattr_core(&fs, v_ino, "user.v"),
-            Err(FsError::EPERM)
-        );
+        assert_eq!(fs.set_xattr(v_ino, "user.v", b"val", 0), Err(FsError::EPERM));
+        assert_eq!(fs.remove_xattr(v_ino, "user.v"), Err(FsError::EPERM));
         assert_eq!(
             crate::operations::xattr::getxattr_core(&fs, v_ino, "user.v", 0),
             Err(FsError::ENODATA)
@@ -319,8 +310,8 @@ mod tests {
         // 9. Status virtual file has identical mutation protections
         let status_ino = fs.virtual_files.get_ino_by_name(".status").unwrap();
         assert_eq!(fs.write_at(status_ino, b"mutate", 0), Err(FsError::EACCES));
-        assert_eq!(unlink_core(&fs, 1, ".status"), Err(FsError::EPERM));
-        assert_eq!(rename_core(&fs, 1, ".status", 1, "renamed.txt"), Err(FsError::EPERM));
+        assert_eq!(fs.remove_file(1, ".status"), Err(FsError::EPERM));
+        assert_eq!(fs.rename_entry(1, ".status", 1, "renamed.txt"), Err(FsError::EPERM));
     }
 
     #[test]
