@@ -976,9 +976,9 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
 
     // 2. Perform rm -rf (15 unlinks + 1 rmdir)
     for name in &file_names {
-        appendfs::operations::links::unlink_core(&fs, dir_ino, name).unwrap();
+        fs.remove_file(dir_ino, name).unwrap();
     }
-    appendfs::operations::dir::rmdir_core(&fs, 1, "bigdir").unwrap();
+    fs.remove_dir(1, "bigdir").unwrap();
 
     // Verify that the active log writer records flushes triggered automatically by operation count!
     let writer = fs.log_writer.as_ref().unwrap();
@@ -1033,7 +1033,7 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
     let d = fs.make_dir(1, "sub", 0o755).unwrap();
     let f1 = fs.create_file(d, "hello.txt", 0o644).unwrap();
     fs.write_at(f1, b"integrity test data", 0).unwrap();
-    let _l = appendfs::operations::links::link_core(&fs, f1, 1, "hardlink.txt").unwrap();
+    fs.hard_link(f1, 1, "hardlink.txt").unwrap();
 
     fs.quiesce().unwrap();
 

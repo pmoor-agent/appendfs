@@ -2035,7 +2035,7 @@ mod tests {
         let f = fs.create_file(d, "file.txt", 0o644).unwrap();
         fs.write_at(f, b"hello integrity checker", 0).unwrap();
         let _s = fs.make_symlink(1, "link_to_file", "mydir/file.txt").unwrap();
-        let _h = crate::operations::links::link_core(&fs, f, 1, "hardlink.txt").unwrap();
+        fs.hard_link(f, 1, "hardlink.txt").unwrap();
 
         fs.quiesce().unwrap();
 

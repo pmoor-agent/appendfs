@@ -586,7 +586,7 @@ mod tests {
         fs.quiesce().unwrap();
         assert!(fs.inner.lock_for_tests().unwrap().exists_below_live(file));
 
-        crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
+        fs.remove_file(1, "f.txt").unwrap();
         assert!(
             fs.inner.lock_for_tests().unwrap().exists_below_live(file),
             "base still describes the inode until the tombstone's batch folds"
@@ -612,7 +612,7 @@ mod tests {
         let ino = fs.create_file(1, "f.txt", 0o644).unwrap();
         // Fold it into `base`, so the lower layers still describe the inode after deletion.
         fs.quiesce().unwrap();
-        crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
+        fs.remove_file(1, "f.txt").unwrap();
         assert!(fs.get_attr(ino).is_none(), "unlinked file must be gone");
 
         // A late attribute update - an atime bump racing the unlink, say - must not rebuild
@@ -645,7 +645,7 @@ mod tests {
 
         // Create and immediately unlink in the same batch
         let _ino = fs.create_file(1, "temp.txt", 0o644).unwrap();
-        crate::operations::links::unlink_core(&fs, 1, "temp.txt").unwrap();
+        fs.remove_file(1, "temp.txt").unwrap();
 
         // Before freeze, live has a phantom tombstone in removed
         fs.with_inner_for_tests(|inner| {
@@ -691,8 +691,8 @@ mod tests {
         fs.quiesce().unwrap();
 
         // Self-canceling rename: file.txt -> tmp.txt -> file.txt
-        crate::operations::links::rename_core(&fs, 1, "file.txt", 1, "tmp.txt").unwrap();
-        crate::operations::links::rename_core(&fs, 1, "tmp.txt", 1, "file.txt").unwrap();
+        fs.rename_entry(1, "file.txt", 1, "tmp.txt").unwrap();
+        fs.rename_entry(1, "tmp.txt", 1, "file.txt").unwrap();
 
         // Before freeze, live contains redundant added: "file.txt" and phantom removed: "tmp.txt"
         fs.with_inner_for_tests(|inner| {
@@ -741,8 +741,8 @@ mod tests {
         fs.quiesce().unwrap();
 
         // Chained rename: a.txt -> b.txt -> c.txt in the same batch
-        crate::operations::links::rename_core(&fs, 1, "a.txt", 1, "b.txt").unwrap();
-        crate::operations::links::rename_core(&fs, 1, "b.txt", 1, "c.txt").unwrap();
+        fs.rename_entry(1, "a.txt", 1, "b.txt").unwrap();
+        fs.rename_entry(1, "b.txt", 1, "c.txt").unwrap();
 
         // Freeze live into flushing
         assert!(fs.freeze_now());
@@ -779,7 +779,7 @@ mod tests {
         fs.quiesce().unwrap();
 
         // Batch 2: unlink file1.txt in live
-        crate::operations::links::unlink_core(&fs, 1, "file1.txt").unwrap();
+        fs.remove_file(1, "file1.txt").unwrap();
         assert!(fs.freeze_now());
 
         // Batch 2 must retain "file1.txt" in removed because it exists in folded base
@@ -812,15 +812,15 @@ mod tests {
         // 1. Create file1.txt
         // 2. Hardlink existing.txt to keep inode alive, then unlink existing.txt
         let _f1 = fs.create_file(1, "file1.txt", 0o644).unwrap();
-        crate::operations::links::link_core(&fs, existing_ino, 1, "existing_link.txt").unwrap();
-        crate::operations::links::unlink_core(&fs, 1, "existing.txt").unwrap();
+        fs.hard_link(existing_ino, 1, "existing_link.txt").unwrap();
+        fs.remove_file(1, "existing.txt").unwrap();
         assert!(fs.freeze_now());
 
         // Batch 1 (frozen, unflushed):
         // 1. Unlink file1.txt (which was created in Batch 0, NOT in base!)
         // 2. Re-create existing.txt with the same inode (which was unlinked in Batch 0, but still in base!)
-        crate::operations::links::unlink_core(&fs, 1, "file1.txt").unwrap();
-        crate::operations::links::link_core(&fs, existing_ino, 1, "existing.txt").unwrap();
+        fs.remove_file(1, "file1.txt").unwrap();
+        fs.hard_link(existing_ino, 1, "existing.txt").unwrap();
         assert!(fs.freeze_now());
 
         fs.with_inner_for_tests(|inner| {

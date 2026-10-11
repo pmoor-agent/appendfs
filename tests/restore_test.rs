@@ -1,6 +1,6 @@
 use appendfs::FsTestExt;
 use appendfs::compat::CompatClock;
-use appendfs::operations::read_write::{FUSE_SET_ATTR_MODE, open_core, release_core, setattr_core, write_handle_core};
+use appendfs::operations::read_write::{FUSE_SET_ATTR_MODE, setattr_core, write_handle_core};
 use appendfs::storage::OsStorage;
 use appendfs::{Clock, Storage, TestFs, VolumeKey};
 
@@ -29,9 +29,9 @@ fn test_python_restore_with_readonly_file_and_directory() {
     // Batch 1:
     // Create readonly_file.txt, write initial data, chmod 0444
     let file = fs.create_file(1, "readonly_file.txt", 0o644).unwrap();
-    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    let fh = fs.open_file(file, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, file, fh, b"Initial data", 0).unwrap();
-    release_core(&fs, file, fh).unwrap();
+    fs.release_file(file, fh).unwrap();
     setattr_core(
         &fs,
         file,
@@ -48,9 +48,9 @@ fn test_python_restore_with_readonly_file_and_directory() {
     // Create readonly_dir with mode 0555 and a nested file
     let dir = fs.make_dir(1, "readonly_dir", 0o755).unwrap();
     let nested = fs.create_file(dir, "nested.txt", 0o644).unwrap();
-    let n_fh = open_core(&fs, nested, libc::O_RDWR as u32).unwrap();
+    let n_fh = fs.open_file(nested, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, nested, n_fh, b"Nested content", 0).unwrap();
-    release_core(&fs, nested, n_fh).unwrap();
+    fs.release_file(nested, n_fh).unwrap();
     setattr_core(
         &fs,
         dir,
@@ -68,9 +68,9 @@ fn test_python_restore_with_readonly_file_and_directory() {
 
     // Batch 2:
     // Rewrite readonly_file.txt with new data
-    let fh2 = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    let fh2 = fs.open_file(file, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, file, fh2, b"Rewritten content on readonly file", 0).unwrap();
-    release_core(&fs, file, fh2).unwrap();
+    fs.release_file(file, fh2).unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);
@@ -147,7 +147,7 @@ fn test_python_restore_across_log_rollover() {
 
     // Create file
     let file = fs.create_file(d3, "test.pdf", 0o600).unwrap();
-    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    let fh = fs.open_file(file, libc::O_RDWR as u32).unwrap();
 
     // Write first chunk: 512 KiB of 0x42 ('B')
     let chunk1 = vec![0x42u8; 512 * 1024];
@@ -164,7 +164,7 @@ fn test_python_restore_across_log_rollover() {
     let chunk2_len = 1324234;
     let chunk2 = vec![0x43u8; chunk2_len];
     write_handle_core(&fs, file, fh, &chunk2, chunk1.len() as i64).unwrap();
-    release_core(&fs, file, fh).unwrap();
+    fs.release_file(file, fh).unwrap();
 
     setattr_core(
         &fs,
@@ -212,8 +212,6 @@ fn test_python_restore_across_log_rollover() {
 
 #[test]
 fn test_python_restore_file_rename() {
-    use appendfs::operations::links::rename_core;
-
     let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
     if !script_path.is_file() {
         return;
@@ -232,15 +230,15 @@ fn test_python_restore_file_rename() {
 
     // Create file as temp.txt, write data
     let file = fs.create_file(1, "temp.txt", 0o644).unwrap();
-    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    let fh = fs.open_file(file, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, file, fh, b"Hello World from temp file", 0).unwrap();
-    release_core(&fs, file, fh).unwrap();
+    fs.release_file(file, fh).unwrap();
 
     // Flush batch 1
     fs.quiesce().unwrap();
 
     // Rename temp.txt -> final.txt
-    rename_core(&fs, 1, "temp.txt", 1, "final.txt").unwrap();
+    fs.rename_entry(1, "temp.txt", 1, "final.txt").unwrap();
 
     // Flush batch 2
     fs.quiesce().unwrap();
@@ -268,8 +266,6 @@ fn test_python_restore_file_rename() {
 
 #[test]
 fn test_python_restore_rsync_style_write_across_rollover_and_rename() {
-    use appendfs::operations::links::rename_core;
-
     let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
     if !script_path.is_file() {
         return;
@@ -295,7 +291,7 @@ fn test_python_restore_rsync_style_write_across_rollover_and_rename() {
     let temp_name = ".visionen.januar.2000.web.pdf.tmp123";
     let final_name = "visionen.januar.2000.web.pdf";
     let file = fs.create_file(d3, temp_name, 0o600).unwrap();
-    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    let fh = fs.open_file(file, libc::O_RDWR as u32).unwrap();
 
     // Write chunk 1: 512 KiB
     let chunk1 = vec![0x42u8; 512 * 1024];
@@ -311,7 +307,7 @@ fn test_python_restore_rsync_style_write_across_rollover_and_rename() {
     let chunk2_len = 1324234;
     let chunk2 = vec![0x43u8; chunk2_len];
     write_handle_core(&fs, file, fh, &chunk2, chunk1.len() as i64).unwrap();
-    release_core(&fs, file, fh).unwrap();
+    fs.release_file(file, fh).unwrap();
 
     // Chmod 0640, set mtime
     setattr_core(
@@ -328,7 +324,7 @@ fn test_python_restore_rsync_style_write_across_rollover_and_rename() {
     .unwrap();
 
     // Atomic rename
-    rename_core(&fs, d3, temp_name, d3, final_name).unwrap();
+    fs.rename_entry(d3, temp_name, d3, final_name).unwrap();
 
     // Flush batch 2 in Log 2
     fs.quiesce().unwrap();
@@ -359,8 +355,6 @@ fn test_python_restore_rsync_style_write_across_rollover_and_rename() {
 
 #[test]
 fn test_python_restore_directory_rename_and_move() {
-    use appendfs::operations::links::rename_core;
-
     let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
     if !script_path.is_file() {
         return;
@@ -381,14 +375,14 @@ fn test_python_restore_directory_rename_and_move() {
     let dir_a = fs.make_dir(1, "dirA", 0o755).unwrap();
     let dir_b = fs.make_dir(1, "dirB", 0o755).unwrap();
     let child = fs.create_file(dir_a, "child.txt", 0o644).unwrap();
-    let fh = open_core(&fs, child, libc::O_RDWR as u32).unwrap();
+    let fh = fs.open_file(child, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, child, fh, b"child file inside dirA", 0).unwrap();
-    release_core(&fs, child, fh).unwrap();
+    fs.release_file(child, fh).unwrap();
 
     fs.quiesce().unwrap();
 
     // Move dirA into dirB as sub_dir
-    rename_core(&fs, 1, "dirA", dir_b, "sub_dir").unwrap();
+    fs.rename_entry(1, "dirA", dir_b, "sub_dir").unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);
@@ -416,8 +410,6 @@ fn test_python_restore_directory_rename_and_move() {
 
 #[test]
 fn test_python_restore_overwrite_rename() {
-    use appendfs::operations::links::rename_core;
-
     let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
     if !script_path.is_file() {
         return;
@@ -436,19 +428,19 @@ fn test_python_restore_overwrite_rename() {
 
     // Create file1 and file2
     let f1 = fs.create_file(1, "source.txt", 0o644).unwrap();
-    let fh1 = open_core(&fs, f1, libc::O_RDWR as u32).unwrap();
+    let fh1 = fs.open_file(f1, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, f1, fh1, b"new content", 0).unwrap();
-    release_core(&fs, f1, fh1).unwrap();
+    fs.release_file(f1, fh1).unwrap();
 
     let f2 = fs.create_file(1, "target.txt", 0o644).unwrap();
-    let fh2 = open_core(&fs, f2, libc::O_RDWR as u32).unwrap();
+    let fh2 = fs.open_file(f2, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, f2, fh2, b"old content that will be overwritten", 0).unwrap();
-    release_core(&fs, f2, fh2).unwrap();
+    fs.release_file(f2, fh2).unwrap();
 
     fs.quiesce().unwrap();
 
     // Overwrite target.txt with source.txt
-    rename_core(&fs, 1, "source.txt", 1, "target.txt").unwrap();
+    fs.rename_entry(1, "source.txt", 1, "target.txt").unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);
@@ -476,8 +468,6 @@ fn test_python_restore_overwrite_rename() {
 
 #[test]
 fn test_python_restore_hardlinks_and_unlink() {
-    use appendfs::operations::links::{link_core, unlink_core};
-
     let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
     if !script_path.is_file() {
         return;
@@ -496,18 +486,18 @@ fn test_python_restore_hardlinks_and_unlink() {
 
     // Create file
     let f = fs.create_file(1, "original.txt", 0o644).unwrap();
-    let fh = open_core(&fs, f, libc::O_RDWR as u32).unwrap();
+    let fh = fs.open_file(f, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, f, fh, b"hardlinked data", 0).unwrap();
-    release_core(&fs, f, fh).unwrap();
+    fs.release_file(f, fh).unwrap();
 
     // Create hardlink
-    link_core(&fs, f, 1, "link1.txt").unwrap();
-    link_core(&fs, f, 1, "link2.txt").unwrap();
+    fs.hard_link(f, 1, "link1.txt").unwrap();
+    fs.hard_link(f, 1, "link2.txt").unwrap();
 
     fs.quiesce().unwrap();
 
     // Unlink original.txt, leaving link1.txt and link2.txt
-    unlink_core(&fs, 1, "original.txt").unwrap();
+    fs.remove_file(1, "original.txt").unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);
@@ -547,8 +537,6 @@ fn test_python_restore_hardlinks_and_unlink() {
 
 #[test]
 fn test_python_restore_hardlinks_same_name_in_different_dirs() {
-    use appendfs::operations::links::link_core;
-
     let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
     if !script_path.is_file() {
         return;
@@ -571,12 +559,12 @@ fn test_python_restore_hardlinks_same_name_in_different_dirs() {
 
     // Create dir1/shared.dat
     let f = fs.create_file(d1, "shared.dat", 0o644).unwrap();
-    let fh = open_core(&fs, f, libc::O_RDWR as u32).unwrap();
+    let fh = fs.open_file(f, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, f, fh, b"initial shared payload", 0).unwrap();
-    release_core(&fs, f, fh).unwrap();
+    fs.release_file(f, fh).unwrap();
 
     // Hardlink to dir2/shared.dat (same filename, different parent)
-    link_core(&fs, f, d2, "shared.dat").unwrap();
+    fs.hard_link(f, d2, "shared.dat").unwrap();
 
     fs.quiesce().unwrap();
 
@@ -584,9 +572,9 @@ fn test_python_restore_hardlinks_same_name_in_different_dirs() {
     fs.force_roll_active_log().unwrap();
 
     // Write more data in new log
-    let fh2 = open_core(&fs, f, libc::O_RDWR as u32).unwrap();
+    let fh2 = fs.open_file(f, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, f, fh2, b" -- appended after rollover", 22).unwrap();
-    release_core(&fs, f, fh2).unwrap();
+    fs.release_file(f, fh2).unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);
@@ -631,8 +619,6 @@ fn test_python_restore_hardlinks_same_name_in_different_dirs() {
 
 #[test]
 fn test_python_restore_directory_overwrite_rename() {
-    use appendfs::operations::links::rename_core;
-
     let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/restore.py");
     if !script_path.is_file() {
         return;
@@ -652,9 +638,9 @@ fn test_python_restore_directory_overwrite_rename() {
     // Create dir_a with file inside
     let dir_a = fs.make_dir(1, "dir_a", 0o755).unwrap();
     let file = fs.create_file(dir_a, "inner.txt", 0o644).unwrap();
-    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    let fh = fs.open_file(file, libc::O_RDWR as u32).unwrap();
     write_handle_core(&fs, file, fh, b"inside dir_a", 0).unwrap();
-    release_core(&fs, file, fh).unwrap();
+    fs.release_file(file, fh).unwrap();
 
     // Create empty dir_b
     let _dir_b = fs.make_dir(1, "dir_b", 0o755).unwrap();
@@ -662,7 +648,7 @@ fn test_python_restore_directory_overwrite_rename() {
     fs.quiesce().unwrap();
 
     // Rename dir_a to overwrite dir_b
-    rename_core(&fs, 1, "dir_a", 1, "dir_b").unwrap();
+    fs.rename_entry(1, "dir_a", 1, "dir_b").unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);
@@ -709,7 +695,7 @@ fn test_python_restore_sparse_hole_and_expansion() {
 
     // Create file
     let file = fs.create_file(1, "sparse.bin", 0o644).unwrap();
-    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    let fh = fs.open_file(file, libc::O_RDWR as u32).unwrap();
 
     // Write chunk at offset 0 (4 KiB)
     let chunk0 = vec![0xAAu8; 4096];
@@ -733,7 +719,7 @@ fn test_python_restore_sparse_hole_and_expansion() {
         2048,
     )
     .unwrap();
-    release_core(&fs, file, fh).unwrap();
+    fs.release_file(file, fh).unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);

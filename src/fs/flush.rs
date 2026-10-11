@@ -1197,7 +1197,7 @@ mod tests {
         fs.quiesce().unwrap();
         assert_eq!(fs.read_file_data(ino, 0, 1000).unwrap(), payload);
 
-        crate::operations::read_write::punch_hole_core(&fs, ino, 200, 300).unwrap();
+        fs.punch_hole(ino, 200, 300).unwrap();
 
         // Size is unchanged by a punch, and the hole reads as zeros while the data on
         // either side is untouched.
@@ -1322,12 +1322,12 @@ mod tests {
         let ino = fs.create_file(1, "short.bin", 0o644).unwrap();
         fs.write_at(ino, &[0xAB; 100], 0).unwrap();
 
-        crate::operations::read_write::punch_hole_core(&fs, ino, 4096, 4096).unwrap();
+        fs.punch_hole(ino, 4096, 4096).unwrap();
         assert_eq!(fs.get_attr(ino).unwrap().size, 100, "punch past EOF must not extend");
         assert_eq!(fs.read_file_data(ino, 0, 100).unwrap(), vec![0xAB; 100]);
 
         // Straddling EOF punches only the part that exists.
-        crate::operations::read_write::punch_hole_core(&fs, ino, 50, 4096).unwrap();
+        fs.punch_hole(ino, 50, 4096).unwrap();
         assert_eq!(fs.get_attr(ino).unwrap().size, 100, "straddling punch must not extend");
         let data = fs.read_file_data(ino, 0, 100).unwrap();
         assert_eq!(&data[..50], &[0xAB; 50]);
@@ -1355,7 +1355,7 @@ mod tests {
         assert_eq!(fs.get_parent_dir_inode(dir3), Some(1));
 
         // Move dir2 from dir1 into dir3
-        crate::operations::links::rename_core(&fs, dir1, "dir2", dir3, "dir2_moved").unwrap();
+        fs.rename_entry(dir1, "dir2", dir3, "dir2_moved").unwrap();
         assert_eq!(fs.get_parent_dir_inode(dir2), Some(dir3));
 
         // Fold live to base
@@ -1468,11 +1468,11 @@ mod tests {
         assert_eq!(stats_before[0].live_extents, 3);
 
         // 2. Perform rm -rf /Gletscher
-        crate::operations::links::unlink_core(&fs, sub_ino, "file3.txt").unwrap();
-        crate::operations::dir::rmdir_core(&fs, gletscher_ino, "sub").unwrap();
-        crate::operations::links::unlink_core(&fs, gletscher_ino, "file1.txt").unwrap();
-        crate::operations::links::unlink_core(&fs, gletscher_ino, "file2.txt").unwrap();
-        crate::operations::dir::rmdir_core(&fs, 1, "Gletscher").unwrap();
+        fs.remove_file(sub_ino, "file3.txt").unwrap();
+        fs.remove_dir(gletscher_ino, "sub").unwrap();
+        fs.remove_file(gletscher_ino, "file1.txt").unwrap();
+        fs.remove_file(gletscher_ino, "file2.txt").unwrap();
+        fs.remove_dir(1, "Gletscher").unwrap();
 
         // Flush deletion to disk
         fs.quiesce().unwrap();
@@ -1522,8 +1522,8 @@ mod tests {
         fs.write_at(file_ino, b"persistent shared content", 0).unwrap();
 
         // 3. Create hard link /Gletscher/shared_link.txt -> inode N (nlink becomes 2)
-        let link_attr = crate::operations::links::link_core(&fs, file_ino, gletscher_ino, "shared_link.txt").unwrap();
-        assert_eq!(link_attr.nlink, 2);
+        fs.hard_link(file_ino, gletscher_ino, "shared_link.txt").unwrap();
+        assert_eq!(fs.get_attr(file_ino).unwrap().nlink, 2);
 
         // Commit everything to disk and seal active generation 1
         fs.quiesce().unwrap();
@@ -1534,8 +1534,8 @@ mod tests {
         assert_eq!(stats1[0].live_extents, 1);
 
         // 4. Delete /Gletscher via rm -rf (/Gletscher/shared_link.txt unlinked, /Gletscher rmdir'd)
-        crate::operations::links::unlink_core(&fs, gletscher_ino, "shared_link.txt").unwrap();
-        crate::operations::dir::rmdir_core(&fs, 1, "Gletscher").unwrap();
+        fs.remove_file(gletscher_ino, "shared_link.txt").unwrap();
+        fs.remove_dir(1, "Gletscher").unwrap();
 
         // Verify that /keep/shared.txt still has nlink 1 in memory
         let keep_file_attr = fs.get_attr(file_ino).unwrap();
@@ -1613,17 +1613,17 @@ mod tests {
         fs.quiesce().unwrap();
 
         // Open the file so open_counts > 0
-        let fh = crate::operations::read_write::open_core(&fs, ino, libc::O_RDWR as u32).unwrap();
+        let fh = fs.open_file(ino, libc::O_RDWR as u32).unwrap();
 
         // Unlink the file: removes directory entry, but node is kept in memory because open_count == 1
-        crate::operations::links::unlink_core(&fs, 1, "unlinked.txt").unwrap();
+        fs.remove_file(1, "unlinked.txt").unwrap();
 
         // Write more data while unlinked, then sync log
         fs.write_at(ino, b" more content", 16).unwrap();
         fs.quiesce().unwrap();
 
         // Close the handle: drops open_count to 0 and tombstones the node in live
-        crate::operations::read_write::release_core(&fs, ino, fh).unwrap();
+        fs.release_file(ino, fh).unwrap();
         fs.quiesce().unwrap();
 
         // Recover filesystem from log
@@ -2076,7 +2076,7 @@ mod tests {
         let end_data = vec![0xCDu8; 100];
         fs.write_at(ino, &end_data, end_offset as i64).unwrap();
 
-        crate::operations::read_write::punch_hole_core(&fs, ino, 100, hole_len).unwrap();
+        fs.punch_hole(ino, 100, hole_len).unwrap();
 
         let total_size = (end_offset + 100) as i64;
         assert_eq!(fs.get_attr(ino).unwrap().size, total_size);
@@ -2775,10 +2775,10 @@ mod tests {
         // In batch 2:
         // 1. touch tmp.txt; rm tmp.txt
         let _ = fs.create_file(1, "tmp.txt", 0o644).unwrap();
-        crate::operations::links::unlink_core(&fs, 1, "tmp.txt").unwrap();
+        fs.remove_file(1, "tmp.txt").unwrap();
         // 2. rename file.txt -> ren.txt -> file.txt
-        crate::operations::links::rename_core(&fs, 1, "file.txt", 1, "ren.txt").unwrap();
-        crate::operations::links::rename_core(&fs, 1, "ren.txt", 1, "file.txt").unwrap();
+        fs.rename_entry(1, "file.txt", 1, "ren.txt").unwrap();
+        fs.rename_entry(1, "ren.txt", 1, "file.txt").unwrap();
 
         // Flush to disk
         fs.quiesce().unwrap();

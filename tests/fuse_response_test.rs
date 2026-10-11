@@ -585,7 +585,7 @@ fn test_open_cache_flags_and_timeout_delineation() {
 #[test]
 fn test_cold_read_deferred_threadpool_execution() {
     use appendfs::FsTestExt;
-    use appendfs::operations::read_write::open_core;
+
     use appendfs::storage::MemoryStorage;
 
     let storage = Arc::new(MemoryStorage::new());
@@ -597,7 +597,7 @@ fn test_cold_read_deferred_threadpool_execution() {
         .fs;
 
     let file = fs.create_file(1, "deferred_read.txt", 0o644).unwrap();
-    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    let fh = fs.open_file(file, libc::O_RDWR as u32).unwrap();
     let payload = b"cold read deferred threadpool test".to_vec();
     fs.write_at(file, &payload, 0).unwrap();
 

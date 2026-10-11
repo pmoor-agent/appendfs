@@ -2,10 +2,6 @@ mod common;
 use appendfs::clock::{AdvancingClock, Clock, MockClock, SystemClock};
 use appendfs::log::{LogAttrDelta, LogDirectoryDelta, LogEntryDelta, LogFileDelta, LogNodeDelta, OpCode, recover_fs};
 use appendfs::node::NodeKind;
-use appendfs::operations::dir::{opendir_core, releasedir_core, rmdir_core};
-use appendfs::operations::links::{link_core, readlink_core, rename_core, unlink_core};
-use appendfs::operations::read_write::{open_core, punch_hole_core, release_core};
-use appendfs::operations::xattr::{removexattr_core, setxattr_core};
 use appendfs::storage::{MemoryStorage, Storage};
 use appendfs::test_utils::AttrChanges;
 use appendfs::{FsTestExt, SnapshotNode, TestFs};
@@ -184,11 +180,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         };
 
                         if let Some(name) = name_to_unlink {
-                            let res1 = unlink_core(&fs_baseline.fs, parent_to_unlink, &name);
-                            let res2 = unlink_core(&fs_micro.fs, parent_to_unlink, &name);
-                            let res3 = unlink_core(&fs_remount.fs, parent_to_unlink, &name);
-                            let res4 = unlink_core(&fs_crash.fs, parent_to_unlink, &name);
-                            let res5 = unlink_core(&fs_remote.fs, parent_to_unlink, &name);
+                            let res1 = fs_baseline.fs.remove_file(parent_to_unlink, &name);
+                            let res2 = fs_micro.fs.remove_file(parent_to_unlink, &name);
+                            let res3 = fs_remount.fs.remove_file(parent_to_unlink, &name);
+                            let res4 = fs_crash.fs.remove_file(parent_to_unlink, &name);
+                            let res5 = fs_remote.fs.remove_file(parent_to_unlink, &name);
 
                             assert_eq!(res1, res2);
                             assert_eq!(res1, res3);
@@ -249,11 +245,17 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 format!("renamed_s{}_step{}", seed, step)
                             };
 
-                            let res1 = rename_core(&fs_baseline.fs, src_parent, &src_name, dest_parent, &dest_name);
-                            let res2 = rename_core(&fs_micro.fs, src_parent, &src_name, dest_parent, &dest_name);
-                            let res3 = rename_core(&fs_remount.fs, src_parent, &src_name, dest_parent, &dest_name);
-                            let res4 = rename_core(&fs_crash.fs, src_parent, &src_name, dest_parent, &dest_name);
-                            let res5 = rename_core(&fs_remote.fs, src_parent, &src_name, dest_parent, &dest_name);
+                            let res1 = fs_baseline
+                                .fs
+                                .rename_entry(src_parent, &src_name, dest_parent, &dest_name);
+                            let res2 = fs_micro.fs.rename_entry(src_parent, &src_name, dest_parent, &dest_name);
+                            let res3 = fs_remount
+                                .fs
+                                .rename_entry(src_parent, &src_name, dest_parent, &dest_name);
+                            let res4 = fs_crash.fs.rename_entry(src_parent, &src_name, dest_parent, &dest_name);
+                            let res5 = fs_remote
+                                .fs
+                                .rename_entry(src_parent, &src_name, dest_parent, &dest_name);
 
                             assert_eq!(res1, res2, "rename result mismatch (baseline vs micro)");
                             assert_eq!(res1, res3, "rename result mismatch (baseline vs remount)");
@@ -283,11 +285,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         };
 
                         if let Some((parent, name)) = loc {
-                            let res1 = rmdir_core(&fs_baseline.fs, parent, &name);
-                            let res2 = rmdir_core(&fs_micro.fs, parent, &name);
-                            let res3 = rmdir_core(&fs_remount.fs, parent, &name);
-                            let res4 = rmdir_core(&fs_crash.fs, parent, &name);
-                            let res5 = rmdir_core(&fs_remote.fs, parent, &name);
+                            let res1 = fs_baseline.fs.remove_dir(parent, &name);
+                            let res2 = fs_micro.fs.remove_dir(parent, &name);
+                            let res3 = fs_remount.fs.remove_dir(parent, &name);
+                            let res4 = fs_crash.fs.remove_dir(parent, &name);
+                            let res5 = fs_remote.fs.remove_dir(parent, &name);
 
                             assert_eq!(res1, res2, "rmdir result mismatch (baseline vs micro)");
                             assert_eq!(res1, res3, "rmdir result mismatch (baseline vs remount)");
@@ -328,11 +330,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let newparent = active_dirs[prng.gen_range(0, active_dirs.len() - 1)];
                         let newname = format!("hardlink_s{}_step{}", seed, step);
 
-                        let res1 = link_core(&fs_baseline.fs, ino, newparent, &newname).map(|_| ());
-                        let res2 = link_core(&fs_micro.fs, ino, newparent, &newname).map(|_| ());
-                        let res3 = link_core(&fs_remount.fs, ino, newparent, &newname).map(|_| ());
-                        let res4 = link_core(&fs_crash.fs, ino, newparent, &newname).map(|_| ());
-                        let res5 = link_core(&fs_remote.fs, ino, newparent, &newname).map(|_| ());
+                        let res1 = fs_baseline.fs.hard_link(ino, newparent, &newname);
+                        let res2 = fs_micro.fs.hard_link(ino, newparent, &newname);
+                        let res3 = fs_remount.fs.hard_link(ino, newparent, &newname);
+                        let res4 = fs_crash.fs.hard_link(ino, newparent, &newname);
+                        let res5 = fs_remote.fs.hard_link(ino, newparent, &newname);
 
                         assert_eq!(res1, res2, "link result mismatch (baseline vs micro)");
                         assert_eq!(res1, res3, "link result mismatch (baseline vs remount)");
@@ -405,11 +407,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                     if !active_files.is_empty() {
                         let ino = active_files[prng.gen_range(0, active_files.len() - 1)];
 
-                        let res1 = readlink_core(&fs_baseline.fs, ino);
-                        let res2 = readlink_core(&fs_micro.fs, ino);
-                        let res3 = readlink_core(&fs_remount.fs, ino);
-                        let res4 = readlink_core(&fs_crash.fs, ino);
-                        let res5 = readlink_core(&fs_remote.fs, ino);
+                        let res1 = fs_baseline.fs.symlink_target(ino);
+                        let res2 = fs_micro.fs.symlink_target(ino);
+                        let res3 = fs_remount.fs.symlink_target(ino);
+                        let res4 = fs_crash.fs.symlink_target(ino);
+                        let res5 = fs_remote.fs.symlink_target(ino);
 
                         assert_eq!(res1, res2, "readlink result mismatch (baseline vs micro)");
                         assert_eq!(res1, res3, "readlink result mismatch (baseline vs remount)");
@@ -436,11 +438,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 11 => {
                     // Opendir: snapshot directory entries and hold open across mutations
                     let ino = active_dirs[prng.gen_range(0, active_dirs.len() - 1)];
-                    let res1 = opendir_core(&fs_baseline.fs, ino, 0);
-                    let res2 = opendir_core(&fs_micro.fs, ino, 0);
-                    let res3 = opendir_core(&fs_remount.fs, ino, 0);
-                    let res4 = opendir_core(&fs_crash.fs, ino, 0);
-                    let res5 = opendir_core(&fs_remote.fs, ino, 0);
+                    let res1 = fs_baseline.fs.open_dir(ino);
+                    let res2 = fs_micro.fs.open_dir(ino);
+                    let res3 = fs_remount.fs.open_dir(ino);
+                    let res4 = fs_crash.fs.open_dir(ino);
+                    let res5 = fs_remote.fs.open_dir(ino);
 
                     assert_eq!(res1.is_ok(), res2.is_ok());
                     assert_eq!(res1.is_ok(), res3.is_ok());
@@ -539,11 +541,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             "Snapshot isolation violated in remote"
                         );
 
-                        let res1 = releasedir_core(&fs_baseline.fs, h.ino, h.fh1);
-                        let res2 = releasedir_core(&fs_micro.fs, h.ino, h.fh2);
-                        let res3 = releasedir_core(&fs_remount.fs, h.ino, h.fh3);
-                        let res4 = releasedir_core(&fs_crash.fs, h.ino, h.fh4);
-                        let res5 = releasedir_core(&fs_remote.fs, h.ino, h.fh5);
+                        let res1 = fs_baseline.fs.release_dir(h.ino, h.fh1);
+                        let res2 = fs_micro.fs.release_dir(h.ino, h.fh2);
+                        let res3 = fs_remount.fs.release_dir(h.ino, h.fh3);
+                        let res4 = fs_crash.fs.release_dir(h.ino, h.fh4);
+                        let res5 = fs_remote.fs.release_dir(h.ino, h.fh5);
 
                         assert_eq!(res1, res2);
                         assert_eq!(res1, res3);
@@ -555,11 +557,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                     // Open file
                     if !active_files.is_empty() {
                         let ino = active_files[prng.gen_range(0, active_files.len() - 1)];
-                        let res1 = open_core(&fs_baseline.fs, ino, libc::O_RDWR as u32);
-                        let res2 = open_core(&fs_micro.fs, ino, libc::O_RDWR as u32);
-                        let res3 = open_core(&fs_remount.fs, ino, libc::O_RDWR as u32);
-                        let res4 = open_core(&fs_crash.fs, ino, libc::O_RDWR as u32);
-                        let res5 = open_core(&fs_remote.fs, ino, libc::O_RDWR as u32);
+                        let res1 = fs_baseline.fs.open_file(ino, libc::O_RDWR as u32);
+                        let res2 = fs_micro.fs.open_file(ino, libc::O_RDWR as u32);
+                        let res3 = fs_remount.fs.open_file(ino, libc::O_RDWR as u32);
+                        let res4 = fs_crash.fs.open_file(ino, libc::O_RDWR as u32);
+                        let res5 = fs_remote.fs.open_file(ino, libc::O_RDWR as u32);
 
                         assert_eq!(res1.is_ok(), res2.is_ok());
                         assert_eq!(res1.is_ok(), res3.is_ok());
@@ -601,11 +603,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                     _ => libc::XATTR_REPLACE,
                                 };
 
-                                let res1 = setxattr_core(&fs_baseline.fs, ino, name, &value, flags).map(|_| ());
-                                let res2 = setxattr_core(&fs_micro.fs, ino, name, &value, flags).map(|_| ());
-                                let res3 = setxattr_core(&fs_remount.fs, ino, name, &value, flags).map(|_| ());
-                                let res4 = setxattr_core(&fs_crash.fs, ino, name, &value, flags).map(|_| ());
-                                let res5 = setxattr_core(&fs_remote.fs, ino, name, &value, flags).map(|_| ());
+                                let res1 = fs_baseline.fs.set_xattr(ino, name, &value, flags);
+                                let res2 = fs_micro.fs.set_xattr(ino, name, &value, flags);
+                                let res3 = fs_remount.fs.set_xattr(ino, name, &value, flags);
+                                let res4 = fs_crash.fs.set_xattr(ino, name, &value, flags);
+                                let res5 = fs_remote.fs.set_xattr(ino, name, &value, flags);
 
                                 assert_eq!(res1, res2, "setxattr result mismatch (baseline vs micro)");
                                 assert_eq!(res1, res3, "setxattr result mismatch (baseline vs remount)");
@@ -613,11 +615,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 assert_eq!(res1, res5, "setxattr result mismatch (baseline vs remote)");
                             }
                             1 => {
-                                let res1 = removexattr_core(&fs_baseline.fs, ino, name).map(|_| ());
-                                let res2 = removexattr_core(&fs_micro.fs, ino, name).map(|_| ());
-                                let res3 = removexattr_core(&fs_remount.fs, ino, name).map(|_| ());
-                                let res4 = removexattr_core(&fs_crash.fs, ino, name).map(|_| ());
-                                let res5 = removexattr_core(&fs_remote.fs, ino, name).map(|_| ());
+                                let res1 = fs_baseline.fs.remove_xattr(ino, name);
+                                let res2 = fs_micro.fs.remove_xattr(ino, name);
+                                let res3 = fs_remount.fs.remove_xattr(ino, name);
+                                let res4 = fs_crash.fs.remove_xattr(ino, name);
+                                let res5 = fs_remote.fs.remove_xattr(ino, name);
 
                                 assert_eq!(res1, res2, "removexattr result mismatch (baseline vs micro)");
                                 assert_eq!(res1, res3, "removexattr result mismatch (baseline vs remount)");
@@ -662,11 +664,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let offset = (prng.gen_range(0, 10) * 16) as u64;
                         let len = prng.gen_range(1, 200) as u64;
 
-                        let res1 = punch_hole_core(&fs_baseline.fs, ino, offset, len);
-                        let res2 = punch_hole_core(&fs_micro.fs, ino, offset, len);
-                        let res3 = punch_hole_core(&fs_remount.fs, ino, offset, len);
-                        let res4 = punch_hole_core(&fs_crash.fs, ino, offset, len);
-                        let res5 = punch_hole_core(&fs_remote.fs, ino, offset, len);
+                        let res1 = fs_baseline.fs.punch_hole(ino, offset, len);
+                        let res2 = fs_micro.fs.punch_hole(ino, offset, len);
+                        let res3 = fs_remount.fs.punch_hole(ino, offset, len);
+                        let res4 = fs_crash.fs.punch_hole(ino, offset, len);
+                        let res5 = fs_remote.fs.punch_hole(ino, offset, len);
 
                         assert_eq!(res1, res2);
                         assert_eq!(res1, res3);
@@ -680,11 +682,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let idx = prng.gen_range(0, open_file_handles.len() - 1);
                         let h = open_file_handles.remove(idx);
 
-                        let res1 = release_core(&fs_baseline.fs, h.ino, h.fh1);
-                        let res2 = release_core(&fs_micro.fs, h.ino, h.fh2);
-                        let res3 = release_core(&fs_remount.fs, h.ino, h.fh3);
-                        let res4 = release_core(&fs_crash.fs, h.ino, h.fh4);
-                        let res5 = release_core(&fs_remote.fs, h.ino, h.fh5);
+                        let res1 = fs_baseline.fs.release_file(h.ino, h.fh1);
+                        let res2 = fs_micro.fs.release_file(h.ino, h.fh2);
+                        let res3 = fs_remount.fs.release_file(h.ino, h.fh3);
+                        let res4 = fs_crash.fs.release_file(h.ino, h.fh4);
+                        let res5 = fs_remote.fs.release_file(h.ino, h.fh5);
 
                         assert_eq!(res1, res2);
                         assert_eq!(res1, res3);
@@ -753,18 +755,18 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         &*snap1, &h.expected_snapshot,
                         "Snapshot isolation violated before checkpoint"
                     );
-                    let _ = releasedir_core(&fs_baseline.fs, h.ino, h.fh1);
-                    let _ = releasedir_core(&fs_micro.fs, h.ino, h.fh2);
-                    let _ = releasedir_core(&fs_remount.fs, h.ino, h.fh3);
-                    let _ = releasedir_core(&fs_crash.fs, h.ino, h.fh4);
-                    let _ = releasedir_core(&fs_remote.fs, h.ino, h.fh5);
+                    let _ = fs_baseline.fs.release_dir(h.ino, h.fh1);
+                    let _ = fs_micro.fs.release_dir(h.ino, h.fh2);
+                    let _ = fs_remount.fs.release_dir(h.ino, h.fh3);
+                    let _ = fs_crash.fs.release_dir(h.ino, h.fh4);
+                    let _ = fs_remote.fs.release_dir(h.ino, h.fh5);
                 }
                 for h in open_file_handles.drain(..) {
-                    let _ = release_core(&fs_baseline.fs, h.ino, h.fh1);
-                    let _ = release_core(&fs_micro.fs, h.ino, h.fh2);
-                    let _ = release_core(&fs_remount.fs, h.ino, h.fh3);
-                    let _ = release_core(&fs_crash.fs, h.ino, h.fh4);
-                    let _ = release_core(&fs_remote.fs, h.ino, h.fh5);
+                    let _ = fs_baseline.fs.release_file(h.ino, h.fh1);
+                    let _ = fs_micro.fs.release_file(h.ino, h.fh2);
+                    let _ = fs_remount.fs.release_file(h.ino, h.fh3);
+                    let _ = fs_crash.fs.release_file(h.ino, h.fh4);
+                    let _ = fs_remote.fs.release_file(h.ino, h.fh5);
                 }
 
                 // Fail a flush partway through writing this batch, then clear the fault.
@@ -1454,11 +1456,11 @@ fn test_rename_onto_own_hardlink_is_a_noop_and_survives_recovery() {
     let fs = TestFs::builder().build();
     let ino = fs.fs.create_file(1, "f0", 0o644).unwrap();
     fs.fs.write_at(ino, b"payload", 0).unwrap();
-    link_core(&fs.fs, ino, 1, "f1").map(|_| ()).unwrap();
+    fs.fs.hard_link(ino, 1, "f1").unwrap();
     // Flush so both names are in `base` when the rename resolves them.
     fs.fs.quiesce().unwrap();
 
-    rename_core(&fs.fs, 1, "f0", 1, "f1").unwrap();
+    fs.fs.rename_entry(1, "f0", 1, "f1").unwrap();
 
     let names = |f: &TestFs| -> Vec<String> { f.fs.list_directory(1).unwrap().into_iter().map(|(n, _)| n).collect() };
     assert_eq!(names(&fs), vec!["f0", "f1"], "both hardlinks must survive");
@@ -1492,8 +1494,8 @@ fn test_rename_into_a_name_freed_by_another_rename_in_the_same_batch() {
     fs.fs.quiesce().unwrap();
 
     // One batch: free the name "B" first, then move "A" into it.
-    rename_core(&fs.fs, 1, "B", 1, "C").unwrap();
-    rename_core(&fs.fs, 1, "A", 1, "B").unwrap();
+    fs.fs.rename_entry(1, "B", 1, "C").unwrap();
+    fs.fs.rename_entry(1, "A", 1, "B").unwrap();
 
     let live = fs.fs.list_directory(1).unwrap();
     assert_eq!(live, vec![("B".to_string(), a), ("C".to_string(), b)]);
@@ -1518,8 +1520,8 @@ fn test_rename_away_and_back_within_one_batch_does_not_duplicate_the_entry() {
     let f = fs.fs.create_file(d, "f", 0o644).unwrap();
     fs.fs.quiesce().unwrap();
 
-    rename_core(&fs.fs, d, "f", 1, "moved").unwrap();
-    rename_core(&fs.fs, 1, "moved", d, "f").unwrap();
+    fs.fs.rename_entry(d, "f", 1, "moved").unwrap();
+    fs.fs.rename_entry(1, "moved", d, "f").unwrap();
 
     let live = fs.fs.list_directory(d).unwrap();
     let live_nlink = fs.fs.get_attr(f).unwrap().nlink;
@@ -1853,7 +1855,7 @@ fn test_summary_export_is_deterministic() {
                         let ino = files[prng.gen_range(0, files.len() - 1)];
                         let newparent = dirs[prng.gen_range(0, dirs.len() - 1)];
                         let newname = format!("hardlink_{}_{}", seed, step);
-                        if link_core(&fs.fs, ino, newparent, &newname).map(|_| ()).is_ok() {
+                        if fs.fs.hard_link(ino, newparent, &newname).is_ok() {
                             entries.push(TrackedEntry {
                                 parent: newparent,
                                 name: newname,
@@ -1868,7 +1870,7 @@ fn test_summary_export_is_deterministic() {
                     if !candidates.is_empty() {
                         let idx = candidates[prng.gen_range(0, candidates.len() - 1)];
                         let e = entries.remove(idx);
-                        let _ = unlink_core(&fs.fs, e.parent, &e.name);
+                        let _ = fs.fs.remove_file(e.parent, &e.name);
                     }
                 }
                 7 => {
@@ -1878,7 +1880,7 @@ fn test_summary_export_is_deterministic() {
                         let newparent = dirs[prng.gen_range(0, dirs.len() - 1)];
                         let newname = format!("renamed_{}_{}", seed, step);
                         let (parent, name) = (entries[idx].parent, entries[idx].name.clone());
-                        if rename_core(&fs.fs, parent, &name, newparent, &newname).is_ok() {
+                        if fs.fs.rename_entry(parent, &name, newparent, &newname).is_ok() {
                             entries[idx].parent = newparent;
                             entries[idx].name = newname;
                         }

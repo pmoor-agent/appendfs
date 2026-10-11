@@ -1435,9 +1435,9 @@ mod tests {
 
         // Advance clock and read with default track_atime = false
         clock.advance(Duration::from_secs(1000));
-        let fh = crate::operations::read_write::open_core(&fs, file, libc::O_RDONLY as u32).unwrap();
+        let fh = fs.open_file(file, libc::O_RDONLY as u32).unwrap();
         let _ = fs.read_blocking(file, fh, 0, 4).unwrap();
-        crate::operations::read_write::release_core(&fs, file, fh).unwrap();
+        fs.release_file(file, fh).unwrap();
 
         let after_read_attr = fs.get_attr(file).unwrap();
         assert_eq!(
@@ -1453,9 +1453,9 @@ mod tests {
 
         clock.advance(Duration::from_secs(1000));
         let expected_time = clock.now();
-        let fh2 = crate::operations::read_write::open_core(&fs_with_atime, file2, libc::O_RDONLY as u32).unwrap();
+        let fh2 = fs_with_atime.open_file(file2, libc::O_RDONLY as u32).unwrap();
         let _ = fs_with_atime.read_blocking(file2, fh2, 0, 4).unwrap();
-        crate::operations::read_write::release_core(&fs_with_atime, file2, fh2).unwrap();
+        fs_with_atime.release_file(file2, fh2).unwrap();
 
         let attr_after_enabled_read = fs_with_atime.get_attr(file2).unwrap();
         assert_eq!(

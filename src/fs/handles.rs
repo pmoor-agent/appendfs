@@ -208,7 +208,7 @@ mod tests {
         fs.create_file(1, "bravo.txt", 0o644).unwrap();
 
         // 2. Open a directory handle on root
-        let fh1 = crate::operations::dir::opendir_core(&fs, 1, 0).expect("opendir_core must succeed on directory");
+        let fh1 = fs.open_dir(1).expect("opendir_core must succeed on directory");
         assert!(fh1 > 0);
 
         let snap1 = fs
@@ -222,7 +222,7 @@ mod tests {
 
         // 3. Mutate directory: add charlie.txt, delete alpha.txt
         fs.create_file(1, "charlie.txt", 0o644).unwrap();
-        crate::operations::links::unlink_core(&fs, 1, "alpha.txt").unwrap();
+        fs.remove_file(1, "alpha.txt").unwrap();
 
         // 4. fh1 MUST retain its original snapshot (.status, alpha, bravo)
         let snap1_recheck = fs
@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(snap1_recheck[2].0, "bravo.txt");
 
         // 5. A new directory handle on root gets the new snapshot (.status, bravo, charlie)
-        let fh2 = crate::operations::dir::opendir_core(&fs, 1, 0).expect("opendir_core must succeed on directory");
+        let fh2 = fs.open_dir(1).expect("opendir_core must succeed on directory");
         assert_ne!(fh1, fh2);
         let snap2 = fs
             .extract_dir_handle(1, fh2)
@@ -259,10 +259,7 @@ mod tests {
 
         // 8. opendir_core on a non-directory returns ENOTDIR
         let alpha_ino = snap1[0].1;
-        assert_eq!(
-            crate::operations::dir::opendir_core(&fs, alpha_ino, 0),
-            Err(FsError::ENOTDIR)
-        );
+        assert_eq!(fs.open_dir(alpha_ino), Err(FsError::ENOTDIR));
     }
 
     #[test]
@@ -281,7 +278,7 @@ mod tests {
         assert_eq!(fs.extract_file_handle(ino, fh2).unwrap().ino(), ino);
 
         // 3. Unlink the file while handles are still open
-        crate::operations::links::unlink_core(&fs, 1, "test.txt").unwrap();
+        fs.remove_file(1, "test.txt").unwrap();
 
         // Inode must still exist (not tombstoned) because open_count is 2
         assert!(fs.get_attr(ino).is_some());
@@ -313,7 +310,7 @@ mod tests {
 
         let fh_reg = fs.open_file_handle(reg_ino, libc::O_RDWR as u32);
         let fh_virt = fs.open_file_handle(v_ino, libc::O_RDONLY as u32);
-        let fh_dir = crate::operations::dir::opendir_core(&fs, 1, 0).expect("opendir must succeed");
+        let fh_dir = fs.open_dir(1).expect("opendir must succeed");
 
         assert_ne!(fh_reg, fh_virt);
         assert_ne!(fh_reg, fh_dir);

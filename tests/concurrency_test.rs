@@ -14,13 +14,11 @@ use appendfs::clock::{Clock, SystemClock};
 use appendfs::log::record::DecodedPayload;
 use appendfs::log::{LogReader, SummaryReader, recover_fs};
 use appendfs::node::{Node, NodeKind};
-use appendfs::operations::dir::{list_dir_core, mkdir_core, opendir_core, releasedir_core, rmdir_core};
-use appendfs::operations::links::{link_core, readlink_core, rename_core, symlink_core, unlink_core};
+use appendfs::operations::dir::{list_dir_core, mkdir_core};
+use appendfs::operations::links::symlink_core;
 use appendfs::operations::locks::{flock_core, getlk_core, setlk_core};
-use appendfs::operations::read_write::{
-    FUSE_SET_ATTR_SIZE, create_core, getattr_core, open_core, release_core, setattr_core,
-};
-use appendfs::operations::xattr::{getxattr_core, listxattr_core, removexattr_core, setxattr_core};
+use appendfs::operations::read_write::{FUSE_SET_ATTR_SIZE, create_core, getattr_core, setattr_core};
+use appendfs::operations::xattr::{getxattr_core, listxattr_core};
 use appendfs::shim::{FileType, ShimFlock};
 use common::{TestRng, wait_until};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -103,10 +101,10 @@ fn worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
             }
             3 => {
                 if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
-                    && let Ok(fh) = open_core(&fs, ino, 0)
+                    && let Ok(fh) = fs.open_file(ino, 0)
                 {
                     let _ = fs.read_blocking(ino, fh, 0, 64);
-                    let _ = release_core(&fs, ino, fh);
+                    let _ = fs.release_file(ino, fh);
                 }
             }
             4 => {
@@ -123,17 +121,17 @@ fn worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
             6 => {
                 if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng) {
                     let name = FILE_NAMES[rng.gen_range(0, FILE_NAMES.len() - 1)];
-                    let _ = link_core(&fs, ino, dir_b, name);
+                    let _ = fs.hard_link(ino, dir_b, name);
                 }
             }
             7 => {
                 if let Some((name, ino)) = pick_entry(&fs, dir_a, &mut rng) {
                     match getattr_core(&fs, ino) {
                         Ok(attr) if attr.file_type == FileType::Directory => {
-                            let _ = rmdir_core(&fs, dir_a, &name);
+                            let _ = fs.remove_dir(dir_a, &name);
                         }
                         Ok(_) => {
-                            let _ = unlink_core(&fs, dir_a, &name);
+                            let _ = fs.remove_file(dir_a, &name);
                         }
                         Err(_) => {}
                     }
@@ -141,26 +139,26 @@ fn worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
             }
             8 => {
                 // Exercise opendir snapshotting & releasedir concurrently with active mutations
-                if let Ok(fh) = opendir_core(&fs, dir_a, 0) {
+                if let Ok(fh) = fs.open_dir(dir_a) {
                     let _ = fs.extract_dir_handle(dir_a, fh);
-                    let _ = releasedir_core(&fs, dir_a, fh);
+                    let _ = fs.release_dir(dir_a, fh);
                 }
             }
             9 => {
                 // Exercise open handle allocation, variable-offset / larger reads, and release concurrently
                 if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
-                    && let Ok(fh) = open_core(&fs, ino, 0)
+                    && let Ok(fh) = fs.open_file(ino, 0)
                 {
                     let offset = rng.gen_range(0, 128) as i64;
                     let size = rng.gen_range(1, 128 * 1024);
                     let _ = fs.read_blocking(ino, fh, offset, size);
-                    let _ = release_core(&fs, ino, fh);
+                    let _ = fs.release_file(ino, fh);
                 }
             }
             10 => {
                 // Exercise BSD flock whole-file locking concurrently
                 if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
-                    && let Ok(fh) = open_core(&fs, ino, 0)
+                    && let Ok(fh) = fs.open_file(ino, 0)
                 {
                     let op = match rng.gen_range(0, 3) {
                         0 => libc::LOCK_SH,
@@ -169,13 +167,13 @@ fn worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                         _ => libc::LOCK_UN,
                     };
                     let _ = flock_core(&fs, ino, fh, seed, op);
-                    let _ = release_core(&fs, ino, fh);
+                    let _ = fs.release_file(ino, fh);
                 }
             }
             11 => {
                 // Exercise POSIX fcntl range locking concurrently
                 if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
-                    && let Ok(fh) = open_core(&fs, ino, 0)
+                    && let Ok(fh) = fs.open_file(ino, 0)
                 {
                     let lock_type = match rng.gen_range(0, 2) {
                         0 => libc::F_RDLCK as i16,
@@ -193,7 +191,7 @@ fn worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                     };
                     let _ = setlk_core(&fs, ino, fh, seed, lock, false);
                     let _ = getlk_core(&fs, ino, fh, seed, lock);
-                    let _ = release_core(&fs, ino, fh);
+                    let _ = fs.release_file(ino, fh);
                 }
             }
             12 => {
@@ -217,10 +215,10 @@ fn worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                                 1 => libc::XATTR_CREATE,
                                 _ => libc::XATTR_REPLACE,
                             };
-                            let _ = setxattr_core(&fs, ino, name, &value, flags);
+                            let _ = fs.set_xattr(ino, name, &value, flags);
                         }
                         1 => {
-                            let _ = removexattr_core(&fs, ino, name);
+                            let _ = fs.remove_xattr(ino, name);
                         }
                         2 => {
                             let _ = getxattr_core(&fs, ino, name, 0);
@@ -234,7 +232,7 @@ fn worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
             _ => {
                 if let Some((name, _)) = pick_entry(&fs, dir_a, &mut rng) {
                     let newname = FILE_NAMES[rng.gen_range(0, FILE_NAMES.len() - 1)];
-                    let _ = rename_core(&fs, dir_a, &name, dir_b, newname);
+                    let _ = fs.rename_entry(dir_a, &name, dir_b, newname);
                 }
             }
         }
@@ -247,7 +245,7 @@ fn lock_worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
     for _ in 0..ops_per_thread() {
         let dir = pick_target_dir(&fs, &shared_dirs, &mut rng);
         if let Some((_, ino)) = pick_entry(&fs, dir, &mut rng)
-            && let Ok(fh) = open_core(&fs, ino, 0)
+            && let Ok(fh) = fs.open_file(ino, 0)
         {
             // Perform multiple lock operations on the open handle
             let op = if rng.gen_range(0, 1) == 0 {
@@ -267,7 +265,7 @@ fn lock_worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
             let _ = setlk_core(&fs, ino, fh, seed, lock, false);
             let _ = getlk_core(&fs, ino, fh, seed, lock);
 
-            let _ = release_core(&fs, ino, fh);
+            let _ = fs.release_file(ino, fh);
         }
     }
 }
@@ -414,7 +412,8 @@ fn verify_tree_invariants(fs: &AppendFs, storage: &dyn Storage, seed: u64) {
                 );
             }
             FileType::Symlink => {
-                readlink_core(fs, ino).unwrap_or_else(|e| panic!("readlink({}) failed: {}", ino, e));
+                fs.symlink_target(ino)
+                    .unwrap_or_else(|e| panic!("readlink({}) failed: {}", ino, e));
             }
             FileType::RegularFile
             | FileType::NamedPipe

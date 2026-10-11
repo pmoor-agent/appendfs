@@ -1377,7 +1377,6 @@ mod tests {
 
     #[test]
     fn test_format_runtime_status_with_activity() {
-        use crate::operations::dir::{opendir_core, releasedir_core};
         use crate::operations::locks::{flock_core, setlk_core};
 
         use crate::remote::block_cache::MemoryBlockCache;
@@ -1413,7 +1412,7 @@ mod tests {
         // Open handles
         let fh_file1 = fs.open_file_handle(f1, 0);
         let fh_file2 = fs.open_file_handle(f2, 0);
-        let dh = opendir_core(&fs, dir, 0).unwrap();
+        let dh = fs.open_dir(dir).unwrap();
 
         // Acquire locks
         flock_core(&fs, f1, fh_file1, 1001, libc::LOCK_EX).unwrap();
@@ -1448,7 +1447,7 @@ mod tests {
         // Clean up handles
         fs.release_file_handle(fh_file1, f1).unwrap();
         fs.release_file_handle(fh_file2, f2).unwrap();
-        releasedir_core(&fs, dir, dh).unwrap();
+        fs.release_dir(dir, dh).unwrap();
 
         // Check read-only mode reporting
         fs.set_read_only();
@@ -1486,8 +1485,6 @@ mod tests {
 
     #[test]
     fn test_inode_counts_overlay_layers() {
-        use crate::operations::links::unlink_core;
-
         let fs = TestFs::builder().build().fs;
         // Base state: 1 root directory
         let counts = fs.inode_counts();
@@ -1520,7 +1517,7 @@ mod tests {
         assert_eq!(counts_flushing.total_logical_bytes, 150);
 
         // In live, unlink f2 and add f3
-        unlink_core(&fs, d1, "f2.txt").unwrap();
+        fs.remove_file(d1, "f2.txt").unwrap();
         let f3 = fs.create_file(1, "f3.txt", 0o644).unwrap();
         fs.write_at(f3, &[0u8; 30], 0).unwrap();
 
@@ -1532,7 +1529,7 @@ mod tests {
         assert_eq!(counts_mixed.total_logical_bytes, 130);
 
         // Unlink f1 as well
-        unlink_core(&fs, 1, "f1.txt").unwrap();
+        fs.remove_file(1, "f1.txt").unwrap();
         let counts_after_del = fs.inode_counts();
         assert_eq!(counts_after_del.files, 1); // f3 only
         assert_eq!(counts_after_del.total_active(), 4);
