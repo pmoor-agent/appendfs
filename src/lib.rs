@@ -32,8 +32,8 @@ pub use check::{
     check_remote_integrity, check_volume, plan_sampled_verification,
 };
 pub use cli::{
-    Cli, Commands, DumpArgs, FsckArgs, InitArgs, MountArgs, MountRoArgs, StatsArgs, find_latest_generation,
-    find_latest_generation_in_storage,
+    Cli, Commands, DumpArgs, FsckArgs, InitArgs, KeyChangePassphraseArgs, KeyCommands, KeyInitArgs, KeySubcommandArgs,
+    MountArgs, MountRoArgs, StatsArgs, find_latest_generation, find_latest_generation_in_storage,
 };
 pub use clock::{
     AdvancingClock, Clock, MockClock, SystemClock, format_duration, format_local_civil_time, format_utc_civil_time,

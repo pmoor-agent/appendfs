@@ -50,7 +50,7 @@ pub const KEY_HEX_LEN: usize = 64;
 
 /// Parses a key file's contents as `KEY_HEX_LEN` hex characters, ignoring surrounding
 /// whitespace. `Err` carries a human-readable reason.
-fn parse_hex_key(content: &[u8]) -> Result<[u8; 32], String> {
+pub fn parse_hex_key(content: &[u8]) -> Result<[u8; 32], String> {
     let text = std::str::from_utf8(content)
         .map_err(|_| "file contains binary data, not hex text".to_string())?
         .trim();
@@ -85,29 +85,77 @@ fn parse_hex_key(content: &[u8]) -> Result<[u8; 32], String> {
 /// intact, because it is the one form where surrounding whitespace can be trimmed without
 /// ambiguity.
 fn load_key_from_file(path: impl AsRef<Path>) -> io::Result<[u8; 32]> {
+    load_key_from_file_with_passphrase(path, None)
+}
+
+/// Loads a 256-bit key from a file, supporting both 64 hex characters (unencrypted)
+/// and PEM-armored passphrase-encrypted key files.
+pub fn load_key_from_file_with_passphrase(
+    path: impl AsRef<Path>,
+    key_passphrase: Option<&str>,
+) -> io::Result<[u8; 32]> {
     let path = path.as_ref();
-    // `fs::read` does not name the path in its error, and callers pass this straight to the
-    // user, so attach it here rather than leaving them with a bare "No such file".
     let content = fs::read(path)
         .map_err(|e| io::Error::new(e.kind(), format!("cannot read key file '{}': {}", path.display(), e)))?;
 
-    parse_hex_key(&content).map_err(|reason| {
-        let mut msg = format!(
-            "key file '{}' is not a valid key: {}.\n\
-             Expected {} hex characters encoding a 256-bit key; surrounding whitespace is ignored.\n\
-             Generate one with: openssl rand -hex 32",
-            path.display(),
-            reason,
-            KEY_HEX_LEN
-        );
-        if content.len() == 32 {
-            msg.push_str(
-                "\nThis file is exactly 32 bytes - if it is a raw binary key from an older \
-                 version, convert it with: xxd -p -c 32 <file>",
+    if crate::crypto::key_file::is_pem_encrypted_key(&content) {
+        let text = std::str::from_utf8(&content).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("encrypted key file '{}' contains invalid UTF-8", path.display()),
+            )
+        })?;
+
+        let pass = match key_passphrase {
+            Some(p) => p.to_string(),
+            None => {
+                if let Ok(env_pass) = std::env::var("APPENDFS_KEY_PASSPHRASE") {
+                    env_pass
+                } else {
+                    prompt_passphrase(&format!("Enter passphrase for key file '{}': ", path.display()))?
+                }
+            }
+        };
+
+        crate::crypto::key_file::decrypt_pem_key(text, &pass).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cannot unlock key file '{}': {}", path.display(), e),
+            )
+        })
+    } else if crate::crypto::key_file::is_pem_unencrypted_key(&content) {
+        let text = std::str::from_utf8(&content).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("key file '{}' contains invalid UTF-8", path.display()),
+            )
+        })?;
+
+        crate::crypto::key_file::parse_pem_unencrypted_key(text).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cannot parse key file '{}': {}", path.display(), e),
+            )
+        })
+    } else {
+        parse_hex_key(&content).map_err(|reason| {
+            let mut msg = format!(
+                "key file '{}' is not a valid key: {}.\n\
+                 Expected a PEM key file or 64 hex characters encoding a 256-bit key; surrounding whitespace is ignored.\n\
+                 Generate one with: appendfs key init -o {}",
+                path.display(),
+                reason,
+                path.display()
             );
-        }
-        io::Error::new(io::ErrorKind::InvalidData, msg)
-    })
+            if content.len() == 32 {
+                msg.push_str(
+                    "\nThis file is exactly 32 bytes - if it is a raw binary key from an older \
+                     version, convert it with: xxd -p -c 32 <file>",
+                );
+            }
+            io::Error::new(io::ErrorKind::InvalidData, msg)
+        })
+    }
 }
 
 /// Builds the Argon2id password material binding a key file to a passphrase.
@@ -163,7 +211,12 @@ impl MasterKey {
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
-        let key = load_key_from_file(path)?;
+        let key = load_key_from_file_with_passphrase(path, None)?;
+        Ok(Self { key })
+    }
+
+    pub fn from_file_with_passphrase(path: impl AsRef<Path>, key_passphrase: Option<&str>) -> io::Result<Self> {
+        let key = load_key_from_file_with_passphrase(path, key_passphrase)?;
         Ok(Self { key })
     }
 
