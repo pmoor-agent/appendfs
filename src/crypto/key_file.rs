@@ -1,384 +1,337 @@
+//! Key files: the one credential an encrypted volume is unlocked with.
+//!
+//! A key file holds the volume's 256-bit master key in a small PEM-style envelope, either
+//! as-is (`APPENDFS KEY`) or wrapped under a passphrase (`APPENDFS ENCRYPTED KEY`). The
+//! passphrase protects the file, not the volume: changing or removing it rewrites the key
+//! file and leaves every byte of the volume untouched.
+
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use rand::RngCore;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-pub const PEM_HEADER_ENCRYPTED: &str = "-----BEGIN APPENDFS ENCRYPTED KEY-----";
-pub const PEM_FOOTER_ENCRYPTED: &str = "-----END APPENDFS ENCRYPTED KEY-----";
-pub const PEM_HEADER_UNENCRYPTED: &str = "-----BEGIN APPENDFS KEY-----";
-pub const PEM_FOOTER_UNENCRYPTED: &str = "-----END APPENDFS KEY-----";
+const PLAIN_BEGIN: &str = "-----BEGIN APPENDFS KEY-----";
+const PLAIN_END: &str = "-----END APPENDFS KEY-----";
+const ENCRYPTED_BEGIN: &str = "-----BEGIN APPENDFS ENCRYPTED KEY-----";
+const ENCRYPTED_END: &str = "-----END APPENDFS ENCRYPTED KEY-----";
 
-pub const PEM_HEADER: &str = PEM_HEADER_ENCRYPTED;
-pub const PEM_FOOTER: &str = PEM_FOOTER_ENCRYPTED;
+const VERSION: &str = "1";
+const CIPHER: &str = "ChaCha20-Poly1305";
+const KDF: &str = "Argon2id";
+/// Associated data for the wrapped key, so a body can never be mistaken for any other
+/// ChaCha20-Poly1305 ciphertext made under the same passphrase.
 const AAD_V1: &[u8] = b"APPENDFS-ENCRYPTED-KEY-V1";
-pub const CURRENT_KEY_FILE_VERSION: u32 = 1;
 
-pub const DEFAULT_ARGON2_MEMORY_KIB: u32 = 64 * 1024;
-pub const DEFAULT_ARGON2_ITERATIONS: u32 = 3;
-pub const DEFAULT_ARGON2_PARALLELISM: u32 = 1;
+/// Environment variable consulted for an encrypted key file's passphrase before prompting.
+const PASSPHRASE_ENV: &str = "APPENDFS_KEY_PASSPHRASE";
 
-/// Parsed metadata and encrypted payload from a PEM-armored key file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedKeyFile {
-    pub version: u32,
-    pub cipher: String,
-    pub kdf: String,
+/// Argon2id cost parameters for wrapping a key under a passphrase. Recorded in each
+/// encrypted key file, so raising the defaults never strands an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Argon2Params {
     pub memory_kib: u32,
     pub iterations: u32,
     pub parallelism: u32,
-    pub salt: [u8; 16],
-    pub nonce: [u8; 12],
-    pub body: Vec<u8>,
 }
 
-/// Checks whether raw file content begins with the encrypted key PEM header.
-pub fn is_pem_encrypted_key(content: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(content) else {
-        return false;
+impl Argon2Params {
+    /// 64 MiB, 3 passes, 1 lane.
+    pub const DEFAULT: Self = Self {
+        memory_kib: 64 * 1024,
+        iterations: 3,
+        parallelism: 1,
     };
-    text.trim_start().starts_with(PEM_HEADER_ENCRYPTED)
-}
 
-/// Checks whether raw file content begins with the unencrypted key PEM header.
-pub fn is_pem_unencrypted_key(content: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(content) else {
-        return false;
+    /// Cheap enough for tests to run many derivations; far too weak for a real key.
+    pub const FAST: Self = Self {
+        memory_kib: 1024,
+        iterations: 1,
+        parallelism: 1,
     };
-    text.trim_start().starts_with(PEM_HEADER_UNENCRYPTED)
 }
 
-#[derive(Default)]
-struct RawHeaders {
-    version: Option<u32>,
-    cipher: Option<String>,
-    kdf: Option<String>,
-    memory_kib: Option<u32>,
-    iterations: Option<u32>,
-    parallelism: Option<u32>,
-    salt: Option<[u8; 16]>,
-    nonce: Option<[u8; 12]>,
-    body: Option<Vec<u8>>,
+/// A volume's 256-bit master key, wiped from memory on drop.
+#[derive(Zeroize)]
+#[zeroize(drop)]
+pub struct MasterKey {
+    pub key: [u8; 32],
 }
 
-impl RawHeaders {
-    fn parse_line(&mut self, key: &str, val: &str) -> Result<(), String> {
-        match key {
-            "version" => {
-                self.version = Some(
-                    val.parse::<u32>()
-                        .map_err(|_| format!("invalid version value '{}'", val))?,
-                );
+impl MasterKey {
+    pub fn new(key: [u8; 32]) -> Self {
+        Self { key }
+    }
+
+    /// A fresh random key, for a new key file.
+    pub fn generate() -> Self {
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        Self { key }
+    }
+
+    /// Loads the key from a key file, asking for its passphrase if it has one.
+    ///
+    /// The passphrase comes from `APPENDFS_KEY_PASSPHRASE` when set, and from the terminal
+    /// (or stdin, when that is not a terminal) otherwise.
+    pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        KeyFile::read(path)?
+            .unlock(|| match std::env::var(PASSPHRASE_ENV) {
+                Ok(passphrase) => Ok(Zeroizing::new(passphrase)),
+                Err(_) => prompt_passphrase(&format!("Enter passphrase for key file '{}': ", path.display())),
+            })
+            .map_err(|e| io::Error::new(e.kind(), format!("cannot unlock key file '{}': {}", path.display(), e)))
+    }
+}
+
+/// A parsed key file.
+pub enum KeyFile {
+    /// The key itself, unprotected.
+    Plain(MasterKey),
+    /// The key wrapped under a passphrase.
+    Encrypted(WrappedKey),
+}
+
+/// A master key encrypted with ChaCha20-Poly1305 under an Argon2id-stretched passphrase.
+pub struct WrappedKey {
+    params: Argon2Params,
+    salt: [u8; 16],
+    nonce: [u8; 12],
+    /// The encrypted key followed by its 16-byte tag.
+    body: [u8; 48],
+}
+
+impl KeyFile {
+    /// Reads and parses the key file at `path`. Does not unlock it.
+    pub fn read(path: &Path) -> io::Result<Self> {
+        let invalid = |reason: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("'{}' is not a valid key file: {}", path.display(), reason),
+            )
+        };
+        let content = fs::read(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("cannot read key file '{}': {}", path.display(), e)))?;
+        let text = std::str::from_utf8(&content).map_err(|_| invalid("it contains binary data"))?;
+        Self::parse(text).map_err(|reason| invalid(&reason))
+    }
+
+    /// Parses key file text, accepting exactly what [`format_plain_key_file`] and
+    /// [`format_encrypted_key_file`] produce - give or take surrounding whitespace.
+    ///
+    /// Anything else is rejected rather than interpreted: a key file that parses but means
+    /// something other than what was written would silently become the wrong key.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+        let (end, encrypted) = match lines.next() {
+            Some(PLAIN_BEGIN) => (PLAIN_END, false),
+            Some(ENCRYPTED_BEGIN) => (ENCRYPTED_END, true),
+            _ => return Err(format!("expected it to begin with '{}'", PLAIN_BEGIN)),
+        };
+
+        let mut fields = Fields(Vec::new());
+        let mut closed = false;
+        for line in lines {
+            if closed {
+                return Err(format!("unexpected content after '{}'", end));
             }
-            "cipher" => self.cipher = Some(val.to_string()),
-            "kdf" => self.kdf = Some(val.to_string()),
-            "argon2-memory" | "memory" => {
-                self.memory_kib = Some(
-                    val.parse::<u32>()
-                        .map_err(|_| format!("invalid memory value '{}'", val))?,
-                );
+            if line == end {
+                closed = true;
+                continue;
             }
-            "argon2-iterations" | "iterations" => {
-                self.iterations = Some(
-                    val.parse::<u32>()
-                        .map_err(|_| format!("invalid iterations value '{}'", val))?,
-                );
-            }
-            "argon2-parallelism" | "parallelism" => {
-                self.parallelism = Some(
-                    val.parse::<u32>()
-                        .map_err(|_| format!("invalid parallelism value '{}'", val))?,
-                );
-            }
-            "salt" => {
-                let bytes = hex::decode(val).map_err(|e| format!("invalid hex in salt: {}", e))?;
-                if bytes.len() != 16 {
-                    return Err(format!(
-                        "expected 16-byte salt (32 hex characters), found {} bytes",
-                        bytes.len()
-                    ));
-                }
-                let mut s = [0u8; 16];
-                s.copy_from_slice(&bytes);
-                self.salt = Some(s);
-            }
-            "nonce" => {
-                let bytes = hex::decode(val).map_err(|e| format!("invalid hex in nonce: {}", e))?;
-                if bytes.len() != 12 {
-                    return Err(format!(
-                        "expected 12-byte nonce (24 hex characters), found {} bytes",
-                        bytes.len()
-                    ));
-                }
-                let mut n = [0u8; 12];
-                n.copy_from_slice(&bytes);
-                self.nonce = Some(n);
-            }
-            "body" => {
-                let bytes = hex::decode(val).map_err(|e| format!("invalid hex in body: {}", e))?;
-                if bytes.len() != 48 {
-                    return Err(format!(
-                        "expected 48-byte body (32 bytes key + 16 bytes tag), found {} bytes",
-                        bytes.len()
-                    ));
-                }
-                self.body = Some(bytes);
-            }
-            other => {
-                log::debug!("Ignoring unknown header in encrypted key file: {}", other);
-            }
+            let (name, value) = line
+                .split_once(':')
+                .ok_or_else(|| format!("malformed line {:?}", line))?;
+            fields.0.push((name.trim(), value.trim()));
+        }
+        if !closed {
+            return Err(format!("missing '{}'", end));
+        }
+
+        fields.expect("Version", VERSION)?;
+        let file = if encrypted {
+            fields.expect("Cipher", CIPHER)?;
+            fields.expect("KDF", KDF)?;
+            KeyFile::Encrypted(WrappedKey {
+                params: Argon2Params {
+                    memory_kib: fields.number("Argon2-Memory")?,
+                    iterations: fields.number("Argon2-Iterations")?,
+                    parallelism: fields.number("Argon2-Parallelism")?,
+                },
+                salt: fields.hex("Salt")?,
+                nonce: fields.hex("Nonce")?,
+                body: fields.hex("Body")?,
+            })
+        } else {
+            let mut key = fields.hex("Body")?;
+            let master = MasterKey::new(key);
+            key.zeroize();
+            KeyFile::Plain(master)
+        };
+        fields.finish()?;
+        Ok(file)
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, KeyFile::Encrypted(_))
+    }
+
+    /// Returns the key, calling `passphrase` only if the file is encrypted.
+    pub fn unlock(self, passphrase: impl FnOnce() -> io::Result<Zeroizing<String>>) -> io::Result<MasterKey> {
+        match self {
+            KeyFile::Plain(key) => Ok(key),
+            KeyFile::Encrypted(wrapped) => wrapped
+                .decrypt(&passphrase()?)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        }
+    }
+}
+
+impl WrappedKey {
+    fn decrypt(&self, passphrase: &str) -> Result<MasterKey, String> {
+        let wrapping_key = derive_wrapping_key(passphrase, &self.salt, self.params)?;
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(wrapping_key.as_ref()));
+
+        let mut key = MasterKey::new([0u8; 32]);
+        key.key.copy_from_slice(&self.body[..32]);
+        cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&self.nonce),
+                AAD_V1,
+                &mut key.key,
+                Tag::from_slice(&self.body[32..]),
+            )
+            .map_err(|_| "incorrect passphrase or corrupted key file".to_string())?;
+        Ok(key)
+    }
+}
+
+/// The `Name: value` lines of a key file, consumed one by one as they are validated.
+struct Fields<'a>(Vec<(&'a str, &'a str)>);
+
+impl<'a> Fields<'a> {
+    fn take(&mut self, name: &str) -> Result<&'a str, String> {
+        let index = self
+            .0
+            .iter()
+            .position(|(n, _)| *n == name)
+            .ok_or_else(|| format!("missing '{}' field", name))?;
+        Ok(self.0.remove(index).1)
+    }
+
+    fn expect(&mut self, name: &str, expected: &str) -> Result<(), String> {
+        let value = self.take(name)?;
+        if value != expected {
+            return Err(format!("unsupported {} '{}'; expected '{}'", name, value, expected));
         }
         Ok(())
     }
-}
 
-/// Parses a PEM-armored encrypted key file string into its components.
-pub fn parse_pem_encrypted_key(content: &str) -> Result<EncryptedKeyFile, String> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with(PEM_HEADER) {
-        return Err(format!("missing PEM header '{}'", PEM_HEADER));
-    }
-    if !trimmed.ends_with(PEM_FOOTER) {
-        return Err(format!("missing PEM footer '{}'", PEM_FOOTER));
+    fn number(&mut self, name: &str) -> Result<u32, String> {
+        let value = self.take(name)?;
+        value
+            .parse()
+            .map_err(|_| format!("'{}' must be a number, found '{}'", name, value))
     }
 
-    let inner = &trimmed[PEM_HEADER.len()..trimmed.len() - PEM_FOOTER.len()];
-    let mut raw = RawHeaders::default();
+    fn hex<const N: usize>(&mut self, name: &str) -> Result<[u8; N], String> {
+        let mut bytes = hex::decode(self.take(name)?).map_err(|e| format!("'{}' is not valid hex: {}", name, e))?;
+        let array = <[u8; N]>::try_from(bytes.as_slice())
+            .map_err(|_| format!("'{}' must be {} hex characters, found {}", name, N * 2, bytes.len() * 2));
+        bytes.zeroize();
+        array
+    }
 
-    for line in inner.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    /// Fails on any field left over, which includes a duplicate of one already taken.
+    fn finish(self) -> Result<(), String> {
+        match self.0.first() {
+            Some((name, _)) => Err(format!("unexpected '{}' field", name)),
+            None => Ok(()),
         }
-
-        let Some((key, val)) = line.split_once(':') else {
-            return Err(format!("malformed line in PEM file: {:?}", line));
-        };
-        raw.parse_line(&key.trim().to_ascii_lowercase(), val.trim())?;
     }
-
-    let version = raw.version.ok_or_else(|| "missing 'Version' header".to_string())?;
-    if version != 1 {
-        return Err(format!(
-            "unsupported key file version {}; only version 1 is supported",
-            version
-        ));
-    }
-
-    let cipher = raw.cipher.ok_or_else(|| "missing 'Cipher' header".to_string())?;
-    let normalized_cipher = cipher.to_ascii_lowercase().replace(['-', '_'], "");
-    if normalized_cipher != "chacha20poly1305" {
-        return Err(format!("unsupported cipher '{}'; expected ChaCha20-Poly1305", cipher));
-    }
-
-    let kdf = raw.kdf.ok_or_else(|| "missing 'KDF' header".to_string())?;
-    if !kdf.eq_ignore_ascii_case("argon2id") {
-        return Err(format!("unsupported KDF '{}'; expected Argon2id", kdf));
-    }
-
-    Ok(EncryptedKeyFile {
-        version,
-        cipher,
-        kdf,
-        memory_kib: raw.memory_kib.unwrap_or(DEFAULT_ARGON2_MEMORY_KIB),
-        iterations: raw.iterations.unwrap_or(DEFAULT_ARGON2_ITERATIONS),
-        parallelism: raw.parallelism.unwrap_or(DEFAULT_ARGON2_PARALLELISM),
-        salt: raw.salt.ok_or_else(|| "missing 'Salt' header".to_string())?,
-        nonce: raw.nonce.ok_or_else(|| "missing 'Nonce' header".to_string())?,
-        body: raw.body.ok_or_else(|| "missing 'Body' header".to_string())?,
-    })
 }
 
-/// Derives a 256-bit wrapping key from a passphrase and salt with specific Argon2id parameters.
-fn derive_wrapping_key(
-    passphrase: &[u8],
-    salt: &[u8; 16],
-    m_cost_kib: u32,
-    t_cost: u32,
-    p_cost: u32,
-) -> Result<[u8; 32], String> {
+fn derive_wrapping_key(passphrase: &str, salt: &[u8; 16], params: Argon2Params) -> Result<Zeroizing<[u8; 32]>, String> {
     use argon2::{Algorithm, Argon2, Params, Version};
 
-    let params =
-        Params::new(m_cost_kib, t_cost, p_cost, Some(32)).map_err(|e| format!("Argon2 params error: {}", e))?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-
-    let mut key = [0u8; 32];
-    argon2
-        .hash_password_into(passphrase, salt, &mut key)
-        .map_err(|e| format!("Argon2 derivation error: {}", e))?;
-
+    let argon2_params = Params::new(params.memory_kib, params.iterations, params.parallelism, Some(32))
+        .map_err(|e| format!("invalid Argon2 parameters: {}", e))?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params)
+        .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
+        .map_err(|e| format!("Argon2 derivation failed: {}", e))?;
     Ok(key)
 }
 
-/// Encrypts a 32-byte master key with a passphrase into PEM format using Argon2id and ChaCha20-Poly1305.
-pub fn encrypt_key_to_pem(
-    raw_key: &[u8; 32],
-    passphrase: &str,
-    m_cost_kib: u32,
-    t_cost: u32,
-    p_cost: u32,
-) -> Result<String, String> {
+/// Formats `key` as an unprotected key file.
+pub fn format_plain_key_file(key: &MasterKey) -> Zeroizing<String> {
+    Zeroizing::new(format!(
+        "{PLAIN_BEGIN}\n\
+         Version: {VERSION}\n\
+         Body: {body}\n\
+         {PLAIN_END}\n",
+        body = hex::encode(key.key),
+    ))
+}
+
+/// Formats `key` as a key file wrapped under `passphrase`, with a fresh salt and nonce.
+pub fn format_encrypted_key_file(key: &MasterKey, passphrase: &str, params: Argon2Params) -> Result<String, String> {
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut salt);
     rand::thread_rng().fill_bytes(&mut nonce);
 
-    let mut wrapping_key = derive_wrapping_key(passphrase.as_bytes(), &salt, m_cost_kib, t_cost, p_cost)?;
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&wrapping_key));
-    wrapping_key.zeroize();
+    let wrapping_key = derive_wrapping_key(passphrase, &salt, params)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(wrapping_key.as_ref()));
 
-    let mut buffer = *raw_key;
+    let mut body = [0u8; 48];
+    body[..32].copy_from_slice(&key.key);
     let tag = cipher
-        .encrypt_in_place_detached(Nonce::from_slice(&nonce), AAD_V1, &mut buffer)
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce), AAD_V1, &mut body[..32])
         .map_err(|e| format!("ChaCha20-Poly1305 encryption failed: {}", e))?;
+    body[32..].copy_from_slice(&tag);
 
-    let mut body = Vec::with_capacity(48);
-    body.extend_from_slice(&buffer);
-    body.extend_from_slice(tag.as_slice());
-    buffer.zeroize();
-
-    let pem = format!(
-        "{header}\n\
-         Version: 1\n\
-         Cipher: ChaCha20-Poly1305\n\
-         KDF: Argon2id\n\
-         Argon2-Memory: {m_cost}\n\
-         Argon2-Iterations: {t_cost}\n\
-         Argon2-Parallelism: {p_cost}\n\
+    Ok(format!(
+        "{ENCRYPTED_BEGIN}\n\
+         Version: {VERSION}\n\
+         Cipher: {CIPHER}\n\
+         KDF: {KDF}\n\
+         Argon2-Memory: {memory}\n\
+         Argon2-Iterations: {iterations}\n\
+         Argon2-Parallelism: {parallelism}\n\
          Salt: {salt}\n\
          Nonce: {nonce}\n\
          Body: {body}\n\
-         {footer}\n",
-        header = PEM_HEADER,
-        m_cost = m_cost_kib,
-        t_cost = t_cost,
-        p_cost = p_cost,
+         {ENCRYPTED_END}\n",
+        memory = params.memory_kib,
+        iterations = params.iterations,
+        parallelism = params.parallelism,
         salt = hex::encode(salt),
         nonce = hex::encode(nonce),
         body = hex::encode(body),
-        footer = PEM_FOOTER,
-    );
-
-    Ok(pem)
+    ))
 }
 
-/// Decrypts a PEM-armored encrypted key file string, returning the 32-byte master key.
-pub fn decrypt_pem_key(pem_content: &str, passphrase: &str) -> Result<[u8; 32], String> {
-    let parsed = parse_pem_encrypted_key(pem_content)?;
+/// Prompts on the terminal for a passphrase without echo, or reads one line from stdin
+/// when it is not a terminal.
+pub fn prompt_passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
+    use std::io::{BufRead, IsTerminal};
 
-    let mut wrapping_key = derive_wrapping_key(
-        passphrase.as_bytes(),
-        &parsed.salt,
-        parsed.memory_kib,
-        parsed.iterations,
-        parsed.parallelism,
-    )?;
-
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&wrapping_key));
-    wrapping_key.zeroize();
-
-    let mut key_buf = [0u8; 32];
-    key_buf.copy_from_slice(&parsed.body[0..32]);
-    let tag = Tag::from_slice(&parsed.body[32..48]);
-
-    cipher
-        .decrypt_in_place_detached(Nonce::from_slice(&parsed.nonce), AAD_V1, &mut key_buf, tag)
-        .map_err(|_| "Incorrect passphrase or corrupted key file".to_string())?;
-
-    Ok(key_buf)
-}
-
-/// Formats a 32-byte key as a PEM-armored unencrypted key file string.
-pub fn format_unencrypted_pem_key(key: &[u8; 32]) -> String {
-    format!(
-        "{header}\n\
-         Version: {version}\n\
-         Body: {body}\n\
-         {footer}\n",
-        header = PEM_HEADER_UNENCRYPTED,
-        version = CURRENT_KEY_FILE_VERSION,
-        body = hex::encode(key),
-        footer = PEM_FOOTER_UNENCRYPTED,
-    )
-}
-
-/// Parses a PEM-armored unencrypted key file string, returning the 32-byte master key.
-pub fn parse_pem_unencrypted_key(content: &str) -> Result<[u8; 32], String> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with(PEM_HEADER_UNENCRYPTED) {
-        return Err(format!("expected '{}' header", PEM_HEADER_UNENCRYPTED));
+    if io::stdin().is_terminal() {
+        return rpassword::prompt_password(prompt).map(Zeroizing::new);
     }
-    if !trimmed.ends_with(PEM_FOOTER_UNENCRYPTED) {
-        return Err(format!("expected '{}' footer", PEM_FOOTER_UNENCRYPTED));
-    }
-
-    let inner = &trimmed[PEM_HEADER_UNENCRYPTED.len()..trimmed.len() - PEM_FOOTER_UNENCRYPTED.len()];
-    let mut version: Option<u32> = None;
-    let mut body_bytes: Option<Vec<u8>> = None;
-
-    for line in inner.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some((k, v)) = line.split_once(':') {
-            let k = k.trim().to_ascii_lowercase();
-            let v = v.trim();
-            match k.as_str() {
-                "version" => {
-                    let ver = v.parse::<u32>().map_err(|_| format!("invalid version value '{}'", v))?;
-                    if ver != CURRENT_KEY_FILE_VERSION {
-                        return Err(format!(
-                            "unsupported key file version {}; only version {} is supported",
-                            ver, CURRENT_KEY_FILE_VERSION
-                        ));
-                    }
-                    version = Some(ver);
-                }
-                "body" | "key" => {
-                    let bytes = if v.len() == 64 {
-                        hex::decode(v).map_err(|e| format!("invalid hex in body: {}", e))?
-                    } else {
-                        use base64::Engine;
-                        use base64::engine::general_purpose::STANDARD;
-                        STANDARD
-                            .decode(v)
-                            .map_err(|e| format!("invalid base64 in body: {}", e))?
-                    };
-                    body_bytes = Some(bytes);
-                }
-                _ => {}
-            }
-        } else {
-            let bytes = if line.len() == 64 {
-                hex::decode(line).map_err(|e| format!("invalid hex in body line: {}", e))?
-            } else {
-                use base64::Engine;
-                use base64::engine::general_purpose::STANDARD;
-                STANDARD
-                    .decode(line)
-                    .map_err(|e| format!("invalid base64 in body line: {}", e))?
-            };
-            body_bytes = Some(bytes);
+    let mut line = Zeroizing::new(String::new());
+    io::stdin().lock().read_line(&mut line)?;
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
         }
     }
-
-    if version.is_none() {
-        return Err("missing 'Version' header".to_string());
-    }
-
-    let bytes = body_bytes.ok_or_else(|| "missing key body in PEM file".to_string())?;
-    if bytes.len() != 32 {
-        return Err(format!("expected 32-byte key, found {} bytes", bytes.len()));
-    }
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes);
-    Ok(key)
+    Ok(line)
 }
 
 /// Writes key file content atomically with `0400` file permissions.
@@ -468,52 +421,159 @@ pub fn write_key_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_pem_round_trip_encryption_decryption() {
-        let raw_key = [0x42u8; 32];
-        let passphrase = "correct horse battery staple";
+    fn passphrase(p: &str) -> impl FnOnce() -> io::Result<Zeroizing<String>> + '_ {
+        move || Ok(Zeroizing::new(p.to_string()))
+    }
 
-        // Fast Argon2 params for unit test
-        let pem = encrypt_key_to_pem(&raw_key, passphrase, 1024, 1, 1).unwrap();
-        assert!(is_pem_encrypted_key(pem.as_bytes()));
-        assert!(pem.contains(PEM_HEADER));
-        assert!(pem.contains(PEM_FOOTER));
-        assert!(pem.contains("Cipher: ChaCha20-Poly1305"));
-        assert!(pem.contains("KDF: Argon2id"));
+    fn no_passphrase() -> io::Result<Zeroizing<String>> {
+        panic!("an unencrypted key file must not ask for a passphrase")
+    }
 
-        let decrypted = decrypt_pem_key(&pem, passphrase).unwrap();
-        assert_eq!(decrypted, raw_key);
-
-        // Wrong passphrase must fail cleanly
-        let err = decrypt_pem_key(&pem, "wrong passphrase").unwrap_err();
-        assert!(err.contains("Incorrect passphrase or corrupted key file"));
+    fn unlock(text: &str, pass: &str) -> io::Result<[u8; 32]> {
+        Ok(KeyFile::parse(text).unwrap().unlock(passphrase(pass))?.key)
     }
 
     #[test]
-    fn test_pem_tampered_components_rejected() {
-        let raw_key = [0x99u8; 32];
-        let passphrase = "secret";
-        let pem = encrypt_key_to_pem(&raw_key, passphrase, 1024, 1, 1).unwrap();
+    fn test_plain_round_trip() {
+        let key = MasterKey::new([0xa5u8; 32]);
+        let text = format_plain_key_file(&key);
+        let parsed = KeyFile::parse(&text).unwrap();
+        assert!(!parsed.is_encrypted());
+        assert_eq!(parsed.unlock(no_passphrase).unwrap().key, key.key);
+    }
 
-        // 1. Missing header
-        let without_header = pem.replace(PEM_HEADER, "");
-        assert!(parse_pem_encrypted_key(&without_header).is_err());
+    #[test]
+    fn test_encrypted_round_trip_needs_the_right_passphrase() {
+        let key = MasterKey::new([0x42u8; 32]);
+        let text = format_encrypted_key_file(&key, "correct horse", Argon2Params::FAST).unwrap();
+        assert!(KeyFile::parse(&text).unwrap().is_encrypted());
+        assert_eq!(unlock(&text, "correct horse").unwrap(), key.key);
 
-        // 2. Missing footer
-        let without_footer = pem.replace(PEM_FOOTER, "");
-        assert!(parse_pem_encrypted_key(&without_footer).is_err());
+        let err = unlock(&text, "wrong horse").unwrap_err();
+        assert!(err.to_string().contains("incorrect passphrase"), "{}", err);
+    }
 
-        // 3. Tampered salt
-        let tampered_salt = pem.replace("Salt: ", "Salt: 0000");
-        assert!(parse_pem_encrypted_key(&tampered_salt).is_err());
+    /// Key files written before this parser existed must keep opening: the production
+    /// volume's key file is one of these, byte for byte.
+    #[test]
+    fn test_existing_key_files_still_parse() {
+        let plain = "-----BEGIN APPENDFS KEY-----\n\
+                     Version: 1\n\
+                     Body: 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\n\
+                     -----END APPENDFS KEY-----\n";
+        assert_eq!(unlock(plain, "").unwrap()[..4], [1, 2, 3, 4]);
 
-        // 4. Tampered body byte
-        let parsed = parse_pem_encrypted_key(&pem).unwrap();
-        let mut tampered_body = parsed.body.clone();
-        tampered_body[0] ^= 0xff;
-        let pem_tampered_body = pem.replace(&hex::encode(&parsed.body), &hex::encode(&tampered_body));
-        let err = decrypt_pem_key(&pem_tampered_body, passphrase).unwrap_err();
-        assert!(err.contains("Incorrect passphrase or corrupted key file"));
+        // The v1_passphrase_compressed fixture's key file, as written by `appendfs key
+        // change-passphrase --fast`.
+        let encrypted = "-----BEGIN APPENDFS ENCRYPTED KEY-----\n\
+                         Version: 1\n\
+                         Cipher: ChaCha20-Poly1305\n\
+                         KDF: Argon2id\n\
+                         Argon2-Memory: 1024\n\
+                         Argon2-Iterations: 1\n\
+                         Argon2-Parallelism: 1\n\
+                         Salt: f61e01e40f1486f6a86753bfe4d7cdcf\n\
+                         Nonce: 7ffc285a9177fa58f2038134\n\
+                         Body: 5ca38c7633b9c9d756197c8a5d2f240f53f5d20ffef7094db8d0f0b24a1123534b3cd72b9b8507c629b46d9d1c9e3b8f\n\
+                         -----END APPENDFS ENCRYPTED KEY-----\n";
+        assert_eq!(
+            hex::encode(unlock(encrypted, "passphrase").unwrap()),
+            "4d193aa79c5c88868873474601f95bac7b8b5e0fa0a1a4eaed518e53f977b0eb"
+        );
+    }
+
+    #[test]
+    fn test_surrounding_whitespace_is_ignored() {
+        let key = MasterKey::new([0x17u8; 32]);
+        let text = format_plain_key_file(&key);
+        for variant in [
+            format!("\n\n{}\n\n", *text),
+            text.replace('\n', "\r\n"),
+            text.replace(": ", ":   "),
+        ] {
+            assert_eq!(unlock(&variant, "").unwrap(), key.key, "{:?}", variant);
+        }
+    }
+
+    #[test]
+    fn test_anything_but_a_key_file_is_rejected() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let plain = format!("{PLAIN_BEGIN}\nVersion: 1\nBody: {hex}\n{PLAIN_END}\n");
+        let cases: Vec<(&str, String)> = vec![
+            ("legacy bare hex key", format!("{}\n", hex)),
+            ("empty file", String::new()),
+            ("missing end", plain.replace(PLAIN_END, "")),
+            ("mismatched end", plain.replace(PLAIN_END, ENCRYPTED_END)),
+            ("content after end", format!("{}trailing\n", plain)),
+            ("missing version", plain.replace("Version: 1\n", "")),
+            ("unsupported version", plain.replace("Version: 1", "Version: 2")),
+            ("missing body", plain.replace(&format!("Body: {hex}\n"), "")),
+            ("short body", plain.replace(hex, &hex[..62])),
+            ("non-hex body", plain.replace(hex, &hex.replace('0', "z"))),
+            (
+                "base64 body",
+                plain.replace(hex, "ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8="),
+            ),
+            (
+                "duplicate body",
+                plain.replace("Version: 1\n", &format!("Version: 1\nBody: {hex}\n")),
+            ),
+            (
+                "unknown field",
+                plain.replace("Version: 1\n", "Version: 1\nComment: hi\n"),
+            ),
+            ("field name case", plain.replace("Body:", "body:")),
+            (
+                "line without colon",
+                plain.replace("Version: 1\n", "Version: 1\noops\n"),
+            ),
+        ];
+        for (name, text) in cases {
+            assert!(KeyFile::parse(&text).is_err(), "{} was accepted", name);
+        }
+    }
+
+    #[test]
+    fn test_tampered_encrypted_key_files_are_rejected() {
+        let key = MasterKey::new([0x99u8; 32]);
+        let text = format_encrypted_key_file(&key, "secret", Argon2Params::FAST).unwrap();
+
+        // Malformed or missing parameters fail to parse.
+        assert!(KeyFile::parse(&text.replace("Salt: ", "Salt: 00")).is_err());
+        assert!(KeyFile::parse(&text.replace("KDF: Argon2id", "KDF: scrypt")).is_err());
+        assert!(KeyFile::parse(&text.replace("Argon2-Memory: 1024\n", "")).is_err());
+
+        // A changed parameter parses but derives a different wrapping key, and a flipped
+        // body byte breaks the tag; either way the passphrase no longer opens it.
+        let body = text.lines().find_map(|l| l.strip_prefix("Body: ")).unwrap().to_string();
+        let mut flipped = hex::decode(&body).unwrap();
+        flipped[0] ^= 0xff;
+        for tampered in [
+            text.replace("Argon2-Iterations: 1", "Argon2-Iterations: 2"),
+            text.replace(&body, &hex::encode(flipped)),
+        ] {
+            let err = unlock(&tampered, "secret").unwrap_err();
+            assert!(err.to_string().contains("incorrect passphrase"), "{}", err);
+        }
+    }
+
+    #[test]
+    fn test_master_key_from_file_reports_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.key");
+        fs::write(
+            &path,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .unwrap();
+        let err = MasterKey::from_file(&path).err().expect("bare hex must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("bad.key"), "{}", err);
+        assert!(err.to_string().contains("not a valid key file"), "{}", err);
+
+        let key = MasterKey::new([0x3cu8; 32]);
+        fs::write(&path, format_plain_key_file(&key).as_bytes()).unwrap();
+        assert_eq!(MasterKey::from_file(&path).unwrap().key, key.key);
     }
 
     #[test]
@@ -543,32 +603,6 @@ mod tests {
         let err = write_key_file_atomic(&key_path, content).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(!key_path.exists());
-    }
-
-    #[test]
-    fn test_unencrypted_pem_round_trip() {
-        let raw_key = [0xa5u8; 32];
-        let pem = format_unencrypted_pem_key(&raw_key);
-        assert!(is_pem_unencrypted_key(pem.as_bytes()));
-        assert!(!is_pem_encrypted_key(pem.as_bytes()));
-        assert!(pem.contains(PEM_HEADER_UNENCRYPTED));
-        assert!(pem.contains(PEM_FOOTER_UNENCRYPTED));
-        assert!(pem.contains("Version: 1"));
-
-        let parsed = parse_pem_unencrypted_key(&pem).unwrap();
-        assert_eq!(parsed, raw_key);
-
-        // Also test base64 variant in body
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD;
-        let b64_pem = format!(
-            "{}\nVersion: 1\nBody: {}\n{}\n",
-            PEM_HEADER_UNENCRYPTED,
-            STANDARD.encode(raw_key),
-            PEM_FOOTER_UNENCRYPTED,
-        );
-        let parsed_b64 = parse_pem_unencrypted_key(&b64_pem).unwrap();
-        assert_eq!(parsed_b64, raw_key);
     }
 
     #[test]

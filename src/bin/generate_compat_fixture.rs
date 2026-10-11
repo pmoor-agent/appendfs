@@ -8,16 +8,19 @@
 //!
 //! # Regenerate specific fixtures:
 //! cargo run --bin generate_compat_fixture tests/fixtures/v1
-//! cargo run --bin generate_compat_fixture tests/fixtures/v1_passphrase_compressed
-//! cargo run --bin generate_compat_fixture tests/fixtures/v1_secret_key_passphrase_compressed
+//! cargo run --bin generate_compat_fixture tests/fixtures/v1_key_file_compressed
 //!
 //! # Generate fixtures for a new format version (e.g. v2):
 //! cargo run --bin generate_compat_fixture tests/fixtures/v2
+//! cargo run --bin generate_compat_fixture tests/fixtures/v2_key_file_compressed
 //! ```
+//!
+//! The legacy `v1_passphrase_compressed` and `v1_secret_key_passphrase_compressed` fixtures
+//! cannot be generated: the credential modes they were created under no longer exist.
 
 use appendfs::compat::{
-    COMPAT_ENCRYPTED_PASSPHRASE, COMPAT_FIXTURE_DUMP_FILES, COMPAT_FIXTURE_FILES, COMPAT_FSCK_REPORT_FILENAME,
-    COMPAT_KEY_FILENAME, CompatFixtureConfig, create_canonical_compat_volume,
+    COMPAT_FIXTURE_DUMP_FILES, COMPAT_FIXTURE_FILES, COMPAT_FSCK_REPORT_FILENAME, COMPAT_KEY_FILENAME,
+    CompatFixtureConfig, create_canonical_compat_volume,
 };
 use std::path::{Path, PathBuf};
 
@@ -27,10 +30,6 @@ fn generate_one(out_dir: &Path, config: CompatFixtureConfig) {
         out_dir.display(),
         config
     );
-    if config.is_encrypted() {
-        println!("Using canonical passphrase: '{}'", COMPAT_ENCRYPTED_PASSPHRASE);
-    }
-
     if let Err(e) = create_canonical_compat_volume(out_dir, config) {
         eprintln!("Error generating compatibility fixture in {}: {}", out_dir.display(), e);
         std::process::exit(1);
@@ -43,7 +42,7 @@ fn generate_one(out_dir: &Path, config: CompatFixtureConfig) {
     {
         println!("  - {}", out_dir.join(name).display());
     }
-    if config == CompatFixtureConfig::SecretKeyPassphraseCompressed {
+    if config.is_encrypted() {
         println!("  - {}", out_dir.join(COMPAT_KEY_FILENAME).display());
     }
 }
@@ -66,7 +65,13 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(&args[1]);
-    let config = CompatFixtureConfig::from_dir_path(&out_dir).unwrap_or(CompatFixtureConfig::UnencryptedUncompressed);
+    let Some(config) = CompatFixtureConfig::from_dir_path(&out_dir) else {
+        eprintln!(
+            "Error: cannot tell which fixture '{}' is; expected a name like 'v2' or 'v2_key_file_compressed'",
+            out_dir.display()
+        );
+        std::process::exit(1);
+    };
 
     generate_one(&out_dir, config);
 }

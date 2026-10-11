@@ -29,7 +29,7 @@ impl fmt::Display for CipherSuite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CryptoError {
     AuthFailed,
-    /// The supplied passphrase or key file does not match this volume.
+    /// The supplied key file does not match this volume.
     ///
     /// Kept distinct from [`CryptoError::AuthFailed`] so a wrong key is never reported as
     /// data corruption - the two are otherwise indistinguishable to a caller.
@@ -47,14 +47,8 @@ impl fmt::Display for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CryptoError::AuthFailed => write!(f, "Cryptographic authentication failed (corrupted or tampered data)"),
-            CryptoError::WrongKey => write!(
-                f,
-                "Wrong passphrase or key file for this volume (the volume itself is intact)"
-            ),
-            CryptoError::KeyRequired => write!(
-                f,
-                "This volume is encrypted - a passphrase or key file is required to read it"
-            ),
+            CryptoError::WrongKey => write!(f, "Wrong key file for this volume (the volume itself is intact)"),
+            CryptoError::KeyRequired => write!(f, "This volume is encrypted - its key file is required to read it"),
             CryptoError::InvalidKeyLength => write!(f, "Invalid cryptographic key length"),
             CryptoError::IoError(s) => write!(f, "Crypto I/O error: {}", s),
         }

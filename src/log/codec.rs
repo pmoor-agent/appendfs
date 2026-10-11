@@ -64,7 +64,7 @@ pub fn decode(key: &LogFileKey, id: RecordId, stored: &[u8], auth_tag: &[u8; 16]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{KeySource, MasterKey, VolumeHeader, VolumeKey};
+    use crate::crypto::{MasterKey, VolumeHeader, VolumeKey};
 
     const SALT: [u8; 16] = [0x5A; 16];
 
@@ -101,7 +101,7 @@ mod tests {
             );
 
             // Encrypted volume.
-            let (_h, key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile, compression).unwrap();
+            let (_h, key) = VolumeHeader::new_encrypted(&master, compression).unwrap();
             let key = key.log_file_key(&SALT);
             let (op, stored, tag) = encode(&key, compression, ID, &data).unwrap();
             assert_ne!(stored, data, "encrypted/{} left the payload readable", compression);
@@ -137,8 +137,7 @@ mod tests {
     #[test]
     fn test_decode_rejects_a_reattributed_record() {
         let master = MasterKey::new([0x21u8; 32]);
-        let (_h, volume_key) =
-            VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile, Compression::Zstd).unwrap();
+        let (_h, volume_key) = VolumeHeader::new_encrypted(&master, Compression::Zstd).unwrap();
         let key = volume_key.log_file_key(&SALT);
         let (op, stored, tag) = encode(&key, Compression::Zstd, ID, &payload()).unwrap();
         let actual_id = RecordId {

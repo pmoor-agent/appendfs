@@ -2,16 +2,14 @@
 use appendfs::cli::{
     Cli, Commands, DumpArgs, FsckArgs, InitArgs, KeyChangePassphraseArgs, KeyCommands, KeyInitArgs, KeySubcommandArgs,
     MountArgs, MountCommonArgs, MountRoArgs, RemoteAddArgs, RemoteCommands, RemoteListArgs, RemoteRmArgs,
-    RemoteSubcommandArgs, RemovePassphraseArgs, StatsArgs,
+    RemoteSubcommandArgs, StatsArgs,
 };
 use appendfs::clock::SystemClock;
-use appendfs::crypto::key_file::{DEFAULT_ARGON2_ITERATIONS, DEFAULT_ARGON2_MEMORY_KIB, DEFAULT_ARGON2_PARALLELISM};
 use appendfs::crypto::{
-    CipherSuite, CryptoError, KeySource, MasterKey, VolumeHeader, VolumeKey, decrypt_pem_key, encrypt_key_to_pem,
-    format_unencrypted_pem_key, generate_random_16, is_pem_encrypted_key, is_pem_unencrypted_key, parse_hex_key,
-    parse_pem_unencrypted_key, prompt_passphrase, write_key_file_atomic,
+    Argon2Params, CipherSuite, KeyFile, MasterKey, VolumeHeader, VolumeKey, format_encrypted_key_file,
+    format_plain_key_file, prompt_passphrase, write_key_file_atomic,
 };
-use appendfs::log::{SummaryReader, SummarySnapshot, export_summary, parse_summary_filename};
+use appendfs::log::SummaryReader;
 use appendfs::storage::{OsStorage, Storage};
 use appendfs::{
     CheckOptions, VolumeStats, check_fs_integrity, check_remote_integrity, dump_file, init_volume, latest_summary_file,
@@ -19,11 +17,10 @@ use appendfs::{
 };
 
 use clap::Parser;
-use rand::RngCore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 fn load_remote_registry(storage: &dyn Storage) -> appendfs::remote::RemoteRegistry {
     match appendfs::remote::RemoteRegistry::load_from_storage(storage) {
@@ -84,11 +81,7 @@ fn read_volume_header_info(log_dir: &Path) -> Result<VolumeHeaderInfo, String> {
 }
 
 /// Opens an appendfs volume's underlying storage and resolves/unlocks its volume key.
-fn open_volume_storage(
-    log_dir: &Path,
-    key_file: Option<&Path>,
-    passphrase_flag: bool,
-) -> Result<OpenVolumeStorage, String> {
+fn open_volume_storage(log_dir: &Path, key_file: Option<&Path>) -> Result<OpenVolumeStorage, String> {
     let VolumeHeaderInfo {
         storage,
         header: volume_header,
@@ -98,70 +91,16 @@ fn open_volume_storage(
         if key_file.is_some() {
             return Err("Volume is not encrypted; --key-file does not apply to it".to_string());
         }
-        if passphrase_flag {
-            return Err("Volume is not encrypted; --passphrase does not apply to it".to_string());
-        }
         return Ok(OpenVolumeStorage {
             storage,
             volume_key: Arc::new(VolumeKey::plaintext_with_volume_id(volume_header.volume_id)),
         });
     }
 
-    // Which credentials to collect comes from the volume, not from which flags happen to be
-    // present. Guessing here would report a credential-type mismatch as a wrong key, which
-    // sends the user hunting for the wrong problem.
-    let source = volume_header.key_source;
-    if key_file.is_some() && !source.needs_key_file() {
-        return Err(format!(
-            "Volume is unlocked by: {}. It does not use a key file, so --key-file does not apply.",
-            source
-        ));
-    }
-    if source.needs_key_file() && key_file.is_none() {
-        return Err(format!(
-            "Volume is unlocked by: {}. Pass --key-file to unlock it.",
-            source
-        ));
-    }
-    if passphrase_flag && !source.needs_passphrase() {
-        return Err(format!(
-            "Volume is unlocked by: {}. It does not use a passphrase, so --passphrase does not apply.",
-            source
-        ));
-    }
-
-    let passphrase = if source.needs_passphrase() {
-        // Without a terminal this fails with a bare errno, which says nothing about *why* a
-        // passphrase was wanted - the common case being a script mounting a two-factor
-        // volume with only `--key-file`.
-        // Wrapped so the passphrase is wiped when it goes out of scope rather than left in
-        // freed heap memory for whatever allocates next.
-        Some(Zeroizing::new(
-            prompt_passphrase(&format!("Enter passphrase for volume '{}': ", log_dir.display())).map_err(|e| {
-                format!(
-                    "Volume is unlocked by: {}. Could not prompt for its passphrase: {}",
-                    source, e
-                )
-            })?,
-        ))
-    } else {
-        None
+    let Some(key_file) = key_file else {
+        return Err("Volume is encrypted. Pass --key-file to unlock it.".to_string());
     };
-
-    let master_key = match (key_file, passphrase.as_deref()) {
-        (Some(kf), Some(pass)) => {
-            MasterKey::from_file_and_passphrase(kf, pass, &volume_header.kdf_salt).map_err(|e| e.to_string())?
-        }
-        (Some(kf), None) => MasterKey::from_file(kf).map_err(|e| e.to_string())?,
-        (None, Some(pass)) => MasterKey::from_passphrase(pass, &volume_header.kdf_salt)
-            .map_err(|e| format!("Key derivation error: {}", e))?,
-        (None, None) => {
-            return Err(format!(
-                "Volume is unlocked by: {}, but no credential was supplied.",
-                source
-            ));
-        }
-    };
+    let master_key = MasterKey::from_file(key_file).map_err(|e| e.to_string())?;
 
     // The key check value is verified here, before recovery reads a single record. Without
     // it a wrong key would surface as an authentication failure mid-replay, which is
@@ -177,56 +116,12 @@ fn open_volume_storage(
 fn open_volume_fs(
     log_dir: &Path,
     key_file: Option<&Path>,
-    passphrase_flag: bool,
     target: appendfs::RecoveryTarget,
 ) -> Result<OpenVolumeFs, String> {
-    let OpenVolumeStorage { storage, volume_key } = open_volume_storage(log_dir, key_file, passphrase_flag)?;
+    let OpenVolumeStorage { storage, volume_key } = open_volume_storage(log_dir, key_file)?;
     let fs = recover_fs(storage.clone(), target, Arc::new(SystemClock), volume_key)
         .map_err(|e| format!("Failed to recover volume from '{}': {}", log_dir.display(), e))?;
     Ok(OpenVolumeFs { fs, storage })
-}
-
-/// Collects the credentials for a brand new volume, returning the key and the KDF salt to
-/// record in its header.
-///
-/// Only `init` calls this, so passphrases are always confirmed and the salt is always freshly
-/// minted; an existing volume's key is resolved by [`resolve_volume_key`] instead.
-fn prompt_master_key(source: KeySource, key_file: Option<&Path>) -> Result<(MasterKey, [u8; 16]), String> {
-    let passphrase = if source.needs_passphrase() {
-        let ask =
-            |prompt: &str| prompt_passphrase(prompt).map_err(|e| format!("Could not prompt for a passphrase: {}", e));
-        let p1 = ask("Enter passphrase: ")?;
-        let p2 = ask("Confirm passphrase: ")?;
-        if p1 != p2 {
-            return Err("Passphrases do not match".to_string());
-        }
-        if p1.is_empty() {
-            return Err("Passphrase must not be empty".to_string());
-        }
-        Some(p1)
-    } else {
-        None
-    };
-
-    match (key_file, passphrase.as_deref()) {
-        // A key file alone carries a full 256 bits, so there is nothing to stretch and the
-        // salt stays zero and unused.
-        (Some(kf), None) => Ok((MasterKey::from_file(kf).map_err(|e| e.to_string())?, [0u8; 16])),
-        (Some(kf), Some(pass)) => {
-            let salt = generate_random_16();
-            let key = MasterKey::from_file_and_passphrase(kf, pass, &salt).map_err(|e| e.to_string())?;
-            Ok((key, salt))
-        }
-        (None, Some(pass)) => {
-            let salt = generate_random_16();
-            let key = MasterKey::from_passphrase(pass, &salt).map_err(|e| format!("Key derivation error: {}", e))?;
-            Ok((key, salt))
-        }
-        (None, None) => Err(format!(
-            "Cannot initialize an encrypted volume with key source {}",
-            source
-        )),
-    }
 }
 
 fn main() {
@@ -241,7 +136,6 @@ fn main() {
         Commands::Dump(args) => cmd_dump(args),
         Commands::Fsck(args) => cmd_fsck(args),
         Commands::Remote(subargs) => cmd_remote(subargs),
-        Commands::RemovePassphrase(args) => cmd_remove_passphrase(args),
         Commands::Key(subargs) => cmd_key(subargs),
     }
 }
@@ -271,7 +165,6 @@ fn default_volume_log(command: &Commands) -> Option<PathBuf> {
         Commands::MountRo(args) => (args.log_dir.clone(), false),
         Commands::Stats(args) => (args.log_dir.clone(), false),
         Commands::Fsck(args) => (args.log_dir.clone(), false),
-        Commands::RemovePassphrase(args) => (args.log_dir.clone(), false),
         // `dump` names a log file rather than a volume, so log beside it.
         Commands::Dump(args) => (args.file.parent()?.to_path_buf(), false),
         Commands::Remote(sub) => match sub.command {
@@ -356,9 +249,8 @@ fn cmd_init(args: InitArgs) {
 
     println!("Initializing appendfs volume at '{}'...", args.log_dir.display());
 
-    let key_source = args.key_source();
-    if key_source != KeySource::None {
-        let (master_key, salt) = match prompt_master_key(key_source, args.key_file.as_deref()) {
+    if let Some(ref key_file) = args.key_file {
+        let master_key = match MasterKey::from_file(key_file) {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -366,14 +258,13 @@ fn cmd_init(args: InitArgs) {
             }
         };
 
-        let (volume_header, volume_key) =
-            match VolumeHeader::new_encrypted(&master_key, salt, key_source, args.compression()) {
-                Ok(res) => res,
-                Err(e) => {
-                    eprintln!("Failed to initialize volume encryption: {}", e);
-                    std::process::exit(1);
-                }
-            };
+        let (volume_header, volume_key) = match VolumeHeader::new_encrypted(&master_key, args.compression()) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("Failed to initialize volume encryption: {}", e);
+                std::process::exit(1);
+            }
+        };
         let volume_id = hex_string(&volume_header.volume_id);
 
         let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
@@ -383,15 +274,15 @@ fn cmd_init(args: InitArgs) {
                 println!("  Log Directory:   {}", args.log_dir.display());
                 println!("  Summary File:    {}", summary_filename);
                 println!("  Cipher:          ChaCha20-Poly1305");
-                println!("  Unlocked by:     {}", key_source);
+                println!("  Key File:        {}", key_file.display());
                 println!("  Compression:     {}", args.compression());
                 println!("  Volume ID:       {}", volume_id);
                 println!("  Root Inode:      1 (/)");
                 println!("  Next Generation: 1 (000001.log)");
                 println!();
-                println!("Back up your credentials now: they are not stored in the volume");
-                println!("and cannot be recovered. Losing them loses the volume, and this");
-                println!("choice cannot be changed later.");
+                println!("Back up your key file now: it is not stored in the volume and");
+                println!("cannot be recovered. Losing it loses the volume. Its passphrase, if");
+                println!("any, can be changed with 'appendfs key change-passphrase'.");
             }
             Err(e) => {
                 eprintln!("Failed to initialize volume in '{}': {}", args.log_dir.display(), e);
@@ -465,12 +356,7 @@ fn cmd_mount(args: MountArgs) {
     let OpenVolumeFs {
         fs: mut fs_instance,
         storage,
-    } = match open_volume_fs(
-        log_dir,
-        args.key_file.as_deref(),
-        args.passphrase,
-        appendfs::RecoveryTarget::Latest,
-    ) {
+    } = match open_volume_fs(log_dir, args.key_file.as_deref(), appendfs::RecoveryTarget::Latest) {
         Ok(res) => res,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -571,14 +457,13 @@ fn cmd_mount_ro(args: MountRoArgs) {
         log_dir.display()
     );
 
-    let OpenVolumeStorage { storage, volume_key } =
-        match open_volume_storage(log_dir, args.key_file.as_deref(), args.passphrase) {
-            Ok(res) => res,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        };
+    let OpenVolumeStorage { storage, volume_key } = match open_volume_storage(log_dir, args.key_file.as_deref()) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let registry = load_remote_registry(storage.as_ref());
     let remote_stores = registry.build_read_stores();
@@ -653,7 +538,6 @@ fn cmd_stats(args: StatsArgs) {
     let OpenVolumeFs { fs, .. } = match open_volume_fs(
         &args.log_dir,
         args.key_file.as_deref(),
-        args.passphrase,
         appendfs::RecoveryTarget::Latest,
     ) {
         Ok(res) => res,
@@ -679,15 +563,12 @@ fn cmd_dump(args: DumpArgs) {
     let filename = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let storage = OsStorage::new(parent);
 
-    // Asking for neither credential dumps the raw on-disk bytes, which is a valid way
-    // to inspect structure. Asking for either resolves against the volume's summary -
-    // not against the file being dumped, which is usually a .log and carries no
-    // volume header - and fails loudly rather than quietly falling back to a
-    // ciphertext dump the user did not ask for. A passphrase volume needs the
-    // explicit flag, since prompting whenever a volume happens to be encrypted would
-    // make scripted raw dumps hang waiting on a terminal.
-    let volume_key = if args.key_file.is_some() || args.passphrase {
-        match open_volume_storage(parent, args.key_file.as_deref(), args.passphrase) {
+    // Without a key file this dumps the raw on-disk bytes, which is a valid way to inspect
+    // structure. With one, the key resolves against the volume's summary - not against the
+    // file being dumped, which is usually a .log and carries no volume header - and fails
+    // loudly rather than quietly falling back to a ciphertext dump the user did not ask for.
+    let volume_key = if let Some(key_file) = args.key_file.as_deref() {
+        match open_volume_storage(parent, Some(key_file)) {
             Ok(res) => Some(res.volume_key),
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -829,14 +710,13 @@ fn cmd_fsck(args: FsckArgs) {
         std::process::exit(1);
     }
 
-    let OpenVolumeStorage { storage, volume_key } =
-        match open_volume_storage(log_dir, args.key_file.as_deref(), args.passphrase) {
-            Ok(res) => res,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        };
+    let OpenVolumeStorage { storage, volume_key } = match open_volume_storage(log_dir, args.key_file.as_deref()) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let registry = load_remote_registry(storage.as_ref());
     let target_remotes = resolve_fsck_target_remotes(&args, &registry);
@@ -1058,239 +938,6 @@ fn cmd_remote_list(list_args: RemoteListArgs) {
     }
 }
 
-fn cmd_remove_passphrase(args: RemovePassphraseArgs) {
-    if !args.log_dir.exists() {
-        eprintln!(
-            "Log directory '{}' does not exist.\nRun 'appendfs init {}' to create a new volume first.",
-            args.log_dir.display(),
-            args.log_dir.display()
-        );
-        std::process::exit(1);
-    }
-
-    if args.new_key_file.exists() {
-        eprintln!(
-            "Error: Output key file '{}' already exists; refusing to overwrite.",
-            args.new_key_file.display()
-        );
-        std::process::exit(1);
-    }
-
-    if args.key_file.as_deref() == Some(&args.new_key_file) {
-        eprintln!("Error: Output key file cannot be the same as the input key file.");
-        std::process::exit(1);
-    }
-
-    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
-    let _lock = match storage.acquire_exclusive_lock() {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Error: Failed to acquire volume lock: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let summary_file = match latest_summary_file(storage.as_ref()) {
-        Ok(Some(sf)) => sf,
-        Ok(None) => {
-            eprintln!(
-                "No appendfs volume found in '{}' (directory contains no summary files).\nRun 'appendfs init {}' to create a new volume first.",
-                args.log_dir.display(),
-                args.log_dir.display()
-            );
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Error reading log directory '{}': {}", args.log_dir.display(), e);
-            std::process::exit(1);
-        }
-    };
-
-    let volume_header = match SummaryReader::read_volume_header(storage.as_ref(), &summary_file) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("Error: Failed to read volume header from '{}': {}", summary_file, e);
-            std::process::exit(1);
-        }
-    };
-
-    let (master_key, volume_key) = resolve_master_key_for_passphrase_removal(&args, &volume_header);
-
-    write_new_secret_key_file(&args.new_key_file, &master_key);
-    export_new_summary_revision(storage.as_ref(), &summary_file, &volume_header, &volume_key);
-
-    println!("Passphrase removed successfully.");
-    println!("New secret key written to: {}", args.new_key_file.display());
-    println!(
-        "The volume can now be unlocked with: appendfs mount {} --key-file {}",
-        args.log_dir.display(),
-        args.new_key_file.display()
-    );
-}
-
-fn resolve_master_key_for_passphrase_removal(
-    args: &RemovePassphraseArgs,
-    volume_header: &VolumeHeader,
-) -> (MasterKey, Arc<VolumeKey>) {
-    if volume_header.cipher == CipherSuite::None {
-        eprintln!("Error: Volume is not encrypted; remove-passphrase only applies to encrypted volumes.");
-        std::process::exit(1);
-    }
-
-    if !volume_header.key_source.needs_passphrase() {
-        eprintln!(
-            "Error: Volume is unlocked by: {}. It does not use a passphrase.",
-            volume_header.key_source
-        );
-        std::process::exit(1);
-    }
-
-    if volume_header.key_source.needs_key_file() && args.key_file.is_none() {
-        eprintln!(
-            "Error: Volume is unlocked by: {}. Pass --key-file to unlock it.",
-            volume_header.key_source
-        );
-        std::process::exit(1);
-    }
-
-    if args.key_file.is_some() && !volume_header.key_source.needs_key_file() {
-        eprintln!(
-            "Error: Volume is unlocked by: {}. It does not use a key file, so --key-file does not apply.",
-            volume_header.key_source
-        );
-        std::process::exit(1);
-    }
-
-    let passphrase = match prompt_passphrase(&format!("Enter passphrase for volume '{}': ", args.log_dir.display())) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Error: Could not prompt for passphrase: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let master_key = match (args.key_file.as_deref(), volume_header.key_source) {
-        (Some(kf), KeySource::KeyFileAndPassphrase) => {
-            match MasterKey::from_file_and_passphrase(kf, &passphrase, &volume_header.kdf_salt) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        (None, KeySource::Passphrase) => match MasterKey::from_passphrase(&passphrase, &volume_header.kdf_salt) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Error: Key derivation error: {}", e);
-                std::process::exit(1);
-            }
-        },
-        _ => unreachable!(),
-    };
-
-    let volume_key = match volume_header.unlock(&master_key) {
-        Ok(vk) => Arc::new(vk),
-        Err(CryptoError::WrongKey) => {
-            eprintln!("Error: Incorrect passphrase or key file.");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Error: Failed to unlock volume: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    (master_key, volume_key)
-}
-
-fn write_new_secret_key_file(path: &Path, master_key: &MasterKey) {
-    let hex_key = hex::encode(master_key.key);
-    let res = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-        writeln!(file, "{}", hex_key)?;
-        file.sync_all()?;
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))?;
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = res {
-        eprintln!("Error: Failed to write new secret key file '{}': {}", path.display(), e);
-        std::process::exit(1);
-    }
-}
-
-fn export_new_summary_revision(
-    storage: &dyn Storage,
-    summary_file: &str,
-    volume_header: &VolumeHeader,
-    volume_key: &Arc<VolumeKey>,
-) {
-    let (gen_num, rev_num) = match parse_summary_filename(summary_file) {
-        Some((g, r)) => (g, r),
-        None => {
-            eprintln!("Error: Invalid summary filename '{}'", summary_file);
-            std::process::exit(1);
-        }
-    };
-
-    let reader = match SummaryReader::open(storage, summary_file, volume_key.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Error: Failed to open latest summary '{}': {}", summary_file, e);
-            std::process::exit(1);
-        }
-    };
-
-    let inodes = match reader.read_all_inodes() {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("Error: Failed to read inodes from summary '{}': {}", summary_file, e);
-            std::process::exit(1);
-        }
-    };
-    let manifest = reader.manifest.clone();
-
-    let mut new_volume_header = volume_header.clone();
-    new_volume_header.key_source = KeySource::KeyFile;
-    new_volume_header.kdf_salt = [0u8; 16];
-
-    let new_rev = match rev_num.checked_add(1) {
-        Some(r) => r,
-        None => {
-            eprintln!("Error: Summary revision overflow for generation {}", gen_num);
-            std::process::exit(1);
-        }
-    };
-
-    let snapshot = SummarySnapshot {
-        inodes: &inodes,
-        manifest: &manifest,
-        volume_header: &new_volume_header,
-        generation: gen_num,
-        revision: new_rev,
-        last_batch_id: reader.header.last_batch_id,
-        next_inode: reader.header.next_inode,
-        created_at: reader.header.created_at,
-    };
-
-    match export_summary(&snapshot, storage, volume_key) {
-        Ok(new_file) => {
-            println!("Exported new summary revision: {}", new_file);
-        }
-        Err(e) => {
-            eprintln!("Error: Failed to export updated summary revision: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
 /// Prints a volume's identity: what it is and what unlocks it. Needs no credentials,
 /// because the header sits in plaintext ahead of the encrypted summary body.
 fn print_volume_identity(log_dir: &Path, header: &VolumeHeader) {
@@ -1299,9 +946,6 @@ fn print_volume_identity(log_dir: &Path, header: &VolumeHeader) {
     println!("Cipher Suite:  {}", header.cipher);
     println!("Compression:   {}", header.compression);
     println!("Volume ID:     {}", hex_string(&header.volume_id));
-    if header.cipher.is_encrypted() {
-        println!("Unlocked by:   {}", header.key_source);
-    }
     println!();
 }
 
@@ -1310,9 +954,8 @@ fn print_volume_identity(log_dir: &Path, header: &VolumeHeader) {
 fn print_credential_help(header: &VolumeHeader) {
     if header.cipher.is_encrypted() {
         eprintln!();
-        eprintln!("Credentials are supplied per invocation and are not stored here.");
-        eprintln!("Back them up: losing them loses the volume, and changing them means");
-        eprintln!("re-encrypting into a fresh volume.");
+        eprintln!("Encrypted volumes are unlocked with --key-file; the key file is not");
+        eprintln!("stored here. Back it up: losing it loses the volume.");
         if header.compression.is_enabled() {
             eprintln!();
             eprintln!("Compressed records reveal roughly how compressible their contents");
@@ -1321,8 +964,8 @@ fn print_credential_help(header: &VolumeHeader) {
     } else {
         eprintln!();
         eprintln!("Volume is unencrypted, and cannot be encrypted in place.");
-        eprintln!("Encryption is chosen at init time - 'appendfs init --key-file <file>'");
-        eprintln!("and/or '--passphrase' - and fixed for the life of the volume.");
+        eprintln!("Encryption is chosen at init time - 'appendfs init --key-file <file>' -");
+        eprintln!("and fixed for the life of the volume.");
     }
 }
 
@@ -1330,34 +973,36 @@ fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn argon2_params(fast: bool) -> (u32, u32, u32) {
-    if fast {
-        (1024, 1, 1)
-    } else {
-        (
-            DEFAULT_ARGON2_MEMORY_KIB,
-            DEFAULT_ARGON2_ITERATIONS,
-            DEFAULT_ARGON2_PARALLELISM,
-        )
+fn prompt_new_passphrase(prompt: &str, confirm_prompt: &str) -> Result<Zeroizing<String>, String> {
+    use std::io::IsTerminal;
+    let p1 = prompt_passphrase(prompt).map_err(|e| format!("Could not read passphrase: {}", e))?;
+    if p1.is_empty() || !std::io::stdin().is_terminal() {
+        return Ok(p1);
     }
+    let p2 = prompt_passphrase(confirm_prompt).map_err(|e| format!("Could not read passphrase confirmation: {}", e))?;
+    if p1 != p2 {
+        return Err("Passphrases do not match".to_string());
+    }
+    Ok(p1)
 }
 
-fn prompt_new_passphrase(prompt: &str, confirm_prompt: &str) -> Result<String, String> {
-    use std::io::IsTerminal;
-    if std::io::stdin().is_terminal() {
-        let p1 = prompt_passphrase(prompt).map_err(|e| format!("Could not read passphrase: {}", e))?;
-        if p1.is_empty() {
-            return Ok(p1);
-        }
-        let p2 =
-            prompt_passphrase(confirm_prompt).map_err(|e| format!("Could not read passphrase confirmation: {}", e))?;
-        if p1 != p2 {
-            return Err("Passphrases do not match".to_string());
-        }
-        Ok(p1)
+/// Writes `key` to `path`, wrapped under `passphrase` unless it is empty.
+fn write_key_file(path: &Path, key: &MasterKey, passphrase: &str, fast: bool) -> Result<(), String> {
+    let content = if passphrase.is_empty() {
+        format_plain_key_file(key)
     } else {
-        prompt_passphrase(prompt).map_err(|e| format!("Could not read passphrase: {}", e))
-    }
+        let params = if fast {
+            Argon2Params::FAST
+        } else {
+            Argon2Params::DEFAULT
+        };
+        Zeroizing::new(
+            format_encrypted_key_file(key, passphrase, params)
+                .map_err(|e| format!("Error encrypting key file: {}", e))?,
+        )
+    };
+    write_key_file_atomic(path, content.as_bytes())
+        .map_err(|e| format!("Error writing key file '{}': {}", path.display(), e))
 }
 
 fn cmd_key(args: KeySubcommandArgs) {
@@ -1368,149 +1013,57 @@ fn cmd_key(args: KeySubcommandArgs) {
 }
 
 fn cmd_key_init(args: KeyInitArgs) {
-    let output_path = match args.output_path() {
-        Ok(p) => p.clone(),
+    let result = (|| {
+        let output_path = args.output_path()?;
+        let passphrase = prompt_new_passphrase("Enter passphrase (empty for none): ", "Confirm passphrase: ")?;
+        write_key_file(output_path, &MasterKey::generate(), &passphrase, args.fast)?;
+        Ok::<_, String>(if passphrase.is_empty() {
+            format!("Generated unencrypted key file: {}", output_path.display())
+        } else {
+            format!("Generated passphrase-encrypted key file: {}", output_path.display())
+        })
+    })();
+    match result {
+        Ok(message) => println!("{}", message),
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
-    };
-
-    let mut raw_key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut raw_key);
-
-    let passphrase = match prompt_new_passphrase("Enter passphrase (empty for none): ", "Confirm passphrase: ") {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    if !passphrase.is_empty() {
-        let (m_cost, t_cost, p_cost) = argon2_params(args.fast);
-        let pem = match encrypt_key_to_pem(&raw_key, &passphrase, m_cost, t_cost, p_cost) {
-            Ok(pem) => pem,
-            Err(e) => {
-                eprintln!("Error encrypting key file: {}", e);
-                std::process::exit(1);
-            }
-        };
-        raw_key.zeroize();
-
-        if let Err(e) = write_key_file_atomic(&output_path, pem.as_bytes()) {
-            eprintln!("Error writing key file '{}': {}", output_path.display(), e);
-            std::process::exit(1);
-        }
-
-        println!("Generated passphrase-encrypted key file: {}", output_path.display());
-    } else {
-        let pem = format_unencrypted_pem_key(&raw_key);
-        raw_key.zeroize();
-        if let Err(e) = write_key_file_atomic(&output_path, pem.as_bytes()) {
-            eprintln!("Error writing key file '{}': {}", output_path.display(), e);
-            std::process::exit(1);
-        }
-
-        println!("Generated unencrypted key file: {}", output_path.display());
     }
 }
 
-fn read_and_unlock_key_file(key_path: &Path) -> Result<([u8; 32], bool), String> {
-    let content =
-        std::fs::read(key_path).map_err(|e| format!("Error reading key file '{}': {}", key_path.display(), e))?;
-
-    let is_encrypted = is_pem_encrypted_key(&content);
-    let raw_key = if is_encrypted {
-        let pem_str = std::str::from_utf8(&content)
-            .map_err(|_| format!("Error: Key file '{}' contains invalid UTF-8.", key_path.display()))?;
-
-        let old_passphrase = prompt_passphrase(&format!(
-            "Enter current passphrase for key file '{}': ",
-            key_path.display()
-        ))
-        .map_err(|e| format!("Error reading passphrase: {}", e))?;
-
-        decrypt_pem_key(pem_str, &old_passphrase)
-            .map_err(|e| format!("Error unlocking key file '{}': {}", key_path.display(), e))?
-    } else if is_pem_unencrypted_key(&content) {
-        let pem_str = std::str::from_utf8(&content)
-            .map_err(|_| format!("Error: Key file '{}' contains invalid UTF-8.", key_path.display()))?;
-
-        parse_pem_unencrypted_key(pem_str)
-            .map_err(|e| format!("Error parsing key file '{}': {}", key_path.display(), e))?
-    } else {
-        parse_hex_key(&content)
-            .map_err(|e| format!("Error: Key file '{}' is not a valid key: {}", key_path.display(), e))?
-    };
-
-    Ok((raw_key, is_encrypted))
-}
-
 fn cmd_key_change_passphrase(args: KeyChangePassphraseArgs) {
-    let key_path = match args.key_path() {
-        Ok(p) => p.clone(),
+    let result = (|| {
+        let key_path = args.key_path()?;
+        let output_path = args.output_path(key_path);
+
+        let key_file = KeyFile::read(key_path).map_err(|e| e.to_string())?;
+        let was_encrypted = key_file.is_encrypted();
+        let key = key_file
+            .unlock(|| {
+                prompt_passphrase(&format!(
+                    "Enter current passphrase for key file '{}': ",
+                    key_path.display()
+                ))
+            })
+            .map_err(|e| format!("cannot unlock key file '{}': {}", key_path.display(), e))?;
+
+        let passphrase = prompt_new_passphrase("Enter new passphrase (empty for none): ", "Confirm new passphrase: ")?;
+        write_key_file(output_path, &key, &passphrase, args.fast)?;
+
+        let shown = output_path.display();
+        Ok::<_, String>(match (was_encrypted, passphrase.is_empty()) {
+            (true, false) => format!("Successfully updated passphrase for key file: {}", shown),
+            (false, false) => format!("Added passphrase protection to key file: {}", shown),
+            (true, true) => format!("Removed passphrase protection from key file: {}", shown),
+            (false, true) => format!("Key file remains unencrypted: {}", shown),
+        })
+    })();
+    match result {
+        Ok(message) => println!("{}", message),
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
-        }
-    };
-    let output_path = args.output_path(&key_path).clone();
-
-    let (mut raw_key, is_encrypted) = match read_and_unlock_key_file(&key_path) {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let new_passphrase =
-        match prompt_new_passphrase("Enter new passphrase (empty for none): ", "Confirm new passphrase: ") {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        };
-
-    if !new_passphrase.is_empty() {
-        let (m_cost, t_cost, p_cost) = argon2_params(args.fast);
-        let pem = match encrypt_key_to_pem(&raw_key, &new_passphrase, m_cost, t_cost, p_cost) {
-            Ok(pem) => pem,
-            Err(e) => {
-                eprintln!("Error encrypting key file: {}", e);
-                std::process::exit(1);
-            }
-        };
-        raw_key.zeroize();
-
-        if let Err(e) = write_key_file_atomic(&output_path, pem.as_bytes()) {
-            eprintln!("Error writing key file '{}': {}", output_path.display(), e);
-            std::process::exit(1);
-        }
-
-        if is_encrypted {
-            println!(
-                "Successfully updated passphrase for key file: {}",
-                output_path.display()
-            );
-        } else {
-            println!("Added passphrase protection to key file: {}", output_path.display());
-        }
-    } else {
-        let pem = format_unencrypted_pem_key(&raw_key);
-        raw_key.zeroize();
-
-        if let Err(e) = write_key_file_atomic(&output_path, pem.as_bytes()) {
-            eprintln!("Error writing key file '{}': {}", output_path.display(), e);
-            std::process::exit(1);
-        }
-
-        if is_encrypted {
-            println!("Removed passphrase protection from key file: {}", output_path.display());
-        } else {
-            println!("Key file remains unencrypted: {}", output_path.display());
         }
     }
 }

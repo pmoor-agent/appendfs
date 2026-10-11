@@ -2210,13 +2210,8 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
     let master_key = appendfs::crypto::MasterKey::new([0x42u8; 32]);
 
     // 1. Initialize encrypted volume
-    let (volume_header, volume_key) = appendfs::crypto::VolumeHeader::new_encrypted(
-        &master_key,
-        [0x11u8; 16],
-        appendfs::crypto::KeySource::KeyFile,
-        appendfs::compress::Compression::None,
-    )
-    .unwrap();
+    let (volume_header, volume_key) =
+        appendfs::crypto::VolumeHeader::new_encrypted(&master_key, appendfs::compress::Compression::None).unwrap();
     appendfs::log::init_volume(
         storage.clone(),
         &volume_key,
@@ -2320,13 +2315,8 @@ fn test_tampered_record_header_is_rejected_not_served() {
     let master_key = appendfs::crypto::MasterKey::new([0x7Eu8; 32]);
     let secret = b"PLAINTEXT_THAT_MUST_NEVER_BE_SERVED";
 
-    let (volume_header, volume_key) = appendfs::crypto::VolumeHeader::new_encrypted(
-        &master_key,
-        [0x0Au8; 16],
-        appendfs::crypto::KeySource::KeyFile,
-        appendfs::compress::Compression::None,
-    )
-    .unwrap();
+    let (volume_header, volume_key) =
+        appendfs::crypto::VolumeHeader::new_encrypted(&master_key, appendfs::compress::Compression::None).unwrap();
     let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
     appendfs::log::init_volume(
         storage.clone(),
@@ -2408,79 +2398,6 @@ fn test_tampered_record_header_is_rejected_not_served() {
     }
 }
 
-/// A volume must record which credentials open it, so a mount asks for the right thing.
-///
-/// Without this the CLI can only infer the credential type from which flags were passed, and
-/// a wrong guess is indistinguishable from a wrong credential - both just fail the key check.
-#[test]
-fn test_key_source_round_trips_through_the_volume_header() {
-    use appendfs::crypto::KeySource;
-
-    for (source, needs_file, needs_pass) in [
-        (KeySource::Passphrase, false, true),
-        (KeySource::KeyFile, true, false),
-        (KeySource::KeyFileAndPassphrase, true, true),
-    ] {
-        let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
-        let master = appendfs::crypto::MasterKey::new([0x5Cu8; 32]);
-
-        let (header, key) = appendfs::crypto::VolumeHeader::new_encrypted(
-            &master,
-            [0x11u8; 16],
-            source,
-            appendfs::compress::Compression::None,
-        )
-        .unwrap();
-        assert_eq!(header.key_source.needs_key_file(), needs_file, "{:?}", source);
-        assert_eq!(header.key_source.needs_passphrase(), needs_pass, "{:?}", source);
-
-        appendfs::log::init_volume(
-            storage.clone(),
-            &key,
-            header,
-            std::sync::Arc::new(appendfs::SystemClock),
-        )
-        .unwrap();
-
-        // The mode must survive the round trip through the plaintext header blob, and be
-        // readable without any credential at all - that is what lets a mount know what to
-        // ask for before it can ask for it.
-        let read_back = appendfs::log::SummaryReader::read_volume_header(storage.as_ref(), "000000.summary").unwrap();
-        assert_eq!(read_back.key_source, source);
-        assert!(read_back.unlock(&master).is_ok());
-    }
-
-    // A plaintext volume reports no credential at all.
-    let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
-    appendfs::init_volume(
-        storage.clone(),
-        &appendfs::VolumeKey::plaintext(),
-        appendfs::VolumeHeader::plaintext(),
-        std::sync::Arc::new(appendfs::SystemClock),
-    )
-    .unwrap();
-    let read_back = appendfs::log::SummaryReader::read_volume_header(storage.as_ref(), "000000.summary").unwrap();
-    assert_eq!(read_back.key_source, KeySource::None);
-    assert!(!read_back.key_source.needs_key_file());
-    assert!(!read_back.key_source.needs_passphrase());
-}
-
-/// An encrypted volume may not describe itself as having no key source.
-#[test]
-fn test_encrypted_volume_rejects_none_key_source() {
-    use appendfs::crypto::KeySource;
-    let master = appendfs::crypto::MasterKey::new([0x01u8; 32]);
-    assert!(
-        appendfs::crypto::VolumeHeader::new_encrypted(
-            &master,
-            [0u8; 16],
-            KeySource::None,
-            appendfs::compress::Compression::None
-        )
-        .is_err()
-    );
-}
-
 /// A rewritten summary footer must produce an error, never a panic or a huge allocation.
 ///
 /// The footer's BLAKE3 checksum carries no key, so anyone able to modify the file can
@@ -2488,7 +2405,7 @@ fn test_encrypted_volume_rejects_none_key_source() {
 /// be bounds-checked before it indexes the decrypted body or sizes a buffer.
 #[test]
 fn test_forged_summary_offsets_error_rather_than_panic() {
-    use appendfs::crypto::{KeySource, MasterKey, VolumeHeader};
+    use appendfs::crypto::{MasterKey, VolumeHeader};
 
     /// Rewrites `000000.summary` via `edit`, restoring the whole-file checksum so the edit
     /// gets past the bitrot check and reaches the code under test.
@@ -2525,13 +2442,7 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
     ] {
         let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
         let master = MasterKey::new([0x33u8; 32]);
-        let (header, key) = VolumeHeader::new_encrypted(
-            &master,
-            [0x44u8; 16],
-            KeySource::KeyFile,
-            appendfs::compress::Compression::None,
-        )
-        .unwrap();
+        let (header, key) = VolumeHeader::new_encrypted(&master, appendfs::compress::Compression::None).unwrap();
         appendfs::log::init_volume(
             storage.clone(),
             &key,
@@ -2554,18 +2465,12 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
 /// that wrote it.
 #[test]
 fn test_export_refuses_a_mismatched_header_and_key() {
-    use appendfs::crypto::{KeySource, MasterKey, VolumeHeader};
+    use appendfs::crypto::{MasterKey, VolumeHeader};
 
     let storage: std::sync::Arc<dyn appendfs::storage::Storage> =
         std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
     let master = MasterKey::new([0x55u8; 32]);
-    let (_header, key) = VolumeHeader::new_encrypted(
-        &master,
-        [0u8; 16],
-        KeySource::KeyFile,
-        appendfs::compress::Compression::None,
-    )
-    .unwrap();
+    let (_header, key) = VolumeHeader::new_encrypted(&master, appendfs::compress::Compression::None).unwrap();
 
     // Swapping in an encrypted key behind the plaintext volume's back leaves the header
     // saying plaintext - the pairing this guard exists to catch.
@@ -2586,7 +2491,7 @@ fn test_export_refuses_a_mismatched_header_and_key() {
 #[test]
 fn test_compressed_volume_round_trips_and_saves_space() {
     use appendfs::compress::Compression;
-    use appendfs::crypto::{KeySource, MasterKey, VolumeHeader};
+    use appendfs::crypto::{MasterKey, VolumeHeader};
 
     // Same payload written to a compressed and an uncompressed volume, so the only
     // difference in log size is the compression.
@@ -2598,8 +2503,7 @@ fn test_compressed_volume_round_trips_and_saves_space() {
     for compression in [Compression::None, Compression::Zstd] {
         let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
         let master = MasterKey::new([0x6Bu8; 32]);
-        let (header, key) =
-            VolumeHeader::new_encrypted(&master, [0x77u8; 16], KeySource::KeyFile, compression).unwrap();
+        let (header, key) = VolumeHeader::new_encrypted(&master, compression).unwrap();
         appendfs::log::init_volume(
             storage.clone(),
             &key,
@@ -2671,13 +2575,12 @@ fn test_compressed_volume_round_trips_and_saves_space() {
 #[test]
 fn test_check_verifies_compressed_volumes_without_false_positives() {
     use appendfs::compress::Compression;
-    use appendfs::crypto::{KeySource, MasterKey, VolumeHeader};
+    use appendfs::crypto::{MasterKey, VolumeHeader};
 
     for compression in [Compression::None, Compression::Zstd] {
         let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
         let master = MasterKey::new([0x31u8; 32]);
-        let (header, key) =
-            VolumeHeader::new_encrypted(&master, [0x32u8; 16], KeySource::KeyFile, compression).unwrap();
+        let (header, key) = VolumeHeader::new_encrypted(&master, compression).unwrap();
         appendfs::log::init_volume(
             storage.clone(),
             &key,

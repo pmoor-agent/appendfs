@@ -16,7 +16,8 @@
 
 use appendfs::FsTestExt;
 use appendfs::compat::{
-    COMPAT_FSCK_REPORT_FILENAME, CompatFixtureConfig, create_canonical_compat_volume, verify_compat_tree,
+    COMPAT_FSCK_REPORT_FILENAME, COMPAT_KEY_FILENAME, CompatFixtureConfig, create_canonical_compat_volume,
+    verify_compat_tree,
 };
 use appendfs::storage::OsStorage;
 use appendfs::{AppendFs, RecoveryTarget, Storage, SummaryReader, recover_fs};
@@ -27,14 +28,6 @@ use std::sync::Arc;
 
 fn fixture_v1_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1")
-}
-
-fn fixture_v1_passphrase_compressed_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1_passphrase_compressed")
-}
-
-fn fixture_v1_secret_key_passphrase_compressed_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1_secret_key_passphrase_compressed")
 }
 
 pub use appendfs::compat::resolve_fixture_volume_key;
@@ -148,76 +141,36 @@ fn test_v1_fsck_matches_golden() {
     verify_fsck_matches_golden(&fixture_v1_dir());
 }
 
+/// Every configuration the generator knows must reproduce its checked-in fixture byte for
+/// byte, which is what proves the write path has not drifted from the format on disk.
+///
+/// The legacy passphrase fixtures are not among them: nothing can create such a volume any
+/// more, so they are covered by recovery alone, in `test_all_fixture_versions`.
 #[test]
-fn test_v1_deterministic_reproducibility() {
-    let temp = tempfile::tempdir().unwrap();
-    create_canonical_compat_volume(temp.path(), CompatFixtureConfig::UnencryptedUncompressed)
-        .expect("create canonical compat volume");
+fn test_generated_fixtures_reproduce_byte_for_byte() {
+    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for config in CompatFixtureConfig::ALL {
+        let temp = tempfile::tempdir().unwrap();
+        create_canonical_compat_volume(temp.path(), config).expect("create canonical compat volume");
 
-    let fixture_dir = fixture_v1_dir();
-    for name in appendfs::compat::COMPAT_FIXTURE_FILES
-        .iter()
-        .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
-        .chain([COMPAT_FSCK_REPORT_FILENAME].iter())
-    {
-        let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
-        let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
-        assert_eq!(
-            actual_bytes,
-            expected_bytes,
-            "Generated file {} differs from checked-in fixture in {}",
-            name,
-            fixture_dir.display()
-        );
-    }
-}
-
-#[test]
-fn test_v1_passphrase_compressed_deterministic_reproducibility() {
-    let temp = tempfile::tempdir().unwrap();
-    create_canonical_compat_volume(temp.path(), CompatFixtureConfig::PassphraseCompressed)
-        .expect("create canonical passphrase compressed compat volume");
-
-    let fixture_dir = fixture_v1_passphrase_compressed_dir();
-    for name in appendfs::compat::COMPAT_FIXTURE_FILES
-        .iter()
-        .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
-        .chain([COMPAT_FSCK_REPORT_FILENAME].iter())
-    {
-        let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
-        let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
-        assert_eq!(
-            actual_bytes,
-            expected_bytes,
-            "Generated passphrase compressed file {} differs from checked-in fixture in {}",
-            name,
-            fixture_dir.display()
-        );
-    }
-}
-
-#[test]
-fn test_v1_secret_key_passphrase_compressed_deterministic_reproducibility() {
-    let temp = tempfile::tempdir().unwrap();
-    create_canonical_compat_volume(temp.path(), CompatFixtureConfig::SecretKeyPassphraseCompressed)
-        .expect("create canonical secret key + passphrase compressed compat volume");
-
-    let fixture_dir = fixture_v1_secret_key_passphrase_compressed_dir();
-    for name in appendfs::compat::COMPAT_FIXTURE_FILES
-        .iter()
-        .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
-        .chain([appendfs::compat::COMPAT_KEY_FILENAME].iter())
-        .chain([COMPAT_FSCK_REPORT_FILENAME].iter())
-    {
-        let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
-        let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
-        assert_eq!(
-            actual_bytes,
-            expected_bytes,
-            "Generated secret key + passphrase file {} differs from checked-in fixture in {}",
-            name,
-            fixture_dir.display()
-        );
+        let fixture_dir = fixtures_dir.join(config.default_dir_name());
+        let key_file = config.is_encrypted().then_some(COMPAT_KEY_FILENAME);
+        for name in appendfs::compat::COMPAT_FIXTURE_FILES
+            .iter()
+            .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
+            .chain([COMPAT_FSCK_REPORT_FILENAME].iter())
+            .chain(key_file.iter())
+        {
+            let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
+            let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
+            assert_eq!(
+                actual_bytes,
+                expected_bytes,
+                "Generated file {} differs from checked-in fixture in {}",
+                name,
+                fixture_dir.display()
+            );
+        }
     }
 }
 
@@ -534,38 +487,25 @@ pub fn verify_python_restore_script(fixture_dir: &Path) {
     let dest_path = temp.path();
 
     let storage = OsStorage::new(fixture_dir);
-    let volume_header = SummaryReader::read_volume_header(&storage, "000000.summary").ok();
-    let is_encrypted = volume_header
-        .as_ref()
-        .map(|h| h.cipher != appendfs::crypto::CipherSuite::None)
+    let is_encrypted = SummaryReader::read_volume_header(&storage, "000000.summary")
+        .map(|h| h.cipher.is_encrypted())
         .unwrap_or(false);
 
     let mut cmd = std::process::Command::new("python3");
     cmd.arg(&script_path).arg(fixture_dir).arg(dest_path);
-    let mut passphrase_input = None;
     if is_encrypted {
-        let h = volume_header.as_ref().expect("encrypted volume must have header");
-        if h.key_source.needs_passphrase() {
-            cmd.arg("--passphrase");
-            passphrase_input = Some(appendfs::compat::COMPAT_ENCRYPTED_PASSPHRASE);
-        }
-        if h.key_source.needs_key_file() {
-            let key_file = fixture_dir.join(appendfs::compat::COMPAT_KEY_FILENAME);
-            cmd.arg("--key-file").arg(&key_file);
-        }
+        cmd.arg("--key-file").arg(fixture_dir.join(COMPAT_KEY_FILENAME));
     }
-    if passphrase_input.is_some() {
-        cmd.stdin(std::process::Stdio::piped());
-    }
+    // Answers the key file's passphrase prompt, if it has one. A script that never reads it
+    // may already have exited, so a failed write is not an error.
+    cmd.stdin(std::process::Stdio::piped());
     let mut child = cmd
         .spawn()
         .expect("failed to execute python3; python3 must be installed and in PATH");
-
-    if let Some(pass) = passphrase_input {
+    {
         use std::io::Write;
         let mut stdin = child.stdin.take().expect("open stdin");
-        writeln!(stdin, "{}", pass).expect("write passphrase to stdin");
-        drop(stdin);
+        let _ = writeln!(stdin, "{}", appendfs::compat::COMPAT_KEY_PASSPHRASE);
     }
 
     let output = child

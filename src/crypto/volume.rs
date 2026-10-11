@@ -1,7 +1,7 @@
 #[cfg(any(test, feature = "testing"))]
 use crate::crypto::cipher::encrypt_payload;
 use crate::crypto::cipher::{CipherSuite, CryptoError, decrypt_payload, encrypt_payload_in_place};
-use crate::crypto::kdf::MasterKey;
+use crate::crypto::key_file::MasterKey;
 use crate::crypto::nonce::{generate_random_16, generate_random_iv, record_nonce};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -32,52 +32,23 @@ fn compute_kcv(master: &[u8; 32], volume_id: &[u8; 16], iv: &[u8; 12]) -> Result
     encrypt_payload_in_place(CipherSuite::ChaCha20Poly1305, &kcv_key, iv, volume_id, &mut empty)
 }
 
-/// Which credentials a volume's key is built from.
+/// Which credentials a volume's key was derived from, back when that was a choice.
 ///
-/// Recorded in the volume header so a mount knows what to ask for. Without it the CLI has to
-/// infer the credential type from which flags the user happened to pass, and getting that
-/// wrong is indistinguishable from getting the credential itself wrong - both just produce a
-/// key that fails the check value.
+/// Volumes used to pick between a passphrase, a key file, or both, and recorded the pick
+/// here. Only key files remain: a passphrase now protects the key file rather than feeding
+/// the volume key, so every encrypted volume unlocks the same way and `cipher` alone says
+/// whether a key file is needed. Volumes created under the retired modes keep working,
+/// because their key file now holds the key those modes derived.
 ///
-/// This field is unauthenticated (it sits in the plaintext header), but tampering with it
-/// only misdirects credential collection into deriving the wrong key, which the check value
-/// then rejects. It is a denial of service, not a way in.
+/// The field survives only because the header layout is positional - bincode writes this as
+/// its variant index, so the order of the variants is part of the on-disk format. Headers
+/// keep whatever they were created with; new ones record `KeyFile` or `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum KeySource {
-    /// Unencrypted volume; no credential at all.
-    None = 0,
-    /// Argon2id over a passphrase, salted by the header's `kdf_salt`.
-    Passphrase = 1,
-    /// The key file's 64 hex characters are the key material directly, with no stretching -
-    /// it already carries a full 256 bits.
-    KeyFile = 2,
-    /// Both, so a stolen key file alone is useless and a guessed passphrase alone is too.
-    KeyFileAndPassphrase = 3,
-}
-
-impl KeySource {
-    /// Whether mounting this volume requires `--key-file`.
-    pub fn needs_key_file(self) -> bool {
-        matches!(self, KeySource::KeyFile | KeySource::KeyFileAndPassphrase)
-    }
-
-    /// Whether mounting this volume requires a passphrase.
-    pub fn needs_passphrase(self) -> bool {
-        matches!(self, KeySource::Passphrase | KeySource::KeyFileAndPassphrase)
-    }
-}
-
-impl std::fmt::Display for KeySource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            KeySource::None => "None (unencrypted)",
-            KeySource::Passphrase => "Passphrase",
-            KeySource::KeyFile => "Key file",
-            KeySource::KeyFileAndPassphrase => "Key file + passphrase",
-        };
-        f.pad(s)
-    }
+enum LegacyKeySource {
+    None,
+    Passphrase,
+    KeyFile,
+    KeyFileAndPassphrase,
 }
 
 /// Volume identity and key-verification material. Always stored in plaintext.
@@ -93,16 +64,16 @@ impl std::fmt::Display for KeySource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeHeader {
     pub cipher: CipherSuite,
-    /// Which credentials reconstruct this volume's key.
-    pub key_source: KeySource,
+    /// Retired; see [`LegacyKeySource`]. Never consulted.
+    legacy_key_source: LegacyKeySource,
     /// How newly written records are compressed. Governs writes only - each record carries
     /// its own tag inside the encrypted envelope, and that is what readers act on.
     #[serde(default)]
     pub compression: crate::compress::Compression,
     pub volume_id: [u8; 16],
-    /// Argon2id salt. Meaningful only when [`KeySource::needs_passphrase`]; zero otherwise,
-    /// since a key file carries full entropy and is used without stretching.
-    pub kdf_salt: [u8; 16],
+    /// Retired with [`LegacyKeySource`]: the Argon2id salt of passphrase-derived volumes,
+    /// zero on every other. Never consulted.
+    legacy_kdf_salt: [u8; 16],
     /// Private: nothing outside this module has business reading or writing the check
     /// value. It is only ever produced by [`VolumeHeader::new_encrypted`] and consumed by
     /// [`VolumeHeader::unlock`].
@@ -116,10 +87,10 @@ impl VolumeHeader {
     pub fn plaintext() -> Self {
         Self {
             cipher: CipherSuite::None,
-            key_source: KeySource::None,
+            legacy_key_source: LegacyKeySource::None,
             compression: crate::compress::Compression::None,
             volume_id: generate_random_16(),
-            kdf_salt: [0u8; 16],
+            legacy_kdf_salt: [0u8; 16],
             kcv_iv: [0u8; 12],
             kcv_tag: [0u8; 16],
         }
@@ -135,54 +106,40 @@ impl VolumeHeader {
     pub(crate) fn deterministic_plaintext(compression: crate::compress::Compression) -> Self {
         Self {
             cipher: CipherSuite::None,
-            key_source: KeySource::None,
+            legacy_key_source: LegacyKeySource::None,
             compression,
             volume_id: [0u8; 16],
-            kdf_salt: [0u8; 16],
+            legacy_kdf_salt: [0u8; 16],
             kcv_iv: [0u8; 12],
             kcv_tag: [0u8; 16],
         }
     }
 
     /// Creates an encrypted volume header along with the key needed to read and write it.
-    ///
-    /// `key_source` records how `master` was produced so later mounts ask for the same
-    /// credentials; passing [`KeySource::None`] here would describe an encrypted volume as
-    /// unencrypted, so it is rejected.
     pub fn new_encrypted(
         master: &MasterKey,
-        kdf_salt: [u8; 16],
-        key_source: KeySource,
         compression: crate::compress::Compression,
     ) -> Result<(Self, VolumeKey), CryptoError> {
         let volume_id = generate_random_16();
         let kcv_iv = generate_random_iv();
-        Self::new_encrypted_with_params(master, volume_id, kdf_salt, kcv_iv, key_source, compression)
+        Self::new_encrypted_with_params(master, volume_id, kcv_iv, compression)
     }
 
     /// Creates an encrypted volume header with explicit parameters (e.g. for deterministic testing/fixtures).
     pub fn new_encrypted_with_params(
         master: &MasterKey,
         volume_id: [u8; 16],
-        kdf_salt: [u8; 16],
         kcv_iv: [u8; 12],
-        key_source: KeySource,
         compression: crate::compress::Compression,
     ) -> Result<(Self, VolumeKey), CryptoError> {
-        if key_source == KeySource::None {
-            return Err(CryptoError::IoError(
-                "an encrypted volume needs a key source other than None".into(),
-            ));
-        }
-
         let kcv_tag = compute_kcv(&master.key, &volume_id, &kcv_iv)?;
 
         let header = Self {
             cipher: CipherSuite::ChaCha20Poly1305,
-            key_source,
+            legacy_key_source: LegacyKeySource::KeyFile,
             compression,
             volume_id,
-            kdf_salt,
+            legacy_kdf_salt: [0u8; 16],
             kcv_iv,
             kcv_tag,
         };
@@ -436,13 +393,7 @@ mod tests {
     #[test]
     fn test_volume_round_trip() {
         let master = MasterKey::new([0x33u8; 32]);
-        let (header, key) = VolumeHeader::new_encrypted(
-            &master,
-            [0u8; 16],
-            KeySource::KeyFile,
-            crate::compress::Compression::None,
-        )
-        .unwrap();
+        let (header, key) = VolumeHeader::new_encrypted(&master, crate::compress::Compression::None).unwrap();
         assert_eq!(header.cipher, CipherSuite::ChaCha20Poly1305);
 
         let payload = b"Record payload for the volume key";
@@ -461,16 +412,28 @@ mod tests {
         assert_eq!(reopened.volume_id, header.volume_id);
     }
 
+    /// Headers written under a retired credential mode must still parse, write back
+    /// unchanged, and unlock with nothing but the key their key file now holds.
+    #[test]
+    fn test_retired_key_sources_unlock_with_the_key_alone() {
+        let master = MasterKey::new([0x5eu8; 32]);
+        for source in [LegacyKeySource::Passphrase, LegacyKeySource::KeyFileAndPassphrase] {
+            let (mut header, _) = VolumeHeader::new_encrypted(&master, crate::compress::Compression::Zstd).unwrap();
+            header.legacy_key_source = source;
+            header.legacy_kdf_salt = [0x20u8; 16];
+
+            let bytes = crate::wire::serialize(&header).unwrap();
+            let read_back: VolumeHeader = crate::wire::deserialize(&bytes).unwrap();
+            assert_eq!(read_back, header, "{:?}", source);
+            assert_eq!(crate::wire::serialize(&read_back).unwrap(), bytes, "{:?}", source);
+            assert!(read_back.unlock(&master).is_ok(), "{:?}", source);
+        }
+    }
+
     #[test]
     fn test_wrong_key_is_distinguishable_from_corruption() {
         let master = MasterKey::new([0x33u8; 32]);
-        let (header, _key) = VolumeHeader::new_encrypted(
-            &master,
-            [0u8; 16],
-            KeySource::KeyFile,
-            crate::compress::Compression::None,
-        )
-        .unwrap();
+        let (header, _key) = VolumeHeader::new_encrypted(&master, crate::compress::Compression::None).unwrap();
 
         // The whole point of the KCV: a wrong key is reported as WrongKey, not AuthFailed,
         // so a mount never tells the user their intact volume is corrupt.
@@ -485,20 +448,8 @@ mod tests {
     fn test_kcv_cannot_be_transplanted_between_volumes() {
         let master_a = MasterKey::new([0x11u8; 32]);
         let master_b = MasterKey::new([0x22u8; 32]);
-        let (header_a, _) = VolumeHeader::new_encrypted(
-            &master_a,
-            [0u8; 16],
-            KeySource::KeyFile,
-            crate::compress::Compression::None,
-        )
-        .unwrap();
-        let (mut header_b, _) = VolumeHeader::new_encrypted(
-            &master_b,
-            [0u8; 16],
-            KeySource::KeyFile,
-            crate::compress::Compression::None,
-        )
-        .unwrap();
+        let (header_a, _) = VolumeHeader::new_encrypted(&master_a, crate::compress::Compression::None).unwrap();
+        let (mut header_b, _) = VolumeHeader::new_encrypted(&master_b, crate::compress::Compression::None).unwrap();
 
         // Splicing A's check value into B's header must not make A's key open B, because
         // the KCV is bound to the volume ID it was minted for.
@@ -520,13 +471,7 @@ mod tests {
     #[test]
     fn test_record_aad_binds_opcode_and_inode() {
         let master = MasterKey::new([0x33u8; 32]);
-        let (_header, key) = VolumeHeader::new_encrypted(
-            &master,
-            [0u8; 16],
-            KeySource::KeyFile,
-            crate::compress::Compression::None,
-        )
-        .unwrap();
+        let (_header, key) = VolumeHeader::new_encrypted(&master, crate::compress::Compression::None).unwrap();
 
         let payload = b"extent belonging to inode 5";
         let file_key = key.log_file_key(&SALT);
@@ -562,13 +507,7 @@ mod tests {
     #[test]
     fn test_log_files_with_different_salts_do_not_share_a_key() {
         let master = MasterKey::new([0x33u8; 32]);
-        let (_header, key) = VolumeHeader::new_encrypted(
-            &master,
-            [0u8; 16],
-            KeySource::KeyFile,
-            crate::compress::Compression::None,
-        )
-        .unwrap();
+        let (_header, key) = VolumeHeader::new_encrypted(&master, crate::compress::Compression::None).unwrap();
         let upstream = key.log_file_key(&[1u8; 16]);
         let fork = key.log_file_key(&[2u8; 16]);
 
@@ -603,13 +542,7 @@ mod tests {
     #[test]
     fn test_summary_round_trip() {
         let master = MasterKey::new([0x66u8; 32]);
-        let (header, key) = VolumeHeader::new_encrypted(
-            &master,
-            [0u8; 16],
-            KeySource::KeyFile,
-            crate::compress::Compression::None,
-        )
-        .unwrap();
+        let (header, key) = VolumeHeader::new_encrypted(&master, crate::compress::Compression::None).unwrap();
 
         let iv = generate_random_iv();
         let aad = b"summary header bytes";

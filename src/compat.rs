@@ -45,75 +45,66 @@ pub const COMPAT_BASE_TIMESTAMP_SECS: u64 = 1_700_000_000;
 pub const COMPAT_UID: u32 = 1000;
 pub const COMPAT_GID: u32 = 1000;
 
-/// Fixed passphrase for canonical encrypted compatibility fixtures.
-pub const COMPAT_ENCRYPTED_PASSPHRASE: &str = "passphrase";
+/// Name of the key file in each encrypted fixture directory.
+pub const COMPAT_KEY_FILENAME: &str = "key.pem";
 
-/// Canonical key file name used for key-file encrypted fixtures.
-pub const COMPAT_KEY_FILENAME: &str = "key.hex";
+/// Passphrase protecting the key files of the fixtures that have an encrypted one.
+pub const COMPAT_KEY_PASSPHRASE: &str = "passphrase";
 
-/// Supported golden fixture configurations.
+/// Key of the generated key-file fixtures, written into their key file unprotected so the
+/// generator stays deterministic.
+pub const COMPAT_KEY: [u8; 32] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+    0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+];
+
+/// Fixture configurations the generator can produce.
+///
+/// `v1_passphrase_compressed` and `v1_secret_key_passphrase_compressed` are not among them:
+/// they were created under credential modes that no longer exist, so nothing can create
+/// such a volume any more. They remain as frozen recovery fixtures, unlocked by a key file
+/// holding the key those modes derived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatFixtureConfig {
     /// Baseline plaintext volume with uncompressed log records.
     UnencryptedUncompressed,
-    /// ChaCha20-Poly1305 encrypted volume with passphrase derivation and Zstd log compression.
-    PassphraseCompressed,
-    /// ChaCha20-Poly1305 encrypted volume with secret key + passphrase derivation and Zstd log compression.
-    SecretKeyPassphraseCompressed,
+    /// ChaCha20-Poly1305 encrypted volume unlocked by a key file, with Zstd log compression.
+    KeyFileCompressed,
 }
 
 impl CompatFixtureConfig {
-    pub const ALL: [Self; 3] = [
-        Self::UnencryptedUncompressed,
-        Self::PassphraseCompressed,
-        Self::SecretKeyPassphraseCompressed,
-    ];
+    pub const ALL: [Self; 2] = [Self::UnencryptedUncompressed, Self::KeyFileCompressed];
 
     pub fn default_dir_name(self) -> &'static str {
         match self {
             Self::UnencryptedUncompressed => "v1",
-            Self::PassphraseCompressed => "v1_passphrase_compressed",
-            Self::SecretKeyPassphraseCompressed => "v1_secret_key_passphrase_compressed",
+            Self::KeyFileCompressed => "v1_key_file_compressed",
         }
     }
 
+    /// Maps a fixture directory such as `v2` or `v2_key_file_compressed` to its
+    /// configuration. Any other name - including the frozen legacy fixtures - is `None`.
     pub fn from_dir_path(path: &Path) -> Option<Self> {
-        let s = path.file_name()?.to_string_lossy();
-        if s.contains("secret_key") || s.contains("key_passphrase") || s.contains("keyfile") {
-            Some(Self::SecretKeyPassphraseCompressed)
-        } else if s.contains("passphrase") || s.contains("encrypted") {
-            Some(Self::PassphraseCompressed)
-        } else if s.starts_with('v') || s.contains("unencrypted") {
-            Some(Self::UnencryptedUncompressed)
-        } else {
-            None
+        let name = path.file_name()?.to_str()?;
+        let suffix = name.strip_prefix('v')?.trim_start_matches(|c: char| c.is_ascii_digit());
+        match suffix {
+            "" => Some(Self::UnencryptedUncompressed),
+            "_key_file_compressed" => Some(Self::KeyFileCompressed),
+            _ => None,
         }
     }
 
     pub fn is_encrypted(self) -> bool {
-        matches!(self, Self::PassphraseCompressed | Self::SecretKeyPassphraseCompressed)
+        self == Self::KeyFileCompressed
     }
 
     pub fn compression(self) -> crate::compress::Compression {
         match self {
             Self::UnencryptedUncompressed => crate::compress::Compression::None,
-            Self::PassphraseCompressed | Self::SecretKeyPassphraseCompressed => crate::compress::Compression::Zstd,
-        }
-    }
-
-    pub fn key_source(self) -> crate::crypto::KeySource {
-        match self {
-            Self::UnencryptedUncompressed => crate::crypto::KeySource::None,
-            Self::PassphraseCompressed => crate::crypto::KeySource::Passphrase,
-            Self::SecretKeyPassphraseCompressed => crate::crypto::KeySource::KeyFileAndPassphrase,
+            Self::KeyFileCompressed => crate::compress::Compression::Zstd,
         }
     }
 }
-
-/// Fixed 16-byte KDF salt for canonical encrypted compatibility fixtures.
-pub const COMPAT_ENCRYPTED_SALT: [u8; 16] = [
-    0x20, 0x26, 0x09, 0x07, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
-];
 
 /// Fixed 16-byte volume ID for canonical encrypted compatibility fixtures.
 pub const COMPAT_ENCRYPTED_VOLUME_ID: [u8; 16] = [
@@ -151,52 +142,27 @@ pub const COMPAT_FIXTURE_DUMP_FILES: &[&str] = &[
 pub const COMPAT_FSCK_REPORT_FILENAME: &str = "fsck-report.txt";
 
 /// Resolves the volume key required to open `fixture_dir`, unlocking encrypted fixtures
-/// with the canonical test credentials.
+/// with the key file stored alongside them.
 pub fn resolve_fixture_volume_key(fixture_dir: &Path) -> Arc<VolumeKey> {
     let storage = OsStorage::new(fixture_dir);
-    let summary_file = "000000.summary";
     let volume_header =
-        crate::log::SummaryReader::read_volume_header(&storage, summary_file).expect("read fixture volume header");
-    if volume_header.cipher == crate::crypto::CipherSuite::None {
-        VolumeKey::plaintext_arc()
-    } else {
-        let master = match volume_header.key_source {
-            crate::crypto::KeySource::Passphrase => {
-                crate::crypto::MasterKey::from_passphrase(COMPAT_ENCRYPTED_PASSPHRASE, &volume_header.kdf_salt)
-                    .expect("derive master key from fixture passphrase")
-            }
-            crate::crypto::KeySource::KeyFileAndPassphrase => {
-                let key_file = fixture_dir.join(COMPAT_KEY_FILENAME);
-                crate::crypto::MasterKey::from_file_and_passphrase(
-                    &key_file,
-                    COMPAT_ENCRYPTED_PASSPHRASE,
-                    &volume_header.kdf_salt,
-                )
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to load required key file '{}' for encrypted fixture '{}': {}",
-                        key_file.display(),
-                        fixture_dir.display(),
-                        e
-                    )
-                })
-            }
-            crate::crypto::KeySource::KeyFile => {
-                let key_file = fixture_dir.join(COMPAT_KEY_FILENAME);
-                crate::crypto::MasterKey::from_file(&key_file).unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to load required key file '{}' for encrypted fixture '{}': {}",
-                        key_file.display(),
-                        fixture_dir.display(),
-                        e
-                    )
-                })
-            }
-            crate::crypto::KeySource::None => unreachable!(),
-        };
-        let volume_key = volume_header.unlock(&master).expect("unlock encrypted fixture volume");
-        Arc::new(volume_key)
+        crate::log::SummaryReader::read_volume_header(&storage, "000000.summary").expect("read fixture volume header");
+    if !volume_header.cipher.is_encrypted() {
+        return VolumeKey::plaintext_arc();
     }
+
+    let key_file = fixture_dir.join(COMPAT_KEY_FILENAME);
+    let master = crate::crypto::KeyFile::read(&key_file)
+        .and_then(|file| file.unlock(|| Ok(zeroize::Zeroizing::new(COMPAT_KEY_PASSPHRASE.to_string()))))
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to load key file '{}' for encrypted fixture '{}': {}",
+                key_file.display(),
+                fixture_dir.display(),
+                e
+            )
+        });
+    Arc::new(volume_header.unlock(&master).expect("unlock encrypted fixture volume"))
 }
 
 /// Generates golden `-dump.txt` files for the canonical volume files in `dir`.
@@ -662,39 +628,19 @@ pub fn populate_compat_tree(fs: &AppendFs, clock: &CompatClock) -> Result<(), Fs
 }
 
 fn create_canonical_encrypted_compat_volume(out_dir: &Path, config: CompatFixtureConfig) -> io::Result<()> {
-    if config == CompatFixtureConfig::SecretKeyPassphraseCompressed {
-        let key_file = out_dir.join(COMPAT_KEY_FILENAME);
-        if !key_file.is_file() {
-            let canonical_key = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures")
-                .join(config.default_dir_name())
-                .join(COMPAT_KEY_FILENAME);
-            fs::copy(&canonical_key, &key_file)?;
-        }
-    }
+    let master_key = crate::crypto::MasterKey::new(COMPAT_KEY);
+    fs::write(
+        out_dir.join(COMPAT_KEY_FILENAME),
+        crate::crypto::format_plain_key_file(&master_key).as_bytes(),
+    )?;
 
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(out_dir));
     let clock = Arc::new(CompatClock::new());
 
-    let master_key = match config {
-        CompatFixtureConfig::PassphraseCompressed => {
-            crate::crypto::MasterKey::from_passphrase(COMPAT_ENCRYPTED_PASSPHRASE, &COMPAT_ENCRYPTED_SALT)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-        }
-        CompatFixtureConfig::SecretKeyPassphraseCompressed => crate::crypto::MasterKey::from_file_and_passphrase(
-            out_dir.join(COMPAT_KEY_FILENAME),
-            COMPAT_ENCRYPTED_PASSPHRASE,
-            &COMPAT_ENCRYPTED_SALT,
-        )?,
-        CompatFixtureConfig::UnencryptedUncompressed => unreachable!(),
-    };
-
     let (volume_header, volume_key) = crate::crypto::VolumeHeader::new_encrypted_with_params(
         &master_key,
         COMPAT_ENCRYPTED_VOLUME_ID,
-        COMPAT_ENCRYPTED_SALT,
         COMPAT_ENCRYPTED_KCV_IV,
-        config.key_source(),
         config.compression(),
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -823,11 +769,6 @@ pub fn create_canonical_compat_volume(out_dir: &Path, config: CompatFixtureConfi
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
-                if config == CompatFixtureConfig::SecretKeyPassphraseCompressed
-                    && path.file_name() == Some(std::ffi::OsStr::new(COMPAT_KEY_FILENAME))
-                {
-                    continue;
-                }
                 let _ = fs::remove_file(path);
             }
         }
