@@ -2,14 +2,18 @@
 //!
 //! A key file holds the volume's 256-bit master key in a small PEM-style envelope, either
 //! as-is (`APPENDFS KEY`) or wrapped under a passphrase (`APPENDFS ENCRYPTED KEY`). The
-//! passphrase protects the file, not the volume: changing or removing it rewrites the key
+//! passphrase protects the file, not the volume: changing or removing it writes a new key
 //! file and leaves every byte of the volume untouched.
+//!
+//! Key files are only ever written to a path that does not exist yet. Replacing one is left
+//! to the user, so no command can destroy the only copy of a volume's key.
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use rand::RngCore;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -25,30 +29,20 @@ const KDF: &str = "Argon2id";
 /// ChaCha20-Poly1305 ciphertext made under the same passphrase.
 const AAD_V1: &[u8] = b"APPENDFS-ENCRYPTED-KEY-V1";
 
-/// Environment variable consulted for an encrypted key file's passphrase before prompting.
-const PASSPHRASE_ENV: &str = "APPENDFS_KEY_PASSPHRASE";
-
 /// Argon2id cost parameters for wrapping a key under a passphrase. Recorded in each
 /// encrypted key file, so raising the defaults never strands an existing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Argon2Params {
-    pub memory_kib: u32,
-    pub iterations: u32,
-    pub parallelism: u32,
+struct Argon2Params {
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
 }
 
 impl Argon2Params {
     /// 64 MiB, 3 passes, 1 lane.
-    pub const DEFAULT: Self = Self {
+    const DEFAULT: Self = Self {
         memory_kib: 64 * 1024,
         iterations: 3,
-        parallelism: 1,
-    };
-
-    /// Cheap enough for tests to run many derivations; far too weak for a real key.
-    pub const FAST: Self = Self {
-        memory_kib: 1024,
-        iterations: 1,
         parallelism: 1,
     };
 }
@@ -72,17 +66,11 @@ impl MasterKey {
         Self { key }
     }
 
-    /// Loads the key from a key file, asking for its passphrase if it has one.
-    ///
-    /// The passphrase comes from `APPENDFS_KEY_PASSPHRASE` when set, and from the terminal
-    /// (or stdin, when that is not a terminal) otherwise.
+    /// Loads the key from a key file, prompting for its passphrase if it has one.
     pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         KeyFile::read(path)?
-            .unlock(|| match std::env::var(PASSPHRASE_ENV) {
-                Ok(passphrase) => Ok(Zeroizing::new(passphrase)),
-                Err(_) => prompt_passphrase(&format!("Enter passphrase for key file '{}': ", path.display())),
-            })
+            .unlock(|| prompt_passphrase(&format!("Enter passphrase for key file '{}': ", path.display())))
             .map_err(|e| io::Error::new(e.kind(), format!("cannot unlock key file '{}': {}", path.display(), e)))
     }
 }
@@ -278,7 +266,8 @@ pub fn format_plain_key_file(key: &MasterKey) -> Zeroizing<String> {
 }
 
 /// Formats `key` as a key file wrapped under `passphrase`, with a fresh salt and nonce.
-pub fn format_encrypted_key_file(key: &MasterKey, passphrase: &str, params: Argon2Params) -> Result<String, String> {
+pub fn format_encrypted_key_file(key: &MasterKey, passphrase: &str) -> Result<String, String> {
+    let params = Argon2Params::DEFAULT;
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut salt);
@@ -334,87 +323,43 @@ pub fn prompt_passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
     Ok(line)
 }
 
-/// Writes key file content atomically with `0400` file permissions.
+/// Writes a new key file at `path`, which must not exist yet.
 ///
-/// Returns an error if the parent directory does not exist.
-///
-/// If `path` already exists, an open file descriptor is held to the existing file
-/// prior to atomically swapping in the new file via `fs::rename`. Once the new file
-/// is safely in place and synced, the old file's blocks are securely overwritten
-/// with random garbage and synced before the descriptor is closed (a la `shred`),
-/// ensuring atomic replacement safety without prematurely wiping the old key.
-pub fn write_key_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        if !parent.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Directory '{}' does not exist", parent.display()),
-            ));
-        }
-        if !parent.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotADirectory,
-                format!("'{}' is not a directory", parent.display()),
-            ));
-        }
-    }
-
-    let old_file = if path.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        }
-        OpenOptions::new().write(true).open(path).ok()
-    } else {
-        None
-    };
-
-    let pid = std::process::id();
-    let tmp_path = format!("{}.tmp.{}", path.display(), pid);
-    let tmp_path = Path::new(&tmp_path);
-
+/// The file is created read-only for its owner (`0400`) before a byte of the key reaches
+/// it, so there is no window in which it is readable by anyone else. It is never written
+/// over: a key file is often the only copy of a volume's key, and replacing one is left to
+/// the user. A write that fails part-way removes what it created rather than leave a
+/// truncated key behind.
+pub fn write_new_key_file(path: &Path, content: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
-        .open(tmp_path)?;
+        .create_new(true)
+        .mode(0o400)
+        .open(path)
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::AlreadyExists => io::Error::new(
+                e.kind(),
+                format!("'{}' already exists; refusing to overwrite it", path.display()),
+            ),
+            _ => io::Error::new(e.kind(), format!("cannot create '{}': {}", path.display(), e)),
+        })?;
 
-    file.write_all(content)?;
-    file.sync_all()?;
-    drop(file);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(tmp_path, fs::Permissions::from_mode(0o400))?;
+    let written = file.write_all(content).and_then(|()| file.sync_all());
+    if let Err(e) = written {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(io::Error::new(
+            e.kind(),
+            format!("cannot write '{}': {}", path.display(), e),
+        ));
     }
 
-    fs::rename(tmp_path, path)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o400));
-    }
-
-    if let Some(mut old) = old_file
-        && let Ok(metadata) = old.metadata()
-    {
-        let len = metadata.len();
-        if len > 0 {
-            use std::io::Seek;
-            let mut garbage = vec![0u8; len as usize];
-            rand::thread_rng().fill_bytes(&mut garbage);
-            let _ = old.seek(std::io::SeekFrom::Start(0));
-            let _ = old.write_all(&garbage);
-            let _ = old.sync_all();
-        }
-    }
-
-    Ok(())
+    // Make the new directory entry durable too, or a crash could lose the file outright.
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
@@ -445,7 +390,7 @@ mod tests {
     #[test]
     fn test_encrypted_round_trip_needs_the_right_passphrase() {
         let key = MasterKey::new([0x42u8; 32]);
-        let text = format_encrypted_key_file(&key, "correct horse", Argon2Params::FAST).unwrap();
+        let text = format_encrypted_key_file(&key, "correct horse").unwrap();
         assert!(KeyFile::parse(&text).unwrap().is_encrypted());
         assert_eq!(unlock(&text, "correct horse").unwrap(), key.key);
 
@@ -463,8 +408,8 @@ mod tests {
                      -----END APPENDFS KEY-----\n";
         assert_eq!(unlock(plain, "").unwrap()[..4], [1, 2, 3, 4]);
 
-        // The v1_passphrase_compressed fixture's key file, as written by `appendfs key
-        // change-passphrase --fast`.
+        // The v1_passphrase_compressed fixture's key file, written with cheap Argon2
+        // parameters by the since-removed `--fast` flag. Such files must keep opening too.
         let encrypted = "-----BEGIN APPENDFS ENCRYPTED KEY-----\n\
                          Version: 1\n\
                          Cipher: ChaCha20-Poly1305\n\
@@ -536,12 +481,12 @@ mod tests {
     #[test]
     fn test_tampered_encrypted_key_files_are_rejected() {
         let key = MasterKey::new([0x99u8; 32]);
-        let text = format_encrypted_key_file(&key, "secret", Argon2Params::FAST).unwrap();
+        let text = format_encrypted_key_file(&key, "secret").unwrap();
 
         // Malformed or missing parameters fail to parse.
         assert!(KeyFile::parse(&text.replace("Salt: ", "Salt: 00")).is_err());
         assert!(KeyFile::parse(&text.replace("KDF: Argon2id", "KDF: scrypt")).is_err());
-        assert!(KeyFile::parse(&text.replace("Argon2-Memory: 1024\n", "")).is_err());
+        assert!(KeyFile::parse(&text.replace("Argon2-Memory: 65536\n", "")).is_err());
 
         // A changed parameter parses but derives a different wrapping key, and a flipped
         // body byte breaks the tag; either way the passphrase no longer opens it.
@@ -549,7 +494,7 @@ mod tests {
         let mut flipped = hex::decode(&body).unwrap();
         flipped[0] ^= 0xff;
         for tampered in [
-            text.replace("Argon2-Iterations: 1", "Argon2-Iterations: 2"),
+            text.replace("Argon2-Iterations: 3", "Argon2-Iterations: 2"),
             text.replace(&body, &hex::encode(flipped)),
         ] {
             let err = unlock(&tampered, "secret").unwrap_err();
@@ -577,59 +522,46 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_key_file_write_and_permissions() {
+    fn test_new_key_file_is_owner_read_only() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join("test.key");
+        let path = dir.path().join("test.key");
 
-        let content = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
-        write_key_file_atomic(&key_path, content).unwrap();
-
-        assert_eq!(fs::read(&key_path).unwrap(), content);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::metadata(&key_path).unwrap().permissions();
-            assert_eq!(perms.mode() & 0o777, 0o400);
-        }
+        write_new_key_file(&path, b"key material").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"key material");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o400);
     }
 
     #[test]
-    fn test_atomic_key_file_fails_if_parent_dir_missing() {
+    fn test_new_key_file_never_overwrites() {
         let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join("nonexistent_subdir/test.key");
+        let path = dir.path().join("existing.key");
+        fs::write(&path, b"the only copy of a volume key").unwrap();
 
-        let content = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
-        let err = write_key_file_atomic(&key_path, content).unwrap_err();
+        let err = write_new_key_file(&path, b"a different key").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(err.to_string().contains("refusing to overwrite"), "{}", err);
+        assert_eq!(fs::read(&path).unwrap(), b"the only copy of a volume key");
+    }
+
+    #[test]
+    fn test_new_key_file_does_not_follow_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(write_new_key_file(&link, b"key").is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn test_new_key_file_fails_if_parent_dir_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent_subdir/test.key");
+
+        let err = write_new_key_file(&path, b"key").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
-        assert!(!key_path.exists());
-    }
-
-    #[test]
-    fn test_atomic_key_file_shreds_old_file_on_replace() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join("shred_test.key");
-
-        let old_content = b"RECOGNIZEABLE_OLD_SECRET_KEY_MATERIAL_PAYLOAD_STRING_1234567890";
-        write_key_file_atomic(&key_path, old_content).unwrap();
-
-        // Keep an open read handle to the old inode before replacing
-        let old_handle = fs::File::open(&key_path).unwrap();
-
-        let new_content = b"NEW_KEY_CONTENT_9876543210";
-        write_key_file_atomic(&key_path, new_content).unwrap();
-
-        // The current path has the new content
-        assert_eq!(fs::read(&key_path).unwrap(), new_content);
-
-        // The old inode was shredded with random bytes
-        use std::io::Read;
-        let mut old_handle = old_handle;
-        use std::io::Seek;
-        old_handle.seek(std::io::SeekFrom::Start(0)).unwrap();
-        let mut shredded = Vec::new();
-        old_handle.read_to_end(&mut shredded).unwrap();
-        assert_eq!(shredded.len(), old_content.len());
-        assert_ne!(&shredded, old_content);
+        assert!(!path.exists());
     }
 }

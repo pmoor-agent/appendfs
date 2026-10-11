@@ -44,3 +44,11 @@ appendfs = { path = ".", features = ["testing"] }
 [build-dependencies]
 cc = "1.0"
 pkg-config = "0.3"
+
+# Key files are wrapped with full-strength Argon2id even in tests, which is several times
+# slower unoptimized; optimizing just the KDF keeps debug builds and test runs quick.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

@@ -115,56 +115,19 @@ pub enum KeyCommands {
 
 #[derive(Args, Debug, Clone)]
 pub struct KeyInitArgs {
-    /// Path to the key file to generate
-    pub file: Option<PathBuf>,
-
-    /// Path to the key file to generate
+    /// Path of the new key file; it must not exist yet
     #[arg(short = 'o', long = "output")]
-    pub output: Option<PathBuf>,
-
-    /// Use fast Argon2 parameters (for testing/development)
-    #[arg(long = "fast", hide = true, default_value_t = false)]
-    pub fast: bool,
-}
-
-impl KeyInitArgs {
-    pub fn output_path(&self) -> Result<&PathBuf, &'static str> {
-        self.output
-            .as_ref()
-            .or(self.file.as_ref())
-            .ok_or("output key file path required (specify path or -o/--output <FILE>)")
-    }
+    pub output: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct KeyChangePassphraseArgs {
-    /// Path to the key file
-    pub file: Option<PathBuf>,
+    /// Path to the existing key file, which is left as it is
+    pub key_file: PathBuf,
 
-    /// Path to the key file
-    #[arg(short = 'k', long = "key-file")]
-    pub key_file: Option<PathBuf>,
-
-    /// Path to write the output key file (defaults to modifying key file in-place)
+    /// Path of the new key file; it must not exist yet
     #[arg(short = 'o', long = "output")]
-    pub output: Option<PathBuf>,
-
-    /// Use fast Argon2 parameters (for testing/development)
-    #[arg(long = "fast", hide = true, default_value_t = false)]
-    pub fast: bool,
-}
-
-impl KeyChangePassphraseArgs {
-    pub fn key_path(&self) -> Result<&PathBuf, &'static str> {
-        self.key_file
-            .as_ref()
-            .or(self.file.as_ref())
-            .ok_or("key file path required (specify path or -k/--key-file <FILE>)")
-    }
-
-    pub fn output_path<'a>(&'a self, input: &'a PathBuf) -> &'a PathBuf {
-        self.output.as_ref().unwrap_or(input)
-    }
+    pub output: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -787,20 +750,30 @@ mod tests {
         else {
             panic!("expected Key Init command");
         };
-        assert_eq!(init_args.output_path().unwrap(), &PathBuf::from("my.key"));
-        assert!(!init_args.fast);
+        assert_eq!(init_args.output, PathBuf::from("my.key"));
 
-        let cli_change = Cli::parse_from(["appendfs", "key", "change-passphrase", "-k", "my.key", "-o", "out.key"]);
+        let cli_change = Cli::parse_from(["appendfs", "key", "change-passphrase", "my.key", "-o", "out.key"]);
         let Commands::Key(KeySubcommandArgs {
             command: KeyCommands::ChangePassphrase(ch_args),
         }) = cli_change.command
         else {
             panic!("expected Key ChangePassphrase command");
         };
-        assert_eq!(ch_args.key_path().unwrap(), &PathBuf::from("my.key"));
-        assert_eq!(
-            ch_args.output_path(ch_args.key_path().unwrap()),
-            &PathBuf::from("out.key")
-        );
+        assert_eq!(ch_args.key_file, PathBuf::from("my.key"));
+        assert_eq!(ch_args.output, PathBuf::from("out.key"));
+    }
+
+    /// Key commands only ever write to a path named with `-o`, so the output can never be
+    /// an existing key file picked up by position.
+    #[test]
+    fn test_key_subcommands_require_an_explicit_output() {
+        for args in [
+            vec!["appendfs", "key", "init"],
+            vec!["appendfs", "key", "init", "my.key"],
+            vec!["appendfs", "key", "change-passphrase", "my.key"],
+            vec!["appendfs", "key", "change-passphrase", "-k", "my.key", "-o", "out.key"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{:?} parsed", args);
+        }
     }
 }

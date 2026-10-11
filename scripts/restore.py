@@ -471,9 +471,7 @@ def load_key_file(key_file_path: str) -> bytes:
     body = take_hex("Body", 48)
     finish()
 
-    passphrase = os.environ.get("APPENDFS_KEY_PASSPHRASE")
-    if passphrase is None:
-        passphrase = prompt_passphrase(f"Enter passphrase for key file '{key_file_path}': ")
+    passphrase = prompt_passphrase(f"Enter passphrase for key file '{key_file_path}': ")
     wrapping_key = argon2.low_level.hash_secret_raw(
         secret=passphrase.encode("utf-8"),
         salt=salt,

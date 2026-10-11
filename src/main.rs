@@ -6,8 +6,8 @@ use appendfs::cli::{
 };
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{
-    Argon2Params, CipherSuite, KeyFile, MasterKey, VolumeHeader, VolumeKey, format_encrypted_key_file,
-    format_plain_key_file, prompt_passphrase, write_key_file_atomic,
+    CipherSuite, KeyFile, MasterKey, VolumeHeader, VolumeKey, format_encrypted_key_file, format_plain_key_file,
+    prompt_passphrase, write_new_key_file,
 };
 use appendfs::log::SummaryReader;
 use appendfs::storage::{OsStorage, Storage};
@@ -986,23 +986,28 @@ fn prompt_new_passphrase(prompt: &str, confirm_prompt: &str) -> Result<Zeroizing
     Ok(p1)
 }
 
-/// Writes `key` to `path`, wrapped under `passphrase` unless it is empty.
-fn write_key_file(path: &Path, key: &MasterKey, passphrase: &str, fast: bool) -> Result<(), String> {
+/// Fails early if `path` is taken, so nobody types a passphrase only to be told the output
+/// cannot be written. [`write_new_key_file`] enforces the same thing when it creates the file.
+fn refuse_existing_output(path: &Path) -> Result<(), String> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Err(format!(
+            "'{}' already exists; key files are never overwritten",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Writes `key` to the new file `path`, wrapped under `passphrase` unless it is empty.
+fn write_key_file(path: &Path, key: &MasterKey, passphrase: &str) -> Result<(), String> {
     let content = if passphrase.is_empty() {
         format_plain_key_file(key)
     } else {
-        let params = if fast {
-            Argon2Params::FAST
-        } else {
-            Argon2Params::DEFAULT
-        };
         Zeroizing::new(
-            format_encrypted_key_file(key, passphrase, params)
-                .map_err(|e| format!("Error encrypting key file: {}", e))?,
+            format_encrypted_key_file(key, passphrase).map_err(|e| format!("Error encrypting key file: {}", e))?,
         )
     };
-    write_key_file_atomic(path, content.as_bytes())
-        .map_err(|e| format!("Error writing key file '{}': {}", path.display(), e))
+    write_new_key_file(path, content.as_bytes()).map_err(|e| e.to_string())
 }
 
 fn cmd_key(args: KeySubcommandArgs) {
@@ -1013,14 +1018,15 @@ fn cmd_key(args: KeySubcommandArgs) {
 }
 
 fn cmd_key_init(args: KeyInitArgs) {
+    let output = &args.output;
     let result = (|| {
-        let output_path = args.output_path()?;
+        refuse_existing_output(output)?;
         let passphrase = prompt_new_passphrase("Enter passphrase (empty for none): ", "Confirm passphrase: ")?;
-        write_key_file(output_path, &MasterKey::generate(), &passphrase, args.fast)?;
+        write_key_file(output, &MasterKey::generate(), &passphrase)?;
         Ok::<_, String>(if passphrase.is_empty() {
-            format!("Generated unencrypted key file: {}", output_path.display())
+            format!("Generated unencrypted key file: {}", output.display())
         } else {
-            format!("Generated passphrase-encrypted key file: {}", output_path.display())
+            format!("Generated passphrase-encrypted key file: {}", output.display())
         })
     })();
     match result {
@@ -1033,34 +1039,39 @@ fn cmd_key_init(args: KeyInitArgs) {
 }
 
 fn cmd_key_change_passphrase(args: KeyChangePassphraseArgs) {
+    let (input, output) = (&args.key_file, &args.output);
     let result = (|| {
-        let key_path = args.key_path()?;
-        let output_path = args.output_path(key_path);
-
-        let key_file = KeyFile::read(key_path).map_err(|e| e.to_string())?;
+        refuse_existing_output(output)?;
+        let key_file = KeyFile::read(input).map_err(|e| e.to_string())?;
         let was_encrypted = key_file.is_encrypted();
         let key = key_file
             .unlock(|| {
                 prompt_passphrase(&format!(
                     "Enter current passphrase for key file '{}': ",
-                    key_path.display()
+                    input.display()
                 ))
             })
-            .map_err(|e| format!("cannot unlock key file '{}': {}", key_path.display(), e))?;
+            .map_err(|e| format!("cannot unlock key file '{}': {}", input.display(), e))?;
 
         let passphrase = prompt_new_passphrase("Enter new passphrase (empty for none): ", "Confirm new passphrase: ")?;
-        write_key_file(output_path, &key, &passphrase, args.fast)?;
+        write_key_file(output, &key, &passphrase)?;
 
-        let shown = output_path.display();
+        let shown = output.display();
         Ok::<_, String>(match (was_encrypted, passphrase.is_empty()) {
-            (true, false) => format!("Successfully updated passphrase for key file: {}", shown),
-            (false, false) => format!("Added passphrase protection to key file: {}", shown),
-            (true, true) => format!("Removed passphrase protection from key file: {}", shown),
-            (false, true) => format!("Key file remains unencrypted: {}", shown),
+            (true, false) => format!("Wrote key file with the new passphrase: {}", shown),
+            (false, false) => format!("Wrote passphrase-protected key file: {}", shown),
+            (true, true) => format!("Wrote key file without passphrase protection: {}", shown),
+            (false, true) => format!("Wrote key file, still without passphrase protection: {}", shown),
         })
     })();
     match result {
-        Ok(message) => println!("{}", message),
+        Ok(message) => {
+            println!("{}", message);
+            println!(
+                "'{}' is unchanged. Once the new key file is safely in place, remove or shred it.",
+                input.display()
+            );
+        }
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
