@@ -1,8 +1,6 @@
+use appendfs::FsTestExt;
 use appendfs::compat::CompatClock;
-use appendfs::operations::dir::mkdir_core;
-use appendfs::operations::read_write::{
-    FUSE_SET_ATTR_MODE, create_core, open_core, release_core, setattr_core, write_handle_core,
-};
+use appendfs::operations::read_write::{FUSE_SET_ATTR_MODE, open_core, release_core, setattr_core, write_handle_core};
 use appendfs::storage::OsStorage;
 use appendfs::{Clock, Storage, TestFs, VolumeKey};
 
@@ -30,13 +28,13 @@ fn test_python_restore_with_readonly_file_and_directory() {
 
     // Batch 1:
     // Create readonly_file.txt, write initial data, chmod 0444
-    let file = create_core(&fs, 1, "readonly_file.txt", 0o644, 0, 1000, 1000).unwrap();
-    let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, file.ino, fh, b"Initial data", 0).unwrap();
-    release_core(&fs, file.ino, fh).unwrap();
+    let file = fs.create_file(1, "readonly_file.txt", 0o644).unwrap();
+    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, file, fh, b"Initial data", 0).unwrap();
+    release_core(&fs, file, fh).unwrap();
     setattr_core(
         &fs,
-        file.ino,
+        file,
         0o444,
         1000,
         1000,
@@ -48,14 +46,14 @@ fn test_python_restore_with_readonly_file_and_directory() {
     .unwrap();
 
     // Create readonly_dir with mode 0555 and a nested file
-    let dir = mkdir_core(&fs, 1, "readonly_dir", 0o755, 1000, 1000).unwrap();
-    let nested = create_core(&fs, dir.ino, "nested.txt", 0o644, 0, 1000, 1000).unwrap();
-    let n_fh = open_core(&fs, nested.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, nested.ino, n_fh, b"Nested content", 0).unwrap();
-    release_core(&fs, nested.ino, n_fh).unwrap();
+    let dir = fs.make_dir(1, "readonly_dir", 0o755).unwrap();
+    let nested = fs.create_file(dir, "nested.txt", 0o644).unwrap();
+    let n_fh = open_core(&fs, nested, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, nested, n_fh, b"Nested content", 0).unwrap();
+    release_core(&fs, nested, n_fh).unwrap();
     setattr_core(
         &fs,
-        dir.ino,
+        dir,
         0o555,
         1000,
         1000,
@@ -70,9 +68,9 @@ fn test_python_restore_with_readonly_file_and_directory() {
 
     // Batch 2:
     // Rewrite readonly_file.txt with new data
-    let fh2 = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, file.ino, fh2, b"Rewritten content on readonly file", 0).unwrap();
-    release_core(&fs, file.ino, fh2).unwrap();
+    let fh2 = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, file, fh2, b"Rewritten content on readonly file", 0).unwrap();
+    release_core(&fs, file, fh2).unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);
@@ -143,17 +141,17 @@ fn test_python_restore_across_log_rollover() {
         .build();
 
     // Create directories
-    let d1 = mkdir_core(&fs, 1, "eth", 0o755, 1000, 1000).unwrap();
-    let d2 = mkdir_core(&fs, d1.ino, "visionen", 0o755, 1000, 1000).unwrap();
-    let d3 = mkdir_core(&fs, d2.ino, "2000", 0o755, 1000, 1000).unwrap();
+    let d1 = fs.make_dir(1, "eth", 0o755).unwrap();
+    let d2 = fs.make_dir(d1, "visionen", 0o755).unwrap();
+    let d3 = fs.make_dir(d2, "2000", 0o755).unwrap();
 
     // Create file
-    let file = create_core(&fs, d3.ino, "test.pdf", 0o600, 0, 1000, 1000).unwrap();
-    let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
+    let file = fs.create_file(d3, "test.pdf", 0o600).unwrap();
+    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
 
     // Write first chunk: 512 KiB of 0x42 ('B')
     let chunk1 = vec![0x42u8; 512 * 1024];
-    write_handle_core(&fs, file.ino, fh, &chunk1, 0).unwrap();
+    write_handle_core(&fs, file, fh, &chunk1, 0).unwrap();
 
     // Flush batch 1 into log 000001.log
     fs.quiesce().unwrap();
@@ -165,12 +163,12 @@ fn test_python_restore_across_log_rollover() {
     // Write second chunk: 1.26 MiB (~1324234 bytes) of 0x43 ('C')
     let chunk2_len = 1324234;
     let chunk2 = vec![0x43u8; chunk2_len];
-    write_handle_core(&fs, file.ino, fh, &chunk2, chunk1.len() as i64).unwrap();
-    release_core(&fs, file.ino, fh).unwrap();
+    write_handle_core(&fs, file, fh, &chunk2, chunk1.len() as i64).unwrap();
+    release_core(&fs, file, fh).unwrap();
 
     setattr_core(
         &fs,
-        file.ino,
+        file,
         0o640,
         1000,
         1000,
@@ -233,10 +231,10 @@ fn test_python_restore_file_rename() {
         .build();
 
     // Create file as temp.txt, write data
-    let file = create_core(&fs, 1, "temp.txt", 0o644, 0, 1000, 1000).unwrap();
-    let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, file.ino, fh, b"Hello World from temp file", 0).unwrap();
-    release_core(&fs, file.ino, fh).unwrap();
+    let file = fs.create_file(1, "temp.txt", 0o644).unwrap();
+    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, file, fh, b"Hello World from temp file", 0).unwrap();
+    release_core(&fs, file, fh).unwrap();
 
     // Flush batch 1
     fs.quiesce().unwrap();
@@ -289,19 +287,19 @@ fn test_python_restore_rsync_style_write_across_rollover_and_rename() {
         .build();
 
     // Directory hierarchy
-    let d1 = mkdir_core(&fs, 1, "eth", 0o755, 1000, 1000).unwrap();
-    let d2 = mkdir_core(&fs, d1.ino, "visionen", 0o755, 1000, 1000).unwrap();
-    let d3 = mkdir_core(&fs, d2.ino, "2000", 0o755, 1000, 1000).unwrap();
+    let d1 = fs.make_dir(1, "eth", 0o755).unwrap();
+    let d2 = fs.make_dir(d1, "visionen", 0o755).unwrap();
+    let d3 = fs.make_dir(d2, "2000", 0o755).unwrap();
 
     // Create temp file like rsync: .visionen.januar.2000.web.pdf.XXXXXX
     let temp_name = ".visionen.januar.2000.web.pdf.tmp123";
     let final_name = "visionen.januar.2000.web.pdf";
-    let file = create_core(&fs, d3.ino, temp_name, 0o600, 0, 1000, 1000).unwrap();
-    let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
+    let file = fs.create_file(d3, temp_name, 0o600).unwrap();
+    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
 
     // Write chunk 1: 512 KiB
     let chunk1 = vec![0x42u8; 512 * 1024];
-    write_handle_core(&fs, file.ino, fh, &chunk1, 0).unwrap();
+    write_handle_core(&fs, file, fh, &chunk1, 0).unwrap();
 
     // Flush batch 1 in Log 1
     fs.quiesce().unwrap();
@@ -312,13 +310,13 @@ fn test_python_restore_rsync_style_write_across_rollover_and_rename() {
     // Write chunk 2: 1.26 MiB (~1324234 bytes)
     let chunk2_len = 1324234;
     let chunk2 = vec![0x43u8; chunk2_len];
-    write_handle_core(&fs, file.ino, fh, &chunk2, chunk1.len() as i64).unwrap();
-    release_core(&fs, file.ino, fh).unwrap();
+    write_handle_core(&fs, file, fh, &chunk2, chunk1.len() as i64).unwrap();
+    release_core(&fs, file, fh).unwrap();
 
     // Chmod 0640, set mtime
     setattr_core(
         &fs,
-        file.ino,
+        file,
         0o640,
         1000,
         1000,
@@ -330,7 +328,7 @@ fn test_python_restore_rsync_style_write_across_rollover_and_rename() {
     .unwrap();
 
     // Atomic rename
-    rename_core(&fs, d3.ino, temp_name, d3.ino, final_name).unwrap();
+    rename_core(&fs, d3, temp_name, d3, final_name).unwrap();
 
     // Flush batch 2 in Log 2
     fs.quiesce().unwrap();
@@ -380,17 +378,17 @@ fn test_python_restore_directory_rename_and_move() {
         .build();
 
     // Create dirA, dirB, and nested file dirA/child.txt
-    let dir_a = mkdir_core(&fs, 1, "dirA", 0o755, 1000, 1000).unwrap();
-    let dir_b = mkdir_core(&fs, 1, "dirB", 0o755, 1000, 1000).unwrap();
-    let child = create_core(&fs, dir_a.ino, "child.txt", 0o644, 0, 1000, 1000).unwrap();
-    let fh = open_core(&fs, child.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, child.ino, fh, b"child file inside dirA", 0).unwrap();
-    release_core(&fs, child.ino, fh).unwrap();
+    let dir_a = fs.make_dir(1, "dirA", 0o755).unwrap();
+    let dir_b = fs.make_dir(1, "dirB", 0o755).unwrap();
+    let child = fs.create_file(dir_a, "child.txt", 0o644).unwrap();
+    let fh = open_core(&fs, child, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, child, fh, b"child file inside dirA", 0).unwrap();
+    release_core(&fs, child, fh).unwrap();
 
     fs.quiesce().unwrap();
 
     // Move dirA into dirB as sub_dir
-    rename_core(&fs, 1, "dirA", dir_b.ino, "sub_dir").unwrap();
+    rename_core(&fs, 1, "dirA", dir_b, "sub_dir").unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);
@@ -437,15 +435,15 @@ fn test_python_restore_overwrite_rename() {
         .build();
 
     // Create file1 and file2
-    let f1 = create_core(&fs, 1, "source.txt", 0o644, 0, 1000, 1000).unwrap();
-    let fh1 = open_core(&fs, f1.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, f1.ino, fh1, b"new content", 0).unwrap();
-    release_core(&fs, f1.ino, fh1).unwrap();
+    let f1 = fs.create_file(1, "source.txt", 0o644).unwrap();
+    let fh1 = open_core(&fs, f1, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, f1, fh1, b"new content", 0).unwrap();
+    release_core(&fs, f1, fh1).unwrap();
 
-    let f2 = create_core(&fs, 1, "target.txt", 0o644, 0, 1000, 1000).unwrap();
-    let fh2 = open_core(&fs, f2.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, f2.ino, fh2, b"old content that will be overwritten", 0).unwrap();
-    release_core(&fs, f2.ino, fh2).unwrap();
+    let f2 = fs.create_file(1, "target.txt", 0o644).unwrap();
+    let fh2 = open_core(&fs, f2, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, f2, fh2, b"old content that will be overwritten", 0).unwrap();
+    release_core(&fs, f2, fh2).unwrap();
 
     fs.quiesce().unwrap();
 
@@ -497,14 +495,14 @@ fn test_python_restore_hardlinks_and_unlink() {
         .build();
 
     // Create file
-    let f = create_core(&fs, 1, "original.txt", 0o644, 0, 1000, 1000).unwrap();
-    let fh = open_core(&fs, f.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, f.ino, fh, b"hardlinked data", 0).unwrap();
-    release_core(&fs, f.ino, fh).unwrap();
+    let f = fs.create_file(1, "original.txt", 0o644).unwrap();
+    let fh = open_core(&fs, f, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, f, fh, b"hardlinked data", 0).unwrap();
+    release_core(&fs, f, fh).unwrap();
 
     // Create hardlink
-    link_core(&fs, f.ino, 1, "link1.txt").unwrap();
-    link_core(&fs, f.ino, 1, "link2.txt").unwrap();
+    link_core(&fs, f, 1, "link1.txt").unwrap();
+    link_core(&fs, f, 1, "link2.txt").unwrap();
 
     fs.quiesce().unwrap();
 
@@ -568,17 +566,17 @@ fn test_python_restore_hardlinks_same_name_in_different_dirs() {
         .build();
 
     // Create dir1 and dir2
-    let d1 = mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
-    let d2 = mkdir_core(&fs, 1, "dir2", 0o755, 1000, 1000).unwrap();
+    let d1 = fs.make_dir(1, "dir1", 0o755).unwrap();
+    let d2 = fs.make_dir(1, "dir2", 0o755).unwrap();
 
     // Create dir1/shared.dat
-    let f = create_core(&fs, d1.ino, "shared.dat", 0o644, 0, 1000, 1000).unwrap();
-    let fh = open_core(&fs, f.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, f.ino, fh, b"initial shared payload", 0).unwrap();
-    release_core(&fs, f.ino, fh).unwrap();
+    let f = fs.create_file(d1, "shared.dat", 0o644).unwrap();
+    let fh = open_core(&fs, f, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, f, fh, b"initial shared payload", 0).unwrap();
+    release_core(&fs, f, fh).unwrap();
 
     // Hardlink to dir2/shared.dat (same filename, different parent)
-    link_core(&fs, f.ino, d2.ino, "shared.dat").unwrap();
+    link_core(&fs, f, d2, "shared.dat").unwrap();
 
     fs.quiesce().unwrap();
 
@@ -586,9 +584,9 @@ fn test_python_restore_hardlinks_same_name_in_different_dirs() {
     fs.force_roll_active_log().unwrap();
 
     // Write more data in new log
-    let fh2 = open_core(&fs, f.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, f.ino, fh2, b" -- appended after rollover", 22).unwrap();
-    release_core(&fs, f.ino, fh2).unwrap();
+    let fh2 = open_core(&fs, f, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, f, fh2, b" -- appended after rollover", 22).unwrap();
+    release_core(&fs, f, fh2).unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);
@@ -652,14 +650,14 @@ fn test_python_restore_directory_overwrite_rename() {
         .build();
 
     // Create dir_a with file inside
-    let dir_a = mkdir_core(&fs, 1, "dir_a", 0o755, 1000, 1000).unwrap();
-    let file = create_core(&fs, dir_a.ino, "inner.txt", 0o644, 0, 1000, 1000).unwrap();
-    let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
-    write_handle_core(&fs, file.ino, fh, b"inside dir_a", 0).unwrap();
-    release_core(&fs, file.ino, fh).unwrap();
+    let dir_a = fs.make_dir(1, "dir_a", 0o755).unwrap();
+    let file = fs.create_file(dir_a, "inner.txt", 0o644).unwrap();
+    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+    write_handle_core(&fs, file, fh, b"inside dir_a", 0).unwrap();
+    release_core(&fs, file, fh).unwrap();
 
     // Create empty dir_b
-    let _dir_b = mkdir_core(&fs, 1, "dir_b", 0o755, 1000, 1000).unwrap();
+    let _dir_b = fs.make_dir(1, "dir_b", 0o755).unwrap();
 
     fs.quiesce().unwrap();
 
@@ -710,16 +708,16 @@ fn test_python_restore_sparse_hole_and_expansion() {
         .build();
 
     // Create file
-    let file = create_core(&fs, 1, "sparse.bin", 0o644, 0, 1000, 1000).unwrap();
-    let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
+    let file = fs.create_file(1, "sparse.bin", 0o644).unwrap();
+    let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
 
     // Write chunk at offset 0 (4 KiB)
     let chunk0 = vec![0xAAu8; 4096];
-    write_handle_core(&fs, file.ino, fh, &chunk0, 0).unwrap();
+    write_handle_core(&fs, file, fh, &chunk0, 0).unwrap();
 
     // Write chunk at offset 64 KiB (leaving a hole 4 KiB..64 KiB)
     let chunk1 = vec![0xBBu8; 4096];
-    write_handle_core(&fs, file.ino, fh, &chunk1, 64 * 1024).unwrap();
+    write_handle_core(&fs, file, fh, &chunk1, 64 * 1024).unwrap();
 
     fs.quiesce().unwrap();
 
@@ -729,13 +727,13 @@ fn test_python_restore_sparse_hole_and_expansion() {
     // Punch hole inside chunk0: punch 1 KiB..3 KiB
     fallocate_core(
         &fs,
-        file.ino,
+        file,
         libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
         1024,
         2048,
     )
     .unwrap();
-    release_core(&fs, file.ino, fh).unwrap();
+    release_core(&fs, file, fh).unwrap();
 
     fs.quiesce().unwrap();
     drop(fs);
@@ -791,7 +789,7 @@ fn test_python_restore_rejects_record_after_seal() {
         .build();
     let writer = fs.log_writer.clone().unwrap();
 
-    mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+    fs.make_dir(1, "dir1", 0o755).unwrap();
     fs.quiesce().unwrap();
 
     // Seal gen 1 cleanly
@@ -871,7 +869,7 @@ fn test_python_restore_rejects_seal_record_count_mismatch() {
         .build();
     let writer = fs.log_writer.clone().unwrap();
 
-    mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+    fs.make_dir(1, "dir1", 0o755).unwrap();
     fs.quiesce().unwrap();
 
     // Seal gen 1 cleanly

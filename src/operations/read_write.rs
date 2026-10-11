@@ -601,9 +601,9 @@ mod tests {
     use crate::{Storage, SystemClock};
 
     fn file_with(fs: &AppendFs, contents: &[u8]) -> u64 {
-        let attr = create_core(fs, 1, "f.bin", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(attr.ino, contents, 0).unwrap();
-        attr.ino
+        let ino = fs.create_file(1, "f.bin", 0o644).unwrap();
+        fs.write_at(ino, contents, 0).unwrap();
+        ino
     }
 
     #[test]
@@ -763,16 +763,16 @@ mod tests {
             .clock(clock.clone())
             .build()
             .fs;
-        let file = create_core(&fs, 1, "fsync_lock.bin", 0o644, 0, 1000, 1000).unwrap();
-        let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
-        fs.write_at(file.ino, b"test", 0).unwrap();
+        let file = fs.create_file(1, "fsync_lock.bin", 0o644).unwrap();
+        let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+        fs.write_at(file, b"test", 0).unwrap();
 
         let pre_total = fs.inner.lock_count();
         let pre_stats = fs.inner.op_stats();
         let pre_flush = pre_stats.iter().find(|s| s.tag == OpTag::Flush).unwrap().count;
 
         // Call the fsync rollover with open file handle fh
-        let res = fs.rollover_for_fsync(file.ino, fh, FlushReason::Fsync);
+        let res = fs.rollover_for_fsync(file, fh, FlushReason::Fsync);
         assert!(res.is_ok());
 
         let post_total = fs.inner.lock_count();
@@ -793,11 +793,11 @@ mod tests {
             .clock(clock.clone())
             .build()
             .fs;
-        let file = create_core(&fs, 1, "fsync.bin", 0o644, 0, 1000, 1000).unwrap();
-        let fh = open_core(&fs, file.ino, libc::O_RDWR as u32).unwrap();
-        fs.write_at(file.ino, b"fsync test", 0).unwrap();
+        let file = fs.create_file(1, "fsync.bin", 0o644).unwrap();
+        let fh = open_core(&fs, file, libc::O_RDWR as u32).unwrap();
+        fs.write_at(file, b"fsync test", 0).unwrap();
 
-        let res = fs.fsync_blocking(file.ino, fh);
+        let res = fs.fsync_blocking(file, fh);
         assert_eq!(res, Ok(()));
 
         let dir_res = fs.fsyncdir_blocking(1);
@@ -815,9 +815,6 @@ mod tests {
 
         // 256-byte name should fail with ENAMETOOLONG
         let name_256 = "f".repeat(256);
-        assert_eq!(
-            create_core(&fs, 1, &name_256, 0o644, 0, 1000, 1000),
-            Err(FsError::ENAMETOOLONG)
-        );
+        assert_eq!(fs.create_file(1, &name_256, 0o644), Err(FsError::ENAMETOOLONG));
     }
 }

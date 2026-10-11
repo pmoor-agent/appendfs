@@ -146,13 +146,13 @@ pub use setxattr_core as setxattr_response;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::FsTestExt;
     use crate::test_utils::TestFs;
 
     #[test]
     fn test_xattr_basic_crud_and_size_query() {
         let fs = TestFs::builder().build().fs;
-        let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        let ino = attr.ino;
+        let ino = fs.create_file(1, "test.txt", 0o644).unwrap();
 
         // 1. Missing attribute returns ENODATA
         assert_eq!(getxattr_core(&fs, ino, "user.comment", 0), Err(FsError::ENODATA));
@@ -198,8 +198,7 @@ mod tests {
     #[test]
     fn test_xattr_create_and_replace_flags() {
         let fs = TestFs::builder().build().fs;
-        let attr = crate::operations::read_write::create_core(&fs, 1, "flags.txt", 0o644, 0, 1000, 1000).unwrap();
-        let ino = attr.ino;
+        let ino = fs.create_file(1, "flags.txt", 0o644).unwrap();
 
         // REPLACE fails on nonexistent attribute
         assert_eq!(
@@ -234,8 +233,7 @@ mod tests {
     #[test]
     fn test_xattr_multiple_attributes_deterministic_order() {
         let fs = TestFs::builder().build().fs;
-        let attr = crate::operations::read_write::create_core(&fs, 1, "multi.txt", 0o644, 0, 1000, 1000).unwrap();
-        let ino = attr.ino;
+        let ino = fs.create_file(1, "multi.txt", 0o644).unwrap();
 
         setxattr_core(&fs, ino, "user.zebra", b"1", 0).unwrap();
         setxattr_core(&fs, ino, "user.apple", b"2", 0).unwrap();
@@ -252,8 +250,7 @@ mod tests {
     #[test]
     fn test_xattr_single_lock_acquisition_tagged_xattr() {
         let fs = TestFs::builder().build().fs;
-        let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        let ino = attr.ino;
+        let ino = fs.create_file(1, "test.txt", 0o644).unwrap();
         setxattr_core(&fs, ino, "user.tag", b"v1", 0).unwrap();
 
         // Test getxattr_core

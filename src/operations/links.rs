@@ -360,12 +360,13 @@ pub fn link_response(fs: &AppendFs, ino: u64, newparent: u64, newname: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::FsTestExt;
     use crate::test_utils::TestFs;
 
     #[test]
     fn test_link_operations_name_length_boundaries() {
         let fs = TestFs::builder().build().fs;
-        let file = crate::operations::read_write::create_core(&fs, 1, "orig.txt", 0o644, 0, 1000, 1000).unwrap();
+        let file = fs.create_file(1, "orig.txt", 0o644).unwrap();
 
         let name_255 = "l".repeat(255);
         let name_256 = "l".repeat(256);
@@ -373,16 +374,13 @@ mod tests {
         // Symlink: 255 bytes succeeds, 256 bytes fails with ENAMETOOLONG
         let sym_attr = symlink_core(&fs, 1, &name_255, "orig.txt", 1000, 1000).unwrap();
         assert_eq!(sym_attr.file_type, FileType::Symlink);
-        assert_eq!(
-            symlink_core(&fs, 1, &name_256, "orig.txt", 1000, 1000),
-            Err(FsError::ENAMETOOLONG)
-        );
+        assert_eq!(fs.make_symlink(1, &name_256, "orig.txt"), Err(FsError::ENAMETOOLONG));
 
         // Hardlink: 255 bytes succeeds, 256 bytes fails with ENAMETOOLONG
         let hard_name_255 = "h".repeat(255);
-        let hard_attr = link_core(&fs, file.ino, 1, &hard_name_255).unwrap();
+        let hard_attr = link_core(&fs, file, 1, &hard_name_255).unwrap();
         assert_eq!(hard_attr.nlink, 2);
-        assert_eq!(link_core(&fs, file.ino, 1, &name_256), Err(FsError::ENAMETOOLONG));
+        assert_eq!(link_core(&fs, file, 1, &name_256), Err(FsError::ENAMETOOLONG));
 
         // Rename:
         // Source 256 bytes fails

@@ -362,6 +362,7 @@ pub fn fsyncdir_response(fs: &AppendFs, ino: u64, datasync: bool) -> DeferredRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::FsTestExt;
     use crate::test_utils::TestFs;
 
     #[test]
@@ -407,7 +408,7 @@ mod tests {
     #[test]
     fn test_lookup_core_single_lock_acquisition_tagged_lookup() {
         let fs = TestFs::builder().build().fs;
-        let file = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+        let file = fs.create_file(1, "test.txt", 0o644).unwrap();
 
         let pre_stats = fs.inner.op_stats();
         let pre_lookup = pre_stats.iter().find(|s| s.tag == OpTag::Lookup).unwrap().count;
@@ -415,7 +416,7 @@ mod tests {
         let pre_total = fs.inner.lock_count();
 
         let attr = lookup_core(&fs, 1, "test.txt").unwrap();
-        assert_eq!(attr.ino, file.ino);
+        assert_eq!(attr.ino, file);
 
         let post_stats = fs.inner.op_stats();
         let post_lookup = post_stats.iter().find(|s| s.tag == OpTag::Lookup).unwrap().count;
@@ -441,7 +442,7 @@ mod tests {
     #[test]
     fn test_list_dir_core_single_lock_acquisition_tagged_readdir() {
         let fs = TestFs::builder().build().fs;
-        let _ = mkdir_core(&fs, 1, "sub1", 0o755, 1000, 1000).unwrap();
+        let _ = fs.make_dir(1, "sub1", 0o755).unwrap();
 
         let pre_stats = fs.inner.op_stats();
         let pre_readdir = pre_stats.iter().find(|s| s.tag == OpTag::ReadDir).unwrap().count;
@@ -478,10 +479,7 @@ mod tests {
 
         // 256-byte name should fail with ENAMETOOLONG
         let name_256 = "d".repeat(256);
-        assert_eq!(
-            mkdir_core(&fs, 1, &name_256, 0o755, 1000, 1000),
-            Err(FsError::ENAMETOOLONG)
-        );
+        assert_eq!(fs.make_dir(1, &name_256, 0o755), Err(FsError::ENAMETOOLONG));
         assert_eq!(lookup_core(&fs, 1, &name_256), Err(FsError::ENAMETOOLONG));
 
         // rmdir_core with 256-byte name should return ENAMETOOLONG

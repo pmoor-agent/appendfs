@@ -7,6 +7,7 @@ use crate::operations::read_write::{
     FUSE_SET_ATTR_UID, create_core, fsync_response, getattr_core, open_core, read_response, release_core, setattr_core,
     write_handle_core,
 };
+use crate::operations::special::mknod_core;
 use crate::operations::xattr::{getxattr_core, listxattr_core};
 use crate::shim::{FileAttr, FileType, FuseResponse};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -53,6 +54,10 @@ pub trait FsTestExt {
 
     /// Creates a symlink to `target` and returns its inode number.
     fn make_symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64, FsError>;
+
+    /// Creates a special file (FIFO, socket or device, per `mode`) and returns its inode
+    /// number.
+    fn make_node(&self, parent: u64, name: &str, mode: u32, rdev: u32) -> Result<u64, FsError>;
 
     /// Applies the attributes set in `changes`, leaving the rest untouched.
     fn set_attrs(&self, ino: u64, changes: AttrChanges) -> Result<(), FsError>;
@@ -191,6 +196,11 @@ impl FsTestExt for AppendFs {
     fn make_symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64, FsError> {
         let (uid, gid) = caller(self)?;
         symlink_core(self, parent, name, target, uid, gid).map(|attr| attr.ino)
+    }
+
+    fn make_node(&self, parent: u64, name: &str, mode: u32, rdev: u32) -> Result<u64, FsError> {
+        let (uid, gid) = caller(self)?;
+        mknod_core(self, parent, name, mode, rdev, uid, gid).map(|attr| attr.ino)
     }
 
     fn set_attrs(&self, ino: u64, changes: AttrChanges) -> Result<(), FsError> {

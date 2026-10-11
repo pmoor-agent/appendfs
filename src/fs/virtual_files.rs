@@ -120,9 +120,7 @@ mod tests {
     use crate::error::FsError;
     use crate::operations::dir::{iter_dir_entries, list_dir_core};
     use crate::operations::links::{rename_core, unlink_core};
-    use crate::operations::read_write::{
-        create_core, fallocate_core, open_core, release_core, setattr_core, write_handle_core,
-    };
+    use crate::operations::read_write::{fallocate_core, open_core, release_core, setattr_core, write_handle_core};
     use crate::test_utils::FsTestExt;
     use crate::test_utils::TestFs;
 
@@ -201,15 +199,15 @@ mod tests {
         let ino_v2 = fs.virtual_files.register(".virtual2", |_| "v2".to_string());
 
         // Create two regular files in root directory
-        let f1 = create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
-        let f2 = create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
+        let f1 = fs.create_file(1, "file1.txt", 0o644).unwrap();
+        let f2 = fs.create_file(1, "file2.txt", 0o644).unwrap();
 
         // Snapshot directory listing via list_dir_core
         let entries = list_dir_core(&fs, 1).unwrap();
         // Entries must contain: file1.txt, file2.txt, .remotes, .status, .virtual1, .virtual2
         assert_eq!(entries.len(), 6);
-        assert!(entries.iter().any(|(name, ino)| name == "file1.txt" && *ino == f1.ino));
-        assert!(entries.iter().any(|(name, ino)| name == "file2.txt" && *ino == f2.ino));
+        assert!(entries.iter().any(|(name, ino)| name == "file1.txt" && *ino == f1));
+        assert!(entries.iter().any(|(name, ino)| name == "file2.txt" && *ino == f2));
         assert!(entries.iter().any(|(name, _)| name == ".remotes"));
         assert!(entries.iter().any(|(name, _)| name == ".status"));
         assert!(entries.iter().any(|(name, ino)| name == ".virtual1" && *ino == ino_v1));
@@ -292,10 +290,7 @@ mod tests {
         assert_eq!(rename_core(&fs, 1, ".remotes", 1, "renamed.txt"), Err(FsError::EPERM));
 
         // 6. Creating over an existing virtual file returns EEXIST
-        assert_eq!(
-            create_core(&fs, 1, ".remotes", 0o644, 0, 1000, 1000),
-            Err(FsError::EEXIST)
-        );
+        assert_eq!(fs.create_file(1, ".remotes", 0o644), Err(FsError::EEXIST));
 
         // 7. Hardlinking a virtual file is rejected with EPERM
         assert_eq!(

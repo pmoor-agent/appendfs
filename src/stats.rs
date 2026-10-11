@@ -1368,7 +1368,7 @@ mod tests {
         assert!(status.contains("Next Generation:    1 (000001.log)"));
 
         // After writing and flushing, the generation file is opened and active
-        crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.create_file(1, "test.txt", 0o644).unwrap();
         fs.quiesce().unwrap();
         let status_after_write = format_runtime_status(&fs);
         assert!(status_after_write.contains("Active Generation:  1 (000001.log)"));
@@ -1377,9 +1377,9 @@ mod tests {
 
     #[test]
     fn test_format_runtime_status_with_activity() {
-        use crate::operations::dir::{mkdir_core, opendir_core, releasedir_core};
+        use crate::operations::dir::{opendir_core, releasedir_core};
         use crate::operations::locks::{flock_core, setlk_core};
-        use crate::operations::read_write::create_core;
+
         use crate::remote::block_cache::MemoryBlockCache;
         use crate::storage::MemoryStorage;
         use std::sync::Arc;
@@ -1402,21 +1402,21 @@ mod tests {
         log_cache.decrypted_cache.insert(1, 0, 100, Arc::new(vec![0u8; 4096]));
 
         // Create entries: 1 subfolder, 2 files, 1 symlink
-        let dir = mkdir_core(&fs, 1, "sub", 0o755, 1000, 1000).unwrap();
-        let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-        let f2 = create_core(&fs, dir.ino, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::links::symlink_core(&fs, 1, "link.txt", "f1.txt", 1000, 1000).unwrap();
+        let dir = fs.make_dir(1, "sub", 0o755).unwrap();
+        let f1 = fs.create_file(1, "f1.txt", 0o644).unwrap();
+        let f2 = fs.create_file(dir, "f2.txt", 0o644).unwrap();
+        fs.make_symlink(1, "link.txt", "f1.txt").unwrap();
 
         // Write some staged data
-        fs.write_at(f1.ino, b"hello world staged data", 0).unwrap();
+        fs.write_at(f1, b"hello world staged data", 0).unwrap();
 
         // Open handles
-        let fh_file1 = fs.open_file_handle(f1.ino, 0);
-        let fh_file2 = fs.open_file_handle(f2.ino, 0);
-        let dh = opendir_core(&fs, dir.ino, 0).unwrap();
+        let fh_file1 = fs.open_file_handle(f1, 0);
+        let fh_file2 = fs.open_file_handle(f2, 0);
+        let dh = opendir_core(&fs, dir, 0).unwrap();
 
         // Acquire locks
-        flock_core(&fs, f1.ino, fh_file1, 1001, libc::LOCK_EX).unwrap();
+        flock_core(&fs, f1, fh_file1, 1001, libc::LOCK_EX).unwrap();
         let rlock = crate::shim::ShimFlock {
             lock_type: libc::F_WRLCK as i16,
             whence: libc::SEEK_SET as i16,
@@ -1424,7 +1424,7 @@ mod tests {
             len: 100,
             pid: 100,
         };
-        setlk_core(&fs, f2.ino, fh_file2, 1002, rlock, false).unwrap();
+        setlk_core(&fs, f2, fh_file2, 1002, rlock, false).unwrap();
 
         // Inspect status
         let status = format_runtime_status(&fs);
@@ -1446,9 +1446,9 @@ mod tests {
         assert!(status.contains("mkdir"));
 
         // Clean up handles
-        fs.release_file_handle(fh_file1, f1.ino).unwrap();
-        fs.release_file_handle(fh_file2, f2.ino).unwrap();
-        releasedir_core(&fs, dir.ino, dh).unwrap();
+        fs.release_file_handle(fh_file1, f1).unwrap();
+        fs.release_file_handle(fh_file2, f2).unwrap();
+        releasedir_core(&fs, dir, dh).unwrap();
 
         // Check read-only mode reporting
         fs.set_read_only();
@@ -1486,9 +1486,7 @@ mod tests {
 
     #[test]
     fn test_inode_counts_overlay_layers() {
-        use crate::operations::dir::mkdir_core;
-        use crate::operations::links::{symlink_core, unlink_core};
-        use crate::operations::read_write::create_core;
+        use crate::operations::links::unlink_core;
 
         let fs = TestFs::builder().build().fs;
         // Base state: 1 root directory
@@ -1498,12 +1496,12 @@ mod tests {
         assert_eq!(counts.total_logical_bytes, 0);
 
         // Add 2 files, 1 dir, 1 symlink in live
-        let d1 = mkdir_core(&fs, 1, "d1", 0o755, 1000, 1000).unwrap();
-        let f1 = create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
-        let f2 = create_core(&fs, d1.ino, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f1.ino, &[0u8; 100], 0).unwrap();
-        fs.write_at(f2.ino, &[0u8; 50], 0).unwrap();
-        symlink_core(&fs, 1, "s1.lnk", "f1.txt", 1000, 1000).unwrap();
+        let d1 = fs.make_dir(1, "d1", 0o755).unwrap();
+        let f1 = fs.create_file(1, "f1.txt", 0o644).unwrap();
+        let f2 = fs.create_file(d1, "f2.txt", 0o644).unwrap();
+        fs.write_at(f1, &[0u8; 100], 0).unwrap();
+        fs.write_at(f2, &[0u8; 50], 0).unwrap();
+        fs.make_symlink(1, "s1.lnk", "f1.txt").unwrap();
 
         let counts_live = fs.inode_counts();
         assert_eq!(counts_live.directories, 2);
@@ -1522,9 +1520,9 @@ mod tests {
         assert_eq!(counts_flushing.total_logical_bytes, 150);
 
         // In live, unlink f2 and add f3
-        unlink_core(&fs, d1.ino, "f2.txt").unwrap();
-        let f3 = create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f3.ino, &[0u8; 30], 0).unwrap();
+        unlink_core(&fs, d1, "f2.txt").unwrap();
+        let f3 = fs.create_file(1, "f3.txt", 0o644).unwrap();
+        fs.write_at(f3, &[0u8; 30], 0).unwrap();
 
         let counts_mixed = fs.inode_counts();
         assert_eq!(counts_mixed.directories, 2);
@@ -1541,10 +1539,10 @@ mod tests {
         assert_eq!(counts_after_del.total_logical_bytes, 30);
 
         // Add special file types: FIFO, CharDevice, BlockDevice, Socket
-        crate::operations::special::mknod_core(&fs, 1, "fifo", libc::S_IFIFO | 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::special::mknod_core(&fs, 1, "chr", libc::S_IFCHR | 0o660, 0x1234, 1000, 1000).unwrap();
-        crate::operations::special::mknod_core(&fs, 1, "blk", libc::S_IFBLK | 0o660, 0x5678, 1000, 1000).unwrap();
-        crate::operations::special::mknod_core(&fs, 1, "sock", libc::S_IFSOCK | 0o755, 0, 1000, 1000).unwrap();
+        fs.make_node(1, "fifo", libc::S_IFIFO | 0o644, 0).unwrap();
+        fs.make_node(1, "chr", libc::S_IFCHR | 0o660, 0x1234).unwrap();
+        fs.make_node(1, "blk", libc::S_IFBLK | 0o660, 0x5678).unwrap();
+        fs.make_node(1, "sock", libc::S_IFSOCK | 0o755, 0).unwrap();
 
         let counts_special = fs.inode_counts();
         assert_eq!(counts_special.named_pipes, 1);
@@ -1558,12 +1556,10 @@ mod tests {
 
     #[test]
     fn test_format_runtime_status_many_inodes_performance() {
-        use crate::operations::read_write::create_core;
-
         let fs = TestFs::builder().build().fs;
         for i in 0..1_000 {
             let name = format!("file_{}.dat", i);
-            create_core(&fs, 1, &name, 0o644, 0, 1000, 1000).unwrap();
+            fs.create_file(1, &name, 0o644).unwrap();
         }
 
         let before_stats_count = fs
@@ -1910,7 +1906,6 @@ mod tests {
     #[test]
     fn test_format_runtime_status_batch_and_recovery_duration() {
         use crate::clock::{AdvancingClock, Clock};
-        use crate::operations::read_write::create_core;
 
         let start_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let clock = Arc::new(AdvancingClock::new(start_time));
@@ -1918,7 +1913,7 @@ mod tests {
         fs.set_recovered_time(Some(clock.now()));
 
         // Flush a batch
-        create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
+        fs.create_file(1, "test.bin", 0o644).unwrap();
         fs.quiesce().unwrap();
 
         // Immediately after flush: age is 0s

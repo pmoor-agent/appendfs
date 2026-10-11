@@ -290,7 +290,7 @@ mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
     use crate::fs::AppendFs;
-    use crate::operations::read_write::create_core;
+
     use crate::storage::Storage;
     use crate::test_utils::FsTestExt;
     use crate::test_utils::TestFs;
@@ -300,8 +300,8 @@ mod tests {
     }
 
     fn stage_a_write(fs: &AppendFs, name: &str) {
-        let file = create_core(fs, 1, name, 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(file.ino, b"payload", 0).unwrap();
+        let file = fs.create_file(1, name, 0o644).unwrap();
+        fs.write_at(file, b"payload", 0).unwrap();
     }
 
     #[test]
@@ -778,18 +778,18 @@ mod tests {
         fs.max_coalesce_batches = 3;
 
         // Stage batch 1
-        let f1 = crate::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f1.ino, b"batch 1", 0).unwrap();
+        let f1 = fs.create_file(1, "f1.bin", 0o644).unwrap();
+        fs.write_at(f1, b"batch 1", 0).unwrap();
         fs.freeze_now();
 
         // Stage batch 2
-        let f2 = crate::operations::read_write::create_core(&fs, 1, "f2.bin", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f2.ino, b"batch 2", 0).unwrap();
+        let f2 = fs.create_file(1, "f2.bin", 0o644).unwrap();
+        fs.write_at(f2, b"batch 2", 0).unwrap();
         fs.freeze_now();
 
         // Stage batch 3
-        let f3 = crate::operations::read_write::create_core(&fs, 1, "f3.bin", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f3.ino, b"batch 3", 0).unwrap();
+        let f3 = fs.create_file(1, "f3.bin", 0o644).unwrap();
+        fs.write_at(f3, b"batch 3", 0).unwrap();
         fs.freeze_now();
 
         fs.run_flush_cycle().unwrap();
@@ -826,8 +826,8 @@ mod tests {
         assert_eq!(stats.total_fold, stats.recent.iter().map(|r| r.fold).sum::<Duration>());
 
         // In the non-coalescing case (1 batch), wait time must be strictly Duration::ZERO
-        let f4 = crate::operations::read_write::create_core(&fs, 1, "f4.bin", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f4.ino, b"batch 4", 0).unwrap();
+        let f4 = fs.create_file(1, "f4.bin", 0o644).unwrap();
+        fs.write_at(f4, b"batch 4", 0).unwrap();
         fs.freeze_now();
         fs.run_flush_cycle().unwrap();
 

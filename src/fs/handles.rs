@@ -196,6 +196,7 @@ impl AppendFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::FsTestExt;
     use crate::test_utils::TestFs;
 
     #[test]
@@ -203,8 +204,8 @@ mod tests {
         let fs = TestFs::builder().build().fs;
 
         // 1. Create two files under root
-        crate::operations::read_write::create_core(&fs, 1, "alpha.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::read_write::create_core(&fs, 1, "bravo.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.create_file(1, "alpha.txt", 0o644).unwrap();
+        fs.create_file(1, "bravo.txt", 0o644).unwrap();
 
         // 2. Open a directory handle on root
         let fh1 = crate::operations::dir::opendir_core(&fs, 1, 0).expect("opendir_core must succeed on directory");
@@ -220,7 +221,7 @@ mod tests {
         assert_eq!(snap1[2].0, "bravo.txt");
 
         // 3. Mutate directory: add charlie.txt, delete alpha.txt
-        crate::operations::read_write::create_core(&fs, 1, "charlie.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.create_file(1, "charlie.txt", 0o644).unwrap();
         crate::operations::links::unlink_core(&fs, 1, "alpha.txt").unwrap();
 
         // 4. fh1 MUST retain its original snapshot (.status, alpha, bravo)
@@ -269,8 +270,7 @@ mod tests {
         let fs = TestFs::builder().build().fs;
 
         // 1. Create a file
-        let attr = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
-        let ino = attr.ino;
+        let ino = fs.create_file(1, "test.txt", 0o644).unwrap();
 
         // 2. Open two file handles
         let fh1 = fs.open_file_handle(ino, libc::O_RDONLY as u32);
@@ -308,8 +308,7 @@ mod tests {
     #[test]
     fn test_unified_handle_map_regular_virtual_and_directory() {
         let fs = TestFs::builder().build().fs;
-        let attr = crate::operations::read_write::create_core(&fs, 1, "data.bin", 0o644, 0, 1000, 1000).unwrap();
-        let reg_ino = attr.ino;
+        let reg_ino = fs.create_file(1, "data.bin", 0o644).unwrap();
         let v_ino = fs.lookup_child(1, ".status").expect(".status must exist");
 
         let fh_reg = fs.open_file_handle(reg_ino, libc::O_RDWR as u32);

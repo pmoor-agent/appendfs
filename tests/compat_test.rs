@@ -18,7 +18,6 @@ use appendfs::FsTestExt;
 use appendfs::compat::{
     COMPAT_FSCK_REPORT_FILENAME, CompatFixtureConfig, create_canonical_compat_volume, verify_compat_tree,
 };
-use appendfs::operations::read_write::create_core;
 use appendfs::storage::OsStorage;
 use appendfs::{AppendFs, RecoveryTarget, Storage, SummaryReader, recover_fs};
 
@@ -73,13 +72,14 @@ pub fn verify_recovery_with_latest_summary_missing(fixture_dir: &Path) {
     fs.attach_log_writer(Arc::new(writer));
     fs.set_log_dir(temp_path);
 
-    let new_file = create_core(&fs, 1, "new_after_reconstruction.txt", 0o644, 0, 1000, 1000)
+    let new_file = fs
+        .create_file(1, "new_after_reconstruction.txt", 0o644)
         .expect("create file after reconstruction");
-    fs.write_at(new_file.ino, b"reconstruction test forward write works!", 0)
+    fs.write_at(new_file, b"reconstruction test forward write works!", 0)
         .expect("write after reconstruction");
     fs.quiesce().expect("flush after reconstruction");
 
-    let read_back = fs.read_at(new_file.ino, 0, 40).expect("read file");
+    let read_back = fs.read_at(new_file, 0, 40).expect("read file");
     assert_eq!(read_back, b"reconstruction test forward write works!");
 }
 
@@ -117,13 +117,14 @@ pub fn verify_recovery_from_latest_summary_snapshot(fixture_dir: &Path) {
     fs.attach_log_writer(Arc::new(writer));
     fs.set_log_dir(temp_path);
 
-    let new_file =
-        create_core(&fs, 1, "new_after_summary.txt", 0o644, 0, 1000, 1000).expect("create file after summary");
-    fs.write_at(new_file.ino, b"summary test forward write works!", 0)
+    let new_file = fs
+        .create_file(1, "new_after_summary.txt", 0o644)
+        .expect("create file after summary");
+    fs.write_at(new_file, b"summary test forward write works!", 0)
         .expect("write after summary");
     fs.quiesce().expect("flush after summary");
 
-    let read_back = fs.read_at(new_file.ino, 0, 33).expect("read file");
+    let read_back = fs.read_at(new_file, 0, 33).expect("read file");
     assert_eq!(read_back, b"summary test forward write works!");
 }
 

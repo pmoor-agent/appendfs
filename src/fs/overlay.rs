@@ -573,6 +573,7 @@ mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
     use crate::storage::Storage;
+    use crate::test_utils::FsTestExt;
     use crate::test_utils::TestFs;
 
     #[test]
@@ -581,13 +582,13 @@ mod tests {
         let clock = Arc::new(SystemClock);
         let fs = TestFs::builder().storage(storage).clock(clock.clone()).build().fs;
 
-        let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
+        let file = fs.create_file(1, "f.txt", 0o644).unwrap();
         fs.quiesce().unwrap();
-        assert!(fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino));
+        assert!(fs.inner.lock_for_tests().unwrap().exists_below_live(file));
 
         crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
         assert!(
-            fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino),
+            fs.inner.lock_for_tests().unwrap().exists_below_live(file),
             "base still describes the inode until the tombstone's batch folds"
         );
 
@@ -595,9 +596,9 @@ mod tests {
         // a writer that validated before taking the lock would insert a fresh delta and
         // resurrect the inode at the next fold - this predicate is what stops it.
         fs.freeze_now();
-        assert!(!fs.inner.lock_for_tests().unwrap().live.contains_key(&attr.ino));
+        assert!(!fs.inner.lock_for_tests().unwrap().live.contains_key(&file));
         assert!(
-            !fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino),
+            !fs.inner.lock_for_tests().unwrap().exists_below_live(file),
             "a tombstone frozen out of live must still report the inode as gone"
         );
     }
@@ -608,18 +609,18 @@ mod tests {
         let clock = Arc::new(SystemClock);
         let fs = TestFs::builder().storage(storage).clock(clock.clone()).build().fs;
 
-        let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino = fs.create_file(1, "f.txt", 0o644).unwrap();
         // Fold it into `base`, so the lower layers still describe the inode after deletion.
         fs.quiesce().unwrap();
         crate::operations::links::unlink_core(&fs, 1, "f.txt").unwrap();
-        assert!(fs.get_attr(attr.ino).is_none(), "unlinked file must be gone");
+        assert!(fs.get_attr(ino).is_none(), "unlinked file must be gone");
 
         // A late attribute update - an atime bump racing the unlink, say - must not rebuild
         // the node from `base` and bring it back carrying its old link count, unreferenced
         // by any directory.
         fs.with_inner_for_tests(|inner| {
             inner.update_attr_delta(
-                attr.ino,
+                ino,
                 AttrDelta {
                     atime: Some(clock.now()),
                     ..Default::default()
@@ -627,11 +628,11 @@ mod tests {
             );
         });
         assert!(
-            fs.get_attr(attr.ino).is_none(),
+            fs.get_attr(ino).is_none(),
             "attribute update resurrected a deleted inode"
         );
         assert!(
-            !fs.snapshot_all().contains_key(&attr.ino),
+            !fs.snapshot_all().contains_key(&ino),
             "resurrected inode leaked into the snapshot as an orphan"
         );
     }
@@ -643,7 +644,7 @@ mod tests {
         let fs = TestFs::builder().storage(storage).clock(clock).build().fs;
 
         // Create and immediately unlink in the same batch
-        let _attr = crate::operations::read_write::create_core(&fs, 1, "temp.txt", 0o644, 0, 1000, 1000).unwrap();
+        let _ino = fs.create_file(1, "temp.txt", 0o644).unwrap();
         crate::operations::links::unlink_core(&fs, 1, "temp.txt").unwrap();
 
         // Before freeze, live has a phantom tombstone in removed
@@ -686,7 +687,7 @@ mod tests {
         let fs = TestFs::builder().storage(storage).clock(clock).build().fs;
 
         // Create file.txt and fold into base
-        let attr = crate::operations::read_write::create_core(&fs, 1, "file.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino = fs.create_file(1, "file.txt", 0o644).unwrap();
         fs.quiesce().unwrap();
 
         // Self-canceling rename: file.txt -> tmp.txt -> file.txt
@@ -725,7 +726,7 @@ mod tests {
         });
 
         // File remains fully accessible
-        assert_eq!(fs.lookup_child(1, "file.txt"), Some(attr.ino));
+        assert_eq!(fs.lookup_child(1, "file.txt"), Some(ino));
         assert_eq!(fs.lookup_child(1, "tmp.txt"), None);
     }
 
@@ -736,7 +737,7 @@ mod tests {
         let fs = TestFs::builder().storage(storage).clock(clock).build().fs;
 
         // Create a.txt and fold into base
-        let attr = crate::operations::read_write::create_core(&fs, 1, "a.txt", 0o644, 0, 1000, 1000).unwrap();
+        let ino = fs.create_file(1, "a.txt", 0o644).unwrap();
         fs.quiesce().unwrap();
 
         // Chained rename: a.txt -> b.txt -> c.txt in the same batch
@@ -751,7 +752,7 @@ mod tests {
             let mut entries = batch.entries.clone();
             inner.normalize_directory_deltas(&mut entries, 0);
             if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = entries.get(&1) {
-                assert_eq!(d.added.get("c.txt"), Some(&attr.ino), "c.txt must be retained in added");
+                assert_eq!(d.added.get("c.txt"), Some(&ino), "c.txt must be retained in added");
                 assert!(
                     !d.added.contains_key("b.txt"),
                     "intermediate b.txt must not be in added"
@@ -774,7 +775,7 @@ mod tests {
         let fs = TestFs::builder().storage(storage).clock(clock).build().fs;
 
         // Batch 1: create file1.txt and flush (which folds into base)
-        let _attr = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
+        let _ino = fs.create_file(1, "file1.txt", 0o644).unwrap();
         fs.quiesce().unwrap();
 
         // Batch 2: unlink file1.txt in live
@@ -804,15 +805,14 @@ mod tests {
         let fs = TestFs::builder().storage(storage).clock(clock).build().fs;
 
         // Initial setup in base: base has root (ino 1) containing "existing.txt"
-        let existing_attr =
-            crate::operations::read_write::create_core(&fs, 1, "existing.txt", 0o644, 0, 1000, 1000).unwrap();
+        let existing_ino = fs.create_file(1, "existing.txt", 0o644).unwrap();
         fs.quiesce().unwrap();
 
         // Batch 0 (frozen, unflushed):
         // 1. Create file1.txt
         // 2. Hardlink existing.txt to keep inode alive, then unlink existing.txt
-        let _f1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
-        crate::operations::links::link_core(&fs, existing_attr.ino, 1, "existing_link.txt").unwrap();
+        let _f1 = fs.create_file(1, "file1.txt", 0o644).unwrap();
+        crate::operations::links::link_core(&fs, existing_ino, 1, "existing_link.txt").unwrap();
         crate::operations::links::unlink_core(&fs, 1, "existing.txt").unwrap();
         assert!(fs.freeze_now());
 
@@ -820,7 +820,7 @@ mod tests {
         // 1. Unlink file1.txt (which was created in Batch 0, NOT in base!)
         // 2. Re-create existing.txt with the same inode (which was unlinked in Batch 0, but still in base!)
         crate::operations::links::unlink_core(&fs, 1, "file1.txt").unwrap();
-        crate::operations::links::link_core(&fs, existing_attr.ino, 1, "existing.txt").unwrap();
+        crate::operations::links::link_core(&fs, existing_ino, 1, "existing.txt").unwrap();
         assert!(fs.freeze_now());
 
         fs.with_inner_for_tests(|inner| {

@@ -487,19 +487,19 @@ mod tests {
         fs.set_storage(storage.clone());
 
         // Batch 1: Create dir "step1"
-        let d1 = crate::operations::dir::mkdir_core(&fs, 1, "step1", 0o755, 1000, 1000).unwrap();
+        let d1 = fs.make_dir(1, "step1", 0o755).unwrap();
         fs.quiesce().unwrap();
         let batch_after_step1 = fs.log_writer.as_ref().unwrap().last_batch_id();
 
         // Batch 2: Create file "file1.txt" inside "step1"
-        let f1 = crate::operations::read_write::create_core(&fs, d1.ino, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f1.ino, b"version 1", 0).unwrap();
+        let f1 = fs.create_file(d1, "file1.txt", 0o644).unwrap();
+        fs.write_at(f1, b"version 1", 0).unwrap();
         fs.quiesce().unwrap();
         let batch_after_file1 = fs.log_writer.as_ref().unwrap().last_batch_id();
 
         // Batch 3: Create file "file2.txt" inside "step1"
-        let f2 = crate::operations::read_write::create_core(&fs, d1.ino, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.write_at(f2.ino, b"version 2", 0).unwrap();
+        let f2 = fs.create_file(d1, "file2.txt", 0o644).unwrap();
+        fs.write_at(f2, b"version 2", 0).unwrap();
         fs.quiesce().unwrap();
 
         // 1. Recover to Latest -> step1, file1.txt, file2.txt all exist
@@ -641,12 +641,12 @@ mod tests {
         fs.set_storage(storage.clone());
 
         // T = 1000: Create "early_dir"
-        crate::operations::dir::mkdir_core(&fs, 1, "early_dir", 0o755, 1000, 1000).unwrap();
+        fs.make_dir(1, "early_dir", 0o755).unwrap();
         fs.quiesce().unwrap();
 
         // Advance clock to T = 2000
         clock.advance(Duration::from_secs(1000));
-        crate::operations::dir::mkdir_core(&fs, 1, "late_dir", 0o755, 1000, 1000).unwrap();
+        fs.make_dir(1, "late_dir", 0o755).unwrap();
         fs.quiesce().unwrap();
 
         // Recover at T = 1500 -> early_dir exists, late_dir does not
@@ -708,7 +708,7 @@ mod tests {
         fs.set_storage(storage.clone());
 
         // Create dir "step1" and quiesce (flushes and commits to 000001.log)
-        crate::operations::dir::mkdir_core(&fs, 1, "step1", 0o755, 1000, 1000).unwrap();
+        fs.make_dir(1, "step1", 0o755).unwrap();
         fs.quiesce().unwrap();
 
         // 1. Recover without exporting summary - generation 1 should immediately have its MD5 populated in manifest
@@ -759,7 +759,7 @@ mod tests {
         let writer = fs.log_writer.clone().unwrap();
 
         // Batch 1 into gen 1
-        crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+        fs.make_dir(1, "dir1", 0o755).unwrap();
         fs.quiesce().unwrap();
 
         // Roll to generation 2 (this seals gen 1 with OpCode::Seal)
@@ -768,7 +768,7 @@ mod tests {
         fs.manifest.write().unwrap().record_sealed_log(sealed);
 
         // Batch 2 into gen 2
-        crate::operations::dir::mkdir_core(&fs, 1, "dir2", 0o755, 1000, 1000).unwrap();
+        fs.make_dir(1, "dir2", 0o755).unwrap();
         fs.quiesce().unwrap();
 
         // Verify recovery succeeds across rolled gen 1 (sealed) and active gen 2
@@ -810,7 +810,7 @@ mod tests {
             .fs;
         let writer = fs.log_writer.clone().unwrap();
 
-        crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+        fs.make_dir(1, "dir1", 0o755).unwrap();
         fs.quiesce().unwrap();
         fs.log_writer = None;
         drop(fs);
@@ -822,7 +822,7 @@ mod tests {
         let mut fs2 = AppendFs::with_clock_and_uids(clock.clone(), 1000, 1000);
         fs2.log_writer = Some(Arc::new(writer2));
         fs2.set_storage(storage.clone());
-        crate::operations::dir::mkdir_core(&fs2, 1, "dir2", 0o755, 1000, 1000).unwrap();
+        fs2.make_dir(1, "dir2", 0o755).unwrap();
         fs2.quiesce().unwrap();
         fs2.log_writer = None;
         drop(fs2);
@@ -864,7 +864,7 @@ mod tests {
             .fs;
         let writer = fs.log_writer.clone().unwrap();
 
-        crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+        fs.make_dir(1, "dir1", 0o755).unwrap();
         fs.quiesce().unwrap();
         writer.seal_active().unwrap();
         drop(fs);
@@ -932,7 +932,7 @@ mod tests {
             .fs;
         let writer = fs.log_writer.clone().unwrap();
 
-        crate::operations::dir::mkdir_core(&fs, 1, "dir1", 0o755, 1000, 1000).unwrap();
+        fs.make_dir(1, "dir1", 0o755).unwrap();
         fs.quiesce().unwrap();
 
         // Seal gen 1 with record_count = 3 (1 dir delta + 1 attr delta + 1 FlushCommit)
@@ -1031,8 +1031,8 @@ mod tests {
                 .fs;
             let writer = fs.log_writer.clone().unwrap();
 
-            let f1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
-            fs.write_at(f1.ino, b"data1", 0).unwrap();
+            let f1 = fs.create_file(1, "file1.txt", 0o644).unwrap();
+            fs.write_at(f1, b"data1", 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000001.summary"));
@@ -1057,8 +1057,8 @@ mod tests {
             fs.log_writer = Some(writer.clone());
             fs.set_storage(storage.clone());
 
-            let f2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
-            fs.write_at(f2.ino, b"data2", 0).unwrap();
+            let f2 = fs.create_file(1, "file2.txt", 0o644).unwrap();
+            fs.write_at(f2, b"data2", 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000002.summary"));
@@ -1106,8 +1106,8 @@ mod tests {
                 .fs;
             let writer = fs.log_writer.clone().unwrap();
 
-            let f1 = crate::operations::read_write::create_core(&fs, 1, "target.txt", 0o644, 0, 1000, 1000).unwrap();
-            fs.write_at(f1.ino, b"data1", 0).unwrap();
+            let f1 = fs.create_file(1, "target.txt", 0o644).unwrap();
+            fs.write_at(f1, b"data1", 0).unwrap();
             fs.quiesce().unwrap();
             batch_gen1 = fs.log_writer.as_ref().unwrap().last_batch_id();
             fs.export_summary(storage.as_ref()).unwrap();
@@ -1133,8 +1133,8 @@ mod tests {
             fs.log_writer = Some(writer.clone());
             fs.set_storage(storage.clone());
 
-            let f2 = crate::operations::read_write::create_core(&fs, 1, "future.txt", 0o644, 0, 1000, 1000).unwrap();
-            fs.write_at(f2.ino, b"data2", 0).unwrap();
+            let f2 = fs.create_file(1, "future.txt", 0o644).unwrap();
+            fs.write_at(f2, b"data2", 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000002.summary"));
@@ -1194,16 +1194,16 @@ mod tests {
                 .fs;
             let writer = fs.log_writer.clone().unwrap();
 
-            let f1 = crate::operations::read_write::create_core(&fs, 1, "rev0.txt", 0o644, 0, 1000, 1000).unwrap();
-            fs.write_at(f1.ino, b"data0", 0).unwrap();
+            let f1 = fs.create_file(1, "rev0.txt", 0o644).unwrap();
+            fs.write_at(f1, b"data0", 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
             assert!(storage.exists("000001.summary"));
             rev0_summary_bytes = mem_storage.get_file_bytes("000001.summary").unwrap();
 
             // In the same session, write rev1.txt and export another summary
-            let f2 = crate::operations::read_write::create_core(&fs, 1, "rev1.txt", 0o644, 0, 1000, 1000).unwrap();
-            fs.write_at(f2.ino, b"data1", 0).unwrap();
+            let f2 = fs.create_file(1, "rev1.txt", 0o644).unwrap();
+            fs.write_at(f2, b"data1", 0).unwrap();
             fs.quiesce().unwrap();
             fs.export_summary(storage.as_ref()).unwrap();
 
