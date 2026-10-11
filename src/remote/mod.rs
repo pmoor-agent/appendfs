@@ -48,13 +48,14 @@ use std::io;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// A remote target configured for tiered reading with priority and optional concurrency limiting.
+/// A remote target configured for tiered reading with priority, access mode, and optional concurrency limiting.
 #[derive(Clone, Debug)]
 pub struct RemoteReadTarget {
     pub name: String,
     pub store: Arc<dyn RemoteStore>,
     pub priority: u32,
     pub limiter: Option<Arc<ConcurrencyLimiter>>,
+    pub mode: RemoteMode,
 }
 
 impl RemoteReadTarget {
@@ -64,7 +65,13 @@ impl RemoteReadTarget {
             store,
             priority,
             limiter: None,
+            mode: RemoteMode::ReadWrite,
         }
+    }
+
+    pub fn with_mode(mut self, mode: RemoteMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub fn with_concurrency_limit(mut self, max_concurrent: usize) -> Self {
@@ -94,6 +101,7 @@ impl From<(String, Arc<dyn RemoteStore>)> for RemoteReadTarget {
             store,
             priority: 100,
             limiter: None,
+            mode: RemoteMode::ReadWrite,
         }
     }
 }
@@ -105,6 +113,7 @@ impl From<(String, Arc<dyn RemoteStore>, u32)> for RemoteReadTarget {
             store,
             priority,
             limiter: None,
+            mode: RemoteMode::ReadWrite,
         }
     }
 }
@@ -116,6 +125,7 @@ impl From<(&str, Arc<dyn RemoteStore>)> for RemoteReadTarget {
             store,
             priority: 100,
             limiter: None,
+            mode: RemoteMode::ReadWrite,
         }
     }
 }
@@ -127,6 +137,7 @@ impl From<(&str, Arc<dyn RemoteStore>, u32)> for RemoteReadTarget {
             store,
             priority,
             limiter: None,
+            mode: RemoteMode::ReadWrite,
         }
     }
 }

@@ -83,17 +83,24 @@ fn restore_next_generation_log(
     objects: &[RemoteObject],
     next_gen: u32,
 ) -> io::Result<()> {
-    let sealed_log_name = crate::log::log_filename(next_gen);
-    if let Some(sealed_obj) = objects.iter().find(|o| o.key == sealed_log_name) {
+    let sealed_candidate = objects
+        .iter()
+        .filter_map(|o| {
+            crate::log::parse_log_filename(&o.key)
+                .and_then(|(g, r)| if g == next_gen { Some((r, &o.key, o.size)) } else { None })
+        })
+        .max_by_key(|&(r, _, _)| r);
+
+    if let Some((_, sealed_log_name, size)) = sealed_candidate {
         log::info!(
             "Found sealed generation {} ({}, {} bytes) on remote; downloading...",
             next_gen,
             sealed_log_name,
-            sealed_obj.size
+            size
         );
-        let mut log_writer = storage.open_writer(&sealed_log_name, WriteMode::Overwrite)?;
+        let mut log_writer = storage.open_writer(sealed_log_name, WriteMode::Overwrite)?;
         let mut adapter = StorageWriterAdapter(&mut log_writer);
-        remote.get_object(&sealed_log_name, &mut adapter)?;
+        remote.get_object(sealed_log_name, &mut adapter)?;
         log_writer.sync()?;
         return Ok(());
     }

@@ -36,8 +36,10 @@ pub struct SummaryHeader {
 }
 
 impl SummaryHeader {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         generation: u32,
+        revision: u16,
         last_batch_id: u64,
         next_inode: u64,
         created_at: std::time::SystemTime,
@@ -49,7 +51,7 @@ impl SummaryHeader {
             magic: *SUMMARY_MAGIC,
             version: CURRENT_SUMMARY_VERSION,
             generation,
-            revision: 0,
+            revision,
             last_batch_id,
             next_inode,
             created_at,
@@ -204,6 +206,7 @@ pub struct SummarySnapshot<'a> {
     /// Volume identity and key-check material, written unencrypted ahead of the body.
     pub volume_header: &'a crate::crypto::VolumeHeader,
     pub generation: u32,
+    pub revision: u16,
     pub last_batch_id: u64,
     pub next_inode: u64,
     pub created_at: std::time::SystemTime,
@@ -234,6 +237,7 @@ pub fn export_summary_with_iv(
         manifest,
         volume_header,
         generation,
+        revision,
         last_batch_id,
         next_inode,
         created_at,
@@ -242,7 +246,7 @@ pub fn export_summary_with_iv(
     // Sort by inode so physical serialization order is deterministic
     inodes_snapshot.sort_by_key(|(ino, _)| *ino);
 
-    let filename = summary_filename(generation);
+    let filename = summary_filename_with_revision(generation, revision);
     let tmp_filename = format!("{}.tmp", filename);
 
     let raw_writer = storage.open_writer(&tmp_filename, WriteMode::Overwrite)?;
@@ -266,6 +270,7 @@ pub fn export_summary_with_iv(
 
     let header = SummaryHeader::new(
         generation,
+        revision,
         last_batch_id,
         next_inode,
         created_at,
@@ -381,6 +386,7 @@ pub fn init_volume_with_clock_uids_and_iv(
             manifest: &manifest,
             volume_header: &volume_header,
             generation: 0,
+            revision: 0,
             last_batch_id: 0,
             next_inode: 2,
             created_at: clock.now(),
@@ -787,6 +793,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
+                revision: 0,
                 last_batch_id: 42,
                 next_inode: 3,
                 created_at: SystemTime::now(),
@@ -851,6 +858,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 4,
+                revision: 0,
                 last_batch_id: 999,
                 next_inode: 51,
                 created_at: SystemTime::now(),
@@ -903,7 +911,7 @@ mod tests {
         // Readers seek past the header by SUMMARY_HEADER_SIZE to reach the volume header
         // blob, so a field added or removed without updating the constant would silently
         // misalign every subsequent offset rather than fail loudly.
-        let header = SummaryHeader::new(1, 2, 3, SystemTime::UNIX_EPOCH, [0u8; 12], 0, 0);
+        let header = SummaryHeader::new(1, 0, 2, 3, SystemTime::UNIX_EPOCH, [0u8; 12], 0, 0);
         assert_eq!(header.to_bytes().len(), SUMMARY_HEADER_SIZE);
     }
 
@@ -974,7 +982,7 @@ mod tests {
     #[test]
     fn test_zero_volume_header_len_fails_with_invalid_data() {
         let storage = Arc::new(MemoryStorage::new());
-        let header = SummaryHeader::new(0, 0, 2, std::time::SystemTime::UNIX_EPOCH, [0u8; 12], 0, 0);
+        let header = SummaryHeader::new(0, 0, 0, 2, std::time::SystemTime::UNIX_EPOCH, [0u8; 12], 0, 0);
         let header_bytes = header.to_bytes();
         let mut writer = storage.open_writer("000000.summary", WriteMode::CreateNew).unwrap();
         writer.append(&header_bytes).unwrap();
@@ -1033,6 +1041,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
+                revision: 0,
                 last_batch_id: 42,
                 next_inode: 3,
                 created_at: SystemTime::UNIX_EPOCH,
@@ -1054,6 +1063,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
+                revision: 0,
                 last_batch_id: 42,
                 next_inode: 3,
                 created_at: SystemTime::UNIX_EPOCH,

@@ -3286,3 +3286,156 @@ fn test_prioritized_replication_rw_and_low_lag_replicates_before_archive_backlog
     assert!(status.contains("[Remote: gcs-netherlands]\n  Target:             s3 (bucket: gcs-bucket, prefix: )\n  Read Priority:      100\n  Mode:               Read-Write\n  Partial Logs:       Enabled\n  Status:             Up to date\n  Synced Generation:  4 / 4\n  Replication Lag:    0 sealed generation(s)"));
     assert!(status.contains("[Remote: aws-glacier]\n  Target:             s3 (bucket: glacier-bucket, prefix: )\n  Read Priority:      100\n  Mode:               Write-Only\n  Partial Logs:       Disabled\n  Status:             Up to date (Archive)\n  Synced Generation:  4 / 4\n  Replication Lag:    0 sealed generation(s)"));
 }
+
+#[test]
+fn test_revisioned_summary_replication_pruning_and_recovery() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+
+    let TestFs { mut fs, .. } = TestFs::builder()
+        .storage(storage.clone())
+        .clock(clock.clone())
+        .max_log_size(1024 * 1024)
+        .build();
+    let writer = fs.log_writer.clone().unwrap();
+
+    let f1 = fs.create_file(1, "rev_file.txt", 0o644).unwrap();
+    fs.write_at(f1, b"revisioned payload data", 0).unwrap();
+    fs.quiesce().unwrap();
+    let sealed1 = writer.force_roll().unwrap().unwrap();
+    fs.manifest.write().unwrap().record_sealed_log(sealed1);
+
+    let summary_unversioned = fs.export_summary(storage.as_ref()).unwrap();
+    assert_eq!(summary_unversioned, "000001.summary");
+
+    // Read reader to create a revision 1 snapshot:
+    let reader =
+        appendfs::log::SummaryReader::open(storage.as_ref(), &summary_unversioned, fs.volume_key.clone()).unwrap();
+    let inodes = reader.read_all_inodes().unwrap();
+    let snapshot = appendfs::log::SummarySnapshot {
+        inodes: &inodes,
+        manifest: &reader.manifest,
+        volume_header: &reader.volume_header,
+        generation: reader.header.generation,
+        revision: 1,
+        last_batch_id: reader.header.last_batch_id,
+        next_inode: reader.header.next_inode,
+        created_at: reader.header.created_at,
+    };
+    let summary = appendfs::log::export_summary(&snapshot, storage.as_ref(), &fs.volume_key).unwrap();
+    assert_eq!(summary, "000001_r1.summary");
+
+    // Remove 000001.summary so only 000001_r1.summary exists on disk
+    storage.remove_file("000001.summary").unwrap();
+    assert!(!storage.exists("000001.summary"));
+    assert!(storage.exists("000001_r1.summary"));
+
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
+    let fs_arc = Arc::new(fs);
+
+    let mock_remote = Arc::new(MockRemoteStore::new());
+    let mut registry = RemoteRegistry::new();
+    registry.add_remote("mock", RemoteTargetConfig::new("test-bucket"));
+    registry.set_store_override("mock", mock_remote.clone());
+    registry.policy.prune_rule = PruneExpr::parse("older_than(0s) && oneof(mock)").unwrap();
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    assert!(storage.exists("000001.log"));
+
+    // 1. Drain on shutdown: verifies replication of 000001_r1.summary and pruning of 000001.log
+    appendfs::remote::RemoteReplicationWorker::drain_on_shutdown(&fs_arc, &registry_arc).unwrap();
+
+    assert!(
+        mock_remote.head_object("000001_r1.summary").unwrap().is_some(),
+        "000001_r1.summary must be uploaded to remote store"
+    );
+    assert!(
+        mock_remote.head_object("000001.log").unwrap().is_some(),
+        "000001.log must be uploaded to remote store"
+    );
+    assert!(
+        !storage.exists("000001.log"),
+        "000001.log must be pruned locally when covered by 000001_r1.summary"
+    );
+    assert!(
+        storage.exists("000001_r1.summary"),
+        "000001_r1.summary must be preserved locally"
+    );
+
+    // 2. Test historical remote recovery of 000001_r1.summary
+    storage.remove_file("000001_r1.summary").unwrap();
+    assert!(!storage.exists("000001_r1.summary"));
+
+    let remote_stores = registry_arc.read().unwrap().build_read_stores();
+    let chosen = appendfs::prepare_remote_recovery_for_target(
+        storage.as_ref(),
+        appendfs::RecoveryTarget::Latest,
+        fs_arc.volume_key.clone(),
+        &remote_stores,
+    )
+    .unwrap();
+    assert_eq!(
+        chosen,
+        Some("000001_r1.summary".to_string()),
+        "prepare_remote_recovery_for_target must discover and download 000001_r1.summary"
+    );
+    assert!(storage.exists("000001_r1.summary"));
+
+    // 3. Test bootstrap from remote with revisioned summary
+    let bootstrap_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let bootstrapped_summary = bootstrap_from_remote(
+        mock_remote.as_ref(),
+        bootstrap_storage.as_ref(),
+        "mock",
+        RemoteTargetConfig::new("test-bucket"),
+    )
+    .unwrap();
+    assert_eq!(
+        bootstrapped_summary, "000001_r1.summary",
+        "bootstrap_from_remote must discover and download 000001_r1.summary"
+    );
+    assert!(bootstrap_storage.exists("000001_r1.summary"));
+}
+
+#[test]
+fn test_prepare_remote_recovery_skips_write_only_remotes() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let clock = Arc::new(SystemClock);
+
+    let TestFs { fs, .. } = TestFs::builder().storage(storage.clone()).clock(clock.clone()).build();
+    let volume_key = fs.volume_key.clone();
+
+    // Create a mock remote store and upload 000000.summary
+    let mock_remote = Arc::new(MockRemoteStore::new());
+    upload_storage_file(storage.as_ref(), mock_remote.as_ref(), "000000.summary", None).unwrap();
+
+    // Remove 000000.summary from local storage
+    storage.remove_file("000000.summary").unwrap();
+    assert!(!storage.exists("000000.summary"));
+
+    // 1. With write-only remote target, prepare_remote_recovery_for_target must skip it
+    let write_only_target =
+        appendfs::remote::RemoteReadTarget::new("glacier", mock_remote.clone(), 100).with_mode(RemoteMode::WriteOnly);
+    let chosen = appendfs::prepare_remote_recovery_for_target(
+        storage.as_ref(),
+        appendfs::RecoveryTarget::Latest,
+        volume_key.clone(),
+        &[write_only_target],
+    )
+    .unwrap();
+    assert_eq!(chosen, None);
+    assert!(!storage.exists("000000.summary"));
+
+    // 2. With read-only or read-write target, prepare_remote_recovery_for_target fetches it
+    let readable_target =
+        appendfs::remote::RemoteReadTarget::new("s3", mock_remote.clone(), 100).with_mode(RemoteMode::ReadOnly);
+    let chosen = appendfs::prepare_remote_recovery_for_target(
+        storage.as_ref(),
+        appendfs::RecoveryTarget::Latest,
+        volume_key.clone(),
+        &[readable_target],
+    )
+    .unwrap();
+    assert_eq!(chosen, Some("000000.summary".to_string()));
+    assert!(storage.exists("000000.summary"));
+}

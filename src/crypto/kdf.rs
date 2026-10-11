@@ -123,9 +123,26 @@ fn combined_material(key_bytes: &[u8; 32], passphrase: &str) -> Vec<u8> {
     material
 }
 
-/// Prompts the user interactively on the terminal for a password without echo.
+/// Prompts the user interactively on the terminal for a password without echo,
+/// or reads from standard input if piped or non-terminal.
 pub fn prompt_passphrase(prompt: &str) -> io::Result<String> {
-    rpassword::prompt_password(prompt)
+    use std::io::{BufRead, IsTerminal};
+
+    if std::io::stdin().is_terminal() {
+        rpassword::prompt_password(prompt)
+    } else {
+        let mut line = String::new();
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+        handle.read_line(&mut line)?;
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        Ok(line)
+    }
 }
 
 /// A securely zeroized master key wrapper.

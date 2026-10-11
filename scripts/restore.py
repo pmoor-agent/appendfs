@@ -283,6 +283,36 @@ def find_log_files(source_path: Path) -> List[Tuple[int, int, Path]]:
     return result
 
 
+def parse_summary_filename(name: str) -> Optional[Tuple[int, int]]:
+    """Parses a summary filename like 000001.summary or 000001_r2.summary into (generation, revision)."""
+    m = re.match(r"^(\d{6})(?:_r(\d+))?\.summary$", name)
+    if not m:
+        return None
+    gen = int(m.group(1))
+    rev = int(m.group(2)) if m.group(2) else 0
+    return (gen, rev)
+
+
+def find_latest_summary_file(source_path: Path) -> Optional[Path]:
+    """Finds the newest .summary file in a volume directory matching (generation, revision)."""
+    if source_path.is_file():
+        if parse_summary_filename(source_path.name):
+            return source_path
+        source_path = source_path.parent
+    if not source_path.is_dir():
+        return None
+    candidates = []
+    for entry in source_path.iterdir():
+        if entry.is_file():
+            parsed = parse_summary_filename(entry.name)
+            if parsed:
+                candidates.append((parsed, entry))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
 class VolumeDecryptor:
     """Handles decryption and authentication for encrypted and plaintext volumes."""
 
@@ -1075,10 +1105,13 @@ def main():
 
     # Determine encryption key if needed
     key_bytes = None
-    summary_0 = volume_path / "000000.summary" if volume_path.is_dir() else volume_path.parent / "000000.summary"
+    latest_summary = find_latest_summary_file(volume_path)
+    summary_path = latest_summary if latest_summary is not None else (
+        volume_path / "000000.summary" if volume_path.is_dir() else volume_path.parent / "000000.summary"
+    )
 
-    if summary_0.is_file():
-        header = read_volume_header_from_summary(summary_0)
+    if summary_path.is_file():
+        header = read_volume_header_from_summary(summary_path)
         if not header.is_encrypted():
             if args.key_file is not None:
                 raise ValueError("Volume is not encrypted; --key-file does not apply to it")
