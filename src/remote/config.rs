@@ -100,6 +100,65 @@ fn default_read_priority() -> u32 {
     100
 }
 
+/// Parses credentials from a string.
+///
+/// Supports:
+/// 1. Key-value pairs (e.g. `aws_access_key_id = ...` and `aws_secret_access_key = ...`
+///    or `access_key_id = ...` and `secret_access_key = ...`, including INI format sections like `[default]`).
+/// 2. Simple two-line format: line 1 = access key ID, line 2 = secret access key
+///    (ignoring comments starting with `#` or `;` and blank lines).
+pub fn parse_credentials_content(content: &str) -> Option<(String, String)> {
+    let mut key_id: Option<String> = None;
+    let mut secret_key: Option<String> = None;
+    let mut positional_lines = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            continue;
+        }
+
+        if let Some((k, v)) = trimmed.split_once('=') {
+            let k = k.trim().to_ascii_lowercase();
+            let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+            if k == "aws_access_key_id" || k == "access_key_id" || k == "aws_access_key" {
+                key_id = Some(v);
+            } else if k == "aws_secret_access_key" || k == "secret_access_key" || k == "aws_secret_key" {
+                secret_key = Some(v);
+            }
+        } else {
+            positional_lines.push(trimmed.to_string());
+        }
+    }
+
+    if let (Some(k), Some(s)) = (key_id, secret_key) {
+        return Some((k, s));
+    }
+
+    if positional_lines.len() >= 2 {
+        return Some((positional_lines[0].clone(), positional_lines[1].clone()));
+    }
+
+    None
+}
+
+/// Reads and parses credentials from a file.
+pub fn read_credentials_file(path: &Path) -> io::Result<(String, String)> {
+    let content = fs::read_to_string(path)?;
+    parse_credentials_content(&content).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Credentials file '{}' does not contain valid access key and secret key",
+                path.display()
+            ),
+        )
+    })
+}
+
 impl RemoteTargetConfig {
     pub fn new(bucket: impl Into<String>) -> Self {
         Self {
@@ -177,6 +236,11 @@ impl RemoteTargetConfig {
         self
     }
 
+    pub fn with_credentials_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.credentials_file = Some(path.into());
+        self
+    }
+
     pub fn validate(&self, name: &str) -> io::Result<()> {
         if self.upload_partial_logs == Some(true) && self.mode != RemoteMode::ReadWrite {
             return Err(io::Error::new(
@@ -204,12 +268,12 @@ impl RemoteTargetConfig {
         }
 
         // 2. Credentials file
-        if let Some(ref path) = self.credentials_file
-            && let Ok(content) = fs::read_to_string(path)
-        {
-            let mut lines = content.lines();
-            if let (Some(k), Some(s)) = (lines.next(), lines.next()) {
-                return Some((k.trim().to_string(), s.trim().to_string()));
+        if let Some(ref path) = self.credentials_file {
+            match read_credentials_file(path) {
+                Ok((k, s)) => return Some((k, s)),
+                Err(e) => {
+                    log::warn!("Failed to read credentials file '{}': {}", path.display(), e);
+                }
             }
         }
 
@@ -626,5 +690,113 @@ bucket = "legacy-bucket"
         assert_eq!(policy.audit_interval_secs, 21600);
         assert_eq!(policy.prune_rule, crate::remote::policy::PruneExpr::default());
         assert_eq!(policy.prune_rule.to_string(), "older_than(30d) && readable(1)");
+    }
+
+    #[test]
+    fn test_parse_credentials_content_two_line() {
+        let content = "AKIA12345EXAMPLE\nwJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n";
+        let parsed = parse_credentials_content(content).expect("should parse simple 2-line format");
+        assert_eq!(parsed.0, "AKIA12345EXAMPLE");
+        assert_eq!(parsed.1, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+    }
+
+    #[test]
+    fn test_parse_credentials_content_with_comments_and_empty_lines() {
+        let content = r#"
+# Primary AWS Credentials
+; Alternative comment style
+
+AKIA12345EXAMPLE
+
+# Secret below
+wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+"#;
+        let parsed = parse_credentials_content(content).expect("should parse 2-line format with comments");
+        assert_eq!(parsed.0, "AKIA12345EXAMPLE");
+        assert_eq!(parsed.1, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+    }
+
+    #[test]
+    fn test_parse_credentials_content_aws_ini_format() {
+        let content = r#"
+[default]
+aws_access_key_id = AKIA12345EXAMPLE
+aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+"#;
+        let parsed = parse_credentials_content(content).expect("should parse AWS INI format");
+        assert_eq!(parsed.0, "AKIA12345EXAMPLE");
+        assert_eq!(parsed.1, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+    }
+
+    #[test]
+    fn test_parse_credentials_content_quoted_and_key_value() {
+        let content = r#"
+ACCESS_KEY_ID="AKIA12345EXAMPLE"
+SECRET_ACCESS_KEY='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+"#;
+        let parsed = parse_credentials_content(content).expect("should parse quoted key-value format");
+        assert_eq!(parsed.0, "AKIA12345EXAMPLE");
+        assert_eq!(parsed.1, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+    }
+
+    #[test]
+    fn test_parse_credentials_content_invalid() {
+        assert!(parse_credentials_content("").is_none());
+        assert!(parse_credentials_content("# only comments\n; nothing else\n").is_none());
+        assert!(parse_credentials_content("SINGLE_LINE_ONLY\n").is_none());
+        assert!(parse_credentials_content("aws_access_key_id = AKIA123\n").is_none());
+    }
+
+    #[test]
+    fn test_read_credentials_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid_file = dir.path().join("creds.txt");
+        fs::write(&valid_file, "KEY1\nSECRET1\n").unwrap();
+
+        let (k, s) = read_credentials_file(&valid_file).unwrap();
+        assert_eq!(k, "KEY1");
+        assert_eq!(s, "SECRET1");
+
+        let missing_file = dir.path().join("missing.txt");
+        let err = read_credentials_file(&missing_file).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        let invalid_file = dir.path().join("invalid.txt");
+        fs::write(&invalid_file, "ONLY_ONE_LINE\n").unwrap();
+        let err = read_credentials_file(&invalid_file).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_resolve_credentials_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_file = dir.path().join("test_creds.txt");
+        fs::write(&creds_file, "FILE_KEY\nFILE_SECRET\n").unwrap();
+
+        // 1. Credentials file overrides literal keys
+        let mut cfg = RemoteTargetConfig::new("bucket");
+        cfg.access_key_id = Some("LITERAL_KEY".to_string());
+        cfg.secret_access_key = Some("LITERAL_SECRET".to_string());
+        cfg.credentials_file = Some(creds_file.clone());
+
+        let creds = cfg.resolve_credentials().expect("should resolve credentials");
+        assert_eq!(creds.0, "FILE_KEY");
+        assert_eq!(creds.1, "FILE_SECRET");
+
+        // 2. Without credentials file, falls back to literal keys
+        cfg.credentials_file = None;
+        let creds_literal = cfg.resolve_credentials().expect("should resolve literal keys");
+        assert_eq!(creds_literal.0, "LITERAL_KEY");
+        assert_eq!(creds_literal.1, "LITERAL_SECRET");
+
+        // 3. Builder method with_credentials_file and store construction
+        let cfg2 = RemoteTargetConfig::new("my-bucket").with_credentials_file(&creds_file);
+        assert!(!cfg2.is_local_dir());
+        let creds2 = cfg2.resolve_credentials().expect("should resolve from builder");
+        assert_eq!(creds2.0, "FILE_KEY");
+        assert_eq!(creds2.1, "FILE_SECRET");
+
+        let store = cfg2.build_store();
+        assert!(format!("{:?}", store).contains("S3RemoteStore"));
     }
 }

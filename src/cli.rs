@@ -203,7 +203,7 @@ pub struct RemoteAddArgs {
     #[arg(long = "secret-access-key-env")]
     pub secret_access_key_env: Option<String>,
 
-    /// Path to file containing credentials (line 1: access key, line 2: secret key)
+    /// Path to file containing credentials (line 1: access key, line 2: secret key, or key=value / INI format)
     #[arg(long = "credentials-file")]
     pub credentials_file: Option<PathBuf>,
 
@@ -326,6 +326,18 @@ pub struct InitArgs {
     /// Secret access key for bootstrap remote credentials
     #[arg(long = "remote-secret-access-key")]
     pub remote_secret_access_key: Option<String>,
+
+    /// Name of environment variable containing Access Key ID for bootstrap remote (e.g. "B2_KEY_ID")
+    #[arg(long = "remote-access-key-id-env")]
+    pub remote_access_key_id_env: Option<String>,
+
+    /// Name of environment variable containing Secret Access Key for bootstrap remote (e.g. "B2_APPLICATION_KEY")
+    #[arg(long = "remote-secret-access-key-env")]
+    pub remote_secret_access_key_env: Option<String>,
+
+    /// Path to file containing credentials for bootstrap remote (line 1: access key, line 2: secret key, or key=value / INI format)
+    #[arg(long = "remote-credentials-file", alias = "credentials-file")]
+    pub remote_credentials_file: Option<PathBuf>,
 }
 
 impl InitArgs {

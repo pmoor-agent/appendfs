@@ -26,7 +26,10 @@ pub use block_cache::{
 };
 pub use bootstrap::bootstrap_from_remote;
 pub use coalesce::{BatchLeaderGuard, CoalesceError, FollowerBlock, RemoteReadCoalescer};
-pub use config::{ConfiguredRemote, RemoteMode, RemoteRegistry, RemoteTargetConfig, ReplicationPolicy};
+pub use config::{
+    ConfiguredRemote, RemoteMode, RemoteRegistry, RemoteTargetConfig, ReplicationPolicy, parse_credentials_content,
+    read_credentials_file,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use counting::{CountingRemoteStore, RemoteStoreMetrics};
 #[cfg(any(test, feature = "testing"))]
