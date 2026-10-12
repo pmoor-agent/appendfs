@@ -6,6 +6,8 @@ pub mod config;
 pub mod counting;
 #[cfg(any(test, feature = "testing"))]
 pub mod failing;
+#[cfg(any(test, feature = "testing"))]
+pub mod fake_s3;
 pub mod fs;
 #[cfg(any(test, feature = "testing"))]
 pub mod latency;
@@ -34,6 +36,8 @@ pub use config::{
 pub use counting::{CountingRemoteStore, RemoteStoreMetrics};
 #[cfg(any(test, feature = "testing"))]
 pub use failing::FailingRemoteStore;
+#[cfg(any(test, feature = "testing"))]
+pub use fake_s3::{FakeS3Request, FakeS3Server};
 pub use fs::LocalDirRemoteStore;
 #[cfg(any(test, feature = "testing"))]
 pub use latency::LatencyRemoteStore;
