@@ -6,7 +6,6 @@ Last Batch ID:       3
 Next Inode:          20
 File Size:           1.03 KiB
 Encryption:          ChaCha20-Poly1305
-Unlocked by:         Passphrase
 Checksum (BLAKE3):   213cf313a04e181b8e3f89a499052f61ee63928287ef94c4246a986ed5e6473d (VERIFIED)
 
 --- Inode Breakdown ---

@@ -748,7 +748,6 @@ pub fn format_runtime_status(fs: &AppendFs) -> String {
 
     let cipher_str = format!("{:?}", fs.volume_header.cipher);
     let compression_str = format!("{:?}", fs.volume_header.compression);
-    let key_source_str = format!("{}", fs.volume_header.key_source);
     let volume_id_hex = hex::encode(fs.volume_header.volume_id);
 
     let next_ino = fs.next_inode.load(Ordering::SeqCst);
@@ -768,7 +767,6 @@ pub fn format_runtime_status(fs: &AppendFs) -> String {
     out.push_str(&format!("  Access Mode:        {}\n", mode_str));
     out.push_str(&format!("  Volume ID:          {}\n", volume_id_hex));
     out.push_str(&format!("  Cipher Suite:       {}\n", cipher_str));
-    out.push_str(&format!("  Key Source:         {}\n", key_source_str));
     out.push_str(&format!("  Compression:        {}\n", compression_str));
     if let Some(head) = head_gen {
         out.push_str(&format!(

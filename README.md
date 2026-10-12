@@ -16,7 +16,7 @@ Instead of mutating files in place on disk, AppendFS stages all filesystem opera
 - **In-Memory Staging & Performance**: Operations are staged in memory and served at memory speed while asynchronously committing batches to disk.
 - **Instant Crash Recovery**: Power cuts or crashes mid-flush cleanly discard uncommitted trailing batches while preserving all previously committed transactions. Periodic `.summary` checkpoint files enable near-instantaneous startup.
 - **Point-in-Time Time Travel**: Mount the filesystem read-only at any past timestamp (`--at-time`) for auditing or backup extraction.
-- **Client-Side Authenticated Encryption**: AEAD encryption with secure key derivation. Volumes can be unlocked via a passphrase, a 256-bit key file, or two-factor authentication (key file + passphrase), with immediate key validation before reading records.
+- **Client-Side Authenticated Encryption**: AEAD encryption under a 256-bit key held in a key file, optionally protected by a passphrase that can be changed at any time, with immediate key validation before reading records.
 - **Transparent Compression**: Payloads are compressed on the fly using **Zstandard (zstd)**, saving storage space and network transfer costs.
 - **Multi-Cloud Replication**: An autonomous background replication worker fans out sealed logs and summaries to S3-compatible cloud providers (AWS S3, Backblaze B2, Cloudflare R2, MinIO, Wasabi, Google Cloud Storage) or local/NFS paths.
 - **Tiered Storage & Range Reads**: Local disk space can be reclaimed by pruning uploaded log files. Missing extents are transparently fetched on demand.
@@ -59,16 +59,15 @@ Create a directory where AppendFS will store its log files and initialize the vo
 # Plaintext volume (compression enabled by default)
 appendfs init /var/lib/appendfs_logs
 
-# Encrypted volume unlocked by passphrase
-appendfs init --passphrase /var/lib/appendfs_logs
-
-# Encrypted volume unlocked by a 256-bit key file
-openssl rand -hex 32 > mykey.key
+# Encrypted volume: generate a key file (prompts for an optional passphrase), then use it
+appendfs key init mykey.key
 appendfs init --key-file mykey.key /var/lib/appendfs_logs
 
-# Two-factor encrypted volume (requires both key file and passphrase)
-appendfs init --key-file mykey.key --passphrase /var/lib/appendfs_logs
+# Add, change, or remove the key file's passphrase later; the volume is untouched
+appendfs key change-passphrase mykey.key
 ```
+
+Back up the key file: it is not stored in the volume, and losing it loses the volume.
 
 ### 2. Mount the Filesystem
 
@@ -84,7 +83,7 @@ appendfs mount /var/lib/appendfs_logs /mnt/mydata
 appendfs mount -f /var/lib/appendfs_logs /mnt/mydata
 ```
 
-*(If the volume is encrypted, pass `--passphrase` to prompt interactively, `--key-file <path>`, or both depending on the volume configuration).*
+*(If the volume is encrypted, pass `--key-file <path>`; you are prompted for the key file's passphrase if it has one).*
 
 ### 3. Using the Filesystem
 
@@ -173,6 +172,9 @@ pip install cryptography zstandard argon2-cffi blake3
 
 # Reconstruct all files to a local target directory
 python3 scripts/restore.py /var/lib/appendfs_logs /tmp/restored_data
+
+# Encrypted volumes need their key file
+python3 scripts/restore.py /var/lib/appendfs_logs /tmp/restored_data --key-file mykey.key
 ```
 
 ---

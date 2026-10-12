@@ -115,17 +115,6 @@ fn test_cli_init_plaintext_generates_random_volume_id() {
     let stats_stdout = String::from_utf8_lossy(&stats_output.stdout);
     assert!(stats_stdout.contains(&format!("Volume ID:     {}", id1)));
 
-    // Verify passing --passphrase to stats on plaintext volume fails cleanly
-    let pass_stats = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .arg("stats")
-        .arg("--passphrase")
-        .arg(temp_dir1.path())
-        .output()
-        .expect("failed to run appendfs stats --passphrase");
-    assert!(!pass_stats.status.success());
-    let pass_stderr = String::from_utf8_lossy(&pass_stats.stderr);
-    assert!(pass_stderr.contains("Volume is not encrypted; --passphrase does not apply to it"));
-
     // Verify passing --key-file to stats on plaintext volume fails cleanly
     let key_stats = Command::new(env!("CARGO_BIN_EXE_appendfs"))
         .arg("stats")
@@ -1080,308 +1069,17 @@ fn test_cli_stats_and_dump_extension_breakdown() {
     assert_eq!(&dump_str[dump_idx..], &stats_str[stats_idx..]);
 }
 
-#[test]
-fn test_cli_remove_passphrase_workflow() {
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+/// Unlocks key file text the way the CLI does, answering an encrypted file's prompt with
+/// `passphrase`.
+fn unlock_key_file(text: &str, passphrase: &str) -> std::io::Result<[u8; 32]> {
+    appendfs::crypto::KeyFile::parse(text)
+        .map_err(std::io::Error::other)?
+        .unlock(|| Ok(zeroize::Zeroizing::new(passphrase.to_string())))
+        .map(|key| key.key)
+}
 
-    let temp_dir = TempDir::new().unwrap();
-    let vol_dir = temp_dir.path().join("vol");
-    let key_file = temp_dir.path().join("old_key.hex");
-    let new_key_file = temp_dir.path().join("new_key.hex");
-
-    // Create a 64-hex old key file
-    let key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    std::fs::write(&key_file, format!("{}\n", key_hex)).unwrap();
-
-    let passphrase = "correct horse battery staple";
-
-    // 1. Initialize volume with --key-file and --passphrase
-    let mut init_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "init",
-            "--key-file",
-            key_file.to_str().unwrap(),
-            "--passphrase",
-            vol_dir.to_str().unwrap(),
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn appendfs init");
-
-    {
-        let mut stdin = init_child.stdin.take().expect("get stdin");
-        writeln!(stdin, "{}", passphrase).unwrap();
-        writeln!(stdin, "{}", passphrase).unwrap();
-    }
-    let init_out = init_child.wait_with_output().expect("wait init");
-    assert!(
-        init_out.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init_out.stderr)
-    );
-
-    // 2. Mount the volume with 2FA credentials and populate non-empty data
-    let mount_dir = temp_dir.path().join("mnt");
-    std::fs::create_dir_all(&mount_dir).unwrap();
-    let initial_dev = std::fs::metadata(&mount_dir).unwrap().dev();
-
-    let mut mount_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "mount",
-            "-f",
-            "--key-file",
-            key_file.to_str().unwrap(),
-            "--passphrase",
-            vol_dir.to_str().unwrap(),
-            mount_dir.to_str().unwrap(),
-        ])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn appendfs mount");
-
-    {
-        let mut stdin = mount_child.stdin.take().expect("get stdin");
-        writeln!(stdin, "{}", passphrase).unwrap();
-    }
-
-    // Wait for FUSE mount
-    let mut mounted = false;
-    for _ in 0..100 {
-        if let Ok(meta) = std::fs::metadata(&mount_dir)
-            && meta.dev() != initial_dev
-        {
-            mounted = true;
-            break;
-        }
-        if let Ok(Some(status)) = mount_child.try_wait() {
-            panic!("mount exited prematurely with: {:?}", status);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(mounted, "timed out waiting for mount");
-
-    // Populate data: directories, nested files with data
-    let sub_dir = mount_dir.join("sub_dir");
-    std::fs::create_dir_all(&sub_dir).unwrap();
-    let hello_file = sub_dir.join("hello.txt");
-    std::fs::write(&hello_file, b"Hello world from encrypted volume!").unwrap();
-
-    let data_file = mount_dir.join("data.bin");
-    let test_bytes = vec![0xABu8; 64 * 1024];
-    std::fs::write(&data_file, &test_bytes).unwrap();
-
-    // Unmount cleanly via SIGINT
-    unsafe {
-        libc::kill(mount_child.id() as libc::pid_t, libc::SIGINT);
-    }
-    assert!(mount_child.wait().unwrap().success());
-
-    // Clean unmount flushes and exports 000001.summary with the non-empty inode tree
-    assert!(vol_dir.join("000001.summary").exists());
-
-    // Verify stats requires passphrase before removal
-    let stats_without_pass = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "stats",
-            "--key-file",
-            key_file.to_str().unwrap(),
-            vol_dir.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run stats");
-    assert!(!stats_without_pass.status.success());
-
-    // 3. Test remove-passphrase while volume is locked
-    {
-        let storage: std::sync::Arc<dyn appendfs::storage::Storage> =
-            std::sync::Arc::new(appendfs::storage::OsStorage::new(&vol_dir));
-        let _lock = storage.acquire_exclusive_lock().expect("acquire lock");
-
-        let locked_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-            .args([
-                "remove-passphrase",
-                "--key-file",
-                key_file.to_str().unwrap(),
-                "--new-key-file",
-                new_key_file.to_str().unwrap(),
-                vol_dir.to_str().unwrap(),
-            ])
-            .output()
-            .expect("run remove-passphrase while locked");
-        assert!(!locked_out.status.success());
-        let err = String::from_utf8_lossy(&locked_out.stderr);
-        assert!(
-            err.contains("already locked") || err.contains("volume lock"),
-            "unexpected err: {}",
-            err
-        );
-        assert!(!new_key_file.exists());
-    }
-
-    // 4. Test remove-passphrase with wrong passphrase fails cleanly
-    {
-        let mut wrong_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-            .args([
-                "remove-passphrase",
-                "--key-file",
-                key_file.to_str().unwrap(),
-                "--new-key-file",
-                new_key_file.to_str().unwrap(),
-                vol_dir.to_str().unwrap(),
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn remove-passphrase");
-
-        {
-            let mut stdin = wrong_child.stdin.take().expect("get stdin");
-            writeln!(stdin, "wrong passphrase").unwrap();
-        }
-        let wrong_out = wrong_child.wait_with_output().expect("wait remove-passphrase");
-        assert!(!wrong_out.status.success());
-        let err = String::from_utf8_lossy(&wrong_out.stderr);
-        assert!(
-            err.contains("Incorrect passphrase or key file"),
-            "unexpected err: {}",
-            err
-        );
-        assert!(!new_key_file.exists());
-    }
-
-    // 5. Run remove-passphrase successfully on the populated volume
-    let mut remove_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "remove-passphrase",
-            "--key-file",
-            key_file.to_str().unwrap(),
-            "--new-key-file",
-            new_key_file.to_str().unwrap(),
-            vol_dir.to_str().unwrap(),
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn remove-passphrase");
-
-    {
-        let mut stdin = remove_child.stdin.take().expect("get stdin");
-        writeln!(stdin, "{}", passphrase).unwrap();
-    }
-    let remove_out = remove_child.wait_with_output().expect("wait remove-passphrase");
-    assert!(
-        remove_out.status.success(),
-        "remove-passphrase failed: {}",
-        String::from_utf8_lossy(&remove_out.stderr)
-    );
-
-    // Verify new key file exists and has 0400 permissions
-    assert!(new_key_file.exists());
-    #[cfg(unix)]
-    {
-        let perms = std::fs::metadata(&new_key_file).unwrap().permissions();
-        assert_eq!(perms.mode() & 0o777, 0o400, "expected 0400 permissions");
-    }
-
-    // Verify summary revision was created for the latest summary (000001_r1.summary)
-    assert!(vol_dir.join("000001_r1.summary").exists());
-
-    // 6. Verify stats now succeeds with ONLY --key-file and reflects populated inodes
-    let stats_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "stats",
-            "--key-file",
-            new_key_file.to_str().unwrap(),
-            vol_dir.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run stats");
-    assert!(
-        stats_out.status.success(),
-        "stats failed: {}",
-        String::from_utf8_lossy(&stats_out.stderr)
-    );
-    let stats_str = String::from_utf8_lossy(&stats_out.stdout);
-    assert!(stats_str.contains("Unlocked by:   Key file"));
-    assert!(
-        stats_str.contains("4 (2 directories, 2 regular files, 0 symlinks)"),
-        "expected non-empty summary with 4 inodes, got: {}",
-        stats_str
-    );
-
-    // Verify stats with --passphrase now fails because volume no longer uses a passphrase
-    let stats_pass = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "stats",
-            "--key-file",
-            new_key_file.to_str().unwrap(),
-            "--passphrase",
-            vol_dir.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run stats with passphrase");
-    assert!(!stats_pass.status.success());
-    let err = String::from_utf8_lossy(&stats_pass.stderr);
-    assert!(err.contains("It does not use a passphrase"));
-
-    // 7. Verify fsck succeeds on the populated volume with the new key file
-    let fsck_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "fsck",
-            "--key-file",
-            new_key_file.to_str().unwrap(),
-            vol_dir.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run fsck");
-    assert!(
-        fsck_out.status.success(),
-        "fsck failed: {}",
-        String::from_utf8_lossy(&fsck_out.stderr)
-    );
-
-    // 8. Remount with ONLY --key-file and verify identical file data is read back
-    let mut remount_child = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "mount",
-            "-f",
-            "--key-file",
-            new_key_file.to_str().unwrap(),
-            vol_dir.to_str().unwrap(),
-            mount_dir.to_str().unwrap(),
-        ])
-        .spawn()
-        .expect("spawn appendfs remount");
-
-    let mut remounted = false;
-    for _ in 0..100 {
-        if let Ok(meta) = std::fs::metadata(&mount_dir)
-            && meta.dev() != initial_dev
-        {
-            remounted = true;
-            break;
-        }
-        if let Ok(Some(status)) = remount_child.try_wait() {
-            panic!("remount exited prematurely with: {:?}", status);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(remounted, "timed out waiting for remount");
-
-    let read_hello = std::fs::read(&hello_file).unwrap();
-    assert_eq!(read_hello, b"Hello world from encrypted volume!");
-    let read_data = std::fs::read(&data_file).unwrap();
-    assert_eq!(read_data, test_bytes);
-
-    unsafe {
-        libc::kill(remount_child.id() as libc::pid_t, libc::SIGINT);
-    }
-    assert!(remount_child.wait().unwrap().success());
+fn is_encrypted_key_file(text: &str) -> bool {
+    appendfs::crypto::KeyFile::parse(text).unwrap().is_encrypted()
 }
 
 fn run_appendfs_with_input(args: &[&str], input: &[u8]) -> std::process::Output {
@@ -1417,8 +1115,7 @@ fn test_cli_key_init_raw_and_permissions() {
     let content = std::fs::read_to_string(&key_file).unwrap();
     assert!(content.contains("-----BEGIN APPENDFS KEY-----"));
     assert!(content.contains("-----END APPENDFS KEY-----"));
-    let key = appendfs::crypto::parse_pem_unencrypted_key(&content).unwrap();
-    assert_eq!(key.len(), 32);
+    assert!(!is_encrypted_key_file(&content));
 }
 
 #[test]
@@ -1463,11 +1160,10 @@ fn test_cli_key_init_pem_and_permissions() {
     assert!(content.contains("-----END APPENDFS ENCRYPTED KEY-----"));
 
     // Can decrypt with correct passphrase
-    let key = appendfs::crypto::decrypt_pem_key(&content, "my_secret_pass").unwrap();
-    assert_eq!(key.len(), 32);
+    assert!(unlock_key_file(&content, "my_secret_pass").is_ok());
 
     // Fails with wrong passphrase
-    assert!(appendfs::crypto::decrypt_pem_key(&content, "wrong_pass").is_err());
+    assert!(unlock_key_file(&content, "wrong_pass").is_err());
 }
 
 #[test]
@@ -1479,8 +1175,8 @@ fn test_cli_key_change_passphrase_workflow() {
     let out = run_appendfs_with_input(&["key", "init", "-o", key_file.to_str().unwrap()], b"\n");
     assert!(out.status.success());
     let pem_1 = std::fs::read_to_string(&key_file).unwrap();
-    assert!(appendfs::crypto::is_pem_unencrypted_key(pem_1.as_bytes()));
-    let initial_key = appendfs::crypto::parse_pem_unencrypted_key(&pem_1).unwrap();
+    assert!(!is_encrypted_key_file(&pem_1));
+    let initial_key = unlock_key_file(&pem_1, "").unwrap();
 
     // 2. change-passphrase on unencrypted key with empty input: remains unencrypted
     let out = run_appendfs_with_input(&["key", "change-passphrase", key_file.to_str().unwrap()], b"\n");
@@ -1488,10 +1184,8 @@ fn test_cli_key_change_passphrase_workflow() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("remains unencrypted"));
     let pem_2 = std::fs::read_to_string(&key_file).unwrap();
-    assert_eq!(
-        appendfs::crypto::parse_pem_unencrypted_key(&pem_2).unwrap(),
-        initial_key
-    );
+    assert!(!is_encrypted_key_file(&pem_2));
+    assert_eq!(unlock_key_file(&pem_2, "").unwrap(), initial_key);
 
     // 3. change-passphrase on unencrypted key adding passphrase_one
     let out = run_appendfs_with_input(
@@ -1510,9 +1204,8 @@ fn test_cli_key_change_passphrase_workflow() {
     }
 
     let enc_pem_1 = std::fs::read_to_string(&key_file).unwrap();
-    assert!(appendfs::crypto::is_pem_encrypted_key(enc_pem_1.as_bytes()));
-    let decrypted_1 = appendfs::crypto::decrypt_pem_key(&enc_pem_1, "passphrase_one").unwrap();
-    assert_eq!(decrypted_1, initial_key);
+    assert!(is_encrypted_key_file(&enc_pem_1));
+    assert_eq!(unlock_key_file(&enc_pem_1, "passphrase_one").unwrap(), initial_key);
 
     // 4. change-passphrase on encrypted key with WRONG old passphrase must fail
     let out = run_appendfs_with_input(
@@ -1521,7 +1214,7 @@ fn test_cli_key_change_passphrase_workflow() {
     );
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("Error unlocking key file"));
+    assert!(stderr.contains("cannot unlock key file"), "{}", stderr);
 
     // 5. change-passphrase from passphrase_one to passphrase_two
     let out = run_appendfs_with_input(
@@ -1540,9 +1233,8 @@ fn test_cli_key_change_passphrase_workflow() {
     }
 
     let enc_pem_2 = std::fs::read_to_string(&key_file).unwrap();
-    assert!(appendfs::crypto::decrypt_pem_key(&enc_pem_2, "passphrase_one").is_err());
-    let decrypted_2 = appendfs::crypto::decrypt_pem_key(&enc_pem_2, "passphrase_two").unwrap();
-    assert_eq!(decrypted_2, initial_key);
+    assert!(unlock_key_file(&enc_pem_2, "passphrase_one").is_err());
+    assert_eq!(unlock_key_file(&enc_pem_2, "passphrase_two").unwrap(), initial_key);
 
     // 6. change-passphrase from passphrase_two to empty (remove passphrase -> PEM unencrypted)
     let out = run_appendfs_with_input(
@@ -1561,24 +1253,21 @@ fn test_cli_key_change_passphrase_workflow() {
     }
 
     let final_pem = std::fs::read_to_string(&key_file).unwrap();
-    assert!(appendfs::crypto::is_pem_unencrypted_key(final_pem.as_bytes()));
-    let final_key = appendfs::crypto::parse_pem_unencrypted_key(&final_pem).unwrap();
-    assert_eq!(final_key, initial_key);
+    assert!(!is_encrypted_key_file(&final_pem));
+    assert_eq!(unlock_key_file(&final_pem, "").unwrap(), initial_key);
 
-    // 7. Verify legacy raw 64-hex key is also accepted by change-passphrase
+    // 7. A bare hex key from before key files had an envelope is refused, and left as it was
     let legacy_key_file = temp_dir.path().join("legacy.key");
-    std::fs::write(&legacy_key_file, format!("{}\n", hex::encode(initial_key))).unwrap();
+    let legacy_content = format!("{}\n", hex::encode(initial_key));
+    std::fs::write(&legacy_key_file, &legacy_content).unwrap();
     let out = run_appendfs_with_input(
         &["key", "change-passphrase", legacy_key_file.to_str().unwrap(), "--fast"],
         b"new_pass_for_legacy\n",
     );
-    assert!(out.status.success());
-    let upgraded_pem = std::fs::read_to_string(&legacy_key_file).unwrap();
-    assert!(appendfs::crypto::is_pem_encrypted_key(upgraded_pem.as_bytes()));
-    assert_eq!(
-        appendfs::crypto::decrypt_pem_key(&upgraded_pem, "new_pass_for_legacy").unwrap(),
-        initial_key
-    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("is not a valid key file"), "{}", stderr);
+    assert_eq!(std::fs::read_to_string(&legacy_key_file).unwrap(), legacy_content);
 }
 
 #[test]

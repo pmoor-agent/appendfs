@@ -648,7 +648,6 @@ fn dump_encrypted_summary_without_key(
     writeln!(out, "Next Inode:          {}", header.next_inode).unwrap();
     writeln!(out, "File Size:           {}", format_bytes(file_len)).unwrap();
     writeln!(out, "Encryption:          {}", volume_header.cipher).unwrap();
-    writeln!(out, "Unlocked by:         {}", volume_header.key_source).unwrap();
     writeln!(
         out,
         "Volume ID:           {}",
@@ -704,9 +703,6 @@ pub fn dump_summary_reader_with_path(
     writeln!(out, "Next Inode:          {}", reader.header.next_inode).unwrap();
     writeln!(out, "File Size:           {}", format_bytes(file_len)).unwrap();
     writeln!(out, "Encryption:          {}", reader.volume_header.cipher).unwrap();
-    if reader.volume_header.cipher.is_encrypted() {
-        writeln!(out, "Unlocked by:         {}", reader.volume_header.key_source).unwrap();
-    }
 
     // Checksum display
     let checksum_hex = reader
@@ -1426,7 +1422,6 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
-                revision: 0,
                 last_batch_id: 100,
                 next_inode: 4,
                 created_at: std::time::SystemTime::now(),
@@ -1663,20 +1658,14 @@ mod tests {
 
     #[test]
     fn test_dump_log_file_compression_encrypted_without_key() {
-        use crate::crypto::{KeySource, MasterKey, VolumeHeader};
+        use crate::crypto::{MasterKey, VolumeHeader};
 
         let dir = tempdir().unwrap();
         let storage = Arc::new(OsStorage::new(dir.path()));
         let clock = SystemClock;
 
         let master = MasterKey::new([0x33u8; 32]);
-        let (_header, vol_key) = VolumeHeader::new_encrypted(
-            &master,
-            [0x11u8; 16],
-            KeySource::KeyFile,
-            crate::compress::Compression::Zstd,
-        )
-        .unwrap();
+        let (_header, vol_key) = VolumeHeader::new_encrypted(&master, crate::compress::Compression::Zstd).unwrap();
 
         let writer = LogWriter::create(
             storage.clone(),

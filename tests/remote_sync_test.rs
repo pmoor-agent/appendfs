@@ -326,13 +326,7 @@ fn test_bootstrap_rebuilds_encrypted_active_log_from_parts() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let master = appendfs::crypto::MasterKey::new([0x42u8; 32]);
-    let (header, key) = VolumeHeader::new_encrypted(
-        &master,
-        [0u8; 16],
-        appendfs::crypto::KeySource::KeyFile,
-        appendfs::compress::Compression::None,
-    )
-    .unwrap();
+    let (header, key) = VolumeHeader::new_encrypted(&master, appendfs::compress::Compression::None).unwrap();
     let volume_key = Arc::new(key);
 
     let TestFs { fs, .. } = TestFs::builder()
@@ -3308,25 +3302,10 @@ fn test_revisioned_summary_replication_pruning_and_recovery() {
     let summary_unversioned = fs.export_summary(storage.as_ref()).unwrap();
     assert_eq!(summary_unversioned, "000001.summary");
 
-    // Read reader to create a revision 1 snapshot:
-    let reader =
-        appendfs::log::SummaryReader::open(storage.as_ref(), &summary_unversioned, fs.volume_key.clone()).unwrap();
-    let inodes = reader.read_all_inodes().unwrap();
-    let snapshot = appendfs::log::SummarySnapshot {
-        inodes: &inodes,
-        manifest: &reader.manifest,
-        volume_header: &reader.volume_header,
-        generation: reader.header.generation,
-        revision: 1,
-        last_batch_id: reader.header.last_batch_id,
-        next_inode: reader.header.next_inode,
-        created_at: reader.header.created_at,
-    };
-    let summary = appendfs::log::export_summary(&snapshot, storage.as_ref(), &fs.volume_key).unwrap();
-    assert_eq!(summary, "000001_r1.summary");
-
-    // Remove 000001.summary so only 000001_r1.summary exists on disk
-    storage.remove_file("000001.summary").unwrap();
+    // Nothing writes summary revisions any more, but volumes may still hold them - the
+    // retired `remove-passphrase` command wrote one. Revisions are told apart by file name
+    // alone, so a renamed copy stands in for one.
+    storage.rename("000001.summary", "000001_r1.summary").unwrap();
     assert!(!storage.exists("000001.summary"));
     assert!(storage.exists("000001_r1.summary"));
 

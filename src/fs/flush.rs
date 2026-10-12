@@ -821,7 +821,6 @@ impl AppendFs {
                 manifest: &manifest,
                 volume_header: &self.volume_header,
                 generation,
-                revision: 0,
                 last_batch_id,
                 next_inode,
                 created_at: now,
@@ -880,7 +879,6 @@ impl AppendFs {
                 manifest: &manifest,
                 volume_header: &self.volume_header,
                 generation: sealed_gen,
-                revision: 0,
                 last_batch_id,
                 next_inode,
                 created_at: now,
@@ -1077,13 +1075,8 @@ mod tests {
 
             let (volume_header, volume_key) = if encrypted {
                 let master = crate::crypto::MasterKey::new([0x42u8; 32]);
-                let (header, key) = crate::crypto::VolumeHeader::new_encrypted(
-                    &master,
-                    [0u8; 16],
-                    crate::crypto::KeySource::KeyFile,
-                    crate::compress::Compression::None,
-                )
-                .unwrap();
+                let (header, key) =
+                    crate::crypto::VolumeHeader::new_encrypted(&master, crate::compress::Compression::None).unwrap();
                 (header, Arc::new(key))
             } else {
                 (
@@ -1977,13 +1970,8 @@ mod tests {
         let clock = crate::clock::AdvancingClock::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
 
         let master = crate::crypto::MasterKey::new([0x42u8; 32]);
-        let (header, key) = crate::crypto::VolumeHeader::new_encrypted(
-            &master,
-            [0u8; 16],
-            crate::crypto::KeySource::KeyFile,
-            crate::compress::Compression::Zstd,
-        )
-        .unwrap();
+        let (header, key) =
+            crate::crypto::VolumeHeader::new_encrypted(&master, crate::compress::Compression::Zstd).unwrap();
         let fs = TestFs::builder()
             .storage(storage.clone())
             .clock(Arc::new(clock.clone()))

@@ -94,9 +94,6 @@ pub enum Commands {
     Fsck(FsckArgs),
     /// Manage remote S3-compatible replication targets
     Remote(RemoteSubcommandArgs),
-    /// Remove passphrase from an encrypted volume and emit a standalone secret key file
-    #[command(name = "remove-passphrase")]
-    RemovePassphrase(RemovePassphraseArgs),
     /// Manage encryption key files and passphrases
     Key(KeySubcommandArgs),
 }
@@ -293,19 +290,12 @@ pub struct DumpArgs {
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Path to key file for decrypting records (64 hex characters)
+    /// Path to the volume's key file, for decrypting records
     ///
-    /// Without this (and without --passphrase) the raw on-disk bytes are shown, which is
-    /// often what you want when inspecting structure.
+    /// Without this the raw on-disk bytes are shown, which is often what you want when
+    /// inspecting structure.
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
-
-    /// Prompt for the volume's passphrase in order to decrypt records
-    ///
-    /// Needed to read a passphrase-protected volume; combine with --key-file for a volume
-    /// that requires both.
-    #[arg(long = "passphrase", default_value_t = false)]
-    pub passphrase: bool,
 }
 
 #[derive(Args, Debug)]
@@ -313,18 +303,12 @@ pub struct InitArgs {
     /// Directory path where the appendfs volume log and summary files will be stored
     pub log_dir: PathBuf,
 
-    /// Encrypt with ChaCha20-Poly1305, unlocked by a key file: 64 hex characters, e.g. from
-    /// `openssl rand -hex 32`
+    /// Encrypt with ChaCha20-Poly1305 under the key in this key file, from `appendfs key init`
     ///
-    /// Add --passphrase to require both, so a stolen key file alone is useless.
+    /// Without it the volume is unencrypted. Either way the choice is fixed for the life of
+    /// the volume; the key file's passphrase, if any, can be changed at any time.
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
-
-    /// Encrypt with ChaCha20-Poly1305, unlocked by a passphrase prompted for interactively
-    ///
-    /// Combine with --key-file to require both.
-    #[arg(long = "passphrase", default_value_t = false)]
-    pub passphrase: bool,
 
     /// Compress record payloads with zstd before storing them (default: true)
     ///
@@ -382,22 +366,6 @@ pub struct InitArgs {
 }
 
 impl InitArgs {
-    /// Resolves the requested credential mode from the encryption flags.
-    ///
-    /// The two flags are orthogonal and between them name every mode, so there is no
-    /// separate "encrypt" switch: naming a credential *is* the request to encrypt, and
-    /// naming none leaves the volume plaintext. Whichever mode this picks is recorded in the
-    /// volume and required at every mount thereafter; it cannot be changed later.
-    pub fn key_source(&self) -> crate::crypto::KeySource {
-        use crate::crypto::KeySource;
-        match (self.key_file.is_some(), self.passphrase) {
-            (true, true) => KeySource::KeyFileAndPassphrase,
-            (true, false) => KeySource::KeyFile,
-            (false, true) => KeySource::Passphrase,
-            (false, false) => KeySource::None,
-        }
-    }
-
     /// The compression policy to record in the volume header. Also fixed at init.
     pub fn compression(&self) -> crate::compress::Compression {
         if self.no_compress || self.compress == Some(false) {
@@ -425,13 +393,9 @@ pub struct MountCommonArgs {
     #[arg(short = 'o', value_delimiter = ',')]
     pub fuse_options: Vec<String>,
 
-    /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
+    /// Path to the volume's key file (required for encrypted volumes)
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
-
-    /// Prompt for the volume's passphrase in order to unlock volume
-    #[arg(long = "passphrase", default_value_t = false)]
-    pub passphrase: bool,
 
     /// Maximum size in bytes of in-memory decrypted record cache (default: 128 MiB)
     #[arg(long = "decrypted-cache-size", default_value_t = DEFAULT_DECRYPTED_CACHE_SIZE)]
@@ -596,13 +560,9 @@ pub struct StatsArgs {
     /// Directory path where the appendfs volume log and summary files are stored
     pub log_dir: PathBuf,
 
-    /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
+    /// Path to the volume's key file (required for encrypted volumes)
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
-
-    /// Prompt for the volume's passphrase in order to unlock volume
-    #[arg(long = "passphrase", default_value_t = false)]
-    pub passphrase: bool,
 }
 
 #[derive(Args, Debug)]
@@ -635,13 +595,9 @@ pub struct FsckArgs {
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
+    /// Path to the volume's key file (required for encrypted volumes)
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
-
-    /// Prompt for the volume's passphrase in order to unlock volume
-    #[arg(long = "passphrase", default_value_t = false)]
-    pub passphrase: bool,
 }
 
 impl FsckArgs {
@@ -660,24 +616,6 @@ impl FsckArgs {
             None
         }
     }
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct RemovePassphraseArgs {
-    /// Volume log directory containing the appendfs volume
-    pub log_dir: PathBuf,
-
-    /// Path to current 32-byte hex key file (required when volume uses a key file)
-    #[arg(long = "key-file")]
-    pub key_file: Option<PathBuf>,
-
-    /// Path to write the new secret key file without passphrase requirement
-    #[arg(long = "new-key-file", alias = "out-key-file")]
-    pub new_key_file: PathBuf,
-
-    /// Prompt for an encryption passphrase to unlock the volume
-    #[arg(long = "passphrase", default_value_t = false)]
-    pub passphrase: bool,
 }
 
 /// Parses a 64-bit integer seed from decimal or hexadecimal format (e.g. `12345` or `0x1a2b`).
