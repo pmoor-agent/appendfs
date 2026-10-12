@@ -60,14 +60,16 @@ Create a directory where AppendFS will store its log files and initialize the vo
 appendfs init /var/lib/appendfs_logs
 
 # Encrypted volume: generate a key file (prompts for an optional passphrase), then use it
-appendfs key init mykey.key
+appendfs key init -o mykey.key
 appendfs init --key-file mykey.key /var/lib/appendfs_logs
 
-# Add, change, or remove the key file's passphrase later; the volume is untouched
-appendfs key change-passphrase mykey.key
+# Add, change, or remove the key file's passphrase later; the volume is untouched.
+# This writes a new key file and leaves the old one for you to remove once it is replaced.
+appendfs key change-passphrase mykey.key -o mykey-new.key
 ```
 
-Back up the key file: it is not stored in the volume, and losing it loses the volume.
+Back up the key file: it is not stored in the volume, and losing it loses the volume. Key
+commands never overwrite an existing file.
 
 ### 2. Mount the Filesystem
 
