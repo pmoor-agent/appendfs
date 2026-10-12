@@ -241,6 +241,16 @@ impl RemoteTargetConfig {
         self
     }
 
+    pub fn with_force_path_style(mut self, enabled: bool) -> Self {
+        self.force_path_style = Some(enabled);
+        self
+    }
+
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
+    }
+
     pub fn validate(&self, name: &str) -> io::Result<()> {
         if self.upload_partial_logs == Some(true) && self.mode != RemoteMode::ReadWrite {
             return Err(io::Error::new(
@@ -312,7 +322,7 @@ impl RemoteTargetConfig {
         let signer = creds.map(|(k, s)| SigV4Signer::new(k, s, &self.region));
 
         let force_path = self.force_path_style.unwrap_or_else(|| {
-            // Default to path style if custom endpoint with explicit port, localhost, or IP address
+            // Default to path style if custom endpoint with explicit port, localhost, IP address, or Google Cloud Storage
             if let Some(ref ep) = self.endpoint {
                 let host_part = ep
                     .trim_start_matches("https://")
@@ -320,7 +330,10 @@ impl RemoteTargetConfig {
                     .split('/')
                     .next()
                     .unwrap_or("");
-                host_part.contains("localhost") || host_part.contains("127.0.0.1") || host_part.contains(':')
+                host_part.contains("localhost")
+                    || host_part.contains("127.0.0.1")
+                    || host_part.contains(':')
+                    || host_part.contains("googleapis.com")
             } else {
                 false
             }
@@ -798,5 +811,39 @@ SECRET_ACCESS_KEY='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
 
         let store = cfg2.build_store();
         assert!(format!("{:?}", store).contains("S3RemoteStore"));
+    }
+
+    #[test]
+    fn test_force_path_style_detection_and_builder() {
+        // 1. Google Cloud Storage regional and global endpoints auto-detect force_path_style = true
+        let gcs_regional = RemoteTargetConfig::new("appendfs-remote")
+            .with_endpoint("https://storage.europe-west4.rep.googleapis.com")
+            .build_store();
+        assert!(format!("{:?}", gcs_regional).contains("force_path_style: true"));
+
+        let gcs_global = RemoteTargetConfig::new("appendfs-remote")
+            .with_endpoint("https://storage.googleapis.com")
+            .build_store();
+        assert!(format!("{:?}", gcs_global).contains("force_path_style: true"));
+
+        // 2. Standard endpoints default to force_path_style = false
+        let standard_s3 = RemoteTargetConfig::new("my-bucket")
+            .with_endpoint("https://s3.amazonaws.com")
+            .build_store();
+        assert!(format!("{:?}", standard_s3).contains("force_path_style: false"));
+
+        // 3. Explicit builder overrides default to true
+        let explicit_true = RemoteTargetConfig::new("my-bucket")
+            .with_endpoint("https://s3.amazonaws.com")
+            .with_force_path_style(true)
+            .build_store();
+        assert!(format!("{:?}", explicit_true).contains("force_path_style: true"));
+
+        // 4. Explicit builder overrides googleapis detection to false
+        let explicit_false = RemoteTargetConfig::new("appendfs-remote")
+            .with_endpoint("https://storage.europe-west4.rep.googleapis.com")
+            .with_force_path_style(false)
+            .build_store();
+        assert!(format!("{:?}", explicit_false).contains("force_path_style: false"));
     }
 }

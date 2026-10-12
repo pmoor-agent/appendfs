@@ -208,7 +208,7 @@ pub struct RemoteAddArgs {
     pub credentials_file: Option<PathBuf>,
 
     /// Force S3 path-style addressing (http://endpoint/bucket/key)
-    #[arg(long = "path-style")]
+    #[arg(long = "path-style", num_args = 0..=1, default_missing_value = "true")]
     pub path_style: Option<bool>,
 
     /// Upload incremental active log parts to this remote before generation seals (default: true)
@@ -338,6 +338,15 @@ pub struct InitArgs {
     /// Path to file containing credentials for bootstrap remote (line 1: access key, line 2: secret key, or key=value / INI format)
     #[arg(long = "remote-credentials-file", alias = "credentials-file")]
     pub remote_credentials_file: Option<PathBuf>,
+
+    /// Force S3 path-style addressing for bootstrap remote (http://endpoint/bucket/key)
+    #[arg(
+        long = "remote-path-style",
+        alias = "path-style",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub remote_path_style: Option<bool>,
 }
 
 impl InitArgs {
