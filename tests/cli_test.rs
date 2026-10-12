@@ -1474,3 +1474,240 @@ fn test_volume_lifecycle_with_encrypted_key_file() {
         b"data protected by encrypted key file"
     );
 }
+
+#[test]
+fn test_init_from_remote_credentials_file_validation() {
+    let temp_dir = TempDir::new().unwrap();
+    let log_dir = temp_dir.path().join("vol_bootstrap");
+    let missing_creds = temp_dir.path().join("non_existent_creds.txt");
+
+    // 1. Missing credentials file via --remote-credentials-file must fail early
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "init",
+            log_dir.to_str().unwrap(),
+            "--from-remote",
+            "origin",
+            "--remote-bucket",
+            "my-bucket",
+            "--remote-credentials-file",
+            missing_creds.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run init");
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not exist") || stderr.contains("No such file or directory"),
+        "stderr was: {}",
+        stderr
+    );
+
+    // 2. Missing credentials file via --credentials-file alias must also fail early
+    let out_alias = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "init",
+            log_dir.to_str().unwrap(),
+            "--from-remote",
+            "origin",
+            "--remote-bucket",
+            "my-bucket",
+            "--credentials-file",
+            missing_creds.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run init");
+
+    assert!(!out_alias.status.success());
+    let stderr_alias = String::from_utf8_lossy(&out_alias.stderr);
+    assert!(
+        stderr_alias.contains("does not exist") || stderr_alias.contains("No such file or directory"),
+        "stderr was: {}",
+        stderr_alias
+    );
+
+    // 3. Invalid credentials file (single line) must fail
+    let invalid_creds = temp_dir.path().join("invalid_creds.txt");
+    std::fs::write(&invalid_creds, "ONLY_ONE_LINE\n").unwrap();
+
+    let out_invalid = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "init",
+            log_dir.to_str().unwrap(),
+            "--from-remote",
+            "origin",
+            "--remote-bucket",
+            "my-bucket",
+            "--remote-credentials-file",
+            invalid_creds.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run init");
+
+    assert!(!out_invalid.status.success());
+    let stderr_invalid = String::from_utf8_lossy(&out_invalid.stderr);
+    assert!(
+        stderr_invalid.contains("does not contain valid access key and secret key"),
+        "stderr was: {}",
+        stderr_invalid
+    );
+
+    // 4. Remote add with missing credentials file must also fail early
+    let out_remote_add = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remote",
+            "add",
+            temp_dir.path().to_str().unwrap(),
+            "origin",
+            "--bucket",
+            "my-bucket",
+            "--credentials-file",
+            missing_creds.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run remote add");
+
+    assert!(!out_remote_add.status.success());
+    let stderr_add = String::from_utf8_lossy(&out_remote_add.stderr);
+    assert!(
+        stderr_add.contains("does not exist") || stderr_add.contains("No such file or directory"),
+        "stderr was: {}",
+        stderr_add
+    );
+}
+
+#[test]
+fn test_init_from_remote_with_credentials_file_e2e() {
+    let temp_dir = TempDir::new().unwrap();
+    let source_dir = temp_dir.path().join("source_vol");
+
+    // Initialize source volume so we have a valid volume summary
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["init", source_dir.to_str().unwrap()])
+        .output()
+        .expect("failed to init source vol");
+    assert!(init_out.status.success());
+
+    let summary_bytes = std::fs::read(source_dir.join("000000.summary")).unwrap();
+    let summary_len = summary_bytes.len();
+
+    // Start mock S3 server
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = std::thread::spawn(move || {
+        use std::io::BufRead;
+        // Request 1: list_objects
+        let (mut stream1, _) = listener.accept().unwrap();
+        let mut reader1 = std::io::BufReader::new(stream1.try_clone().unwrap());
+        let mut headers1 = Vec::new();
+        let mut line = String::new();
+        while reader1.read_line(&mut line).unwrap() > 0 {
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            headers1.push(line.trim().to_string());
+            line.clear();
+        }
+
+        let list_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>test-bucket</Name>
+    <Prefix></Prefix>
+    <KeyCount>1</KeyCount>
+    <MaxKeys>1000</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+    <Contents>
+        <Key>000000.summary</Key>
+        <Size>{}</Size>
+    </Contents>
+</ListBucketResult>"#,
+            summary_len
+        );
+
+        let resp1 = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            list_xml.len(),
+            list_xml
+        );
+        stream1.write_all(resp1.as_bytes()).unwrap();
+        stream1.flush().unwrap();
+        drop(stream1);
+
+        // Request 2: get_object 000000.summary
+        let (mut stream2, _) = listener.accept().unwrap();
+        let mut reader2 = std::io::BufReader::new(stream2.try_clone().unwrap());
+        let mut headers2 = Vec::new();
+        line.clear();
+        while reader2.read_line(&mut line).unwrap() > 0 {
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            headers2.push(line.trim().to_string());
+            line.clear();
+        }
+
+        let resp2 = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            summary_bytes.len()
+        );
+        stream2.write_all(resp2.as_bytes()).unwrap();
+        stream2.write_all(&summary_bytes).unwrap();
+        stream2.flush().unwrap();
+        drop(stream2);
+
+        (headers1, headers2)
+    });
+
+    // Write INI-style credentials file to verify full parsing
+    let creds_file = temp_dir.path().join("aws_creds.ini");
+    std::fs::write(
+        &creds_file,
+        "[default]\naws_access_key_id = BOOTSTRAP_KEY_123\naws_secret_access_key = BOOTSTRAP_SECRET_456\n",
+    )
+    .unwrap();
+
+    let bootstrap_dir = temp_dir.path().join("bootstrapped_vol");
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "init",
+            bootstrap_dir.to_str().unwrap(),
+            "--from-remote",
+            "cloud_origin",
+            "--remote-bucket",
+            "test-bucket",
+            "--remote-endpoint",
+            &format!("http://{}", addr),
+            "--remote-credentials-file",
+            creds_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run bootstrap init");
+
+    assert!(
+        out.status.success(),
+        "bootstrap init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(bootstrap_dir.join("000000.summary").exists());
+    assert!(bootstrap_dir.join("remotes.toml").exists());
+
+    let remotes_toml = std::fs::read_to_string(bootstrap_dir.join("remotes.toml")).unwrap();
+    assert!(remotes_toml.contains("credentials_file"));
+    assert!(remotes_toml.contains(creds_file.to_str().unwrap()));
+
+    let (headers1, headers2) = server_handle.join().unwrap();
+    let auth1 = headers1
+        .iter()
+        .find(|h| h.to_ascii_lowercase().starts_with("authorization:"))
+        .expect("authorization header on list request");
+    assert!(auth1.contains("BOOTSTRAP_KEY_123"));
+
+    let auth2 = headers2
+        .iter()
+        .find(|h| h.to_ascii_lowercase().starts_with("authorization:"))
+        .expect("authorization header on get request");
+    assert!(auth2.contains("BOOTSTRAP_KEY_123"));
+}

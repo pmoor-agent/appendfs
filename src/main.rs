@@ -200,12 +200,47 @@ fn cmd_init(args: InitArgs) {
             std::process::exit(1);
         }
 
+        if let Some(ref creds_path) = args.remote_credentials_file
+            && let Err(e) = appendfs::remote::read_credentials_file(creds_path)
+        {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        if let Some(ref key_env) = args.remote_access_key_id_env
+            && std::env::var(key_env).is_err()
+        {
+            eprintln!("Error: Environment variable '{}' is not set.", key_env);
+            std::process::exit(1);
+        }
+        if let Some(ref secret_env) = args.remote_secret_access_key_env
+            && std::env::var(secret_env).is_err()
+        {
+            eprintln!("Error: Environment variable '{}' is not set.", secret_env);
+            std::process::exit(1);
+        }
+
         let remote_cfg = if let Some(cfg) = registry.get_remote(remote_name) {
             if cfg.mode == appendfs::remote::RemoteMode::WriteOnly {
                 eprintln!("Error: Cannot bootstrap an initial filesystem from a write-only remote.");
                 std::process::exit(1);
             }
-            cfg.clone()
+            let mut cfg = cfg.clone();
+            if let Some(ref creds_file) = args.remote_credentials_file {
+                cfg.credentials_file = Some(creds_file.clone());
+            }
+            if let Some(ref key_id) = args.remote_access_key_id {
+                cfg.access_key_id = Some(key_id.clone());
+            }
+            if let Some(ref secret) = args.remote_secret_access_key {
+                cfg.secret_access_key = Some(secret.clone());
+            }
+            if let Some(ref key_env) = args.remote_access_key_id_env {
+                cfg.access_key_id_env = Some(key_env.clone());
+            }
+            if let Some(ref secret_env) = args.remote_secret_access_key_env {
+                cfg.secret_access_key_env = Some(secret_env.clone());
+            }
+            cfg
         } else if let Some(ref path) = args.remote_path {
             let mut cfg = appendfs::remote::RemoteTargetConfig::new_path(path);
             cfg.mode = args.remote_mode;
@@ -218,6 +253,9 @@ fn cmd_init(args: InitArgs) {
             cfg.mode = args.remote_mode;
             cfg.access_key_id = args.remote_access_key_id.clone();
             cfg.secret_access_key = args.remote_secret_access_key.clone();
+            cfg.access_key_id_env = args.remote_access_key_id_env.clone();
+            cfg.secret_access_key_env = args.remote_secret_access_key_env.clone();
+            cfg.credentials_file = args.remote_credentials_file.clone();
             cfg
         } else {
             eprintln!(
@@ -843,6 +881,12 @@ fn cmd_remote_add(add_args: RemoteAddArgs) {
     cfg.secret_access_key = add_args.secret_access_key;
     cfg.access_key_id_env = add_args.access_key_id_env;
     cfg.secret_access_key_env = add_args.secret_access_key_env;
+    if let Some(ref creds_file) = add_args.credentials_file
+        && let Err(e) = appendfs::remote::read_credentials_file(creds_file)
+    {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
     cfg.credentials_file = add_args.credentials_file;
     cfg.force_path_style = add_args.path_style;
     cfg.storage_class = add_args.storage_class;

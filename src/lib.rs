@@ -59,7 +59,8 @@ pub use remote::{
     DEFAULT_DECRYPTED_CACHE_SIZE, DEFAULT_POLL_INTERVAL, DecryptedRecordCache, FollowerBlock, MemoryBlockCache,
     OnDiskBlockCache, PruneContext, PruneExpr, RemoteMode, RemoteObject, RemoteReadCoalescer, RemoteReadTarget,
     RemoteRegistry, RemoteReplicationWorker, RemoteStore, RemoteTargetConfig, ReplicationPolicy, S3RemoteStore,
-    TMP_FILE_MAX_AGE, TieredCache, TieredStorageReader, prepare_remote_recovery_for_target,
+    TMP_FILE_MAX_AGE, TieredCache, TieredStorageReader, parse_credentials_content, prepare_remote_recovery_for_target,
+    read_credentials_file,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use remote::{CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, MockRemoteStore, RemoteStoreMetrics};
