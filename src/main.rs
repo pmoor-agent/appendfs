@@ -240,6 +240,9 @@ fn cmd_init(args: InitArgs) {
             if let Some(ref secret_env) = args.remote_secret_access_key_env {
                 cfg.secret_access_key_env = Some(secret_env.clone());
             }
+            if let Some(path_style) = args.remote_path_style {
+                cfg.force_path_style = Some(path_style);
+            }
             cfg
         } else if let Some(ref path) = args.remote_path {
             let mut cfg = appendfs::remote::RemoteTargetConfig::new_path(path);
@@ -256,6 +259,7 @@ fn cmd_init(args: InitArgs) {
             cfg.access_key_id_env = args.remote_access_key_id_env.clone();
             cfg.secret_access_key_env = args.remote_secret_access_key_env.clone();
             cfg.credentials_file = args.remote_credentials_file.clone();
+            cfg.force_path_style = args.remote_path_style;
             cfg
         } else {
             eprintln!(

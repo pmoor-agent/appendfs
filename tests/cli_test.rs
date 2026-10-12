@@ -1711,3 +1711,213 @@ fn test_init_from_remote_with_credentials_file_e2e() {
         .expect("authorization header on get request");
     assert!(auth2.contains("BOOTSTRAP_KEY_123"));
 }
+
+#[test]
+fn test_remote_add_path_style_flags() {
+    let temp_dir = TempDir::new().unwrap();
+    let vol_dir = temp_dir.path().join("vol");
+
+    // Initialize volume
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["init", vol_dir.to_str().unwrap()])
+        .output()
+        .expect("failed to init vol");
+    assert!(init_out.status.success());
+
+    // 1. --path-style as a boolean flag without explicit value defaults to true
+    let add_out1 = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remote",
+            "add",
+            vol_dir.to_str().unwrap(),
+            "gcs_store",
+            "--bucket",
+            "my-gcs-bucket",
+            "--endpoint",
+            "https://storage.europe-west4.rep.googleapis.com",
+            "--path-style",
+        ])
+        .output()
+        .expect("failed to run remote add");
+    assert!(
+        add_out1.status.success(),
+        "remote add failed: {}",
+        String::from_utf8_lossy(&add_out1.stderr)
+    );
+
+    let remotes_toml1 = std::fs::read_to_string(vol_dir.join("remotes.toml")).unwrap();
+    assert!(remotes_toml1.contains("force_path_style = true"));
+
+    // 2. --path-style false explicitly sets false
+    let add_out2 = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "remote",
+            "add",
+            vol_dir.to_str().unwrap(),
+            "s3_virtual",
+            "--bucket",
+            "my-aws-bucket",
+            "--endpoint",
+            "https://s3.amazonaws.com",
+            "--path-style",
+            "false",
+        ])
+        .output()
+        .expect("failed to run remote add");
+    assert!(
+        add_out2.status.success(),
+        "remote add failed: {}",
+        String::from_utf8_lossy(&add_out2.stderr)
+    );
+
+    let remotes_toml2 = std::fs::read_to_string(vol_dir.join("remotes.toml")).unwrap();
+    assert!(remotes_toml2.contains("force_path_style = false"));
+}
+
+#[test]
+fn test_init_from_remote_path_style_flag_and_toml_persistence() {
+    let temp_dir = TempDir::new().unwrap();
+    let source_dir = temp_dir.path().join("source_vol");
+
+    // Initialize source volume so we have a valid volume summary
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["init", source_dir.to_str().unwrap()])
+        .output()
+        .expect("failed to init source vol");
+    assert!(init_out.status.success());
+
+    let summary_bytes = std::fs::read(source_dir.join("000000.summary")).unwrap();
+    let summary_len = summary_bytes.len();
+
+    // Start mock server that records requested URIs
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut request_lines = Vec::new();
+
+        // 2 requests expected: list_objects, then get_object
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).unwrap();
+            request_lines.push(first_line.trim().to_string());
+
+            let mut header_line = String::new();
+            while reader.read_line(&mut header_line).unwrap() > 0 {
+                if header_line == "\r\n" || header_line == "\n" {
+                    break;
+                }
+                header_line.clear();
+            }
+
+            if first_line.contains("list-type=2") {
+                let list_xml = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>my-bucket</Name>
+    <Prefix></Prefix>
+    <KeyCount>1</KeyCount>
+    <MaxKeys>1000</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+    <Contents>
+        <Key>000000.summary</Key>
+        <Size>{}</Size>
+    </Contents>
+</ListBucketResult>"#,
+                    summary_len
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    list_xml.len(),
+                    list_xml
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            } else {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    summary_bytes.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.write_all(&summary_bytes).unwrap();
+            }
+            stream.flush().unwrap();
+        }
+
+        request_lines
+    });
+
+    let creds_file = temp_dir.path().join("creds.txt");
+    std::fs::write(&creds_file, "TEST_KEY\nTEST_SECRET\n").unwrap();
+
+    let bootstrap_dir = temp_dir.path().join("bootstrapped_vol");
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "init",
+            bootstrap_dir.to_str().unwrap(),
+            "--from-remote",
+            "gcs_backup",
+            "--remote-bucket",
+            "my-bucket",
+            "--remote-endpoint",
+            &format!("http://{}", addr),
+            "--remote-credentials-file",
+            creds_file.to_str().unwrap(),
+            "--remote-path-style",
+        ])
+        .output()
+        .expect("failed to run bootstrap init");
+
+    assert!(
+        out.status.success(),
+        "bootstrap init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Verify remotes.toml persists force_path_style = true
+    let remotes_toml = std::fs::read_to_string(bootstrap_dir.join("remotes.toml")).unwrap();
+    assert!(remotes_toml.contains("force_path_style = true"));
+
+    let reqs = server_handle.join().unwrap();
+    assert_eq!(reqs.len(), 2);
+    assert!(
+        reqs[0].starts_with("GET /my-bucket?list-type=2"),
+        "request 0 was: {}",
+        reqs[0]
+    );
+    assert!(
+        reqs[1].starts_with("GET /my-bucket/000000.summary"),
+        "request 1 was: {}",
+        reqs[1]
+    );
+
+    // Also verify --path-style alias works on init
+    let bootstrap_dir2 = temp_dir.path().join("bootstrapped_vol2");
+    let out2 = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "init",
+            bootstrap_dir2.to_str().unwrap(),
+            "--from-remote",
+            "gcs_backup2",
+            "--remote-bucket",
+            "my-bucket",
+            "--remote-endpoint",
+            "https://storage.europe-west4.rep.googleapis.com",
+            "--credentials-file",
+            creds_file.to_str().unwrap(),
+            "--path-style",
+        ])
+        .output()
+        .expect("failed to parse init with aliases");
+
+    // The command might fail at network connection because https://storage.europe-west4... is not real credentials,
+    // but the argument parsing should succeed (not exit with clap usage error).
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(
+        !stderr2.contains("error: unexpected argument") && !stderr2.contains("Usage:"),
+        "clap failed on --path-style alias: {}",
+        stderr2
+    );
+}
