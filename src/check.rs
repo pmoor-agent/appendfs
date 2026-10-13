@@ -624,6 +624,10 @@ fn verify_raw_record(
 /// 1 MiB blocks containing live data across the entire volume. Records crossing 1 MiB block boundaries
 /// automatically expand the required fetch set to include the full span of blocks needed for complete decryption,
 /// and all live extents completely covered by the resulting block set are verified.
+///
+/// Seed blocks are continuously selected from a random shuffle across the volume and expanded across
+/// multi-block record boundaries until the accumulated block count reaches the target number of blocks,
+/// ensuring planned read traffic closely matches the requested sampling percentage even with large extents.
 #[allow(clippy::too_many_lines)]
 pub fn plan_sampled_verification(fs: &AppendFs, options: &CheckOptions) -> VerificationPlan {
     let base_map = fs.inner.lock(OpTag::Stats).unwrap().base.clone();
@@ -751,7 +755,8 @@ pub fn plan_sampled_verification(fs: &AppendFs, options: &CheckOptions) -> Verif
         targets.insert(None);
     }
 
-    // 5. Sample blocks across the entire volume based on total block count
+    // 5. Sample blocks across the entire volume by continuously expanding records until the
+    // accumulated expanded block count reaches the target number of blocks.
     let total_live_blocks = all_live_blocks.len();
     let selected_blocks = if total_live_blocks == 0 || options.sample_percent <= 0.0 {
         Vec::new()
@@ -763,9 +768,34 @@ pub fn plan_sampled_verification(fs: &AppendFs, options: &CheckOptions) -> Verif
             .max(1)
             .min(total_live_blocks);
         all_live_blocks.shuffle(&mut rng);
-        all_live_blocks.truncate(target_blocks);
-        all_live_blocks.sort_unstable();
-        all_live_blocks
+
+        let mut seed_blocks = Vec::new();
+        let mut seen_blocks = HashSet::new();
+
+        for &(generation, blk) in &all_live_blocks {
+            if seen_blocks.contains(&(generation, blk)) {
+                continue;
+            }
+
+            if let Some(records) = records_by_gen_block.get(&(generation, blk)) {
+                for rec in records {
+                    let start_blk = rec.record_log_offset / BLOCK_SIZE;
+                    let end_blk = (rec.record_log_offset + rec.record_size as u64).saturating_sub(1) / BLOCK_SIZE;
+                    for b in start_blk..=end_blk {
+                        seen_blocks.insert((generation, b));
+                    }
+                }
+            }
+            seen_blocks.insert((generation, blk));
+            seed_blocks.push((generation, blk));
+
+            if seen_blocks.len() >= target_blocks {
+                break;
+            }
+        }
+
+        seed_blocks.sort_unstable();
+        seed_blocks
     };
 
     // 6. Assign selected blocks to targets in contiguous ranges, expanding straddling records.
@@ -3172,6 +3202,46 @@ mod tests {
             total_sampled_blocks <= 2,
             "10% sample of 10 blocks should fetch 1-2 blocks, fetched: {}",
             total_sampled_blocks
+        );
+
+        let report = check_fs_integrity(&fs, None, &opts, Some(&plan), None);
+        assert!(report.is_clean(), "issues: {:?}", report.issues);
+        assert_eq!(report.sampled_blocks, total_sampled_blocks);
+    }
+
+    #[test]
+    fn test_sampled_verification_multi_megabyte_extent_expansion_correction() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
+        fs.max_extent_size = 4 * 1024 * 1024;
+
+        // Create 10 files of ~3 MiB each (total ~30 MiB / 30 1-MiB blocks)
+        let payload = vec![0x55u8; 3 * 1024 * 1024];
+        for i in 1..=10 {
+            let f = fs.create_file(1, &format!("media_{}.bin", i), 0o644).unwrap();
+            fs.write_at(f, &payload, 0).unwrap();
+        }
+        fs.quiesce().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
+
+        // 10% sampling across volume:
+        // Volume has ~30 1-MiB blocks across 10 records.
+        // Without extent correction, 10% sampling would select 3 seed blocks, which expand
+        // to ~9-12 blocks (~30-40% of the volume).
+        // With extent correction, ~1 seed block is selected, expanding to ~3 blocks (~10% of the volume).
+        let opts = CheckOptions::sampled(10.0, Some(12345));
+        let plan = plan_sampled_verification(&fs, &opts);
+        let total_sampled_blocks = plan.total_blocks();
+
+        assert!(
+            total_sampled_blocks <= 7,
+            "10% sample of 30 blocks with ~3 MiB extents should fetch <= 7 blocks (1 seed block), got: {}",
+            total_sampled_blocks
+        );
+        assert!(
+            plan.sampled_record_bytes <= 7 * 1024 * 1024,
+            "Sampled record bytes ({}) should be <= 7 MiB (at most 2 boundary records), not ~15-20 MiB",
+            plan.sampled_record_bytes
         );
 
         let report = check_fs_integrity(&fs, None, &opts, Some(&plan), None);
