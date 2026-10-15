@@ -466,7 +466,7 @@ pub fn backfill_summary_salts(
                 ));
             }
 
-            log_entry.key_salt = Some(file_header.key_salt);
+            log_entry.update_from_file_header(&file_header);
             updated_count += 1;
         }
     }

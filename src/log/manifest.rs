@@ -85,6 +85,41 @@ impl LogFileInfo {
     pub fn is_sealed(&self) -> bool {
         self.sealed_at.is_some()
     }
+
+    /// Reconstructs the log's `FileHeader` from manifest metadata if `key_salt` is present.
+    pub fn file_header(&self) -> Option<crate::log::record::FileHeader> {
+        let key_salt = self.key_salt?;
+        Some(crate::log::record::FileHeader {
+            magic: crate::log::record::FILE_MAGIC,
+            version: self.version,
+            generation: self.generation,
+            revision: self.revision,
+            created_at: self.created_at,
+            key_salt,
+        })
+    }
+
+    /// Updates all header-derived fields on this `LogFileInfo` from a `FileHeader`.
+    ///
+    /// By exhaustively matching every field of `FileHeader` (except `magic`),
+    /// this guarantees at compile time that adding new fields to `FileHeader`
+    /// requires updating `LogFileInfo` as well.
+    pub fn update_from_file_header(&mut self, header: &crate::log::record::FileHeader) {
+        let crate::log::record::FileHeader {
+            magic: _,
+            version,
+            generation,
+            revision,
+            created_at,
+            key_salt,
+        } = *header;
+
+        self.version = version;
+        self.generation = generation;
+        self.revision = revision;
+        self.created_at = created_at;
+        self.key_salt = Some(key_salt);
+    }
 }
 
 /// Returns the physical filename for a given log generation (e.g. "000001.log").
@@ -498,5 +533,58 @@ mod tests {
         manifest.record_sealed_log(log2.clone());
         assert_eq!(manifest.latest_log(), Some(&log2));
         assert_eq!(manifest.latest_generation(), Some(3));
+    }
+
+    #[test]
+    fn test_all_file_header_fields_present_in_manifest() {
+        use crate::log::record::{FILE_MAGIC, FileHeader};
+
+        let header = FileHeader {
+            magic: FILE_MAGIC,
+            version: 1,
+            generation: 42,
+            revision: 3,
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(12345),
+            key_salt: [0x77; 16],
+        };
+
+        // 1. Compile-time enforcement:
+        // Exhaustively destructure FileHeader without wildcard `..`.
+        // If ANY field is added to FileHeader in the future, this pattern match
+        // will fail compilation unless explicitly updated here.
+        let FileHeader {
+            magic: _,
+            version,
+            generation,
+            revision,
+            created_at,
+            key_salt,
+        } = header;
+
+        // 2. Ensure each field is mapped to LogFileInfo:
+        let mut info = LogFileInfo {
+            version: 0,
+            generation: 0,
+            revision: 0,
+            filename: "000042_r3.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 5,
+            total_bytes: 1024,
+            total_data_bytes: 512,
+            md5: [0u8; 16],
+            sealed_at: None,
+            key_salt: None,
+        };
+
+        info.update_from_file_header(&header);
+
+        assert_eq!(info.version, version);
+        assert_eq!(info.generation, generation);
+        assert_eq!(info.revision, revision);
+        assert_eq!(info.created_at, created_at);
+        assert_eq!(info.key_salt, Some(key_salt));
+
+        // 3. Verify LogFileInfo::file_header reconstructs the exact header:
+        assert_eq!(info.file_header(), Some(header));
     }
 }

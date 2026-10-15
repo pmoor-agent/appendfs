@@ -116,7 +116,7 @@ impl LogFileCache {
                 && let Ok(mut man) = m.write()
                 && let Some(log_entry) = man.logs.iter_mut().find(|l| l.generation == generation)
             {
-                log_entry.key_salt = Some(header.key_salt);
+                log_entry.update_from_file_header(&header);
             }
             Arc::new(volume_key.log_file_key(&header.key_salt))
         };
