@@ -1,8 +1,8 @@
 #![cfg_attr(not(test), deny(clippy::too_many_lines))]
 use appendfs::cli::{
-    Cli, Commands, DumpArgs, FsckArgs, InitArgs, KeyChangePassphraseArgs, KeyCommands, KeyInitArgs, KeySubcommandArgs,
-    MountArgs, MountCommonArgs, MountRoArgs, RemoteAddArgs, RemoteCommands, RemoteListArgs, RemoteRmArgs,
-    RemoteSubcommandArgs, StatsArgs,
+    BackfillSaltsArgs, Cli, Commands, DumpArgs, FsckArgs, InitArgs, KeyChangePassphraseArgs, KeyCommands, KeyInitArgs,
+    KeySubcommandArgs, MountArgs, MountCommonArgs, MountRoArgs, RemoteAddArgs, RemoteCommands, RemoteListArgs,
+    RemoteRmArgs, RemoteSubcommandArgs, StatsArgs,
 };
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{
@@ -137,6 +137,7 @@ fn main() {
         Commands::Fsck(args) => cmd_fsck(args),
         Commands::Remote(subargs) => cmd_remote(subargs),
         Commands::Key(subargs) => cmd_key(subargs),
+        Commands::BackfillSalts(args) => cmd_backfill_salts(args),
     }
 }
 
@@ -165,6 +166,7 @@ fn default_volume_log(command: &Commands) -> Option<PathBuf> {
         Commands::MountRo(args) => (args.log_dir.clone(), false),
         Commands::Stats(args) => (args.log_dir.clone(), false),
         Commands::Fsck(args) => (args.log_dir.clone(), false),
+        Commands::BackfillSalts(args) => (args.log_dir.clone(), false),
         // `dump` names a log file rather than a volume, so log beside it.
         Commands::Dump(args) => (args.file.parent()?.to_path_buf(), false),
         Commands::Remote(sub) => match sub.command {
@@ -851,6 +853,33 @@ fn cmd_fsck(args: FsckArgs) {
     print!("{}", combined_report.format_report(Some(log_dir), args.verbose > 0));
     if !combined_report.is_clean() {
         std::process::exit(1);
+    }
+}
+
+fn cmd_backfill_salts(args: BackfillSaltsArgs) {
+    let OpenVolumeStorage { storage, volume_key } = match open_volume_storage(&args.log_dir, args.key_file.as_deref()) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let registry = load_remote_registry(storage.as_ref());
+    let remote_stores = registry.build_read_stores();
+
+    let clock = SystemClock;
+    match appendfs::backfill_summary_salts(storage.as_ref(), &volume_key, &clock, &remote_stores, args.force) {
+        Ok(Some(new_summary)) => {
+            println!("Successfully backfilled key salts into new summary: {}", new_summary);
+        }
+        Ok(None) => {
+            println!("Summary already contains all log key salts; no update needed.");
+        }
+        Err(e) => {
+            eprintln!("Failed to backfill summary salts: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 

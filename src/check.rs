@@ -3099,6 +3099,7 @@ mod tests {
                 total_data_bytes: size,
                 md5,
                 sealed_at: Some(std::time::SystemTime::UNIX_EPOCH),
+                key_salt: Some([0u8; 16]),
             };
             manifest.record_sealed_log(log_info);
         }
@@ -3187,6 +3188,7 @@ mod tests {
                 total_data_bytes: file_len,
                 md5: [0u8; 16],
                 sealed_at: Some(std::time::SystemTime::UNIX_EPOCH),
+                key_salt: Some([0u8; 16]),
             };
             fs.manifest.write().unwrap().record_sealed_log(log_info);
             fs.log_writer = None;

@@ -102,13 +102,30 @@ impl LogFileCache {
             return Ok(open.clone());
         }
         let reader = self.open_reader(generation)?;
-        let mut header_buf = [0u8; FILE_HEADER_SIZE];
-        reader.read_exact_at(0, &mut header_buf)?;
-        let header = FileHeader::from_bytes(&header_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let open = OpenLog {
-            reader,
-            file_key: Arc::new(volume_key.log_file_key(&header.key_salt)),
+
+        let key_salt_opt = self.manifest.as_ref().and_then(|m| {
+            m.read()
+                .ok()
+                .and_then(|man| man.get_by_generation(generation).and_then(|l| l.key_salt))
+        });
+
+        let file_key = if let Some(key_salt) = key_salt_opt {
+            Arc::new(volume_key.log_file_key(&key_salt))
+        } else {
+            let mut header_buf = [0u8; FILE_HEADER_SIZE];
+            reader.read_exact_at(0, &mut header_buf)?;
+            let header =
+                FileHeader::from_bytes(&header_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if let Some(ref m) = self.manifest
+                && let Ok(mut man) = m.write()
+                && let Some(log_entry) = man.logs.iter_mut().find(|l| l.generation == generation)
+            {
+                log_entry.key_salt = Some(header.key_salt);
+            }
+            Arc::new(volume_key.log_file_key(&header.key_salt))
         };
+
+        let open = OpenLog { reader, file_key };
         guard.insert(generation, open.clone());
         Ok(open)
     }
@@ -386,5 +403,125 @@ mod tests {
             .read_extent_payload(gen_num, offset, rec_size, 7, 0, &mut buf2, &key)
             .unwrap();
         assert_eq!(&buf2, b"extent");
+    }
+
+    #[test]
+    fn test_log_file_cache_bypasses_block0_when_salt_in_manifest() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+        let clock = Arc::new(SystemClock);
+        let key = VolumeKey::plaintext_arc();
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            clock.clone(),
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            key.clone(),
+        )
+        .unwrap();
+
+        // Write 1 MiB of padding data so next record is strictly in block 1 (offset >= 1024*1024)
+        let padding = vec![0x42u8; 1024 * 1024];
+        writer.append_data(10, &padding).unwrap();
+
+        // Write target record in block 1
+        let payload = b"block 1 payload data";
+        let (gen_num, offset, rec_size) = writer.append_data(11, payload).unwrap();
+        assert!(offset >= 1024 * 1024, "offset {} must be >= 1 MiB", offset);
+        writer.flush().unwrap();
+        let sealed_info = writer.seal_active().unwrap().unwrap();
+        assert!(sealed_info.key_salt.is_some());
+
+        let cache_dir = temp_dir.path().join(".cache");
+        let block_cache = Arc::new(
+            crate::remote::OnDiskBlockCache::new(&cache_dir, 64 * 1024 * 1024, clock).expect("create block cache"),
+        );
+
+        let manifest = Arc::new(RwLock::new(crate::log::LogManifest {
+            logs: vec![sealed_info],
+        }));
+
+        let cache = LogFileCache::with_remote_support(
+            storage.clone(),
+            Some(block_cache.clone()),
+            Vec::<crate::remote::RemoteReadTarget>::new(),
+            Some(manifest),
+        )
+        .with_cache_local_reads(true);
+
+        // Read the target record from block 1
+        let mut buf = [0u8; 7];
+        cache
+            .read_extent_payload(gen_num, offset, rec_size, 0, 0, &mut buf, &key)
+            .unwrap();
+        assert_eq!(&buf, b"block 1");
+
+        // Verify: block 1 (000001_000001.bin) IS in cache
+        assert!(cache_dir.join("000001_000001.bin").exists(), "block 1 should be cached");
+
+        // Crucial verification: block 0 (000001_000000.bin) is NOT in cache!
+        assert!(
+            !cache_dir.join("000001_000000.bin").exists(),
+            "block 0 must NOT be read or cached into OnDiskBlockCache when key_salt is in manifest!"
+        );
+    }
+
+    #[test]
+    fn test_log_file_cache_reads_block0_when_salt_is_none() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+        let clock = Arc::new(SystemClock);
+        let key = VolumeKey::plaintext_arc();
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            clock.clone(),
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            key.clone(),
+        )
+        .unwrap();
+
+        // Write 1 MiB of padding data so next record is strictly in block 1 (offset >= 1024*1024)
+        let padding = vec![0x42u8; 1024 * 1024];
+        writer.append_data(10, &padding).unwrap();
+
+        let payload = b"block 1 payload data";
+        let (gen_num, offset, rec_size) = writer.append_data(11, payload).unwrap();
+        assert!(offset >= 1024 * 1024);
+        writer.flush().unwrap();
+        let mut sealed_info = writer.seal_active().unwrap().unwrap();
+        // Simulate legacy v1 manifest without key_salt
+        sealed_info.key_salt = None;
+
+        let cache_dir = temp_dir.path().join(".cache");
+        let block_cache = Arc::new(
+            crate::remote::OnDiskBlockCache::new(&cache_dir, 64 * 1024 * 1024, clock).expect("create block cache"),
+        );
+
+        let manifest = Arc::new(RwLock::new(crate::log::LogManifest {
+            logs: vec![sealed_info],
+        }));
+
+        let cache = LogFileCache::with_remote_support(
+            storage.clone(),
+            Some(block_cache.clone()),
+            Vec::<crate::remote::RemoteReadTarget>::new(),
+            Some(manifest),
+        )
+        .with_cache_local_reads(true);
+
+        let mut buf = [0u8; 7];
+        cache
+            .read_extent_payload(gen_num, offset, rec_size, 0, 0, &mut buf, &key)
+            .unwrap();
+        assert_eq!(&buf, b"block 1");
+
+        // When key_salt is None, block 0 MUST be cached because FileHeader was read
+        assert!(
+            cache_dir.join("000001_000000.bin").exists(),
+            "block 0 is cached when key_salt is None"
+        );
     }
 }

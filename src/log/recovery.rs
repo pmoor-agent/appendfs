@@ -409,6 +409,7 @@ pub fn recover_fs(
             total_data_bytes: log_data_bytes,
             md5: log_md5,
             sealed_at,
+            key_salt: Some(reader.file_header().key_salt),
         };
         fs_instance.manifest.write().unwrap().record_sealed_log(log_file_info);
 

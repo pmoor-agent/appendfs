@@ -16,6 +16,7 @@ struct ActiveLogFile {
     generation: u32,
     /// The key this file's records are encrypted under, derived from the salt in its header.
     file_key: LogFileKey,
+    key_salt: [u8; 16],
     /// Sequence number the next record in this file will be encrypted under.
     ///
     /// Advanced whenever a record is encoded and never moved back, not even by
@@ -259,6 +260,7 @@ impl ActiveLogFile {
             total_data_bytes: self.total_data_bytes,
             md5: sealed_md5,
             sealed_at: Some(timestamp),
+            key_salt: Some(self.key_salt),
         })
     }
 }
@@ -384,6 +386,7 @@ fn open_generation_file(
     Ok(ActiveLogFile {
         writer: Box::new(writer),
         generation,
+        key_salt,
         file_key: keying.volume_key.log_file_key(&key_salt),
         next_sequence: 0,
         current_offset: FILE_HEADER_SIZE as u64,

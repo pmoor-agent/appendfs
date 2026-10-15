@@ -77,8 +77,8 @@ impl CompatFixtureConfig {
 
     pub fn default_dir_name(self) -> &'static str {
         match self {
-            Self::UnencryptedUncompressed => "v1",
-            Self::KeyFileCompressed => "v1_key_file_compressed",
+            Self::UnencryptedUncompressed => "v2",
+            Self::KeyFileCompressed => "v2_key_file_compressed",
         }
     }
 

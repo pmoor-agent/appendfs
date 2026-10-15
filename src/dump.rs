@@ -1400,6 +1400,7 @@ mod tests {
                     total_data_bytes: 4096,
                     md5: [1u8; 16],
                     sealed_at: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(10)),
+                    key_salt: Some([1u8; 16]),
                 },
                 crate::log::LogFileInfo {
                     version: 1,
@@ -1412,6 +1413,7 @@ mod tests {
                     total_data_bytes: 4096,
                     md5: [2u8; 16],
                     sealed_at: None,
+                    key_salt: Some([2u8; 16]),
                 },
             ],
         };
@@ -1422,6 +1424,7 @@ mod tests {
                 manifest: &manifest,
                 volume_header: &crate::crypto::VolumeHeader::plaintext(),
                 generation: 1,
+                revision: 0,
                 last_batch_id: 100,
                 next_inode: 4,
                 created_at: std::time::SystemTime::now(),

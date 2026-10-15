@@ -19,6 +19,21 @@ This directory contains checked-in golden on-disk storage fixtures used by `test
   - `*-dump.txt`: Golden decrypted dump inspection outputs.
   - `fsck-report.txt`: Golden filesystem integrity check report under 100% data verification.
 
+- `v2/`: Plaintext uncompressed golden files for format version 2 (`SummaryHeader` version 2 with manifest log key salts).
+  - `000000.summary`: Initial volume summary snapshot.
+  - `000001.log`: 3 flushed commit batches covering directories, files, symlinks, special files, and extended attributes.
+  - `000001.summary`: Exported snapshot of all populated inodes.
+  - `*-dump.txt`: Golden dump inspection outputs for summary and log files.
+  - `fsck-report.txt`: Golden filesystem integrity check report under 100% data verification.
+
+- `v2_key_file_compressed/`: ChaCha20-Poly1305 encrypted golden files under the key in `key.pem`, with Zstd record compression and `SummaryHeader` version 2.
+  - `key.pem`: Canonical unencrypted key file.
+  - `000000.summary`: Initial volume summary snapshot (encrypted with explicit deterministic IV).
+  - `000001.log`: 3 flushed encrypted and compressed commit batches.
+  - `000001.summary`: Exported snapshot of all populated inodes (encrypted with explicit deterministic IV).
+  - `*-dump.txt`: Golden decrypted dump inspection outputs.
+  - `fsck-report.txt`: Golden filesystem integrity check report under 100% data verification.
+
 - `v1_passphrase_compressed/`: Legacy fixture from a retired credential mode: the volume key was derived with Argon2id from the passphrase `"passphrase"` alone. That derived key now sits in `key.pem`, itself encrypted under the passphrase `"passphrase"`. Recovery-only: nothing can generate this fixture any more.
   - `key.pem`: Passphrase-encrypted key file holding the derived volume key.
   - `000000.summary`: Initial volume summary snapshot (encrypted with explicit deterministic IV).

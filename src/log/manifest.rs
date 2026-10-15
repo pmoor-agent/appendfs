@@ -26,6 +26,58 @@ pub struct LogFileInfo {
     /// Timestamp of the terminal Seal record if cleanly sealed, or None if unsealed/crashed.
     #[serde(with = "crate::clock::serde_system_time_opt")]
     pub sealed_at: Option<SystemTime>,
+    /// Key salt from FileHeader used to derive the encryption key for this log file.
+    /// `None` for legacy v1 summaries until backfilled.
+    #[serde(default)]
+    pub key_salt: Option<[u8; 16]>,
+}
+
+/// Legacy format version 1 layout of `LogFileInfo` as serialized in v1 summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogFileInfoV1 {
+    pub version: u32,
+    pub generation: u32,
+    pub revision: u16,
+    pub filename: String,
+    #[serde(with = "crate::clock::serde_system_time")]
+    pub created_at: SystemTime,
+    pub record_count: u32,
+    pub total_bytes: u64,
+    pub total_data_bytes: u64,
+    pub md5: [u8; 16],
+    #[serde(with = "crate::clock::serde_system_time_opt")]
+    pub sealed_at: Option<SystemTime>,
+}
+
+/// Legacy format version 1 layout of `LogManifest` as serialized in v1 summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogManifestV1 {
+    pub logs: Vec<LogFileInfoV1>,
+}
+
+impl LogManifestV1 {
+    /// Converts a legacy v1 manifest into a v2 manifest, setting `key_salt` to `None`.
+    pub fn into_v2(self) -> LogManifest {
+        LogManifest {
+            logs: self
+                .logs
+                .into_iter()
+                .map(|l| LogFileInfo {
+                    version: l.version,
+                    generation: l.generation,
+                    revision: l.revision,
+                    filename: l.filename,
+                    created_at: l.created_at,
+                    record_count: l.record_count,
+                    total_bytes: l.total_bytes,
+                    total_data_bytes: l.total_data_bytes,
+                    md5: l.md5,
+                    sealed_at: l.sealed_at,
+                    key_salt: None,
+                })
+                .collect(),
+        }
+    }
 }
 
 impl LogFileInfo {
@@ -185,6 +237,7 @@ mod tests {
             total_data_bytes: 512,
             md5: [1u8; 16],
             sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            key_salt: Some([10u8; 16]),
         };
         assert!(log1.is_sealed());
         manifest.record_sealed_log(log1);
@@ -202,6 +255,7 @@ mod tests {
             total_data_bytes: 1024,
             md5: [2u8; 16],
             sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            key_salt: Some([20u8; 16]),
         };
         assert!(log2.is_sealed());
         manifest.record_sealed_log(log2);
@@ -211,6 +265,32 @@ mod tests {
         let bytes = crate::wire::serialize(&manifest).unwrap();
         let deserialized: LogManifest = crate::wire::deserialize(&bytes).unwrap();
         assert_eq!(manifest, deserialized);
+    }
+
+    #[test]
+    fn test_v1_manifest_deserialization_and_conversion() {
+        let v1 = LogManifestV1 {
+            logs: vec![LogFileInfoV1 {
+                version: 1,
+                generation: 1,
+                revision: 0,
+                filename: "000001.log".to_string(),
+                created_at: SystemTime::UNIX_EPOCH,
+                record_count: 5,
+                total_bytes: 1024,
+                total_data_bytes: 512,
+                md5: [1u8; 16],
+                sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            }],
+        };
+        let bytes = crate::wire::serialize(&v1).unwrap();
+        let deserialized_v1: LogManifestV1 = crate::wire::deserialize(&bytes).unwrap();
+        assert_eq!(v1, deserialized_v1);
+
+        let converted = deserialized_v1.into_v2();
+        assert_eq!(converted.logs.len(), 1);
+        assert_eq!(converted.logs[0].generation, 1);
+        assert_eq!(converted.logs[0].key_salt, None);
     }
 
     #[test]
@@ -242,6 +322,7 @@ mod tests {
             total_data_bytes: 0,
             md5: [42u8; 16],
             sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(5)),
+            key_salt: Some([42u8; 16]),
         });
         assert_eq!(manifest.logs.len(), 1);
         assert_eq!(manifest.logs[0].generation, 1);
@@ -266,6 +347,7 @@ mod tests {
             total_data_bytes: 512,
             md5: [1u8; 16],
             sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            key_salt: Some([1u8; 16]),
         };
         manifest.record_sealed_log(log1);
         assert!(manifest.last_shutdown_clean());
@@ -283,6 +365,7 @@ mod tests {
             total_data_bytes: 256,
             md5: [2u8; 16],
             sealed_at: None,
+            key_salt: Some([2u8; 16]),
         };
         manifest.record_sealed_log(log2);
         assert!(!manifest.last_shutdown_clean());
@@ -301,6 +384,7 @@ mod tests {
             total_data_bytes: 50,
             md5: [1u8; 16],
             sealed_at: None,
+            key_salt: Some([1u8; 16]),
         });
         manifest2.record_sealed_log(LogFileInfo {
             version: 1,
@@ -313,6 +397,7 @@ mod tests {
             total_data_bytes: 50,
             md5: [2u8; 16],
             sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            key_salt: Some([2u8; 16]),
         });
         // Last shutdown was clean (log2 was sealed), but not all logs were sealed (log1 wasn't)
         assert!(manifest2.last_shutdown_clean());
@@ -334,6 +419,7 @@ mod tests {
             total_data_bytes: 512,
             md5: [1u8; 16],
             sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            key_salt: Some([1u8; 16]),
         };
         manifest.record_sealed_log(log.clone());
         manifest.record_sealed_log(log);
@@ -354,6 +440,7 @@ mod tests {
             total_data_bytes: 512,
             md5: [2u8; 16],
             sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            key_salt: Some([2u8; 16]),
         };
         let log1 = LogFileInfo {
             version: 1,
@@ -366,6 +453,7 @@ mod tests {
             total_data_bytes: 512,
             md5: [1u8; 16],
             sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            key_salt: Some([1u8; 16]),
         };
         manifest.record_sealed_log(log2);
         manifest.record_sealed_log(log1);
@@ -388,6 +476,7 @@ mod tests {
             total_data_bytes: 512,
             md5: [1u8; 16],
             sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            key_salt: Some([1u8; 16]),
         };
         manifest.record_sealed_log(log1.clone());
         assert_eq!(manifest.latest_log(), Some(&log1));
@@ -404,6 +493,7 @@ mod tests {
             total_data_bytes: 256,
             md5: [2u8; 16],
             sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            key_salt: Some([2u8; 16]),
         };
         manifest.record_sealed_log(log2.clone());
         assert_eq!(manifest.latest_log(), Some(&log2));

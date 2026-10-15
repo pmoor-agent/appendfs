@@ -30,6 +30,10 @@ fn fixture_v1_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1")
 }
 
+fn fixture_v2_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2")
+}
+
 pub use appendfs::compat::resolve_fixture_volume_key;
 
 /// Tests recovery when the latest summary file is missing, forcing full log replay and
@@ -139,6 +143,26 @@ fn test_v1_stats_matches_latest_summary_dump() {
 #[test]
 fn test_v1_fsck_matches_golden() {
     verify_fsck_matches_golden(&fixture_v1_dir());
+}
+
+#[test]
+fn test_v2_log_reconstruction_with_latest_summary_missing() {
+    verify_recovery_with_latest_summary_missing(&fixture_v2_dir());
+}
+
+#[test]
+fn test_v2_recovery_from_latest_summary_snapshot() {
+    verify_recovery_from_latest_summary_snapshot(&fixture_v2_dir());
+}
+
+#[test]
+fn test_v2_stats_matches_latest_summary_dump() {
+    verify_stats_matches_latest_summary_dump(&fixture_v2_dir());
+}
+
+#[test]
+fn test_v2_fsck_matches_golden() {
+    verify_fsck_matches_golden(&fixture_v2_dir());
 }
 
 /// Every configuration the generator knows must reproduce its checked-in fixture byte for
