@@ -73,7 +73,7 @@ impl SummaryHeader {
                 format!("not an appendfs summary file (bad magic {:?})", header.magic),
             ));
         }
-        if header.version != 1 && header.version != CURRENT_SUMMARY_VERSION {
+        if header.version == 0 || header.version > CURRENT_SUMMARY_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -403,63 +403,55 @@ pub fn init_volume_with_clock_uids_and_iv(
 /// Returns `Ok(Some(new_summary_filename))` if a new summary revision was exported,
 /// or `Ok(None)` if all key salts were already present and format version was already current (and `!force`).
 pub fn backfill_summary_salts(
-    storage: &dyn Storage,
+    storage: Arc<dyn Storage>,
     volume_key: &VolumeKey,
     clock: &dyn crate::clock::Clock,
-    remotes: &[crate::remote::RemoteReadTarget],
+    remotes: Vec<crate::remote::RemoteReadTarget>,
+    block_cache: Option<Arc<dyn crate::remote::BlockCache>>,
     force: bool,
 ) -> io::Result<Option<String>> {
-    let latest_filename = latest_summary_file(storage)?
+    let latest_filename = latest_summary_file(storage.as_ref())?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no summary file found in volume storage"))?;
 
-    let summary_reader = SummaryReader::open(storage, &latest_filename, Arc::new(volume_key.clone()))?;
+    let summary_reader = SummaryReader::open(storage.as_ref(), &latest_filename, Arc::new(volume_key.clone()))?;
     let inodes = summary_reader.read_all_inodes()?;
     let mut manifest = summary_reader.manifest.clone();
+
+    let block_cache = block_cache.unwrap_or_else(|| Arc::new(crate::remote::MemoryBlockCache::new(64 * 1024 * 1024)));
 
     let mut updated_count = 0;
     for log_entry in &mut manifest.logs {
         if log_entry.key_salt.is_none() {
-            let mut header_buf = [0u8; crate::log::record::FILE_HEADER_SIZE];
-            let mut read_ok = false;
-
-            // 1. Try reading from local storage first
-            if let Ok(reader) = storage.open_reader(&log_entry.filename)
-                && reader.read_exact_at(0, &mut header_buf).is_ok()
+            let mut expected_len = log_entry.total_bytes;
+            if expected_len == 0
+                && let Ok(r) = storage.open_reader(&log_entry.filename)
+                && let Ok(l) = r.len()
             {
-                read_ok = true;
+                expected_len = l;
+            }
+            if expected_len == 0 {
+                expected_len = crate::log::record::FILE_HEADER_SIZE as u64;
             }
 
-            // 2. If not available locally, try remote stores (for locally pruned logs)
-            if !read_ok {
-                for remote in remotes {
-                    if !remote.mode.is_readable() {
-                        continue;
-                    }
-                    let mut buf = Vec::new();
-                    if let Ok(n) = remote.store.get_object_range(
-                        &log_entry.filename,
-                        0,
-                        crate::log::record::FILE_HEADER_SIZE as u64,
-                        &mut buf,
-                    ) && n == crate::log::record::FILE_HEADER_SIZE as u64
-                        && buf.len() == crate::log::record::FILE_HEADER_SIZE
-                    {
-                        header_buf.copy_from_slice(&buf);
-                        read_ok = true;
-                        break;
-                    }
-                }
-            }
+            let tiered_reader = crate::remote::TieredStorageReader::with_local_storage(
+                log_entry.generation,
+                log_entry.filename.clone(),
+                expected_len,
+                Some(Arc::clone(&storage)),
+                remotes.clone(),
+                Arc::clone(&block_cache),
+            );
 
-            if !read_ok {
-                return Err(io::Error::new(
+            let mut header_buf = [0u8; crate::log::record::FILE_HEADER_SIZE];
+            tiered_reader.read_exact_at(0, &mut header_buf).map_err(|e| {
+                io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "cannot read header for log generation {} ({}) locally or from remotes to backfill key salt",
-                        log_entry.generation, log_entry.filename
+                        "cannot read header for log generation {} ({}) locally or from remotes to backfill key salt: {}",
+                        log_entry.generation, log_entry.filename, e
                     ),
-                ));
-            }
+                )
+            })?;
 
             let file_header = crate::log::record::FileHeader::from_bytes(&header_buf)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -496,7 +488,7 @@ pub fn backfill_summary_salts(
         created_at: clock.now(),
     };
 
-    let new_filename = export_summary(&snapshot, storage, volume_key)?;
+    let new_filename = export_summary(&snapshot, storage.as_ref(), volume_key)?;
     Ok(Some(new_filename))
 }
 
@@ -1462,7 +1454,7 @@ mod tests {
         assert_eq!(reader.header.revision, 0);
 
         // Run backfill_summary_salts
-        let backfilled = backfill_summary_salts(storage.as_ref(), &volume_key, &clock, &[], false).unwrap();
+        let backfilled = backfill_summary_salts(storage.clone(), &volume_key, &clock, vec![], None, false).unwrap();
         assert_eq!(backfilled, Some("000001_r1.summary".to_string()));
 
         // Verify new summary has revision 1, CURRENT_SUMMARY_VERSION, and key_salt matches actual_salt
@@ -1473,11 +1465,11 @@ mod tests {
         assert_eq!(reader_r1.manifest.logs[0].key_salt, Some(actual_salt));
 
         // Running backfill again without force should return Ok(None)
-        let backfill_again = backfill_summary_salts(storage.as_ref(), &volume_key, &clock, &[], false).unwrap();
+        let backfill_again = backfill_summary_salts(storage.clone(), &volume_key, &clock, vec![], None, false).unwrap();
         assert_eq!(backfill_again, None);
 
         // Running backfill with force: true should bump revision again
-        let forced = backfill_summary_salts(storage.as_ref(), &volume_key, &clock, &[], true).unwrap();
+        let forced = backfill_summary_salts(storage.clone(), &volume_key, &clock, vec![], None, true).unwrap();
         assert_eq!(forced, Some("000001_r2.summary".to_string()));
         let reader_r2 =
             SummaryReader::open(storage.as_ref(), "000001_r2.summary", Arc::new(volume_key.clone())).unwrap();
@@ -1487,7 +1479,7 @@ mod tests {
     #[test]
     fn test_backfill_summary_salts_from_remote() {
         use crate::log::LogManifest;
-        use crate::remote::RemoteStore;
+        use crate::remote::{BlockCache, RemoteStore};
 
         let storage = Arc::new(MemoryStorage::new());
         let clock = crate::clock::SystemClock;
@@ -1544,9 +1536,23 @@ mod tests {
                 .with_mode(crate::remote::RemoteMode::ReadWrite),
         ];
 
-        // Backfill should fetch header from remote store and succeed
-        let backfilled = backfill_summary_salts(storage.as_ref(), &volume_key, &clock, &remotes, false).unwrap();
+        let block_cache = Arc::new(crate::remote::MemoryBlockCache::new(64 * 1024 * 1024));
+        assert!(block_cache.read_block("000001", 0).unwrap().is_none());
+
+        // Backfill should fetch header from remote store via TieredStorageReader and succeed
+        let backfilled = backfill_summary_salts(
+            storage.clone(),
+            &volume_key,
+            &clock,
+            remotes,
+            Some(block_cache.clone()),
+            false,
+        )
+        .unwrap();
         assert_eq!(backfilled, Some("000001_r1.summary".to_string()));
+
+        // Verify that reading through TieredStorageReader populated block cache for block 0
+        assert!(block_cache.read_block("000001", 0).unwrap().is_some());
 
         let reader_r1 =
             SummaryReader::open(storage.as_ref(), "000001_r1.summary", Arc::new(volume_key.clone())).unwrap();

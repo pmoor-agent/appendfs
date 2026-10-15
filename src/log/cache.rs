@@ -1,4 +1,5 @@
 use crate::crypto::{LogFileKey, VolumeKey};
+use crate::log::manifest::LogFileInfo;
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader};
 use crate::remote::RemoteReadTarget;
 use crate::remote::block_cache::{BlockCache, DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache};
@@ -96,20 +97,15 @@ impl LogFileCache {
     /// from `volume_key` on first open. The derived key is cached with the file, which is sound
     /// because a volume has exactly one key for its lifetime (see `VolumeKey`).
     /// If the log file was pruned locally, falls back to `TieredStorageReader` over S3 range requests.
-    pub fn get_or_open(&self, generation: u32, volume_key: &VolumeKey) -> io::Result<OpenLog> {
+    pub fn get_or_open(&self, manifest_entry: &LogFileInfo, volume_key: &VolumeKey) -> io::Result<OpenLog> {
+        let generation = manifest_entry.generation;
         let mut guard = self.cache.lock().unwrap();
         if let Some(open) = guard.get(&generation) {
             return Ok(open.clone());
         }
-        let reader = self.open_reader(generation)?;
+        let reader = self.open_reader(manifest_entry)?;
 
-        let key_salt_opt = self.manifest.as_ref().and_then(|m| {
-            m.read()
-                .ok()
-                .and_then(|man| man.get_by_generation(generation).and_then(|l| l.key_salt))
-        });
-
-        let file_key = if let Some(key_salt) = key_salt_opt {
+        let file_key = if let Some(key_salt) = manifest_entry.key_salt {
             Arc::new(volume_key.log_file_key(&key_salt))
         } else {
             let mut header_buf = [0u8; FILE_HEADER_SIZE];
@@ -130,21 +126,19 @@ impl LogFileCache {
         Ok(open)
     }
 
-    /// Opens a reader for `generation`, locally or - once the local file has been pruned -
+    /// Opens a reader for `manifest_entry`, locally or - once the local file has been pruned -
     /// over the remotes.
-    fn open_reader(&self, generation: u32) -> io::Result<Arc<dyn StorageReader>> {
-        let (filename, in_manifest, mut expected_len) = if let Some(ref m) = self.manifest {
-            let man = m.read().unwrap();
-            let log_entry = man.get_by_generation(generation);
-            let in_manifest = log_entry.is_some();
-            let expected_len = log_entry.map(|l| l.total_bytes).unwrap_or(0);
-            let filename = log_entry
-                .map(|l| l.filename.clone())
-                .unwrap_or_else(|| super::log_filename(generation));
-            (filename, in_manifest, expected_len)
-        } else {
-            (super::log_filename(generation), false, 0)
-        };
+    fn open_reader(&self, manifest_entry: &LogFileInfo) -> io::Result<Arc<dyn StorageReader>> {
+        let generation = manifest_entry.generation;
+        let filename = manifest_entry.filename.clone();
+        let mut expected_len = manifest_entry.total_bytes;
+
+        let in_manifest = self
+            .manifest
+            .as_ref()
+            .and_then(|m| m.read().ok())
+            .map(|m| m.get_by_generation(generation).is_some())
+            .unwrap_or(false);
 
         // If expected_len is not yet in manifest but local file exists:
         if in_manifest
@@ -167,7 +161,7 @@ impl LogFileCache {
             let remotes = self.remotes.read().unwrap().clone();
             return Ok(Arc::new(TieredStorageReader::with_local_storage(
                 generation,
-                filename.clone(),
+                filename,
                 expected_len,
                 Some(self.storage.clone()),
                 remotes,
@@ -184,16 +178,6 @@ impl LogFileCache {
                 if remotes.is_empty() {
                     return Err(e);
                 }
-
-                let expected_len = match self.manifest {
-                    Some(ref m) => m
-                        .read()
-                        .unwrap()
-                        .get_by_generation(generation)
-                        .map(|l| l.total_bytes)
-                        .unwrap_or(0),
-                    None => return Err(e),
-                };
 
                 if expected_len == 0 {
                     return Err(e);
@@ -243,12 +227,12 @@ impl LogFileCache {
         dst_buf: &mut [u8],
         volume_key: &crate::crypto::VolumeKey,
     ) -> io::Result<usize> {
-        let revision = self
+        let manifest_entry = self
             .manifest
             .as_ref()
             .and_then(|m| m.read().ok())
-            .and_then(|m| m.get_by_generation(generation).map(|l| l.revision))
-            .unwrap_or(0);
+            .and_then(|m| m.get_by_generation(generation).cloned());
+        let revision = manifest_entry.as_ref().map(|l| l.revision).unwrap_or(0);
 
         let decrypted: Arc<Vec<u8>> =
             if let Some(cached) = self.decrypted_cache.get(generation, revision, record_log_offset) {
@@ -260,7 +244,27 @@ impl LogFileCache {
                         format!("record_size {} is smaller than record header size", record_size),
                     ));
                 }
-                let open = self.get_or_open(generation, volume_key)?;
+                let fallback_entry;
+                let entry_ref = match manifest_entry.as_ref() {
+                    Some(entry) => entry,
+                    None => {
+                        fallback_entry = LogFileInfo {
+                            version: crate::log::record::CURRENT_VERSION,
+                            generation,
+                            revision,
+                            filename: super::log_filename(generation),
+                            created_at: std::time::SystemTime::UNIX_EPOCH,
+                            record_count: 0,
+                            total_bytes: 0,
+                            total_data_bytes: 0,
+                            md5: [0u8; 16],
+                            sealed_at: None,
+                            key_salt: None,
+                        };
+                        &fallback_entry
+                    }
+                };
+                let open = self.get_or_open(entry_ref, volume_key)?;
                 let mut raw_record = vec![0u8; record_size as usize];
                 open.reader.read_exact_at(record_log_offset, &mut raw_record)?;
 
@@ -357,11 +361,25 @@ mod tests {
 
         let cache = LogFileCache::with_storage(storage);
 
+        let info = LogFileInfo {
+            version: crate::log::record::CURRENT_VERSION,
+            generation: 1,
+            revision: 0,
+            filename: crate::log::log_filename(1),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            record_count: 0,
+            total_bytes: 0,
+            total_data_bytes: 0,
+            md5: [0u8; 16],
+            sealed_at: None,
+            key_salt: None,
+        };
+
         // First access opens and verifies header
-        let file1 = cache.get_or_open(1, &VolumeKey::plaintext()).unwrap();
+        let file1 = cache.get_or_open(&info, &VolumeKey::plaintext()).unwrap();
 
         // Second access returns cached handle
-        let file2 = cache.get_or_open(1, &VolumeKey::plaintext()).unwrap();
+        let file2 = cache.get_or_open(&info, &VolumeKey::plaintext()).unwrap();
         assert!(Arc::ptr_eq(&file1.reader, &file2.reader));
     }
 

@@ -868,8 +868,22 @@ fn cmd_backfill_salts(args: BackfillSaltsArgs) {
     let registry = load_remote_registry(storage.as_ref());
     let remote_stores = registry.build_read_stores();
 
+    let cache_dir = args.log_dir.join(".cache");
+    let block_cache: Arc<dyn appendfs::remote::BlockCache> =
+        match appendfs::remote::OnDiskBlockCache::new(&cache_dir, 512 * 1024 * 1024, Arc::new(SystemClock)) {
+            Ok(c) => Arc::new(c),
+            Err(_) => Arc::new(appendfs::remote::MemoryBlockCache::new(64 * 1024 * 1024)),
+        };
+
     let clock = SystemClock;
-    match appendfs::backfill_summary_salts(storage.as_ref(), &volume_key, &clock, &remote_stores, args.force) {
+    match appendfs::backfill_summary_salts(
+        storage,
+        &volume_key,
+        &clock,
+        remote_stores,
+        Some(block_cache),
+        args.force,
+    ) {
         Ok(Some(new_summary)) => {
             println!("Successfully backfilled key salts into new summary: {}", new_summary);
         }

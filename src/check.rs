@@ -1214,8 +1214,8 @@ pub fn execute_sampled_verification(
     for (&generation, records) in &local_records_by_gen {
         let records_bytes: u64 = records.iter().map(|r| r.record_size as u64).sum();
         if let Some(ref c) = local_cache {
-            let log_filename = manifest
-                .get_by_generation(generation)
+            let manifest_entry = manifest.get_by_generation(generation);
+            let log_filename = manifest_entry
                 .map(|l| l.filename.clone())
                 .unwrap_or_else(|| crate::log::log_filename(generation));
             if !c.storage().exists(&log_filename) {
@@ -1248,7 +1248,28 @@ pub fn execute_sampled_verification(
                 }
             };
 
-            let open = match c.get_or_open(generation, &fs.volume_key) {
+            let fallback_entry;
+            let entry_ref = match manifest_entry {
+                Some(entry) => entry,
+                None => {
+                    fallback_entry = crate::log::manifest::LogFileInfo {
+                        version: crate::log::record::CURRENT_VERSION,
+                        generation,
+                        revision: 0,
+                        filename: log_filename.clone(),
+                        created_at: std::time::SystemTime::UNIX_EPOCH,
+                        record_count: 0,
+                        total_bytes: file_len,
+                        total_data_bytes: 0,
+                        md5: [0u8; 16],
+                        sealed_at: None,
+                        key_salt: None,
+                    };
+                    &fallback_entry
+                }
+            };
+
+            let open = match c.get_or_open(entry_ref, &fs.volume_key) {
                 Ok(open) => open,
                 Err(e) => {
                     for rec in records {

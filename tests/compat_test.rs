@@ -34,6 +34,10 @@ fn fixture_v2_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2")
 }
 
+fn fixture_v2_key_file_compressed_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2_key_file_compressed")
+}
+
 pub use appendfs::compat::resolve_fixture_volume_key;
 
 /// Tests recovery when the latest summary file is missing, forcing full log replay and
@@ -163,6 +167,63 @@ fn test_v2_stats_matches_latest_summary_dump() {
 #[test]
 fn test_v2_fsck_matches_golden() {
     verify_fsck_matches_golden(&fixture_v2_dir());
+}
+
+#[test]
+fn test_v2_key_file_compressed_log_reconstruction_with_latest_summary_missing() {
+    verify_recovery_with_latest_summary_missing(&fixture_v2_key_file_compressed_dir());
+}
+
+#[test]
+fn test_v2_key_file_compressed_recovery_from_latest_summary_snapshot() {
+    verify_recovery_from_latest_summary_snapshot(&fixture_v2_key_file_compressed_dir());
+}
+
+#[test]
+fn test_v2_key_file_compressed_stats_matches_latest_summary_dump() {
+    verify_stats_matches_latest_summary_dump(&fixture_v2_key_file_compressed_dir());
+}
+
+#[test]
+fn test_v2_key_file_compressed_fsck_matches_golden() {
+    verify_fsck_matches_golden(&fixture_v2_key_file_compressed_dir());
+}
+
+/// Verifies that re-running the generator reproduces the checked-in fixture directory
+/// byte for byte.
+pub fn verify_deterministic_reproducibility(fixture_dir: &Path) {
+    let config = CompatFixtureConfig::from_dir_path(fixture_dir)
+        .unwrap_or_else(|| panic!("No compat config for {}", fixture_dir.display()));
+    let temp = tempfile::tempdir().unwrap();
+    create_canonical_compat_volume(temp.path(), config).expect("create canonical compat volume");
+
+    let key_file = config.is_encrypted().then_some(COMPAT_KEY_FILENAME);
+    for name in appendfs::compat::COMPAT_FIXTURE_FILES
+        .iter()
+        .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
+        .chain([COMPAT_FSCK_REPORT_FILENAME].iter())
+        .chain(key_file.iter())
+    {
+        let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
+        let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
+        assert_eq!(
+            actual_bytes,
+            expected_bytes,
+            "Generated file {} differs from checked-in fixture in {}",
+            name,
+            fixture_dir.display()
+        );
+    }
+}
+
+#[test]
+fn test_v2_deterministic_reproducibility() {
+    verify_deterministic_reproducibility(&fixture_v2_dir());
+}
+
+#[test]
+fn test_v2_key_file_compressed_deterministic_reproducibility() {
+    verify_deterministic_reproducibility(&fixture_v2_key_file_compressed_dir());
 }
 
 /// Every configuration the generator knows must reproduce its checked-in fixture byte for
@@ -496,6 +557,9 @@ fn test_all_fixture_versions() {
         verify_stats_matches_latest_summary_dump(version_dir);
         verify_fsck_matches_golden(version_dir);
         verify_python_restore_script(version_dir);
+        if version_name.starts_with("v2") {
+            verify_deterministic_reproducibility(version_dir);
+        }
     }
 }
 
