@@ -7,6 +7,12 @@ use std::io::{self, Read, Write};
 use std::time::Duration;
 use url::Url;
 
+#[derive(Debug)]
+pub(crate) struct PreparedRequest {
+    pub(crate) url: String,
+    pub(crate) headers: Vec<(String, String)>,
+}
+
 /// S3-compatible remote storage client using standard S3 REST operations.
 #[derive(Debug, Clone)]
 pub struct S3RemoteStore {
@@ -15,7 +21,6 @@ pub struct S3RemoteStore {
     pub endpoint: Option<String>,
     pub prefix: String,
     pub signer: Option<SigV4Signer>,
-    pub force_path_style: bool,
     pub storage_class: Option<String>,
     agent: ureq::Agent,
 }
@@ -27,7 +32,6 @@ impl S3RemoteStore {
         endpoint: Option<String>,
         prefix: impl Into<String>,
         signer: Option<SigV4Signer>,
-        force_path_style: bool,
         storage_class: Option<String>,
     ) -> Self {
         let agent = ureq::builder()
@@ -47,7 +51,6 @@ impl S3RemoteStore {
             endpoint,
             prefix: p,
             signer,
-            force_path_style,
             storage_class,
             agent,
         }
@@ -63,30 +66,23 @@ impl S3RemoteStore {
         format!("{}{}", self.prefix, trimmed)
     }
 
+    /// Returns `(base_url, host_header, canonical_base_path)`.
+    ///
+    /// Without an endpoint the target is AWS, addressed virtual-hosted style
+    /// (`{bucket}.s3.{region}.amazonaws.com`), AWS's recommended form.
+    /// A custom endpoint is addressed path-style (`{endpoint}/{bucket}`): the one form every S3-compatible
+    /// service accepts (GCS, R2, MinIO, AWS regional endpoints), including on IPs and `localhost`.
     fn resolve_endpoint(&self) -> (String, String, String) {
-        // Returns (base_url, host_header, canonical_base_path)
         if let Some(ref ep) = self.endpoint {
             let parsed = Url::parse(ep).unwrap_or_else(|_| Url::parse("http://127.0.0.1:9000").unwrap());
             let host_header = match parsed.port() {
                 Some(port) => format!("{}:{}", parsed.host_str().unwrap_or(""), port),
                 None => parsed.host_str().unwrap_or("").to_string(),
             };
-
             let base = ep.trim_end_matches('/');
-            if self.force_path_style {
-                (
-                    format!("{}/{}", base, self.bucket),
-                    host_header,
-                    format!("/{}", self.bucket),
-                )
-            } else {
-                (base.to_string(), host_header, "".to_string())
-            }
-        } else if self.force_path_style {
-            let host = format!("s3.{}.amazonaws.com", self.region);
             (
-                format!("https://{}/{}", host, self.bucket),
-                host,
+                format!("{}/{}", base, self.bucket),
+                host_header,
                 format!("/{}", self.bucket),
             )
         } else {
@@ -122,6 +118,42 @@ impl S3RemoteStore {
         extra_headers: &[(String, String)],
         payload_sha256: &str,
     ) -> io::Result<ureq::Request> {
+        let prepared = self.prepare_request(
+            method,
+            raw_key,
+            query,
+            extra_headers,
+            payload_sha256,
+            &Self::format_now_datetime(),
+        );
+
+        let mut req = match method {
+            "GET" => self.agent.get(&prepared.url),
+            "PUT" => self.agent.put(&prepared.url),
+            "HEAD" => self.agent.head(&prepared.url),
+            "DELETE" => self.agent.delete(&prepared.url),
+            _ => return Err(io::Error::new(io::ErrorKind::Unsupported, method)),
+        };
+        for (k, v) in query {
+            req = req.query(k, v);
+        }
+        for (k, v) in &prepared.headers {
+            req = req.set(k, v);
+        }
+        Ok(req)
+    }
+
+    /// Resolves the request URL and the headers to send (signed at `datetime`, `YYYYMMDDTHHMMSSZ`).
+    /// The `Host` header is derived from the URL by the HTTP client and is not part of `headers`.
+    pub(crate) fn prepare_request(
+        &self,
+        method: &str,
+        raw_key: &str,
+        query: &[(String, String)],
+        extra_headers: &[(String, String)],
+        payload_sha256: &str,
+        datetime: &str,
+    ) -> PreparedRequest {
         let (base_url, host_header, canonical_base_path) = self.resolve_endpoint();
         let key_path = if raw_key.is_empty() {
             "".to_string()
@@ -129,42 +161,32 @@ impl S3RemoteStore {
             format!("/{}", raw_key.trim_start_matches('/'))
         };
 
-        let target_url = format!("{}{}", base_url, key_path);
+        let url = format!("{}{}", base_url, key_path);
         let canonical_path = format!("{}{}", canonical_base_path, key_path);
 
-        let mut headers = BTreeMap::new();
-        headers.insert("host".to_string(), host_header);
+        let mut signed_headers = BTreeMap::new();
+        signed_headers.insert("host".to_string(), host_header);
         for (k, v) in extra_headers {
-            headers.insert(k.to_ascii_lowercase(), v.clone());
+            signed_headers.insert(k.to_ascii_lowercase(), v.clone());
         }
 
-        let mut req = match method {
-            "GET" => self.agent.get(&target_url),
-            "PUT" => self.agent.put(&target_url),
-            "HEAD" => self.agent.head(&target_url),
-            "DELETE" => self.agent.delete(&target_url),
-            _ => return Err(io::Error::new(io::ErrorKind::Unsupported, method)),
-        };
-
-        for (k, v) in query {
-            req = req.query(k, v);
-        }
-
+        let mut headers = Vec::new();
         if let Some(ref signer) = self.signer {
-            let datetime = Self::format_now_datetime();
-            let (auth, date, sha) =
-                signer.sign_request(method, &canonical_path, query, &headers, payload_sha256, &datetime);
-            req = req
-                .set("Authorization", &auth)
-                .set("x-amz-date", &date)
-                .set("x-amz-content-sha256", &sha);
+            let (auth, date, sha) = signer.sign_request(
+                method,
+                &canonical_path,
+                query,
+                &signed_headers,
+                payload_sha256,
+                datetime,
+            );
+            headers.push(("Authorization".to_string(), auth));
+            headers.push(("x-amz-date".to_string(), date));
+            headers.push(("x-amz-content-sha256".to_string(), sha));
         }
+        headers.extend(extra_headers.iter().cloned());
 
-        for (k, v) in extra_headers {
-            req = req.set(k, v);
-        }
-
-        Ok(req)
+        PreparedRequest { url, headers }
     }
 
     fn parse_error_response(resp: ureq::Response) -> io::Error {
@@ -477,7 +499,6 @@ mod tests {
             Some(server.endpoint()),
             "test_prefix",
             Some(signer),
-            true,
             storage_class,
         )
     }

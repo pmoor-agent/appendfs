@@ -82,8 +82,6 @@ pub struct RemoteTargetConfig {
     pub secret_access_key_env: Option<String>,
     #[serde(default)]
     pub credentials_file: Option<PathBuf>,
-    #[serde(default)]
-    pub force_path_style: Option<bool>,
     /// Whether to upload incremental active log parts to this remote before generation seals (None = default based on mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_partial_logs: Option<bool>,
@@ -176,7 +174,6 @@ impl RemoteTargetConfig {
             access_key_id_env: None,
             secret_access_key_env: None,
             credentials_file: None,
-            force_path_style: None,
             upload_partial_logs: None,
             storage_class: None,
         }
@@ -198,7 +195,6 @@ impl RemoteTargetConfig {
             access_key_id_env: None,
             secret_access_key_env: None,
             credentials_file: None,
-            force_path_style: None,
             upload_partial_logs: None,
             storage_class: None,
         }
@@ -238,11 +234,6 @@ impl RemoteTargetConfig {
 
     pub fn with_credentials_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.credentials_file = Some(path.into());
-        self
-    }
-
-    pub fn with_force_path_style(mut self, enabled: bool) -> Self {
-        self.force_path_style = Some(enabled);
         self
     }
 
@@ -316,38 +307,22 @@ impl RemoteTargetConfig {
         if let Some(local_path) = self.endpoint.as_deref().and_then(|ep| ep.strip_prefix("file://")) {
             return Arc::new(crate::remote::LocalDirRemoteStore::new(local_path));
         }
+        Arc::new(self.build_s3_store())
+    }
 
+    pub(crate) fn build_s3_store(&self) -> S3RemoteStore {
         let bucket = self.bucket.as_deref().unwrap_or("appendfs-bucket");
         let creds = self.resolve_credentials();
         let signer = creds.map(|(k, s)| SigV4Signer::new(k, s, &self.region));
 
-        let force_path = self.force_path_style.unwrap_or_else(|| {
-            // Default to path style if custom endpoint with explicit port, localhost, IP address, or Google Cloud Storage
-            if let Some(ref ep) = self.endpoint {
-                let host_part = ep
-                    .trim_start_matches("https://")
-                    .trim_start_matches("http://")
-                    .split('/')
-                    .next()
-                    .unwrap_or("");
-                host_part.contains("localhost")
-                    || host_part.contains("127.0.0.1")
-                    || host_part.contains(':')
-                    || host_part.contains("googleapis.com")
-            } else {
-                false
-            }
-        });
-
-        Arc::new(S3RemoteStore::new(
+        S3RemoteStore::new(
             bucket,
             &self.region,
             self.endpoint.clone(),
             &self.prefix,
             signer,
-            force_path,
             self.storage_class.clone(),
-        ))
+        )
     }
 }
 
@@ -813,37 +788,184 @@ SECRET_ACCESS_KEY='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
         assert!(format!("{:?}", store).contains("S3RemoteStore"));
     }
 
+    /// Pins the exact URLs and signatures for the two remote shapes in live use (AWS without an endpoint,
+    /// GCS behind a regional endpoint), so changes to endpoint resolution or signing cannot silently
+    /// change what is sent to AWS or GCS.
     #[test]
-    fn test_force_path_style_detection_and_builder() {
-        // 1. Google Cloud Storage regional and global endpoints auto-detect force_path_style = true
-        let gcs_regional = RemoteTargetConfig::new("appendfs-remote")
-            .with_endpoint("https://storage.europe-west4.rep.googleapis.com")
-            .build_store();
-        assert!(format!("{:?}", gcs_regional).contains("force_path_style: true"));
+    fn test_live_remote_shapes_request_addressing_is_stable() {
+        let registry: RemoteRegistry = toml::from_str(
+            r#"
+[remotes.aws-archive]
+bucket = "example-archive-111122223333-eu-west-1-an"
+region = "eu-west-1"
+prefix = ""
+mode = "write-only"
+replicate_ancestors = false
+read_priority = 100
+access_key_id = "AKIDEXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+storage_class = "DEEP_ARCHIVE"
 
-        let gcs_global = RemoteTargetConfig::new("appendfs-remote")
-            .with_endpoint("https://storage.googleapis.com")
-            .build_store();
-        assert!(format!("{:?}", gcs_global).contains("force_path_style: true"));
+[remotes.gcs-regional]
+bucket = "example-bucket"
+region = "europe-west4"
+endpoint = "https://storage.europe-west4.rep.googleapis.com"
+prefix = ""
+mode = "read-write"
+replicate_ancestors = false
+read_priority = 100
+access_key_id = "GOOGEXAMPLE"
+secret_access_key = "bGoa+V7g/yqDXvKRqq+JTFn4uQZbPiQJo4pf9RzJ"
+# No longer read, but existing remotes.toml files still carry it and must keep loading.
+force_path_style = true
+upload_partial_logs = false
+"#,
+        )
+        .unwrap();
 
-        // 2. Standard endpoints default to force_path_style = false
-        let standard_s3 = RemoteTargetConfig::new("my-bucket")
-            .with_endpoint("https://s3.amazonaws.com")
-            .build_store();
-        assert!(format!("{:?}", standard_s3).contains("force_path_style: false"));
+        const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        const DATETIME: &str = "20261015T120000Z";
+        let list_query = [
+            ("list-type".to_string(), "2".to_string()),
+            ("prefix".to_string(), "".to_string()),
+        ];
+        let put_headers = [
+            ("Content-Length".to_string(), "1024".to_string()),
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+        ];
 
-        // 3. Explicit builder overrides default to true
-        let explicit_true = RemoteTargetConfig::new("my-bucket")
-            .with_endpoint("https://s3.amazonaws.com")
-            .with_force_path_style(true)
-            .build_store();
-        assert!(format!("{:?}", explicit_true).contains("force_path_style: true"));
+        let mut actual = Vec::new();
+        for (name, storage_class) in [("aws-archive", Some("DEEP_ARCHIVE")), ("gcs-regional", None)] {
+            let store = registry.get_remote(name).unwrap().build_s3_store();
+            let mut put_headers = put_headers.to_vec();
+            if let Some(sc) = storage_class {
+                put_headers.push(("x-amz-storage-class".to_string(), sc.to_string()));
+            }
+            for (method, key, query, headers, payload) in [
+                ("GET", "", &list_query[..], &[][..], EMPTY_SHA256),
+                ("GET", "000001.summary", &[][..], &[][..], EMPTY_SHA256),
+                ("PUT", "000002.log", &[][..], &put_headers[..], "UNSIGNED-PAYLOAD"),
+            ] {
+                let prepared = store.prepare_request(method, key, query, headers, payload, DATETIME);
+                actual.push((name, method, prepared.url, prepared.headers));
+            }
+        }
 
-        // 4. Explicit builder overrides googleapis detection to false
-        let explicit_false = RemoteTargetConfig::new("appendfs-remote")
-            .with_endpoint("https://storage.europe-west4.rep.googleapis.com")
-            .with_force_path_style(false)
-            .build_store();
-        assert!(format!("{:?}", explicit_false).contains("force_path_style: false"));
+        let signed = |remote: &str, signed_headers: &str, signature: &str| {
+            let (key_id, region) = match remote {
+                "aws-archive" => ("AKIDEXAMPLE", "eu-west-1"),
+                _ => ("GOOGEXAMPLE", "europe-west4"),
+            };
+            format!(
+                "AWS4-HMAC-SHA256 Credential={}/20261015/{}/s3/aws4_request, SignedHeaders={}, Signature={}",
+                key_id, region, signed_headers, signature
+            )
+        };
+        let aws = "https://example-archive-111122223333-eu-west-1-an.s3.eu-west-1.amazonaws.com";
+        let gcs = "https://storage.europe-west4.rep.googleapis.com/example-bucket";
+        let get_headers = "host;x-amz-content-sha256;x-amz-date";
+        let expected = [
+            (
+                "aws-archive",
+                "GET",
+                aws.to_string(),
+                signed(
+                    "aws-archive",
+                    get_headers,
+                    "8cf11a185b724d7b8be038f6669912eb8ec02c324842679cff14578ee1f5a52b",
+                ),
+            ),
+            (
+                "aws-archive",
+                "GET",
+                format!("{}/000001.summary", aws),
+                signed(
+                    "aws-archive",
+                    get_headers,
+                    "cf5f9f129737208f410ef500e57da08627562af484f7a3548e506cc0abd6a1bd",
+                ),
+            ),
+            (
+                "aws-archive",
+                "PUT",
+                format!("{}/000002.log", aws),
+                signed(
+                    "aws-archive",
+                    "content-length;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class",
+                    "37cf9ad1734c6a421f4009311a9c4e388d293c8c22048f854dee218e671406a1",
+                ),
+            ),
+            (
+                "gcs-regional",
+                "GET",
+                gcs.to_string(),
+                signed(
+                    "gcs-regional",
+                    get_headers,
+                    "0e6a4da69d75c02f68a370e2ac9c9d3531d8b8322814d2eb673a9ee753f6278f",
+                ),
+            ),
+            (
+                "gcs-regional",
+                "GET",
+                format!("{}/000001.summary", gcs),
+                signed(
+                    "gcs-regional",
+                    get_headers,
+                    "91b0f7ba6b0794dd0372998648e996007e72c2e5d99512d64f319b4960591e78",
+                ),
+            ),
+            (
+                "gcs-regional",
+                "PUT",
+                format!("{}/000002.log", gcs),
+                signed(
+                    "gcs-regional",
+                    "content-length;content-type;host;x-amz-content-sha256;x-amz-date",
+                    "0838742dc9618a123d21b8850a05d549bb062b035d8be228be885dc97467dd79",
+                ),
+            ),
+        ];
+
+        assert_eq!(actual.len(), expected.len());
+        for ((name, method, url, headers), (exp_name, exp_method, exp_url, exp_auth)) in actual.iter().zip(&expected) {
+            assert_eq!((*name, *method, url), (*exp_name, *exp_method, exp_url));
+            let auth = headers.iter().find(|(k, _)| k == "Authorization").map(|(_, v)| v);
+            assert_eq!(auth, Some(exp_auth), "{} {} {}", name, method, url);
+            assert!(headers.contains(&("x-amz-date".to_string(), DATETIME.to_string())));
+        }
+    }
+
+    #[test]
+    fn test_custom_endpoints_are_addressed_path_style() {
+        for (endpoint, expected_url) in [
+            (
+                "https://storage.googleapis.com",
+                "https://storage.googleapis.com/my-bucket/k",
+            ),
+            (
+                "https://s3.eu-central-1.amazonaws.com",
+                "https://s3.eu-central-1.amazonaws.com/my-bucket/k",
+            ),
+            (
+                "https://acct.r2.cloudflarestorage.com/",
+                "https://acct.r2.cloudflarestorage.com/my-bucket/k",
+            ),
+            ("http://localhost:9000", "http://localhost:9000/my-bucket/k"),
+        ] {
+            let store = RemoteTargetConfig::new("my-bucket")
+                .with_endpoint(endpoint)
+                .build_s3_store();
+            let prepared = store.prepare_request("GET", "k", &[], &[], "UNSIGNED-PAYLOAD", "20261015T120000Z");
+            assert_eq!(prepared.url, expected_url, "endpoint {}", endpoint);
+        }
+
+        // Without an endpoint the target is AWS, addressed virtual-hosted style.
+        let mut aws = RemoteTargetConfig::new("my-bucket");
+        aws.region = "eu-west-1".to_string();
+        let prepared =
+            aws.build_s3_store()
+                .prepare_request("GET", "k", &[], &[], "UNSIGNED-PAYLOAD", "20261015T120000Z");
+        assert_eq!(prepared.url, "https://my-bucket.s3.eu-west-1.amazonaws.com/k");
     }
 }
