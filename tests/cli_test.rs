@@ -1,5 +1,6 @@
 // Drives the mounted filesystem through raw syscalls that std does not expose.
 #![allow(unsafe_code)]
+use appendfs::{FakeS3Server, RemoteStore};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -1589,77 +1590,18 @@ fn test_init_from_remote_with_credentials_file_e2e() {
         .expect("failed to init source vol");
     assert!(init_out.status.success());
 
+    // The CLI auto-selects path-style addressing for a 127.0.0.1 endpoint.
+    let server = FakeS3Server::start("test-bucket");
     let summary_bytes = std::fs::read(source_dir.join("000000.summary")).unwrap();
-    let summary_len = summary_bytes.len();
-
-    // Start mock S3 server
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let server_handle = std::thread::spawn(move || {
-        use std::io::BufRead;
-        // Request 1: list_objects
-        let (mut stream1, _) = listener.accept().unwrap();
-        let mut reader1 = std::io::BufReader::new(stream1.try_clone().unwrap());
-        let mut headers1 = Vec::new();
-        let mut line = String::new();
-        while reader1.read_line(&mut line).unwrap() > 0 {
-            if line == "\r\n" || line == "\n" {
-                break;
-            }
-            headers1.push(line.trim().to_string());
-            line.clear();
-        }
-
-        let list_xml = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>test-bucket</Name>
-    <Prefix></Prefix>
-    <KeyCount>1</KeyCount>
-    <MaxKeys>1000</MaxKeys>
-    <IsTruncated>false</IsTruncated>
-    <Contents>
-        <Key>000000.summary</Key>
-        <Size>{}</Size>
-    </Contents>
-</ListBucketResult>"#,
-            summary_len
-        );
-
-        let resp1 = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            list_xml.len(),
-            list_xml
-        );
-        stream1.write_all(resp1.as_bytes()).unwrap();
-        stream1.flush().unwrap();
-        drop(stream1);
-
-        // Request 2: get_object 000000.summary
-        let (mut stream2, _) = listener.accept().unwrap();
-        let mut reader2 = std::io::BufReader::new(stream2.try_clone().unwrap());
-        let mut headers2 = Vec::new();
-        line.clear();
-        while reader2.read_line(&mut line).unwrap() > 0 {
-            if line == "\r\n" || line == "\n" {
-                break;
-            }
-            headers2.push(line.trim().to_string());
-            line.clear();
-        }
-
-        let resp2 = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            summary_bytes.len()
-        );
-        stream2.write_all(resp2.as_bytes()).unwrap();
-        stream2.write_all(&summary_bytes).unwrap();
-        stream2.flush().unwrap();
-        drop(stream2);
-
-        (headers1, headers2)
-    });
+    server
+        .store()
+        .put_object(
+            "000000.summary",
+            &mut summary_bytes.as_slice(),
+            summary_bytes.len() as u64,
+            None,
+        )
+        .unwrap();
 
     // Write INI-style credentials file to verify full parsing
     let creds_file = temp_dir.path().join("aws_creds.ini");
@@ -1679,7 +1621,7 @@ fn test_init_from_remote_with_credentials_file_e2e() {
             "--remote-bucket",
             "test-bucket",
             "--remote-endpoint",
-            &format!("http://{}", addr),
+            &server.endpoint(),
             "--remote-credentials-file",
             creds_file.to_str().unwrap(),
         ])
@@ -1698,18 +1640,16 @@ fn test_init_from_remote_with_credentials_file_e2e() {
     assert!(remotes_toml.contains("credentials_file"));
     assert!(remotes_toml.contains(creds_file.to_str().unwrap()));
 
-    let (headers1, headers2) = server_handle.join().unwrap();
-    let auth1 = headers1
-        .iter()
-        .find(|h| h.to_ascii_lowercase().starts_with("authorization:"))
-        .expect("authorization header on list request");
-    assert!(auth1.contains("BOOTSTRAP_KEY_123"));
-
-    let auth2 = headers2
-        .iter()
-        .find(|h| h.to_ascii_lowercase().starts_with("authorization:"))
-        .expect("authorization header on get request");
-    assert!(auth2.contains("BOOTSTRAP_KEY_123"));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "requests: {:?}", requests);
+    for request in &requests {
+        let auth = request.header("authorization").expect("authorization header");
+        assert!(auth.contains("BOOTSTRAP_KEY_123"), "{}", auth);
+    }
+    assert_eq!(
+        std::fs::read(bootstrap_dir.join("000000.summary")).unwrap(),
+        summary_bytes
+    );
 }
 
 #[test]
@@ -1786,68 +1726,17 @@ fn test_init_from_remote_path_style_flag_and_toml_persistence() {
         .expect("failed to init source vol");
     assert!(init_out.status.success());
 
+    let server = FakeS3Server::start("my-bucket");
     let summary_bytes = std::fs::read(source_dir.join("000000.summary")).unwrap();
-    let summary_len = summary_bytes.len();
-
-    // Start mock server that records requested URIs
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let server_handle = std::thread::spawn(move || {
-        use std::io::BufRead;
-        let mut request_lines = Vec::new();
-
-        // 2 requests expected: list_objects, then get_object
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut first_line = String::new();
-            reader.read_line(&mut first_line).unwrap();
-            request_lines.push(first_line.trim().to_string());
-
-            let mut header_line = String::new();
-            while reader.read_line(&mut header_line).unwrap() > 0 {
-                if header_line == "\r\n" || header_line == "\n" {
-                    break;
-                }
-                header_line.clear();
-            }
-
-            if first_line.contains("list-type=2") {
-                let list_xml = format!(
-                    r#"<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>my-bucket</Name>
-    <Prefix></Prefix>
-    <KeyCount>1</KeyCount>
-    <MaxKeys>1000</MaxKeys>
-    <IsTruncated>false</IsTruncated>
-    <Contents>
-        <Key>000000.summary</Key>
-        <Size>{}</Size>
-    </Contents>
-</ListBucketResult>"#,
-                    summary_len
-                );
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    list_xml.len(),
-                    list_xml
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
-            } else {
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    summary_bytes.len()
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
-                stream.write_all(&summary_bytes).unwrap();
-            }
-            stream.flush().unwrap();
-        }
-
-        request_lines
-    });
+    server
+        .store()
+        .put_object(
+            "000000.summary",
+            &mut summary_bytes.as_slice(),
+            summary_bytes.len() as u64,
+            None,
+        )
+        .unwrap();
 
     let creds_file = temp_dir.path().join("creds.txt");
     std::fs::write(&creds_file, "TEST_KEY\nTEST_SECRET\n").unwrap();
@@ -1862,7 +1751,7 @@ fn test_init_from_remote_path_style_flag_and_toml_persistence() {
             "--remote-bucket",
             "my-bucket",
             "--remote-endpoint",
-            &format!("http://{}", addr),
+            &server.endpoint(),
             "--remote-credentials-file",
             creds_file.to_str().unwrap(),
             "--remote-path-style",
@@ -1880,18 +1769,13 @@ fn test_init_from_remote_path_style_flag_and_toml_persistence() {
     let remotes_toml = std::fs::read_to_string(bootstrap_dir.join("remotes.toml")).unwrap();
     assert!(remotes_toml.contains("force_path_style = true"));
 
-    let reqs = server_handle.join().unwrap();
-    assert_eq!(reqs.len(), 2);
-    assert!(
-        reqs[0].starts_with("GET /my-bucket?list-type=2"),
-        "request 0 was: {}",
-        reqs[0]
-    );
-    assert!(
-        reqs[1].starts_with("GET /my-bucket/000000.summary"),
-        "request 1 was: {}",
-        reqs[1]
-    );
+    let requests: Vec<_> = server
+        .requests()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(requests, ["GET /my-bucket", "GET /my-bucket/000000.summary"]);
+    assert_eq!(server.requests()[0].query_param("list-type"), Some("2"));
 
     // Also verify --path-style alias works on init
     let bootstrap_dir2 = temp_dir.path().join("bootstrapped_vol2");

@@ -467,121 +467,214 @@ fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
-    use std::net::TcpListener;
-    use std::thread;
+    use crate::remote::FakeS3Server;
 
-    #[test]
-    fn test_s3_put_object_storage_class_header() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut headers = Vec::new();
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap() > 0 {
-                if line == "\r\n" || line == "\n" {
-                    break;
-                }
-                headers.push(line.trim().to_string());
-                line.clear();
-            }
-
-            // Send HTTP 200 response
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                .unwrap();
-            headers
-        });
-
+    fn client(server: &FakeS3Server, storage_class: Option<String>) -> S3RemoteStore {
         let signer = SigV4Signer::new("TESTKEY", "TESTSECRET", "us-east-1");
-        let store = S3RemoteStore::new(
+        S3RemoteStore::new(
             "mybucket",
             "us-east-1",
-            Some(format!("http://{}", addr)),
+            Some(server.endpoint()),
             "test_prefix",
             Some(signer),
             true,
-            Some("INTELLIGENT_TIERING".to_string()),
-        );
+            storage_class,
+        )
+    }
+
+    #[test]
+    fn test_s3_put_object_storage_class_header() {
+        let server = FakeS3Server::start("mybucket");
+        let store = client(&server, Some("INTELLIGENT_TIERING".to_string()));
 
         let data = b"storage class payload";
         store
             .put_object("gen1.log", &mut &data[..], data.len() as u64, None)
             .unwrap();
 
-        let headers = handle.join().unwrap();
-        let has_storage_class = headers
-            .iter()
-            .any(|h| h.eq_ignore_ascii_case("x-amz-storage-class: INTELLIGENT_TIERING"));
-        assert!(
-            has_storage_class,
-            "Headers must contain 'x-amz-storage-class: INTELLIGENT_TIERING'. Received: {:?}",
-            headers
-        );
-
-        let auth_header = headers
-            .iter()
-            .find(|h| h.to_ascii_lowercase().starts_with("authorization:"))
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].header("x-amz-storage-class"), Some("INTELLIGENT_TIERING"));
+        let auth = requests[0]
+            .header("authorization")
             .expect("Authorization header must be present");
         assert!(
-            auth_header.contains("x-amz-storage-class"),
+            auth.contains("x-amz-storage-class"),
             "SigV4 SignedHeaders must include x-amz-storage-class: {}",
-            auth_header
+            auth
+        );
+        assert_eq!(
+            server.store().get_raw_bytes("test_prefix/gen1.log").as_deref(),
+            Some(&data[..])
         );
     }
 
     #[test]
     fn test_s3_put_object_no_storage_class_default() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut headers = Vec::new();
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap() > 0 {
-                if line == "\r\n" || line == "\n" {
-                    break;
-                }
-                headers.push(line.trim().to_string());
-                line.clear();
-            }
-
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                .unwrap();
-            headers
-        });
-
-        let signer = SigV4Signer::new("TESTKEY", "TESTSECRET", "us-east-1");
-        let store = S3RemoteStore::new(
-            "mybucket",
-            "us-east-1",
-            Some(format!("http://{}", addr)),
-            "test_prefix",
-            Some(signer),
-            true,
-            None,
-        );
+        let server = FakeS3Server::start("mybucket");
+        let store = client(&server, None);
 
         let data = b"payload";
         store
             .put_object("gen1.log", &mut &data[..], data.len() as u64, None)
             .unwrap();
 
-        let headers = handle.join().unwrap();
-        let has_storage_class = headers
-            .iter()
-            .any(|h| h.to_ascii_lowercase().starts_with("x-amz-storage-class"));
-        assert!(
-            !has_storage_class,
-            "Headers must NOT contain 'x-amz-storage-class' when none configured. Received: {:?}",
-            headers
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].header("x-amz-storage-class"), None);
+    }
+
+    #[test]
+    fn test_s3_object_round_trip() {
+        let server = FakeS3Server::start("mybucket");
+        let store = client(&server, None);
+
+        let data: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        let md5: [u8; 16] = *md5::compute(&data);
+        store
+            .put_object("000001.log", &mut data.as_slice(), data.len() as u64, Some(&md5))
+            .unwrap();
+
+        let head = store.head_object("000001.log").unwrap().expect("object must exist");
+        assert_eq!(head.key, "000001.log");
+        assert_eq!(head.size, data.len() as u64);
+        assert_eq!(head.etag.as_deref(), Some(hex::encode(md5).as_str()));
+
+        let mut full = Vec::new();
+        assert_eq!(store.get_object("000001.log", &mut full).unwrap(), data.len() as u64);
+        assert_eq!(full, data);
+
+        let mut range = Vec::new();
+        assert_eq!(
+            store.get_object_range("000001.log", 1000, 300, &mut range).unwrap(),
+            300
         );
+        assert_eq!(range, &data[1000..1300]);
+
+        let listed = store.list_objects("").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "000001.log");
+        assert_eq!(listed[0].size, data.len() as u64);
+
+        store.delete_object("000001.log").unwrap();
+        assert!(store.head_object("000001.log").unwrap().is_none());
+        // Deleting a missing key is not an error.
+        store.delete_object("000001.log").unwrap();
+
+        let err = store.get_object("000001.log", &mut Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("NoSuchKey"), "{}", err);
+
+        // Path-style addressing puts the bucket first, then the configured prefix.
+        let paths: Vec<_> = server
+            .requests()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "PUT /mybucket/test_prefix/000001.log",
+                "HEAD /mybucket/test_prefix/000001.log",
+                "GET /mybucket/test_prefix/000001.log",
+                "GET /mybucket/test_prefix/000001.log",
+                "GET /mybucket",
+                "DELETE /mybucket/test_prefix/000001.log",
+                "HEAD /mybucket/test_prefix/000001.log",
+                "DELETE /mybucket/test_prefix/000001.log",
+                "GET /mybucket/test_prefix/000001.log",
+            ]
+        );
+        assert_eq!(server.requests()[2].header("range"), None);
+        assert_eq!(server.requests()[3].header("range"), Some("bytes=1000-1299"));
+    }
+
+    #[test]
+    fn test_s3_list_objects_follows_continuation_tokens() {
+        let server = FakeS3Server::start("mybucket");
+        server.set_list_page_size(2);
+        for key in [
+            "test_prefix/a",
+            "test_prefix/b",
+            "test_prefix/c",
+            "test_prefix/d",
+            "test_prefix/e",
+        ] {
+            server.store().put_object(key, &mut &b"x"[..], 1, None).unwrap();
+        }
+        // Outside the client's prefix; must never be listed.
+        server.store().put_object("other/f", &mut &b"x"[..], 1, None).unwrap();
+
+        let store = client(&server, None);
+        let keys: Vec<_> = store.list_objects("").unwrap().into_iter().map(|o| o.key).collect();
+        assert_eq!(keys, ["a", "b", "c", "d", "e"]);
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert_eq!(request.query_param("list-type"), Some("2"));
+            assert_eq!(request.query_param("prefix"), Some("test_prefix/"));
+        }
+        assert_eq!(requests[0].query_param("continuation-token"), None);
+        assert_eq!(requests[1].query_param("continuation-token"), Some("test_prefix/b"));
+        assert_eq!(requests[2].query_param("continuation-token"), Some("test_prefix/d"));
+    }
+
+    #[test]
+    fn test_s3_head_object_missing_returns_none() {
+        let server = FakeS3Server::start("mybucket");
+        let store = client(&server, None);
+        assert!(store.head_object("missing.log").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_s3_put_object_bad_digest_is_rejected() {
+        let server = FakeS3Server::start("mybucket");
+        let store = client(&server, None);
+
+        let data = b"payload";
+        let wrong_md5: [u8; 16] = *md5::compute(b"something else");
+        let err = store
+            .put_object("gen1.log", &mut &data[..], data.len() as u64, Some(&wrong_md5))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("BadDigest"), "{}", err);
+        assert!(server.store().object_len("test_prefix/gen1.log").is_none());
+    }
+
+    #[test]
+    fn test_s3_error_responses_map_to_error_kinds() {
+        let server = FakeS3Server::start("mybucket");
+        let store = client(&server, None);
+        server
+            .store()
+            .put_object("test_prefix/k", &mut &b"x"[..], 1, None)
+            .unwrap();
+
+        for (status, code, kind) in [
+            (403, "AccessDenied", io::ErrorKind::PermissionDenied),
+            (503, "SlowDown", io::ErrorKind::WouldBlock),
+            (500, "InternalError", io::ErrorKind::Other),
+        ] {
+            server.fail_next_request(status, code);
+            let err = store.get_object("k", &mut Vec::new()).unwrap_err();
+            assert_eq!(err.kind(), kind, "HTTP {} {}", status, code);
+            assert!(err.to_string().contains(code), "{}", err);
+        }
+
+        // The injected failures are one-shot; the object is still served afterwards.
+        let mut out = Vec::new();
+        store.get_object("k", &mut out).unwrap();
+        assert_eq!(out, b"x");
+    }
+
+    #[test]
+    fn test_s3_unknown_bucket_is_not_found() {
+        let server = FakeS3Server::start("otherbucket");
+        let store = client(&server, None);
+        let err = store.list_objects("").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("NoSuchBucket"), "{}", err);
     }
 
     #[test]

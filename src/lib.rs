@@ -63,7 +63,10 @@ pub use remote::{
     read_credentials_file,
 };
 #[cfg(any(test, feature = "testing"))]
-pub use remote::{CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, MockRemoteStore, RemoteStoreMetrics};
+pub use remote::{
+    CountingRemoteStore, FailingRemoteStore, FakeS3Request, FakeS3Server, LatencyRemoteStore, MockRemoteStore,
+    RemoteStoreMetrics,
+};
 pub use shim::{
     DeferredCallback, DeferredCompletion, DeferredReceiver, DeferredResult, DeferredToken, DirEntry, DirEntryPlus,
     FileAttr, FileType, Filesystem, FuseResponse, ReplyData, Request, RequestContext, StatfsAttr,
