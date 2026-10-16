@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Any subdirectories placed into `tests/fixtures/` are automatically discovered
-//! and tested by `test_all_fixture_versions`.
+//! and tested by the data-driven test suite.
 
 use appendfs::FsTestExt;
 use appendfs::compat::{
@@ -26,19 +26,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-fn fixture_v1_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1")
-}
-
-fn fixture_v2_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2")
-}
-
-fn fixture_v2_key_file_compressed_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2_key_file_compressed")
-}
-
 pub use appendfs::compat::resolve_fixture_volume_key;
+
+fn all_fixture_dirs() -> Vec<PathBuf> {
+    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    assert!(fixtures_dir.is_dir(), "tests/fixtures directory must exist");
+
+    let mut versions: Vec<PathBuf> = fs::read_dir(&fixtures_dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.path())
+        .collect();
+    versions.sort();
+
+    assert!(
+        !versions.is_empty(),
+        "at least one fixture version directory must exist"
+    );
+    versions
+}
 
 /// Tests recovery when the latest summary file is missing, forcing full log replay and
 /// reconstruction from the earliest summary and all subsequent log records.
@@ -129,64 +136,24 @@ pub fn verify_recovery_from_latest_summary_snapshot(fixture_dir: &Path) {
     assert_eq!(read_back, b"summary test forward write works!");
 }
 
+/// Restores each fixture volume directly from its latest exported summary snapshot file
+/// and verifies its directory tree, file contents, symlinks, special files, xattrs, and
+/// forward mutability.
 #[test]
-fn test_v1_log_reconstruction_with_latest_summary_missing() {
-    verify_recovery_with_latest_summary_missing(&fixture_v1_dir());
+fn test_recovery_from_latest_summary_snapshot() {
+    for fixture_dir in all_fixture_dirs() {
+        verify_recovery_from_latest_summary_snapshot(&fixture_dir);
+    }
 }
 
+/// Restores each fixture volume when the latest summary file is missing, forcing full
+/// log replay and reconstruction from 000000.summary and all subsequent log records across
+/// all commit batches.
 #[test]
-fn test_v1_recovery_from_latest_summary_snapshot() {
-    verify_recovery_from_latest_summary_snapshot(&fixture_v1_dir());
-}
-
-#[test]
-fn test_v1_stats_matches_latest_summary_dump() {
-    verify_stats_matches_latest_summary_dump(&fixture_v1_dir());
-}
-
-#[test]
-fn test_v1_fsck_matches_golden() {
-    verify_fsck_matches_golden(&fixture_v1_dir());
-}
-
-#[test]
-fn test_v2_log_reconstruction_with_latest_summary_missing() {
-    verify_recovery_with_latest_summary_missing(&fixture_v2_dir());
-}
-
-#[test]
-fn test_v2_recovery_from_latest_summary_snapshot() {
-    verify_recovery_from_latest_summary_snapshot(&fixture_v2_dir());
-}
-
-#[test]
-fn test_v2_stats_matches_latest_summary_dump() {
-    verify_stats_matches_latest_summary_dump(&fixture_v2_dir());
-}
-
-#[test]
-fn test_v2_fsck_matches_golden() {
-    verify_fsck_matches_golden(&fixture_v2_dir());
-}
-
-#[test]
-fn test_v2_key_file_compressed_log_reconstruction_with_latest_summary_missing() {
-    verify_recovery_with_latest_summary_missing(&fixture_v2_key_file_compressed_dir());
-}
-
-#[test]
-fn test_v2_key_file_compressed_recovery_from_latest_summary_snapshot() {
-    verify_recovery_from_latest_summary_snapshot(&fixture_v2_key_file_compressed_dir());
-}
-
-#[test]
-fn test_v2_key_file_compressed_stats_matches_latest_summary_dump() {
-    verify_stats_matches_latest_summary_dump(&fixture_v2_key_file_compressed_dir());
-}
-
-#[test]
-fn test_v2_key_file_compressed_fsck_matches_golden() {
-    verify_fsck_matches_golden(&fixture_v2_key_file_compressed_dir());
+fn test_recovery_with_latest_summary_missing() {
+    for fixture_dir in all_fixture_dirs() {
+        verify_recovery_with_latest_summary_missing(&fixture_dir);
+    }
 }
 
 /// Verifies that re-running the generator reproduces the checked-in fixture directory
@@ -216,46 +183,14 @@ pub fn verify_deterministic_reproducibility(fixture_dir: &Path) {
     }
 }
 
+/// Every configuration the generator knows (V2) must reproduce its checked-in fixture byte
+/// for byte, proving the write path has not drifted from the on-disk format.
 #[test]
 fn test_v2_deterministic_reproducibility() {
-    verify_deterministic_reproducibility(&fixture_v2_dir());
-}
-
-#[test]
-fn test_v2_key_file_compressed_deterministic_reproducibility() {
-    verify_deterministic_reproducibility(&fixture_v2_key_file_compressed_dir());
-}
-
-/// Every configuration the generator knows must reproduce its checked-in fixture byte for
-/// byte, which is what proves the write path has not drifted from the format on disk.
-///
-/// The legacy passphrase fixtures are not among them: nothing can create such a volume any
-/// more, so they are covered by recovery alone, in `test_all_fixture_versions`.
-#[test]
-fn test_generated_fixtures_reproduce_byte_for_byte() {
     let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     for config in CompatFixtureConfig::ALL {
-        let temp = tempfile::tempdir().unwrap();
-        create_canonical_compat_volume(temp.path(), config).expect("create canonical compat volume");
-
         let fixture_dir = fixtures_dir.join(config.default_dir_name());
-        let key_file = config.is_encrypted().then_some(COMPAT_KEY_FILENAME);
-        for name in appendfs::compat::COMPAT_FIXTURE_FILES
-            .iter()
-            .chain(appendfs::compat::COMPAT_FIXTURE_DUMP_FILES.iter())
-            .chain([COMPAT_FSCK_REPORT_FILENAME].iter())
-            .chain(key_file.iter())
-        {
-            let actual_bytes = fs::read(temp.path().join(name)).expect("read generated file");
-            let expected_bytes = fs::read(fixture_dir.join(name)).expect("read fixture file");
-            assert_eq!(
-                actual_bytes,
-                expected_bytes,
-                "Generated file {} differs from checked-in fixture in {}",
-                name,
-                fixture_dir.display()
-            );
-        }
+        verify_deterministic_reproducibility(&fixture_dir);
     }
 }
 
@@ -343,10 +278,11 @@ fn collect_secret_plaintext(fs: &AppendFs) -> Vec<(String, Vec<u8>)> {
 /// The `-dump.txt` goldens beside the fixture are excluded: they are decrypted renderings
 /// produced *with* the fixture key, and contain plaintext by design.
 pub fn verify_no_plaintext_in_encrypted_fixture(fixture_dir: &Path) {
-    let Some(config) = CompatFixtureConfig::from_dir_path(fixture_dir) else {
-        return;
-    };
-    if !config.is_encrypted() {
+    let storage_header = OsStorage::new(fixture_dir);
+    let is_encrypted = SummaryReader::read_volume_header(&storage_header, "000000.summary")
+        .map(|h| h.cipher.is_encrypted())
+        .unwrap_or(false);
+    if !is_encrypted {
         return;
     }
 
@@ -529,40 +465,6 @@ pub fn verify_fsck_matches_golden(fixture_dir: &Path) {
     );
 }
 
-#[test]
-fn test_all_fixture_versions() {
-    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    assert!(fixtures_dir.is_dir(), "tests/fixtures directory must exist");
-
-    let mut versions: Vec<PathBuf> = fs::read_dir(&fixtures_dir)
-        .unwrap()
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .map(|e| e.path())
-        .collect();
-    versions.sort();
-
-    assert!(
-        !versions.is_empty(),
-        "at least one fixture version directory must exist"
-    );
-
-    for version_dir in &versions {
-        let version_name = version_dir.file_name().unwrap().to_string_lossy();
-        println!("Running compatibility checks on fixture: {}", version_name);
-        verify_recovery_with_latest_summary_missing(version_dir);
-        verify_recovery_from_latest_summary_snapshot(version_dir);
-        verify_no_plaintext_in_encrypted_fixture(version_dir);
-        verify_fixture_dumps(version_dir);
-        verify_stats_matches_latest_summary_dump(version_dir);
-        verify_fsck_matches_golden(version_dir);
-        verify_python_restore_script(version_dir);
-        if version_name.starts_with("v2") {
-            verify_deterministic_reproducibility(version_dir);
-        }
-    }
-}
-
 /// Verifies that the standalone Python restore script (scripts/restore.py) can successfully
 /// replay all log batches from the golden fixture and reconstruct identical file data.
 pub fn verify_python_restore_script(fixture_dir: &Path) {
@@ -632,4 +534,50 @@ pub fn verify_python_restore_script(fixture_dir: &Path) {
         fs::read_link(dest_path.join("symlink_rel")).unwrap(),
         Path::new("hello.txt")
     );
+}
+
+/// Verifies that no name, file content, symlink target, or xattr of an encrypted fixture
+/// appears in its checked-in volume files, or in anything the read path writes to disk
+/// while serving them (including the on-disk block cache).
+#[test]
+fn test_no_plaintext_in_encrypted_fixtures() {
+    for fixture_dir in all_fixture_dirs() {
+        verify_no_plaintext_in_encrypted_fixture(&fixture_dir);
+    }
+}
+
+/// Verifies that dump output for all canonical volume files in each fixture directory matches
+/// the checked-in golden *-dump.txt files.
+#[test]
+fn test_fixture_dumps() {
+    for fixture_dir in all_fixture_dirs() {
+        verify_fixture_dumps(&fixture_dir);
+    }
+}
+
+/// Verifies that `appendfs stats` output is identical to `appendfs dump` on the latest summary file
+/// starting from the canonical "--- Inode Breakdown ---" report header across all fixture versions.
+#[test]
+fn test_stats_matches_latest_summary_dump() {
+    for fixture_dir in all_fixture_dirs() {
+        verify_stats_matches_latest_summary_dump(&fixture_dir);
+    }
+}
+
+/// Verifies that running fsck in full data verification mode against the canonical volume
+/// in each fixture directory produces output identical to the checked-in golden fsck-report.txt.
+#[test]
+fn test_fsck_matches_golden() {
+    for fixture_dir in all_fixture_dirs() {
+        verify_fsck_matches_golden(&fixture_dir);
+    }
+}
+
+/// Verifies that the standalone Python restore script (scripts/restore.py) can successfully
+/// replay all log batches from the golden fixtures and reconstruct identical file data.
+#[test]
+fn test_python_restore_script() {
+    for fixture_dir in all_fixture_dirs() {
+        verify_python_restore_script(&fixture_dir);
+    }
 }
