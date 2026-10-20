@@ -240,9 +240,6 @@ fn cmd_init(args: InitArgs) {
             if let Some(ref secret_env) = args.remote_secret_access_key_env {
                 cfg.secret_access_key_env = Some(secret_env.clone());
             }
-            if let Some(path_style) = args.remote_path_style {
-                cfg.force_path_style = Some(path_style);
-            }
             cfg
         } else if let Some(ref path) = args.remote_path {
             let mut cfg = appendfs::remote::RemoteTargetConfig::new_path(path);
@@ -259,7 +256,6 @@ fn cmd_init(args: InitArgs) {
             cfg.access_key_id_env = args.remote_access_key_id_env.clone();
             cfg.secret_access_key_env = args.remote_secret_access_key_env.clone();
             cfg.credentials_file = args.remote_credentials_file.clone();
-            cfg.force_path_style = args.remote_path_style;
             cfg
         } else {
             eprintln!(
@@ -892,7 +888,6 @@ fn cmd_remote_add(add_args: RemoteAddArgs) {
         std::process::exit(1);
     }
     cfg.credentials_file = add_args.credentials_file;
-    cfg.force_path_style = add_args.path_style;
     cfg.storage_class = add_args.storage_class;
     if add_args.no_upload_partial_logs && add_args.upload_partial_logs.is_some() {
         eprintln!("Error: Cannot specify both --upload-partial-logs and --no-upload-partial-logs.");

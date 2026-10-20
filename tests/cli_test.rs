@@ -1590,7 +1590,6 @@ fn test_init_from_remote_with_credentials_file_e2e() {
         .expect("failed to init source vol");
     assert!(init_out.status.success());
 
-    // The CLI auto-selects path-style addressing for a 127.0.0.1 endpoint.
     let server = FakeS3Server::start("test-bucket");
     let summary_bytes = std::fs::read(source_dir.join("000000.summary")).unwrap();
     server
@@ -1653,69 +1652,7 @@ fn test_init_from_remote_with_credentials_file_e2e() {
 }
 
 #[test]
-fn test_remote_add_path_style_flags() {
-    let temp_dir = TempDir::new().unwrap();
-    let vol_dir = temp_dir.path().join("vol");
-
-    // Initialize volume
-    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args(["init", vol_dir.to_str().unwrap()])
-        .output()
-        .expect("failed to init vol");
-    assert!(init_out.status.success());
-
-    // 1. --path-style as a boolean flag without explicit value defaults to true
-    let add_out1 = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "remote",
-            "add",
-            vol_dir.to_str().unwrap(),
-            "gcs_store",
-            "--bucket",
-            "my-gcs-bucket",
-            "--endpoint",
-            "https://storage.europe-west4.rep.googleapis.com",
-            "--path-style",
-        ])
-        .output()
-        .expect("failed to run remote add");
-    assert!(
-        add_out1.status.success(),
-        "remote add failed: {}",
-        String::from_utf8_lossy(&add_out1.stderr)
-    );
-
-    let remotes_toml1 = std::fs::read_to_string(vol_dir.join("remotes.toml")).unwrap();
-    assert!(remotes_toml1.contains("force_path_style = true"));
-
-    // 2. --path-style false explicitly sets false
-    let add_out2 = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "remote",
-            "add",
-            vol_dir.to_str().unwrap(),
-            "s3_virtual",
-            "--bucket",
-            "my-aws-bucket",
-            "--endpoint",
-            "https://s3.amazonaws.com",
-            "--path-style",
-            "false",
-        ])
-        .output()
-        .expect("failed to run remote add");
-    assert!(
-        add_out2.status.success(),
-        "remote add failed: {}",
-        String::from_utf8_lossy(&add_out2.stderr)
-    );
-
-    let remotes_toml2 = std::fs::read_to_string(vol_dir.join("remotes.toml")).unwrap();
-    assert!(remotes_toml2.contains("force_path_style = false"));
-}
-
-#[test]
-fn test_init_from_remote_path_style_flag_and_toml_persistence() {
+fn test_init_from_remote_endpoint_is_addressed_path_style() {
     let temp_dir = TempDir::new().unwrap();
     let source_dir = temp_dir.path().join("source_vol");
 
@@ -1754,7 +1691,6 @@ fn test_init_from_remote_path_style_flag_and_toml_persistence() {
             &server.endpoint(),
             "--remote-credentials-file",
             creds_file.to_str().unwrap(),
-            "--remote-path-style",
         ])
         .output()
         .expect("failed to run bootstrap init");
@@ -1765,10 +1701,6 @@ fn test_init_from_remote_path_style_flag_and_toml_persistence() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Verify remotes.toml persists force_path_style = true
-    let remotes_toml = std::fs::read_to_string(bootstrap_dir.join("remotes.toml")).unwrap();
-    assert!(remotes_toml.contains("force_path_style = true"));
-
     let requests: Vec<_> = server
         .requests()
         .iter()
@@ -1776,32 +1708,4 @@ fn test_init_from_remote_path_style_flag_and_toml_persistence() {
         .collect();
     assert_eq!(requests, ["GET /my-bucket", "GET /my-bucket/000000.summary"]);
     assert_eq!(server.requests()[0].query_param("list-type"), Some("2"));
-
-    // Also verify --path-style alias works on init
-    let bootstrap_dir2 = temp_dir.path().join("bootstrapped_vol2");
-    let out2 = Command::new(env!("CARGO_BIN_EXE_appendfs"))
-        .args([
-            "init",
-            bootstrap_dir2.to_str().unwrap(),
-            "--from-remote",
-            "gcs_backup2",
-            "--remote-bucket",
-            "my-bucket",
-            "--remote-endpoint",
-            "https://storage.europe-west4.rep.googleapis.com",
-            "--credentials-file",
-            creds_file.to_str().unwrap(),
-            "--path-style",
-        ])
-        .output()
-        .expect("failed to parse init with aliases");
-
-    // The command might fail at network connection because https://storage.europe-west4... is not real credentials,
-    // but the argument parsing should succeed (not exit with clap usage error).
-    let stderr2 = String::from_utf8_lossy(&out2.stderr);
-    assert!(
-        !stderr2.contains("error: unexpected argument") && !stderr2.contains("Usage:"),
-        "clap failed on --path-style alias: {}",
-        stderr2
-    );
 }
