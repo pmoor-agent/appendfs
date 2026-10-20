@@ -174,7 +174,17 @@ fn default_volume_log(command: &Commands) -> Option<PathBuf> {
         Commands::Fsck(args) => (args.log_dir.clone(), false),
         Commands::BackfillSalts(args) => (args.log_dir.clone(), false),
         // `dump` names a log file rather than a volume, so log beside it.
-        Commands::Dump(args) => (args.file.parent()?.to_path_buf(), false),
+        Commands::Dump(args) => {
+            if !args.file.is_file() {
+                return None;
+            }
+            let parent = args
+                .file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            (parent.to_path_buf(), false)
+        }
         Commands::Remote(sub) => match sub.command {
             appendfs::cli::RemoteCommands::Add(ref a) => (a.log_dir.clone(), false),
             appendfs::cli::RemoteCommands::Rm(ref a) => (a.log_dir.clone(), false),
@@ -605,7 +615,10 @@ fn cmd_dump(args: DumpArgs) {
         std::process::exit(1);
     }
 
-    let parent = file_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = file_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let filename = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let storage = OsStorage::new(parent);
 
