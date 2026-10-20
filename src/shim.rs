@@ -624,14 +624,6 @@ impl<'a> FuseResponse<'a> {
         }
     }
 
-    #[inline]
-    pub fn xattr_size_value(&self) -> Option<usize> {
-        match self {
-            FuseResponse::XattrSize(sz) => Some(*sz),
-            _ => None,
-        }
-    }
-
     /// Converts this response into an owned `'static` response that can be safely sent across
     /// threads or queued in asynchronous runtimes.
     pub fn to_static(&self) -> FuseResponse<'static> {

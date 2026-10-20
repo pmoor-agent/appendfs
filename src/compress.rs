@@ -107,11 +107,6 @@ pub fn is_compression_beneficial(original_len: usize, compressed_len: usize) -> 
     saved >= original_len / MIN_SAVING_DENOMINATOR * MIN_SAVING_NUMERATOR && compressed_len > 0
 }
 
-/// Compresses `payload` directly into `dst` using the thread-local compressor.
-pub fn compress_zstd_into(payload: &[u8], dst: &mut [u8]) -> io::Result<usize> {
-    with_compressor(|c| c.compress_to_buffer(payload, dst))
-}
-
 /// Compresses `payload` using zstd if compression is beneficial.
 pub fn compress_zstd(payload: &[u8]) -> Option<Vec<u8>> {
     if let Ok(compressed) = compress_zstd_unconditional(payload)

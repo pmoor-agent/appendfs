@@ -175,11 +175,6 @@ impl RemoteObject {
         }
     }
 
-    pub fn with_storage_class(mut self, sc: impl Into<String>) -> Self {
-        self.storage_class = Some(sc.into());
-        self
-    }
-
     /// Returns the raw MD5 byte array parsed from the ETag (if valid 32-character hex).
     pub fn etag_md5(&self) -> Option<[u8; 16]> {
         let etag_str = self.etag.as_deref()?.trim_matches('"');

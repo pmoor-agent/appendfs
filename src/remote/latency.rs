@@ -13,7 +13,6 @@ pub struct LatencyRemoteStore {
     fixed_delay: RwLock<Option<Duration>>,
     random_delay: RwLock<Option<(Duration, Duration)>>,
     method_delays: RwLock<HashMap<String, Duration>>,
-    bytes_per_sec: RwLock<Option<u64>>,
 }
 
 impl LatencyRemoteStore {
@@ -23,7 +22,6 @@ impl LatencyRemoteStore {
             fixed_delay: RwLock::new(None),
             random_delay: RwLock::new(None),
             method_delays: RwLock::new(HashMap::new()),
-            bytes_per_sec: RwLock::new(None),
         }
     }
 
@@ -37,29 +35,9 @@ impl LatencyRemoteStore {
         *self.fixed_delay.write().unwrap() = Some(delay);
     }
 
-    /// Clears any fixed delay.
-    pub fn clear_fixed_delay(&self) {
-        *self.fixed_delay.write().unwrap() = None;
-    }
-
     /// Injects a delay for a specific method (e.g. "get_object_range", "put_object").
     pub fn set_method_delay(&self, method: &str, delay: Duration) {
         self.method_delays.write().unwrap().insert(method.to_string(), delay);
-    }
-
-    /// Clears any delay for a specific method.
-    pub fn clear_method_delay(&self, method: &str) {
-        self.method_delays.write().unwrap().remove(method);
-    }
-
-    /// Simulates bandwidth throttling by adding a transfer delay proportional to byte length.
-    pub fn set_bandwidth_limit(&self, bytes_per_sec: u64) {
-        *self.bytes_per_sec.write().unwrap() = Some(bytes_per_sec);
-    }
-
-    /// Clears simulated bandwidth limits.
-    pub fn clear_bandwidth_limit(&self) {
-        *self.bytes_per_sec.write().unwrap() = None;
     }
 
     /// Injects a random delay between `min` and `max` on each remote store operation.
@@ -72,15 +50,7 @@ impl LatencyRemoteStore {
         *self.random_delay.write().unwrap() = None;
     }
 
-    /// Clears all configured delays and limits.
-    pub fn clear_delays(&self) {
-        *self.fixed_delay.write().unwrap() = None;
-        *self.random_delay.write().unwrap() = None;
-        self.method_delays.write().unwrap().clear();
-        *self.bytes_per_sec.write().unwrap() = None;
-    }
-
-    fn apply_delay(&self, method: &str, payload_bytes: u64) {
+    fn apply_delay(&self, method: &str, _payload_bytes: u64) {
         let mut total = Duration::ZERO;
         if let Some(d) = *self.fixed_delay.read().unwrap() {
             total += d;
@@ -100,13 +70,6 @@ impl LatencyRemoteStore {
         }
         if let Some(d) = self.method_delays.read().unwrap().get(method) {
             total += *d;
-        }
-        if let Some(bps) = *self.bytes_per_sec.read().unwrap()
-            && bps > 0
-            && payload_bytes > 0
-        {
-            let nanos = (payload_bytes as u128 * 1_000_000_000) / (bps as u128);
-            total += Duration::from_nanos(nanos.min(u64::MAX as u128) as u64);
         }
 
         if total > Duration::ZERO {

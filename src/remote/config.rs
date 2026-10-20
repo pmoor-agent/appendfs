@@ -217,16 +217,6 @@ impl RemoteTargetConfig {
         self
     }
 
-    pub fn with_read_priority(mut self, priority: u32) -> Self {
-        self.read_priority = priority;
-        self
-    }
-
-    pub fn with_max_concurrent_reads(mut self, max: usize) -> Self {
-        self.max_concurrent_reads = if max > 0 { Some(max) } else { None };
-        self
-    }
-
     pub fn with_upload_partial_logs(mut self, enabled: bool) -> Self {
         self.upload_partial_logs = Some(enabled);
         self

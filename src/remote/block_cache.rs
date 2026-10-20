@@ -15,11 +15,6 @@ pub fn block_index(offset: u64) -> u64 {
     offset / BLOCK_SIZE
 }
 
-/// Computes the start byte offset of a block index.
-pub fn block_start_offset(block_idx: u64) -> u64 {
-    block_idx * BLOCK_SIZE
-}
-
 /// Monotonically increasing nonce for unique temporary cache file generation.
 static NEXT_TMP_NONCE: AtomicU64 = AtomicU64::new(1);
 

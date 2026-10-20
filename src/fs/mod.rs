@@ -87,13 +87,6 @@ impl FileHandle {
     }
 
     #[inline]
-    pub fn flags(&self) -> u32 {
-        match self {
-            FileHandle::Regular { flags, .. } | FileHandle::Virtual { flags, .. } => *flags,
-        }
-    }
-
-    #[inline]
     pub fn is_regular(&self) -> bool {
         matches!(self, FileHandle::Regular { .. })
     }
@@ -120,37 +113,8 @@ impl Handle {
     }
 
     #[inline]
-    pub fn flags(&self) -> u32 {
-        match self {
-            Handle::File(f) => f.flags(),
-            Handle::Directory(d) => d.flags,
-        }
-    }
-
-    #[inline]
-    pub fn is_file(&self) -> bool {
-        matches!(self, Handle::File(_))
-    }
-
-    #[inline]
     pub fn is_dir(&self) -> bool {
         matches!(self, Handle::Directory(_))
-    }
-
-    #[inline]
-    pub fn as_file(&self) -> Option<&FileHandle> {
-        match self {
-            Handle::File(f) => Some(f),
-            Handle::Directory(_) => None,
-        }
-    }
-
-    #[inline]
-    pub fn as_dir(&self) -> Option<&DirHandle> {
-        match self {
-            Handle::Directory(d) => Some(d),
-            Handle::File(_) => None,
-        }
     }
 }
 
@@ -1025,12 +989,6 @@ impl AppendFs {
     /// Total operations across all frozen batches waiting in `flushing`.
     pub fn flushing_ops(&self) -> usize {
         self.inner.lock(OpTag::Stats).unwrap().flushing_ops
-    }
-
-    /// Total dirty bytes currently in memory (staged in `live` + queued in `flushing`).
-    pub fn total_dirty_bytes(&self) -> usize {
-        let inner = self.inner.lock(OpTag::Stats).unwrap();
-        inner.staged_bytes + inner.flushing_bytes
     }
 
     /// Total dirty operations currently in memory (staged in `live` + queued in `flushing`).

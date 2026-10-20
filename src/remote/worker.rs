@@ -511,8 +511,6 @@ pub struct RemoteReplicationWorker {
     running: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
     fs: Arc<AppendFs>,
-    registry: Arc<RwLock<RemoteRegistry>>,
-    log_dir: PathBuf,
 }
 
 /// Default background poll interval when no roll/summary events trigger replication (60 seconds).
@@ -600,44 +598,7 @@ impl RemoteReplicationWorker {
             running,
             thread_handle: Some(thread_handle),
             fs,
-            registry,
-            log_dir,
         }
-    }
-
-    /// Explicitly and synchronously triggers an immediate remote replication cycle (fast path).
-    pub fn sync_now(&self) -> io::Result<()> {
-        self.sync_now_with_audit(false)
-    }
-
-    /// Explicitly and synchronously triggers an immediate remote replication cycle with full consistency audit.
-    pub fn audit_now(&self) -> io::Result<()> {
-        self.sync_now_with_audit(true)
-    }
-
-    pub fn sync_now_with_audit(&self, force_audit: bool) -> io::Result<()> {
-        let mut last_part_sync = SystemTime::UNIX_EPOCH;
-        let mut uploaded_parts = std::collections::HashMap::new();
-        let mut last_audit = if force_audit {
-            SystemTime::UNIX_EPOCH
-        } else {
-            self.fs.clock.now()
-        };
-        let mut confirmed_generations = std::collections::HashMap::new();
-        let mut confirmed_summaries = std::collections::HashMap::new();
-        Self::run_cycle_with_audit(
-            &self.fs,
-            &self.registry,
-            &self.log_dir,
-            &mut last_part_sync,
-            &mut uploaded_parts,
-            &mut last_audit,
-            &mut confirmed_generations,
-            &mut confirmed_summaries,
-            force_audit,
-            Some(&self.running),
-            None,
-        )
     }
 
     pub fn run_cycle(

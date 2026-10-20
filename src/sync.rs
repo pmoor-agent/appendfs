@@ -391,11 +391,6 @@ impl<'a, T> ActionGuard<'a, T> {
         self.pre_unlock_hooks.push(Box::new(hook));
     }
 
-    /// Returns the elapsed duration since this lock guard was acquired.
-    pub fn hold_elapsed(&self) -> Duration {
-        self.hold_start.elapsed()
-    }
-
     /// Temporarily releases the lock and waits on `cvar`, re-acquiring the lock before returning.
     pub fn wait(mut self, cvar: &Condvar) -> Self {
         let elapsed = self.hold_start.elapsed();

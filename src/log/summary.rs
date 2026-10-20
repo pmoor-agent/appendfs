@@ -791,11 +791,6 @@ impl SummaryReader {
         Ok(inodes.get(&inode).map(|arc| arc.as_ref().clone()))
     }
 
-    /// Alias for `read_inode`.
-    pub fn read_node(&self, inode: u64) -> io::Result<Option<Node>> {
-        self.read_inode(inode)
-    }
-
     /// Iterates through all `(inode, Node)` stored in this summary file in ascending inode order.
     pub fn iter_inodes(&self) -> io::Result<impl Iterator<Item = (u64, Node)>> {
         let inodes = self.read_all_inodes()?;

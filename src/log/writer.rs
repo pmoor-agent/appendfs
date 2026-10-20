@@ -948,18 +948,6 @@ impl LogWriter {
         }
     }
 
-    /// Returns the encryption key salt of the currently active log generation if open.
-    pub fn active_key_salt(&self) -> Option<[u8; 16]> {
-        let state = match self.active_state.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-        match &*state {
-            ActiveLogState::Unopened { .. } => None,
-            ActiveLogState::Open(active) => Some(active.key_salt),
-        }
-    }
-
     /// Returns a `LogFileInfo` representing the active open generation if currently open.
     pub fn active_log_info(&self) -> Option<super::manifest::LogFileInfo> {
         let state = match self.active_state.lock() {

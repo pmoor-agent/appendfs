@@ -60,10 +60,6 @@ impl CountingRemoteStore {
         }
     }
 
-    pub fn with_shared_metrics(inner: Arc<dyn RemoteStore>, metrics: Arc<RemoteStoreMetrics>) -> Self {
-        Self { inner, metrics }
-    }
-
     /// Access the wrapped inner store.
     pub fn inner(&self) -> &Arc<dyn RemoteStore> {
         &self.inner
