@@ -8,7 +8,9 @@
 use super::{AppendFs, FlushReason, FsInner, ShutdownState};
 use crate::error::FsError;
 use crate::extent_map::{Extent, ExtentMap, StagedBuffer};
-use crate::log::{GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode};
+#[cfg(any(test, feature = "testing"))]
+use crate::log::GenerationLiveStats;
+use crate::log::{LogEntryDelta, LogFileInfo, LogWriter, OpCode};
 use crate::node::{EntryDelta, NodeDelta};
 use crate::operations::locks::LockManager;
 use crate::storage::Storage;
@@ -760,6 +762,7 @@ impl AppendFs {
     }
 
     /// Dynamically calculates live extent statistics across all active files and log generations.
+    #[cfg(any(test, feature = "testing"))]
     pub fn calculate_generation_live_stats(&self) -> Vec<GenerationLiveStats> {
         let manifest = self.manifest.read().unwrap().clone();
         let inner = self.inner.lock(OpTag::Stats).unwrap();

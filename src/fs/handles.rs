@@ -5,10 +5,9 @@
 //! Directory handles hold an immutable snapshot of the listing taken at `opendir`, so a
 //! paginated `readdir` is isolated from concurrent mutations.
 
-use super::{
-    AppendFs, DirHandle, FileHandle, ReadPlan, ReadSlice, ReadSliceSource, ShutdownState, execute_read_plan,
-    is_virtual_ino,
-};
+use super::{AppendFs, FileHandle, ReadPlan, ReadSlice, ReadSliceSource, ShutdownState};
+#[cfg(any(test, feature = "testing"))]
+use super::{DirHandle, execute_read_plan, is_virtual_ino};
 use crate::error::FsError;
 use crate::node::AttrDelta;
 use crate::operations::locks::LockManager;
@@ -18,6 +17,7 @@ use std::sync::Arc;
 impl AppendFs {
     // --- POSIX File & Directory Handle Tracking ---
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn open_file_handle(&self, ino: u64, flags: u32) -> u64 {
         let is_virtual = is_virtual_ino(ino);
         let file_handle = if is_virtual {
@@ -105,6 +105,7 @@ impl AppendFs {
         })
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<Vec<u8>, FsError> {
         let plan = self.plan_read_handle(ino, fh, offset, size)?;
         execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key)

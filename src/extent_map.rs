@@ -143,6 +143,7 @@ impl Extent {
         }
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn new_staged_buffer(bytes: Vec<u8>, payload_offset: u32, length: u32) -> Self {
         Self::new_staged(Arc::new(RwLock::new(bytes)), payload_offset, length)
     }
@@ -354,24 +355,28 @@ impl ExtentMap {
 
     /// Returns `true` if this map has zero extents and zero allocated storage.
     #[inline]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_empty_storage(&self) -> bool {
         matches!(self.inner, ExtentMapInner::Empty)
     }
 
     /// Returns `true` if this map stores exactly one extent inline without heap allocation.
     #[inline]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_single(&self) -> bool {
         matches!(self.inner, ExtentMapInner::Single(_))
     }
 
     /// Returns `true` if this map is currently stored in compact `Vector` mode.
     #[inline]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_vector(&self) -> bool {
         matches!(self.inner, ExtentMapInner::Vector(_))
     }
 
     /// Returns `true` if this map has promoted to `Tree` mode.
     #[inline]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_tree(&self) -> bool {
         matches!(self.inner, ExtentMapInner::Tree(_))
     }

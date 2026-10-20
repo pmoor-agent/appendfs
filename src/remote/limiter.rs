@@ -34,6 +34,7 @@ impl ConcurrencyLimiter {
         self.active_count.load(Ordering::SeqCst)
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn available_permits(&self) -> usize {
         *self.available.lock().unwrap()
     }
@@ -57,6 +58,7 @@ impl ConcurrencyLimiter {
     }
 
     /// Attempts to acquire a permit without blocking.
+    #[cfg(any(test, feature = "testing"))]
     pub fn try_acquire(self: &Arc<Self>) -> Option<ConcurrencyPermit> {
         let mut avail = self.available.lock().unwrap();
         if *avail > 0 {

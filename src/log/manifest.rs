@@ -212,6 +212,7 @@ impl LogManifest {
     }
 
     /// Returns the latest sealed log entry recorded in the manifest, if any.
+    #[cfg(any(test, feature = "testing"))]
     pub fn latest_log(&self) -> Option<&LogFileInfo> {
         self.logs.last()
     }
@@ -223,11 +224,13 @@ impl LogManifest {
 
     /// Returns true if the volume was cleanly unmounted/sealed prior to summary export,
     /// or false if the last recorded log generation was unsealed (indicating an unclean crash recovery).
+    #[cfg(any(test, feature = "testing"))]
     pub fn last_shutdown_clean(&self) -> bool {
         self.logs.last().is_none_or(|l| l.is_sealed())
     }
 
     /// Returns true if all recorded log generations were cleanly sealed.
+    #[cfg(any(test, feature = "testing"))]
     pub fn all_logs_sealed(&self) -> bool {
         self.logs.iter().all(|l| l.is_sealed())
     }

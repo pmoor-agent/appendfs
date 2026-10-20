@@ -813,6 +813,7 @@ impl LogWriter {
     /// compressing optimistically directly into the internal reusable buffer if enabled.
     ///
     /// Returns `(generation, record_log_offset, record_size)`.
+    #[cfg(any(test, feature = "testing"))]
     pub fn append_data(&self, inode: u64, data: &[u8]) -> io::Result<(u32, u64, u32)> {
         self.append_data_slices(inode, &[data], data.len())
     }

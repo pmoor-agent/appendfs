@@ -161,6 +161,7 @@ impl OpStatSnapshot {
         }
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn avg_wait_time(&self) -> Duration {
         if self.count > 0 {
             self.wait_time / (self.count as u32)

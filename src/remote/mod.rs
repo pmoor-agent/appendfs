@@ -81,6 +81,7 @@ impl RemoteReadTarget {
         self
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_concurrency_limit(mut self, max_concurrent: usize) -> Self {
         if max_concurrent > 0 {
             self.limiter = Some(Arc::new(ConcurrencyLimiter::new(max_concurrent)));

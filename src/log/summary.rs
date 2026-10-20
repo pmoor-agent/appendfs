@@ -786,12 +786,14 @@ impl SummaryReader {
     }
 
     /// Reads and deserializes a single `Node` for `inode` from this summary file.
+    #[cfg(any(test, feature = "testing"))]
     pub fn read_inode(&self, inode: u64) -> io::Result<Option<Node>> {
         let inodes = self.read_all_inodes()?;
         Ok(inodes.get(&inode).map(|arc| arc.as_ref().clone()))
     }
 
     /// Iterates through all `(inode, Node)` stored in this summary file in ascending inode order.
+    #[cfg(any(test, feature = "testing"))]
     pub fn iter_inodes(&self) -> io::Result<impl Iterator<Item = (u64, Node)>> {
         let inodes = self.read_all_inodes()?;
         let mut entries: Vec<(u64, Node)> = inodes

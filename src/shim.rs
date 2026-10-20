@@ -626,6 +626,7 @@ impl<'a> FuseResponse<'a> {
 
     /// Converts this response into an owned `'static` response that can be safely sent across
     /// threads or queued in asynchronous runtimes.
+    #[cfg(any(test, feature = "testing"))]
     pub fn to_static(&self) -> FuseResponse<'static> {
         match self {
             FuseResponse::Ok => FuseResponse::Ok,
@@ -754,14 +755,17 @@ impl<T: Send + 'static> DeferredResult<T> {
         DeferredResult::Deferred(Box::new(completion))
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_ready(&self) -> bool {
         matches!(self, DeferredResult::Ready(_))
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_deferred(&self) -> bool {
         matches!(self, DeferredResult::Deferred(_))
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub fn into_ready(self) -> Option<Result<T, FsError>> {
         match self {
             DeferredResult::Ready(r) => Some(r),

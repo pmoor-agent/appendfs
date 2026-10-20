@@ -404,6 +404,7 @@ impl VolumeStats {
     }
 
     /// Collects volume statistics directly from a snapshot's inodes and manifest.
+    #[cfg(any(test, feature = "testing"))]
     pub fn collect_from_snapshot(inodes: &HashMap<u64, Arc<Node>>, manifest: &LogManifest) -> Self {
         let counts = InodeCounts::from_nodes(inodes.values().map(|a| a.as_ref()));
         let generations = calculate_generation_live_stats_from_nodes(inodes.values().map(|a| a.as_ref()), manifest);
