@@ -443,7 +443,7 @@ pub fn calculate_generation_live_stats_from_nodes<'a, I>(nodes: I, manifest: &Lo
 where
     I: IntoIterator<Item = &'a Node>,
 {
-    let mut live_map: HashMap<u32, (u64, u32)> = HashMap::new();
+    let mut live_map: HashMap<u32, (u64, u64)> = HashMap::new();
     for node in nodes {
         if let NodeKind::File { extent_map, .. } = &node.kind {
             for (_, entry) in extent_map.iter() {
@@ -467,7 +467,7 @@ where
         result.push(GenerationLiveStats {
             generation: log.generation,
             filename: log.filename.clone(),
-            record_count: log.record_count,
+            record_count: u64::from(log.record_count),
             total_bytes: log.total_bytes,
             total_data_bytes: log.total_data_bytes,
             live_bytes,
@@ -526,6 +526,41 @@ pub fn format_generations_table(generations: &[GenerationLiveStats]) -> String {
             )
             .unwrap();
         }
+
+        writeln!(
+            out,
+            "{:-<14} {:-<10} {:-<12} {:-<12} {:-<12} {:-<8} {:-<12}  {:-<24}",
+            "", "", "", "", "", "", "", ""
+        )
+        .unwrap();
+
+        let total_records: u64 = generations.iter().map(|g| g.record_count).sum();
+        let total_bytes: u64 = generations.iter().map(|g| g.total_bytes).sum();
+        let total_data_bytes: u64 = generations.iter().map(|g| g.total_data_bytes).sum();
+        let total_live_bytes: u64 = generations.iter().map(|g| g.live_bytes).sum();
+        let total_live_extents: u64 = generations.iter().map(|g| g.live_extents).sum();
+        let overall_live_ratio = if total_data_bytes > 0 {
+            total_live_bytes as f64 / total_data_bytes as f64
+        } else {
+            0.0
+        };
+
+        let (total_status, total_ratio_str) =
+            format_generation_status(total_data_bytes, total_live_bytes, overall_live_ratio, total_records);
+
+        writeln!(
+            out,
+            "{:<14} {:>10} {:>12} {:>12} {:>12} {:>8} {:>12}  {}",
+            "Total",
+            total_records,
+            format_bytes(total_bytes),
+            format_bytes(total_data_bytes),
+            format_bytes(total_live_bytes),
+            total_live_extents,
+            total_ratio_str,
+            total_status,
+        )
+        .unwrap();
     }
     out
 }
@@ -670,12 +705,12 @@ pub fn format_extension_stats_table(extensions: &[ExtensionStats], total_files: 
     out
 }
 
-/// Determines the status label and live ratio display string for a log generation.
+/// Determines the status label and live ratio display string for a log generation or volume-wide aggregate.
 pub fn format_generation_status(
     total_data_bytes: u64,
     live_bytes: u64,
     live_ratio: f64,
-    record_count: u32,
+    record_count: u64,
 ) -> (&'static str, String) {
     if total_data_bytes == 0 {
         let status = if record_count == 0 { "Empty" } else { "Metadata Only" };
@@ -1266,6 +1301,87 @@ mod tests {
         // Empty table
         let empty_table = format_generations_table(&[]);
         assert!(empty_table.contains("No log generation files present"));
+
+        // Total summary line
+        let total_line = table
+            .lines()
+            .find(|l| l.starts_with("Total"))
+            .expect("table must include Total summary line");
+        assert!(total_line.contains("15"));
+        assert!(total_line.contains("12.00 KiB"));
+        assert!(total_line.contains("6.00 KiB"));
+        assert!(total_line.contains("100.0%"));
+        assert!(total_line.ends_with("Healthy"));
+    }
+
+    #[test]
+    fn test_format_generations_table_summary_line_metrics_and_status() {
+        // Test multiple generations with compaction candidate ratio
+        let generations = vec![
+            GenerationLiveStats {
+                generation: 1,
+                filename: "000001.log".to_string(),
+                record_count: 100,
+                total_bytes: 100_000,
+                total_data_bytes: 80_000,
+                live_bytes: 10_000,
+                live_extents: 5,
+                live_ratio: 0.125,
+                sealed: true,
+            },
+            GenerationLiveStats {
+                generation: 2,
+                filename: "000002.log".to_string(),
+                record_count: 50,
+                total_bytes: 50_000,
+                total_data_bytes: 40_000,
+                live_bytes: 10_000,
+                live_extents: 3,
+                live_ratio: 0.25,
+                sealed: true,
+            },
+        ];
+
+        let table = format_generations_table(&generations);
+        let total_line = table
+            .lines()
+            .find(|l| l.starts_with("Total"))
+            .expect("must contain Total row");
+        // Records sum: 150
+        assert!(total_line.contains("150"));
+        // Log size: 150_000 bytes = 146.48 KiB
+        assert!(total_line.contains(&format_bytes(150_000)));
+        // Data size: 120_000 bytes = 117.19 KiB
+        assert!(total_line.contains(&format_bytes(120_000)));
+        // Live data: 20_000 bytes = 19.53 KiB
+        assert!(total_line.contains(&format_bytes(20_000)));
+        // Extents: 8
+        assert!(total_line.contains("8"));
+        // Live ratio: 20_000 / 120_000 = 16.7%
+        assert!(total_line.contains("16.7%"));
+        // Status: < 30% -> Compaction Candidate
+        assert!(total_line.ends_with("Compaction Candidate"));
+
+        // Single generation with zero data (metadata only)
+        let meta_generations = vec![GenerationLiveStats {
+            generation: 1,
+            filename: "000001.log".to_string(),
+            record_count: 12,
+            total_bytes: 1024,
+            total_data_bytes: 0,
+            live_bytes: 0,
+            live_extents: 0,
+            live_ratio: 0.0,
+            sealed: true,
+        }];
+        let meta_table = format_generations_table(&meta_generations);
+        let meta_total = meta_table
+            .lines()
+            .find(|l| l.starts_with("Total"))
+            .expect("must contain Total row");
+        assert!(meta_total.contains("12"));
+        assert!(meta_total.contains("N/A"));
+        assert!(meta_total.ends_with("Metadata Only"));
     }
 
     #[test]

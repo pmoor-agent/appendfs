@@ -1460,6 +1460,11 @@ mod tests {
                 .lines()
                 .any(|l| l.contains("000002.log") && l.ends_with("Healthy (not sealed)"))
         );
+        assert!(
+            dump_snap_v0
+                .lines()
+                .any(|l| l.starts_with("Total") && l.contains("100") && l.ends_with("Healthy"))
+        );
 
         // Level 1: Inode Tree Listing
         let dump_snap_v1 = dump_file(storage.as_ref(), "000001.summary", 1, None).unwrap();
