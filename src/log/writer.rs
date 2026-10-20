@@ -238,6 +238,22 @@ impl ActiveLogFile {
         Ok((generation, record_log_offset, total_needed as u32))
     }
 
+    fn to_log_info(&self) -> super::manifest::LogFileInfo {
+        super::manifest::LogFileInfo {
+            version: crate::log::record::CURRENT_VERSION,
+            generation: self.generation,
+            revision: 0,
+            filename: self.filename.clone(),
+            created_at: self.created_at,
+            record_count: self.record_count,
+            total_bytes: self.current_offset,
+            total_data_bytes: self.total_data_bytes,
+            md5: [0u8; 16],
+            sealed_at: None,
+            key_salt: Some(self.key_salt),
+        }
+    }
+
     fn seal(mut self, timestamp: std::time::SystemTime) -> io::Result<super::manifest::LogFileInfo> {
         if self.current_offset > FILE_HEADER_SIZE as u64 {
             let seal_payload = crate::log::record::SealPayload {
@@ -247,21 +263,11 @@ impl ActiveLogFile {
             self.append_serialized(OpCode::Seal, 0, &seal_payload)?;
         }
         self.writer.sync()?;
+        let mut info = self.to_log_info();
         drop(self.writer);
-        let sealed_md5 = self.md5_hasher.compute().0;
-        Ok(super::manifest::LogFileInfo {
-            version: crate::log::record::CURRENT_VERSION,
-            generation: self.generation,
-            revision: 0,
-            filename: self.filename,
-            created_at: self.created_at,
-            record_count: self.record_count,
-            total_bytes: self.current_offset,
-            total_data_bytes: self.total_data_bytes,
-            md5: sealed_md5,
-            sealed_at: Some(timestamp),
-            key_salt: Some(self.key_salt),
-        })
+        info.sealed_at = Some(timestamp);
+        info.md5 = self.md5_hasher.compute().0;
+        Ok(info)
     }
 }
 
@@ -962,19 +968,7 @@ impl LogWriter {
         };
         match &*state {
             ActiveLogState::Unopened { .. } => None,
-            ActiveLogState::Open(active) => Some(super::manifest::LogFileInfo {
-                version: crate::log::record::CURRENT_VERSION,
-                generation: active.generation,
-                revision: 0,
-                filename: active.filename.clone(),
-                created_at: active.created_at,
-                record_count: active.record_count,
-                total_bytes: active.current_offset,
-                total_data_bytes: active.total_data_bytes,
-                md5: [0u8; 16],
-                sealed_at: None,
-                key_salt: Some(active.key_salt),
-            }),
+            ActiveLogState::Open(active) => Some(active.to_log_info()),
         }
     }
 

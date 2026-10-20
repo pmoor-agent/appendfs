@@ -1237,7 +1237,10 @@ impl AppendFs {
     }
 
     pub fn set_storage(&mut self, storage: Arc<dyn Storage>) {
-        let cache = Arc::new(LogFileCache::with_storage(storage));
+        let cache = Arc::new(LogFileCache::with_storage_and_manifest(
+            storage,
+            Some(Arc::clone(&self.manifest)),
+        ));
         if let Some(ref writer) = self.log_writer {
             cache.set_active_writer(writer);
         }
@@ -1249,6 +1252,14 @@ impl AppendFs {
             cache.set_active_writer(writer);
         }
         self.log_cache = Some(cache);
+    }
+
+    pub fn ensure_log_cache_active_writer(&self) {
+        if let Some(ref cache) = self.log_cache
+            && let Some(ref writer) = self.log_writer
+        {
+            cache.set_active_writer(writer);
+        }
     }
 
     pub fn set_log_dir(&mut self, log_dir: impl AsRef<Path>) {

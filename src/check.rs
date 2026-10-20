@@ -631,7 +631,7 @@ fn verify_raw_record(
 #[allow(clippy::too_many_lines)]
 pub fn plan_sampled_verification(fs: &AppendFs, options: &CheckOptions) -> VerificationPlan {
     let base_map = fs.inner.lock(OpTag::Stats).unwrap().base.clone();
-    let manifest = fs.manifest.read().unwrap();
+    let manifest = fs.manifest.read().unwrap().clone();
     const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
 
     // 1. Collect all unique live records from the inode tree, skipping invalid extents
@@ -961,7 +961,7 @@ pub fn execute_sampled_verification(
         return;
     }
 
-    let manifest = fs.manifest.read().unwrap();
+    let manifest = fs.manifest.read().unwrap().clone();
     const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
 
     let gen_len = |generation: u32| {
@@ -1220,11 +1220,22 @@ pub fn execute_sampled_verification(
                     .filter(|w| w.generation() == generation)
                     .and_then(|w| w.active_log_info())
             });
-            let log_filename = manifest_entry
-                .as_ref()
-                .map(|l| l.filename.clone())
-                .unwrap_or_else(|| crate::log::log_filename(generation));
-            if !c.storage().exists(&log_filename) {
+            let Some(manifest_entry) = manifest_entry else {
+                for rec in records {
+                    report.issues.push(IntegrityIssue::error(
+                        "UNINDEXED_LOG_FILE",
+                        Some(rec.inode),
+                        format!(
+                            "File inode {} extent references generation {}, which is neither tracked in the manifest nor the active log writer",
+                            rec.inode, generation
+                        ),
+                    ));
+                }
+                advance(records_bytes);
+                continue;
+            };
+            let log_filename = &manifest_entry.filename;
+            if !c.storage().exists(log_filename) {
                 for rec in records {
                     report.issues.push(IntegrityIssue::error(
                         "MISSING_LOG_FILE",
@@ -1239,7 +1250,7 @@ pub fn execute_sampled_verification(
                 continue;
             }
 
-            let file_len = match c.storage().file_len(&log_filename) {
+            let file_len = match c.storage().file_len(log_filename) {
                 Ok(len) => len,
                 Err(e) => {
                     for rec in records {
@@ -1254,32 +1265,7 @@ pub fn execute_sampled_verification(
                 }
             };
 
-            let fallback_entry;
-            let entry_ref = match manifest_entry.as_ref() {
-                Some(entry) => entry,
-                None => {
-                    // Fallback entry used only when a log generation is neither present in the sealed
-                    // manifest nor matches the active log writer (e.g. an unindexed legacy log file
-                    // or volume corruption). In this rare fallback case, `key_salt: None` causes
-                    // `get_or_open` to read the file header from disk and memoize the key salt.
-                    fallback_entry = crate::log::manifest::LogFileInfo {
-                        version: crate::log::record::CURRENT_VERSION,
-                        generation,
-                        revision: 0,
-                        filename: log_filename.clone(),
-                        created_at: std::time::SystemTime::UNIX_EPOCH,
-                        record_count: 0,
-                        total_bytes: file_len,
-                        total_data_bytes: 0,
-                        md5: [0u8; 16],
-                        sealed_at: None,
-                        key_salt: None,
-                    };
-                    &fallback_entry
-                }
-            };
-
-            let open = match c.get_or_open(entry_ref, &fs.volume_key) {
+            let open = match c.get_or_open(&manifest_entry, &fs.volume_key) {
                 Ok(open) => open,
                 Err(e) => {
                     for rec in records {
@@ -2344,6 +2330,37 @@ mod tests {
                 .issues
                 .iter()
                 .any(|i| i.code == "EXTENT_INVALID_RECORD_SIZE")
+        );
+    }
+
+    #[test]
+    fn test_unindexed_log_generation_detected_in_verification() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
+        fs.set_storage(storage);
+
+        let f = fs.create_file(1, "unindexed.txt", 0o644).unwrap();
+        fs.write_at(f, b"hello unindexed generation", 0).unwrap();
+        fs.quiesce().unwrap();
+
+        // Inject extent pointing to generation 999 which is neither in manifest nor active writer
+        {
+            let mut inner = fs.inner.lock_for_tests().unwrap();
+            let node_arc = inner.base.get_mut(&f).unwrap();
+            let mut node = (**node_arc).clone();
+            if let NodeKind::File { extent_map, size } = &mut node.kind {
+                *size = 4096;
+                extent_map.insert(0, crate::extent_map::Extent::new_disk(999, 100, 4096, 0, 4096));
+            }
+            *node_arc = Arc::new(node);
+        }
+
+        let report = check_fs_integrity(&fs, None, &CheckOptions::full_data(), None, None);
+        assert!(!report.is_clean());
+        assert!(
+            report.issues.iter().any(|i| i.code == "UNINDEXED_LOG_FILE"),
+            "Expected UNINDEXED_LOG_FILE issue, got: {:?}",
+            report.issues
         );
     }
 

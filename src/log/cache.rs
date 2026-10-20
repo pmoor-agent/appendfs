@@ -43,13 +43,20 @@ impl LogFileCache {
     }
 
     pub fn with_storage(storage: Arc<dyn Storage>) -> Self {
+        Self::with_storage_and_manifest(storage, None)
+    }
+
+    pub fn with_storage_and_manifest(
+        storage: Arc<dyn Storage>,
+        manifest: Option<Arc<RwLock<crate::log::LogManifest>>>,
+    ) -> Self {
         Self {
             storage,
             cache: Mutex::new(HashMap::new()),
             decrypted_cache: Arc::new(DecryptedRecordCache::new(DEFAULT_DECRYPTED_CACHE_SIZE)),
             block_cache: None,
             remotes: Arc::new(RwLock::new(Vec::new())),
-            manifest: None,
+            manifest,
             active_writer: Arc::new(RwLock::new(None)),
             cache_local_reads: false,
         }
@@ -131,7 +138,7 @@ impl LogFileCache {
             let header =
                 FileHeader::from_bytes(&header_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             if let Some(ref m) = self.manifest
-                && let Ok(mut man) = m.write()
+                && let Ok(mut man) = m.try_write()
                 && let Some(log_entry) = man.logs.iter_mut().find(|l| l.generation == generation)
             {
                 log_entry.update_from_file_header(&header);
@@ -257,8 +264,17 @@ impl LogFileCache {
                     .and_then(|w| w.as_ref().and_then(|weak| weak.upgrade()))
                     .filter(|w| w.generation() == generation)
                     .and_then(|w| w.active_log_info())
-            });
-        let revision = manifest_entry.as_ref().map(|l| l.revision).unwrap_or(0);
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "log generation {} not found in manifest or active log writer",
+                        generation
+                    ),
+                )
+            })?;
+        let revision = manifest_entry.revision;
 
         let decrypted: Arc<Vec<u8>> =
             if let Some(cached) = self.decrypted_cache.get(generation, revision, record_log_offset) {
@@ -270,31 +286,7 @@ impl LogFileCache {
                         format!("record_size {} is smaller than record header size", record_size),
                     ));
                 }
-                let fallback_entry;
-                let entry_ref = match manifest_entry.as_ref() {
-                    Some(entry) => entry,
-                    None => {
-                        // Fallback entry used only when a log generation is neither present in the sealed
-                        // manifest nor matches the active log writer (e.g. an unindexed legacy log file
-                        // or volume corruption). In this rare fallback case, `key_salt: None` causes
-                        // `get_or_open` to read the file header from disk and memoize the key salt.
-                        fallback_entry = LogFileInfo {
-                            version: crate::log::record::CURRENT_VERSION,
-                            generation,
-                            revision,
-                            filename: super::log_filename(generation),
-                            created_at: std::time::SystemTime::UNIX_EPOCH,
-                            record_count: 0,
-                            total_bytes: 0,
-                            total_data_bytes: 0,
-                            md5: [0u8; 16],
-                            sealed_at: None,
-                            key_salt: None,
-                        };
-                        &fallback_entry
-                    }
-                };
-                let open = self.get_or_open(entry_ref, volume_key)?;
+                let open = self.get_or_open(&manifest_entry, volume_key)?;
                 let mut raw_record = vec![0u8; record_size as usize];
                 open.reader.read_exact_at(record_log_offset, &mut raw_record)?;
 
@@ -418,21 +410,24 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
         let key = VolumeKey::plaintext_arc();
-        let writer = LogWriter::create(
-            storage.clone(),
-            1,
-            Arc::new(clock),
-            crate::cli::DEFAULT_MAX_LOG_SIZE,
-            1,
-            key.clone(),
-        )
-        .unwrap();
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                Arc::new(clock),
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                key.clone(),
+            )
+            .unwrap(),
+        );
 
         let payload = b"cached extent data 123456789";
         let (gen_num, offset, rec_size) = writer.append_data(10, payload).unwrap();
         writer.flush().unwrap();
 
         let cache = LogFileCache::with_storage(storage);
+        cache.set_active_writer(&writer);
 
         // First read populates in-memory decrypted cache
         let mut buf1 = [0u8; 6];
@@ -691,5 +686,20 @@ mod tests {
             "offset 0 must NOT be read when active writer funnels key salt! Recorded offsets: {:?}",
             recorded
         );
+    }
+
+    #[test]
+    fn test_read_extent_payload_fails_if_untracked_generation() {
+        let storage = Arc::new(crate::storage::MemoryStorage::new());
+        let manifest = Arc::new(RwLock::new(crate::log::LogManifest::new()));
+        let cache = LogFileCache::with_storage_and_manifest(storage, Some(manifest));
+        let key = VolumeKey::plaintext();
+
+        let mut buf = [0u8; 10];
+        let err = cache
+            .read_extent_payload(999, 100, 50, 0, 0, &mut buf, &key)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("not found in manifest or active log writer"));
     }
 }
