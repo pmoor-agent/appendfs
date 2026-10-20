@@ -721,9 +721,9 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
     );
 }
 
-/// `--log-file /dev/null` is how logging is turned off; there is no separate flag for it.
+/// `--log-path /dev/null` is how logging is turned off; there is no separate flag for it.
 #[test]
-fn test_cli_log_file_dev_null_leaves_no_log_behind() {
+fn test_cli_log_path_dev_null_leaves_no_log_behind() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::thread;
     use std::time::Duration;
@@ -748,7 +748,7 @@ fn test_cli_log_file_dev_null_leaves_no_log_behind() {
             "mount",
             log_dir.path().to_str().unwrap(),
             mount_dir.path().to_str().unwrap(),
-            "--log-file",
+            "--log-path",
             "/dev/null",
         ])
         .output()
@@ -788,6 +788,96 @@ fn test_cli_log_file_dev_null_leaves_no_log_behind() {
         before,
         "/dev/null must leave no log of its own behind"
     );
+}
+
+#[test]
+fn test_cli_log_path_existing_directory() {
+    let vol_dir = TempDir::new().unwrap();
+    let custom_logs_dir = TempDir::new().unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "--log-path",
+            custom_logs_dir.path().to_str().unwrap(),
+            "init",
+            vol_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to init");
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Volume's own logs directory must NOT have been used
+    assert_eq!(log_file_count(vol_dir.path()), 0);
+
+    // Custom directory must contain the log file
+    let entries: Vec<_> = std::fs::read_dir(custom_logs_dir.path()).unwrap().flatten().collect();
+    assert_eq!(entries.len(), 1);
+    let log_file = &entries[0];
+    assert!(log_file.file_name().to_string_lossy().starts_with("appendfs-"));
+    assert!(log_file.file_name().to_string_lossy().ends_with(".log"));
+
+    let content = std::fs::read_to_string(log_file.path()).unwrap();
+    assert!(content.contains("init"));
+}
+
+#[test]
+fn test_cli_log_path_nonexistent_directory_with_trailing_slash() {
+    let vol_dir = TempDir::new().unwrap();
+    let parent_dir = TempDir::new().unwrap();
+    let nested_dir = format!("{}/custom_logs/", parent_dir.path().display());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["--log-path", &nested_dir, "init", vol_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to init");
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Nested directory must have been created and contain the log file
+    let created_dir = parent_dir.path().join("custom_logs");
+    assert!(created_dir.is_dir());
+
+    let entries: Vec<_> = std::fs::read_dir(&created_dir).unwrap().flatten().collect();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].file_name().to_string_lossy().starts_with("appendfs-"));
+    assert!(entries[0].file_name().to_string_lossy().ends_with(".log"));
+}
+
+#[test]
+fn test_cli_log_path_exact_file() {
+    let vol_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+    let exact_file = target_dir.path().join("specific_name.log");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "--log-path",
+            exact_file.to_str().unwrap(),
+            "init",
+            vol_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to init");
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Volume's own logs directory must NOT have been used
+    assert_eq!(log_file_count(vol_dir.path()), 0);
+
+    // Exact file must exist and contain the log
+    assert!(exact_file.is_file());
+    let content = std::fs::read_to_string(&exact_file).unwrap();
+    assert!(content.contains("init"));
 }
 
 /// Every command logs, so a one-shot run leaves its own file in the volume alongside the

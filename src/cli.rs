@@ -70,11 +70,12 @@ pub struct Cli {
     #[arg(long = "log-level", global = true, default_value = crate::logging::DEFAULT_LOG_LEVEL)]
     pub log_level: String,
 
-    /// Where to write diagnostic logs. Mount commands default to
-    /// <log-dir>/logs/appendfs-<date>-<time>-<pid>.log and other commands to nothing;
-    /// `/dev/stderr` follows along on a terminal and `/dev/null` discards.
-    #[arg(long = "log-file", global = true)]
-    pub log_file: Option<PathBuf>,
+    /// Where to write diagnostic logs. Volume commands default to
+    /// <log-dir>/logs/appendfs-<date>-<time>.<mmm>.log.
+    /// Can point to an exact file (e.g. `/path/to/file.log`, `/dev/stderr`, `/dev/null`)
+    /// or a directory (existing directory or path ending with '/').
+    #[arg(long = "log-path", global = true)]
+    pub log_path: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]

@@ -144,7 +144,13 @@ fn main() {
 /// Points logging at a file, and says where, since a backgrounded mount leaves no other
 /// trace of it.
 fn init_logging(cli: &Cli) {
-    let Some(path) = cli.log_file.clone().or_else(|| default_volume_log(&cli.command)) else {
+    let started = jiff::Zoned::now();
+    let Some(path) = cli
+        .log_path
+        .as_deref()
+        .map(|p| appendfs::logging::resolve_log_path(p, &started))
+        .or_else(|| default_volume_log(&cli.command))
+    else {
         return;
     };
 
