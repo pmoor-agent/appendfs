@@ -897,8 +897,10 @@ impl AppendFs {
     pub fn sync_and_export_summary_with_iv(&self, explicit_iv: Option<[u8; 12]>) -> std::io::Result<Option<String>> {
         self.quiesce()?;
         if let Some(ref writer) = self.log_writer {
-            if !writer.is_open() {
-                // Read-only session where no log records were ever flushed or written
+            let latest_sealed_gen = self.manifest.read().unwrap().latest_generation().unwrap_or(0);
+            let last_summary_gen = self.last_summary_generation.load(Ordering::SeqCst);
+            if !writer.is_open() && latest_sealed_gen <= last_summary_gen {
+                // Read-only session where no uncovered log records were ever flushed or written
                 return Ok(None);
             }
             let storage = writer.storage();
@@ -2261,6 +2263,132 @@ mod tests {
         assert!(
             summary_count(storage.as_ref()) > summaries_before,
             "a read-write unmount must export a final summary"
+        );
+    }
+
+    #[test]
+    fn test_destroy_after_log_roll_exports_final_summary() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let fs = TestFs::builder()
+            .storage(storage.clone())
+            .clock(clock.clone())
+            .max_log_size(200)
+            .build()
+            .fs;
+
+        // Write enough data to trigger a roll from generation 1 to generation 2
+        let file = fs.create_file(1, "data.bin", 0o644).unwrap();
+        fs.write_at(file, &[42u8; 300], 0).unwrap();
+        fs.quiesce().unwrap();
+
+        // Ensure generation 1 was rolled and next generation is unopened/lazy
+        assert!(storage.exists("000001.log"));
+        let writer = fs.log_writer.as_ref().unwrap();
+        assert!(!writer.is_open(), "next generation must remain lazy/unopened");
+
+        let summaries_before = summary_count(storage.as_ref());
+        fs.destroy();
+
+        assert!(
+            summary_count(storage.as_ref()) > summaries_before,
+            "destroy must export a summary covering generation 1 despite unopened next gen"
+        );
+        assert!(storage.exists("000001.summary"));
+
+        // Recovery should load 000001.summary and find last_summary_generation = 1
+        let recovered = crate::log::recovery::recover_fs(
+            storage,
+            crate::log::recovery::RecoveryTarget::Latest,
+            clock,
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        assert_eq!(recovered.last_summary_generation.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_destroy_with_uncovered_replayed_log_exports_final_summary() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let mut t = TestFs::builder().storage(storage.clone()).clock(clock.clone()).build();
+
+        // Write a file in generation 1
+        let file = t.fs.create_file(1, "uncovered.txt", 0o644).unwrap();
+        t.fs.write_at(file, b"uncovered content", 0).unwrap();
+        t.fs.quiesce().unwrap();
+
+        // Simulate crash / unclean unmount where 000001.log exists without 000001.summary
+        assert!(storage.exists("000001.log"));
+        assert!(!storage.exists("000001.summary"));
+
+        // Drop the previous instance without running destroy()
+        t.fs.log_writer = None;
+        drop(t);
+
+        // Mount Session 2: recover volume, attach lazy writer for generation 2
+        let mut recovered = crate::log::recovery::recover_fs(
+            storage.clone(),
+            crate::log::recovery::RecoveryTarget::Latest,
+            clock.clone(),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        assert_eq!(recovered.last_summary_generation.load(Ordering::SeqCst), 0);
+
+        let writer = recovered.next_log_writer(storage.clone(), 100_000).unwrap();
+        recovered.attach_log_writer(Arc::new(writer));
+
+        // Perform only read-only actions (no writes)
+        assert!(recovered.lookup_child(1, "uncovered.txt").is_some());
+        assert!(!recovered.log_writer.as_ref().unwrap().is_open());
+
+        // Destroy (clean unmount): must export 000001.summary because 000001.log was uncovered
+        recovered.destroy();
+
+        assert!(storage.exists("000001.summary"));
+        assert_eq!(recovered.last_summary_generation.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_destroy_when_already_summarized_and_clean_does_not_reexport() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let mut t = TestFs::builder().storage(storage.clone()).clock(clock.clone()).build();
+
+        // Write a file and cleanly export 000001.summary
+        let file = t.fs.create_file(1, "covered.txt", 0o644).unwrap();
+        t.fs.write_at(file, b"covered content", 0).unwrap();
+        t.fs.quiesce().unwrap();
+        t.fs.sync_and_export_summary().unwrap();
+        assert!(storage.exists("000001.summary"));
+
+        let summaries_before = summary_count(storage.as_ref());
+
+        // Drop previous instance
+        t.fs.log_writer = None;
+        drop(t);
+
+        // Mount Session 2: recover volume (loads 000001.summary)
+        let mut recovered = crate::log::recovery::recover_fs(
+            storage.clone(),
+            crate::log::recovery::RecoveryTarget::Latest,
+            clock.clone(),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        assert_eq!(recovered.last_summary_generation.load(Ordering::SeqCst), 1);
+
+        let writer = recovered.next_log_writer(storage.clone(), 100_000).unwrap();
+        recovered.attach_log_writer(Arc::new(writer));
+
+        // No writes performed
+        recovered.destroy();
+
+        assert_eq!(
+            summary_count(storage.as_ref()),
+            summaries_before,
+            "clean unmount with no new writes on an already-summarized volume must not re-export"
         );
     }
 

@@ -956,6 +956,74 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
 }
 
 #[test]
+fn test_clean_unmount_exports_summary_when_latest_log_is_uncovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
+
+    // 1. Initialize volume
+    appendfs::init_volume(
+        storage.clone(),
+        &appendfs::VolumeKey::plaintext(),
+        appendfs::VolumeHeader::plaintext(),
+        std::sync::Arc::new(appendfs::SystemClock),
+    )
+    .unwrap();
+
+    // 2. Mount and write data that rolls the log file (max_log_size = 200 bytes)
+    {
+        let mut fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            Arc::new(appendfs::SystemClock),
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let writer = fs.next_log_writer(storage.clone(), 200).unwrap();
+        fs.attach_log_writer(Arc::new(writer));
+        fs.set_log_dir(log_path);
+
+        let file = fs.create_file(1, "rolled.bin", 0o644).unwrap();
+        fs.write_at(file, &[0xAA; 300], 0).unwrap();
+
+        // Flush mutations, triggering a roll to gen 2 (which remains unopened/lazy)
+        fs.quiesce().unwrap();
+        assert!(!fs.log_writer.as_ref().unwrap().is_open());
+        assert!(storage.exists("000001.log"));
+
+        // Unmount (drop fs) -> must export 000001.summary even though active writer is unopened
+    }
+
+    assert!(storage.exists("000001.summary"));
+
+    // 3. Mount 2: Read-only session where 000001.log is now covered by 000001.summary
+    {
+        let mut fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            Arc::new(appendfs::SystemClock),
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+        let writer = fs
+            .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
+            .unwrap();
+        fs.attach_log_writer(Arc::new(writer));
+        fs.set_log_dir(log_path);
+
+        // Read-only operation
+        let file_ino = fs.lookup_child(1, "rolled.bin").unwrap();
+        assert_eq!(fs.get_attr(file_ino).unwrap().size, 300);
+
+        // Drop fs (unmount)
+    }
+
+    // Assert no 000002.summary or 000002.log was created
+    assert!(!storage.exists("000002.summary"));
+    assert!(!storage.exists("000002.log"));
+}
+
+#[test]
 fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path();
