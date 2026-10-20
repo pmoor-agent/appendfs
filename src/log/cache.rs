@@ -227,6 +227,7 @@ impl LogFileCache {
     }
 
     /// Stores a decrypted record payload for `(generation, record_log_offset)` in the cache.
+    #[cfg(any(test, feature = "testing"))]
     pub fn insert_cached_record(&self, generation: u32, record_log_offset: u64, payload: Arc<Vec<u8>>) {
         self.decrypted_cache.insert(generation, 0, record_log_offset, payload);
     }

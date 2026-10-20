@@ -87,11 +87,13 @@ impl FileHandle {
     }
 
     #[inline]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_regular(&self) -> bool {
         matches!(self, FileHandle::Regular { .. })
     }
 
     #[inline]
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_virtual(&self) -> bool {
         matches!(self, FileHandle::Virtual { .. })
     }
@@ -991,12 +993,6 @@ impl AppendFs {
         self.inner.lock(OpTag::Stats).unwrap().flushing_ops
     }
 
-    /// Total dirty operations currently in memory (staged in `live` + queued in `flushing`).
-    pub fn total_dirty_ops(&self) -> usize {
-        let inner = self.inner.lock(OpTag::Stats).unwrap();
-        inner.staged_ops + inner.flushing_ops
-    }
-
     /// Attaches an active `LogWriter` to the filesystem instance.
     ///
     /// # Panics
@@ -1230,6 +1226,7 @@ impl AppendFs {
     }
 
     /// Returns the number of currently tracked in-flight asynchronous operations.
+    #[cfg(any(test, feature = "testing"))]
     pub fn in_flight_async_ops(&self) -> usize {
         self.async_tracker.in_flight()
     }

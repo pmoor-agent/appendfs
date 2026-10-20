@@ -656,6 +656,7 @@ pub fn setlk_response(
     DeferredResult::deferred(rx)
 }
 
+#[cfg(any(test, feature = "testing"))]
 pub fn flock_core(fs: &AppendFs, ino: u64, fh: u64, _lock_owner: u64, op: i32) -> Result<(), FsError> {
     let base_op = op & !libc::LOCK_NB;
 
@@ -772,6 +773,7 @@ pub fn getlk_core(fs: &AppendFs, ino: u64, fh: u64, lock_owner: u64, lock: ShimF
     })
 }
 
+#[cfg(any(test, feature = "testing"))]
 pub fn setlk_core(
     fs: &AppendFs,
     ino: u64,

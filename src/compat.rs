@@ -143,6 +143,7 @@ pub const COMPAT_FSCK_REPORT_FILENAME: &str = "fsck-report.txt";
 
 /// Resolves the volume key required to open `fixture_dir`, unlocking encrypted fixtures
 /// with the key file stored alongside them.
+#[cfg(any(test, feature = "testing"))]
 pub fn resolve_fixture_volume_key(fixture_dir: &Path) -> Arc<VolumeKey> {
     let storage = OsStorage::new(fixture_dir);
     let volume_header =

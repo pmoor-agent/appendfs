@@ -333,6 +333,7 @@ impl FuseOpMetrics {
     }
 
     /// Cumulative duration that `op` was soft-throttled.
+    #[cfg(any(test, feature = "testing"))]
     pub fn throttled_duration(&self, op: FuseOp) -> Duration {
         let nanos = self.throttled_nanos[op.index()].load(Ordering::Relaxed);
         Duration::from_nanos(nanos)
@@ -395,6 +396,7 @@ impl FuseOpMetrics {
     }
 
     /// Total cumulative execution duration across all operations.
+    #[cfg(any(test, feature = "testing"))]
     pub fn total_duration(&self) -> Duration {
         let nanos: u64 = self.total_nanos.iter().map(|c| c.load(Ordering::Relaxed)).sum();
         Duration::from_nanos(nanos)

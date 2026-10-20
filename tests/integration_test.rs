@@ -1079,9 +1079,12 @@ fn test_background_flusher_in_mount_session() {
 
     // Wait up to 5 seconds for the background flusher to flush dirty ops to disk
     assert!(
-        wait_until(|| fs.total_dirty_ops() == 0, std::time::Duration::from_secs(5)),
+        wait_until(
+            || fs.staged_ops() + fs.flushing_ops() == 0,
+            std::time::Duration::from_secs(5)
+        ),
         "Dirty ops ({}) must be flushed to 0 by the background flusher",
-        fs.total_dirty_ops()
+        fs.staged_ops() + fs.flushing_ops()
     );
     let writer = fs.log_writer.as_ref().unwrap();
     assert!(writer.record_count() > 0);

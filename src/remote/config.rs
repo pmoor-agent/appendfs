@@ -438,18 +438,6 @@ impl RemoteRegistry {
         writer.sync()
     }
 
-    /// Loads configuration from `<log_dir>/remotes.toml`, or returns default if absent.
-    pub fn load_from_dir(log_dir: &Path) -> io::Result<Self> {
-        let storage = crate::storage::OsStorage::new(log_dir);
-        Self::load_from_storage(&storage)
-    }
-
-    /// Persists configuration to `<log_dir>/remotes.toml`.
-    pub fn save_to_dir(&self, log_dir: &Path) -> io::Result<()> {
-        let storage = crate::storage::OsStorage::new(log_dir);
-        self.save_to_storage(&storage)
-    }
-
     pub fn add_remote(&mut self, name: impl Into<String>, config: RemoteTargetConfig) {
         self.remotes.insert(name.into(), config);
     }
@@ -565,8 +553,9 @@ mod tests {
             .with_storage_class("DEEP_ARCHIVE");
         registry.add_remote("glacier", r4);
 
-        registry.save_to_dir(dir.path()).unwrap();
-        let loaded = RemoteRegistry::load_from_dir(dir.path()).unwrap();
+        let storage = crate::storage::OsStorage::new(dir.path());
+        registry.save_to_storage(&storage).unwrap();
+        let loaded = RemoteRegistry::load_from_storage(&storage).unwrap();
         assert_eq!(registry, loaded);
 
         assert_eq!(loaded.remotes.len(), 4);
