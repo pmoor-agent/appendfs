@@ -438,7 +438,7 @@ fn cmd_mount(args: MountArgs) {
     fs_instance.track_atime = args.track_atime;
     fs_instance.set_read_parallelism(args.read_parallelism);
 
-    fs_instance.log_cache = Some(build_log_cache(
+    fs_instance.set_log_cache(build_log_cache(
         &args,
         storage.clone(),
         registry.build_read_stores(),
@@ -531,7 +531,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
     fs_instance.set_read_only();
     fs_instance.set_read_parallelism(args.read_parallelism);
 
-    fs_instance.log_cache = Some(build_log_cache(&args, storage, remote_stores, &fs_instance.manifest));
+    fs_instance.set_log_cache(build_log_cache(&args, storage, remote_stores, &fs_instance.manifest));
 
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
     fs_instance.set_remote_registry(Arc::clone(&registry_arc));

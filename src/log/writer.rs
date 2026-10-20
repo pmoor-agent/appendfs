@@ -942,6 +942,42 @@ impl LogWriter {
         }
     }
 
+    /// Returns the encryption key salt of the currently active log generation if open.
+    pub fn active_key_salt(&self) -> Option<[u8; 16]> {
+        let state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match &*state {
+            ActiveLogState::Unopened { .. } => None,
+            ActiveLogState::Open(active) => Some(active.key_salt),
+        }
+    }
+
+    /// Returns a `LogFileInfo` representing the active open generation if currently open.
+    pub fn active_log_info(&self) -> Option<super::manifest::LogFileInfo> {
+        let state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match &*state {
+            ActiveLogState::Unopened { .. } => None,
+            ActiveLogState::Open(active) => Some(super::manifest::LogFileInfo {
+                version: crate::log::record::CURRENT_VERSION,
+                generation: active.generation,
+                revision: 0,
+                filename: active.filename.clone(),
+                created_at: active.created_at,
+                record_count: active.record_count,
+                total_bytes: active.current_offset,
+                total_data_bytes: active.total_data_bytes,
+                md5: [0u8; 16],
+                sealed_at: None,
+                key_salt: Some(active.key_salt),
+            }),
+        }
+    }
+
     /// Returns the ID of the last committed flush batch, or 0 if none has been committed yet.
     pub fn last_batch_id(&self) -> u64 {
         self.batch_id.load(Ordering::SeqCst).saturating_sub(1)

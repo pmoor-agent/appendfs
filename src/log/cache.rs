@@ -29,6 +29,7 @@ pub struct LogFileCache {
     pub block_cache: Option<Arc<dyn BlockCache>>,
     pub remotes: Arc<RwLock<Vec<RemoteReadTarget>>>,
     pub manifest: Option<Arc<RwLock<crate::log::LogManifest>>>,
+    pub active_writer: Arc<RwLock<Option<std::sync::Weak<crate::log::LogWriter>>>>,
     /// Whether logs in the manifest that are still present locally are read through `block_cache` too.
     /// Off by default: the local file already holds those blocks, so caching them only pays
     /// off once the log is pruned, and costs a second copy on disk until then.
@@ -49,6 +50,7 @@ impl LogFileCache {
             block_cache: None,
             remotes: Arc::new(RwLock::new(Vec::new())),
             manifest: None,
+            active_writer: Arc::new(RwLock::new(None)),
             cache_local_reads: false,
         }
     }
@@ -66,8 +68,24 @@ impl LogFileCache {
             block_cache,
             remotes: Arc::new(RwLock::new(remotes.into_iter().map(Into::into).collect())),
             manifest,
+            active_writer: Arc::new(RwLock::new(None)),
             cache_local_reads: false,
         }
+    }
+
+    /// Attaches the active `LogWriter` via a `Weak` reference so the key salt for the currently
+    /// open unsealed generation can be resolved without reading its file header from disk,
+    /// while allowing the writer to be dropped and release its volume lock normally.
+    pub fn set_active_writer(&self, writer: &Arc<crate::log::LogWriter>) {
+        if let Ok(mut guard) = self.active_writer.write() {
+            *guard = Some(Arc::downgrade(writer));
+        }
+    }
+
+    /// Builder method to attach an active `LogWriter`.
+    pub fn with_active_writer(self, writer: &Arc<crate::log::LogWriter>) -> Self {
+        self.set_active_writer(writer);
+        self
     }
 
     /// Makes reads of logs in the manifest that are still present locally copy their blocks into `block_cache`,
@@ -216,7 +234,7 @@ impl LogFileCache {
     ///
     /// If the decrypted payload for `(generation, record_log_offset)` is already present in `decrypted_cache`,
     /// it is copied directly with ZERO disk I/O and ZERO decryption overhead.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn read_extent_payload(
         &self,
         generation: u32,
@@ -231,7 +249,15 @@ impl LogFileCache {
             .manifest
             .as_ref()
             .and_then(|m| m.read().ok())
-            .and_then(|m| m.get_by_generation(generation).cloned());
+            .and_then(|m| m.get_by_generation(generation).cloned())
+            .or_else(|| {
+                self.active_writer
+                    .read()
+                    .ok()
+                    .and_then(|w| w.as_ref().and_then(|weak| weak.upgrade()))
+                    .filter(|w| w.generation() == generation)
+                    .and_then(|w| w.active_log_info())
+            });
         let revision = manifest_entry.as_ref().map(|l| l.revision).unwrap_or(0);
 
         let decrypted: Arc<Vec<u8>> =
@@ -248,6 +274,10 @@ impl LogFileCache {
                 let entry_ref = match manifest_entry.as_ref() {
                     Some(entry) => entry,
                     None => {
+                        // Fallback entry used only when a log generation is neither present in the sealed
+                        // manifest nor matches the active log writer (e.g. an unindexed legacy log file
+                        // or volume corruption). In this rare fallback case, `key_salt: None` causes
+                        // `get_or_open` to read the file header from disk and memoize the key salt.
                         fallback_entry = LogFileInfo {
                             version: crate::log::record::CURRENT_VERSION,
                             generation,
@@ -540,6 +570,126 @@ mod tests {
         assert!(
             cache_dir.join("000001_000000.bin").exists(),
             "block 0 is cached when key_salt is None"
+        );
+    }
+
+    #[test]
+    fn test_log_file_cache_bypasses_block0_for_active_writer_log() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let os_storage = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+        let clock = Arc::new(SystemClock);
+        let key = VolumeKey::plaintext_arc();
+
+        // Custom reader and storage that track offsets passed to read_exact_at
+        struct TrackingReader {
+            reader: Arc<dyn crate::storage::StorageReader>,
+            offsets: Arc<Mutex<Vec<u64>>>,
+        }
+        impl crate::storage::StorageReader for TrackingReader {
+            fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+                self.offsets.lock().unwrap().push(offset);
+                self.reader.read_exact_at(offset, buf)
+            }
+            fn len(&self) -> std::io::Result<u64> {
+                self.reader.len()
+            }
+        }
+
+        struct TrackingStorage {
+            inner: Arc<dyn Storage>,
+            offsets: Arc<Mutex<Vec<u64>>>,
+        }
+        impl Storage for TrackingStorage {
+            fn open_reader(&self, filename: &str) -> std::io::Result<Arc<dyn crate::storage::StorageReader>> {
+                let r = self.inner.open_reader(filename)?;
+                Ok(Arc::new(TrackingReader {
+                    reader: r,
+                    offsets: Arc::clone(&self.offsets),
+                }))
+            }
+            fn open_writer(
+                &self,
+                filename: &str,
+                mode: crate::storage::WriteMode,
+            ) -> std::io::Result<Box<dyn crate::storage::StorageWriter>> {
+                self.inner.open_writer(filename, mode)
+            }
+            fn exists(&self, filename: &str) -> bool {
+                self.inner.exists(filename)
+            }
+            fn file_len(&self, filename: &str) -> std::io::Result<u64> {
+                self.inner.file_len(filename)
+            }
+            fn remove_file(&self, filename: &str) -> std::io::Result<()> {
+                self.inner.remove_file(filename)
+            }
+            fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+                self.inner.rename(from, to)
+            }
+            fn acquire_exclusive_lock(&self) -> std::io::Result<Box<dyn crate::storage::StorageLock>> {
+                self.inner.acquire_exclusive_lock()
+            }
+            fn list_files(&self) -> std::io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+        }
+
+        let read_offsets = Arc::new(Mutex::new(Vec::new()));
+        let tracking_storage: Arc<dyn Storage> = Arc::new(TrackingStorage {
+            inner: os_storage.clone(),
+            offsets: Arc::clone(&read_offsets),
+        });
+
+        let writer = Arc::new(
+            LogWriter::create(
+                os_storage.clone(),
+                1,
+                clock.clone(),
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                key.clone(),
+            )
+            .unwrap(),
+        );
+
+        // Write 1 MiB of padding data so next record is strictly in block 1 (offset >= 1024*1024)
+        let padding = vec![0x42u8; 1024 * 1024];
+        writer.append_data(10, &padding).unwrap();
+
+        let payload = b"block 1 active data";
+        let (gen_num, offset, rec_size) = writer.append_data(11, payload).unwrap();
+        assert!(offset >= 1024 * 1024);
+        writer.flush().unwrap();
+
+        // Note: gen_num is NOT sealed and NOT present in the manifest!
+        let manifest = Arc::new(RwLock::new(crate::log::LogManifest::new()));
+
+        let cache = LogFileCache::with_remote_support(
+            tracking_storage,
+            None,
+            Vec::<crate::remote::RemoteReadTarget>::new(),
+            Some(manifest),
+        );
+
+        // Funnel active writer to the cache
+        cache.set_active_writer(&writer);
+
+        // Read the target record from block 1 of the unsealed active log
+        let mut buf = [0u8; 7];
+        cache
+            .read_extent_payload(gen_num, offset, rec_size, 0, 0, &mut buf, &key)
+            .unwrap();
+        assert_eq!(&buf, b"block 1");
+
+        // Verify: read was issued directly to `offset`
+        let recorded = read_offsets.lock().unwrap().clone();
+        assert!(recorded.contains(&offset), "record offset {} must be read", offset);
+
+        // Crucial verification: offset 0 (FileHeader) was NEVER read because key salt was obtained from active writer!
+        assert!(
+            !recorded.contains(&0),
+            "offset 0 must NOT be read when active writer funnels key salt! Recorded offsets: {:?}",
+            recorded
         );
     }
 }

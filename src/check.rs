@@ -1214,8 +1214,14 @@ pub fn execute_sampled_verification(
     for (&generation, records) in &local_records_by_gen {
         let records_bytes: u64 = records.iter().map(|r| r.record_size as u64).sum();
         if let Some(ref c) = local_cache {
-            let manifest_entry = manifest.get_by_generation(generation);
+            let manifest_entry = manifest.get_by_generation(generation).cloned().or_else(|| {
+                fs.log_writer
+                    .as_ref()
+                    .filter(|w| w.generation() == generation)
+                    .and_then(|w| w.active_log_info())
+            });
             let log_filename = manifest_entry
+                .as_ref()
                 .map(|l| l.filename.clone())
                 .unwrap_or_else(|| crate::log::log_filename(generation));
             if !c.storage().exists(&log_filename) {
@@ -1249,9 +1255,13 @@ pub fn execute_sampled_verification(
             };
 
             let fallback_entry;
-            let entry_ref = match manifest_entry {
+            let entry_ref = match manifest_entry.as_ref() {
                 Some(entry) => entry,
                 None => {
+                    // Fallback entry used only when a log generation is neither present in the sealed
+                    // manifest nor matches the active log writer (e.g. an unindexed legacy log file
+                    // or volume corruption). In this rare fallback case, `key_salt: None` causes
+                    // `get_or_open` to read the file header from disk and memoize the key salt.
                     fallback_entry = crate::log::manifest::LogFileInfo {
                         version: crate::log::record::CURRENT_VERSION,
                         generation,
