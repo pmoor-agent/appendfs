@@ -3012,12 +3012,12 @@ fn test_pre_synced_remote_reflects_up_to_date_status_without_lockstep_lag() {
     let fs_arc = Arc::new(fs);
 
     // Setup two remotes:
-    // 1. aws-glacier: Write-Only archive, only holds generations 1 and 2
-    // 2. gcs-netherlands: Read-Write, holds all generations 1..5 (synced in previous run)
+    // 1. aws-archive: Write-Only archive, only holds generations 1 and 2
+    // 2. gcs-regional: Read-Write, holds all generations 1..5 (synced in previous run)
     let glacier_raw = Arc::new(MockRemoteStore::new());
     let gcs_raw = Arc::new(MockRemoteStore::new());
 
-    // Pre-populate gcs-netherlands with all 5 generations and summaries
+    // Pre-populate gcs-regional with all 5 generations and summaries
     for g in 1..=5 {
         let log_file = format!("{:06}.log", g);
         let bytes = read_storage_file(storage.as_ref(), &log_file);
@@ -3058,7 +3058,7 @@ fn test_pre_synced_remote_reflects_up_to_date_status_without_lockstep_lag() {
             .unwrap();
     }
 
-    // Pre-populate aws-glacier with only generations 1 and 2
+    // Pre-populate aws-archive with only generations 1 and 2
     for g in 1..=2 {
         let log_file = format!("{:06}.log", g);
         let bytes = read_storage_file(storage.as_ref(), &log_file);
@@ -3073,20 +3073,20 @@ fn test_pre_synced_remote_reflects_up_to_date_status_without_lockstep_lag() {
             .unwrap();
     }
 
-    // Inject failure on aws-glacier so it fails all uploads and remains stuck at gen 2 during replication
+    // Inject failure on aws-archive so it fails all uploads and remains stuck at gen 2 during replication
     let glacier_failing = Arc::new(FailingRemoteStore::new(glacier_raw.clone()));
     glacier_failing.fail_method("put_object");
 
     let mut registry = RemoteRegistry::new();
-    let mut glacier_cfg = RemoteTargetConfig::new("appendfs-glacier-bucket");
+    let mut glacier_cfg = RemoteTargetConfig::new("glacier-bucket");
     glacier_cfg.mode = RemoteMode::WriteOnly;
-    registry.add_remote("aws-glacier", glacier_cfg);
-    registry.set_store_override("aws-glacier", glacier_failing);
+    registry.add_remote("aws-archive", glacier_cfg);
+    registry.set_store_override("aws-archive", glacier_failing);
 
-    let mut gcs_cfg = RemoteTargetConfig::new("appendfs-remote");
+    let mut gcs_cfg = RemoteTargetConfig::new("gcs-bucket");
     gcs_cfg.mode = RemoteMode::ReadWrite;
-    registry.add_remote("gcs-netherlands", gcs_cfg);
-    registry.set_store_override("gcs-netherlands", gcs_raw);
+    registry.add_remote("gcs-regional", gcs_cfg);
+    registry.set_store_override("gcs-regional", gcs_raw);
 
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
     fs_arc.set_remote_registry(registry_arc.clone());
@@ -3105,15 +3105,15 @@ fn test_pre_synced_remote_reflects_up_to_date_status_without_lockstep_lag() {
 
     let status = appendfs::remote::worker::format_remotes_status(&fs_arc);
 
-    // Verify gcs-netherlands is NOT held back at generation 2:
+    // Verify gcs-regional is NOT held back at generation 2:
     // It must report Up to date, 5 / 5 synced generations, and 0 lag!
-    assert!(status.contains("[Remote: gcs-netherlands]"));
+    assert!(status.contains("[Remote: gcs-regional]"));
     assert!(status.contains(
         "Status:             Up to date\n  Synced Generation:  5 / 5\n  Replication Lag:    0 sealed generation(s)"
     ));
 
-    // Verify aws-glacier accurately reports its lag and error without corrupting gcs-netherlands:
-    assert!(status.contains("[Remote: aws-glacier]"));
+    // Verify aws-archive accurately reports its lag and error without corrupting gcs-regional:
+    assert!(status.contains("[Remote: aws-archive]"));
     assert!(status.contains("Status:             Syncing (Archive)\n  Synced Generation:  2 / 5\n  Replication Lag:    3 sealed generation(s)"));
     assert!(status.contains("Last Error:"));
 }
@@ -3192,8 +3192,8 @@ fn test_prioritized_replication_rw_and_low_lag_replicates_before_archive_backlog
     let fs_arc = Arc::new(fs);
 
     // Setup:
-    // gcs-netherlands (ReadWrite): missing ONLY generation 4 (lag 1)
-    // aws-glacier (WriteOnly): missing generations 2, 3, 4 (lag 3)
+    // gcs-regional (ReadWrite): missing ONLY generation 4 (lag 1)
+    // aws-archive (WriteOnly): missing generations 2, 3, 4 (lag 3)
     let gcs_raw = Arc::new(MockRemoteStore::new());
     for g in 1..=3 {
         let log_file = format!("{:06}.log", g);
@@ -3237,13 +3237,13 @@ fn test_prioritized_replication_rw_and_low_lag_replicates_before_archive_backlog
     let mut registry = RemoteRegistry::new();
     let mut glacier_cfg = RemoteTargetConfig::new("glacier-bucket");
     glacier_cfg.mode = RemoteMode::WriteOnly;
-    registry.add_remote("aws-glacier", glacier_cfg);
-    registry.set_store_override("aws-glacier", glacier_tracking);
+    registry.add_remote("aws-archive", glacier_cfg);
+    registry.set_store_override("aws-archive", glacier_tracking);
 
     let mut gcs_cfg = RemoteTargetConfig::new("gcs-bucket");
     gcs_cfg.mode = RemoteMode::ReadWrite;
-    registry.add_remote("gcs-netherlands", gcs_cfg);
-    registry.set_store_override("gcs-netherlands", gcs_tracking);
+    registry.add_remote("gcs-regional", gcs_cfg);
+    registry.set_store_override("gcs-regional", gcs_tracking);
 
     let registry_arc = Arc::new(std::sync::RwLock::new(registry));
     fs_arc.set_remote_registry(registry_arc.clone());
@@ -3277,8 +3277,8 @@ fn test_prioritized_replication_rw_and_low_lag_replicates_before_archive_backlog
 
     // Both remotes should now be fully up-to-date!
     let status = appendfs::remote::worker::format_remotes_status(&fs_arc);
-    assert!(status.contains("[Remote: gcs-netherlands]\n  Target:             s3 (bucket: gcs-bucket, prefix: )\n  Read Priority:      100\n  Mode:               Read-Write\n  Partial Logs:       Enabled\n  Status:             Up to date\n  Synced Generation:  4 / 4\n  Replication Lag:    0 sealed generation(s)"));
-    assert!(status.contains("[Remote: aws-glacier]\n  Target:             s3 (bucket: glacier-bucket, prefix: )\n  Read Priority:      100\n  Mode:               Write-Only\n  Partial Logs:       Disabled\n  Status:             Up to date (Archive)\n  Synced Generation:  4 / 4\n  Replication Lag:    0 sealed generation(s)"));
+    assert!(status.contains("[Remote: gcs-regional]\n  Target:             s3 (bucket: gcs-bucket, prefix: )\n  Read Priority:      100\n  Mode:               Read-Write\n  Partial Logs:       Enabled\n  Status:             Up to date\n  Synced Generation:  4 / 4\n  Replication Lag:    0 sealed generation(s)"));
+    assert!(status.contains("[Remote: aws-archive]\n  Target:             s3 (bucket: glacier-bucket, prefix: )\n  Read Priority:      100\n  Mode:               Write-Only\n  Partial Logs:       Disabled\n  Status:             Up to date (Archive)\n  Synced Generation:  4 / 4\n  Replication Lag:    0 sealed generation(s)"));
 }
 
 #[test]
