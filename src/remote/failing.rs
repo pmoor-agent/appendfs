@@ -42,12 +42,6 @@ impl FailingRemoteStore {
         self.fail_next_requests.store(n, Ordering::SeqCst);
     }
 
-    /// Configures the specific error kind and message returned on injected failure.
-    pub fn set_error(&self, kind: io::ErrorKind, msg: impl Into<String>) {
-        *self.error_kind.write().unwrap() = kind;
-        *self.error_message.write().unwrap() = msg.into();
-    }
-
     /// Injects an error for a specific method (e.g. "get_object_range", "put_object").
     pub fn fail_method(&self, method: &str) {
         self.fail_methods.write().unwrap().insert(method.to_string());
@@ -61,11 +55,6 @@ impl FailingRemoteStore {
     /// Injects an error for operations referencing a specific key.
     pub fn fail_key(&self, key: &str) {
         self.fail_keys.write().unwrap().insert(key.to_string());
-    }
-
-    /// Clears any injected failure for a specific key.
-    pub fn clear_fail_key(&self, key: &str) {
-        self.fail_keys.write().unwrap().remove(key);
     }
 
     /// Injects a bitflip into data returned by `get_object` or `get_object_range`.

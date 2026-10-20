@@ -178,16 +178,6 @@ impl Extent {
         }
     }
 
-    /// Bytes this extent occupies on disk - zero for a hole. Drives `st_blocks`.
-    #[inline]
-    pub fn allocated_len(&self) -> u64 {
-        match self {
-            Self::Zero { .. } => 0,
-            Self::Disk { record_size, .. } => *record_size as u64,
-            Self::Staged { length, .. } => *length as u64,
-        }
-    }
-
     #[inline]
     pub fn trim_right(&mut self, new_len: u64) {
         match self {
@@ -254,33 +244,6 @@ impl Extent {
             }
             _ => false,
         }
-    }
-
-    /// Compatibility helper for existing code inspecting extent state.
-    #[inline]
-    pub fn read_state(&self) -> Self {
-        self.clone()
-    }
-
-    /// Compatibility helper for shared pointers (now plain value clone).
-    #[inline]
-    pub fn share(&self) -> Self {
-        self.clone()
-    }
-
-    #[inline]
-    pub fn is_staged(&self) -> bool {
-        matches!(self, Self::Staged { .. })
-    }
-
-    #[inline]
-    pub fn is_disk(&self) -> bool {
-        matches!(self, Self::Disk { .. })
-    }
-
-    #[inline]
-    pub fn is_zero(&self) -> bool {
-        matches!(self, Self::Zero { .. })
     }
 }
 

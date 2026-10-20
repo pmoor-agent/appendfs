@@ -168,21 +168,6 @@ impl AppendFs {
         self.with_inner(OpTag::Handle, |inner| inner.allocate_fh())
     }
 
-    pub fn open_dir_handle(&self, ino: u64, flags: u32, entries: Vec<(String, u64)>) -> u64 {
-        self.with_inner(OpTag::Handle, |inner| {
-            let fh = inner.allocate_fh();
-            inner.insert_dir_handle(
-                fh,
-                DirHandle {
-                    ino,
-                    flags,
-                    entries: Arc::new(entries),
-                },
-            );
-            fh
-        })
-    }
-
     pub fn release_dir_handle(&self, fh: u64, ino: u64) -> Result<(), FsError> {
         self.with_inner(OpTag::Handle, |inner| match inner.handles.get(&fh) {
             Some(h) if h.ino() == ino && h.is_dir() => {

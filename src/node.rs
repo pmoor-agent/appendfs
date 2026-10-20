@@ -166,33 +166,6 @@ impl Node {
         matches!(self.kind, NodeKind::File { .. })
     }
 
-    pub fn is_symlink(&self) -> bool {
-        matches!(self.kind, NodeKind::Symlink { .. })
-    }
-
-    pub fn is_fifo(&self) -> bool {
-        matches!(self.kind, NodeKind::Fifo)
-    }
-
-    pub fn is_char_device(&self) -> bool {
-        matches!(self.kind, NodeKind::CharDevice { .. })
-    }
-
-    pub fn is_block_device(&self) -> bool {
-        matches!(self.kind, NodeKind::BlockDevice { .. })
-    }
-
-    pub fn is_socket(&self) -> bool {
-        matches!(self.kind, NodeKind::Socket)
-    }
-
-    pub fn is_special(&self) -> bool {
-        matches!(
-            self.kind,
-            NodeKind::Fifo | NodeKind::CharDevice { .. } | NodeKind::BlockDevice { .. } | NodeKind::Socket
-        )
-    }
-
     pub fn rdev(&self) -> u32 {
         match self.kind {
             NodeKind::CharDevice { rdev } | NodeKind::BlockDevice { rdev } => rdev,

@@ -82,15 +82,6 @@ impl FaultStorage {
         self.fail_on_open.write().unwrap().remove(filename);
     }
 
-    /// Clears all injected faults (write limits, open errors, bitflips).
-    pub fn clear_all_faults(&self) {
-        self.clear_write_limit();
-        self.fail_sync.store(false, Ordering::SeqCst);
-        self.fail_lock_records.store(false, Ordering::SeqCst);
-        self.fail_on_open.write().unwrap().clear();
-        self.bitflips.write().unwrap().clear();
-    }
-
     /// Injects a bitflip at a specific byte offset in a file on read.
     pub fn inject_bitflip(&self, filename: &str, offset: u64, bit_mask: u8) {
         self.bitflips

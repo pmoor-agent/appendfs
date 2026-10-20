@@ -338,12 +338,6 @@ impl FuseOpMetrics {
         Duration::from_nanos(nanos)
     }
 
-    /// Cumulative duration that `op` was hard-stalled.
-    pub fn stalled_duration(&self, op: FuseOp) -> Duration {
-        let nanos = self.stalled_nanos[op.index()].load(Ordering::Relaxed);
-        Duration::from_nanos(nanos)
-    }
-
     /// Average throttled duration for `op` when the operation was actually throttled.
     pub fn avg_throttled_duration(&self, op: FuseOp) -> Duration {
         let throttled = self.throttled(op);
@@ -352,16 +346,6 @@ impl FuseOpMetrics {
         }
         let nanos = self.throttled_nanos[op.index()].load(Ordering::Relaxed);
         Duration::from_nanos(nanos / throttled)
-    }
-
-    /// Average stalled duration for `op` when the operation encountered a hard stall.
-    pub fn avg_stalled_duration(&self, op: FuseOp) -> Duration {
-        let stalled = self.stalled(op);
-        if stalled == 0 {
-            return Duration::ZERO;
-        }
-        let nanos = self.stalled_nanos[op.index()].load(Ordering::Relaxed);
-        Duration::from_nanos(nanos / stalled)
     }
 
     /// Average execution latency for `op`.

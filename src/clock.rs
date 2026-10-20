@@ -83,10 +83,6 @@ pub fn unix_to_system_time(secs: i64, nsecs: u32) -> SystemTime {
     }
 }
 
-pub fn default_epoch() -> SystemTime {
-    UNIX_EPOCH
-}
-
 /// Formats a `SystemTime` as `<unix_secs>.<nanos>s (YYYY-MM-DD HH:MM:SS)` in local civil time.
 pub fn format_local_civil_time(time: SystemTime) -> String {
     let (secs, nsecs) = system_time_to_unix(time);

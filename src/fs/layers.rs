@@ -8,7 +8,6 @@
 //! two separate lock acquisitions, so a walk that reads an older layer before a newer
 //! one can straddle that move and miss the batch entirely.
 
-use super::AppendFs;
 use crate::error::FsError;
 use crate::extent_map::Extent;
 use crate::node::{EntryDelta, Node, NodeDelta, NodeKind};
@@ -409,12 +408,6 @@ impl<'a> InodeLayerStack<'a> {
             has_cold_slices,
             slices: raw_slices,
         })
-    }
-
-    /// Reads file data resolving extents across layers.
-    pub fn read_file_data(&self, offset: u64, size: usize, fs: &AppendFs) -> Result<Vec<u8>, FsError> {
-        let plan = self.plan_read_file_data(offset, size, fs.log_cache.as_deref())?;
-        execute_read_plan(plan, fs.log_cache.as_deref(), &fs.volume_key)
     }
 }
 

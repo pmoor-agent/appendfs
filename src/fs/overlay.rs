@@ -4,7 +4,7 @@
 //! into them. Reads go through [`AppendFs::with_layer_stack`], which takes all three
 //! layer locks in a safe order - see [`super::layers`] for why the order matters.
 
-use super::{AppendFs, FlushBatch, FsInner, InodeLayerStack, is_virtual_ino};
+use super::{AppendFs, FsInner, InodeLayerStack, is_virtual_ino};
 // Only the test-only by-inode read helpers at the bottom of this file return these.
 #[cfg(any(test, feature = "testing"))]
 use super::{ReadPlan, execute_read_plan};
@@ -16,7 +16,7 @@ use crate::node::{
 };
 use crate::shim::{FileAttr, FileType};
 use crate::sync::OpTag;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -190,10 +190,6 @@ impl FsInner {
 
     pub fn exists_below_live(&self, ino: u64) -> bool {
         self.with_inode_layers_below_live(ino, |layers| layers.exists())
-    }
-
-    pub fn attr_below_live(&self, ino: u64) -> Option<FileAttr> {
-        self.with_inode_layers_below_live(ino, |layers| layers.attr())
     }
 
     /// Normalizes directory deltas across a batch about to be flushed against the folded `base`
@@ -476,15 +472,6 @@ impl AppendFs {
     }
 
     // --- Overlay Query & Resolution Methods ---
-
-    pub fn with_layers<R>(
-        &self,
-        tag: OpTag,
-        f: impl FnOnce(&HashMap<u64, EntryDelta>, &VecDeque<Arc<FlushBatch>>, &HashMap<u64, Arc<Node>>) -> R,
-    ) -> R {
-        let inner = self.inner.lock(tag).unwrap();
-        f(&inner.live, &inner.flushing, &inner.base)
-    }
 
     pub fn get_attr_locked(&self, inner: &FsInner, ino: u64) -> Option<FileAttr> {
         if is_virtual_ino(ino) {

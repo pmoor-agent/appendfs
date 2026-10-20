@@ -56,11 +56,6 @@ impl S3RemoteStore {
         }
     }
 
-    pub fn with_storage_class(mut self, storage_class: impl Into<String>) -> Self {
-        self.storage_class = Some(storage_class.into());
-        self
-    }
-
     fn full_key(&self, key: &str) -> String {
         let trimmed = key.trim_start_matches('/');
         format!("{}{}", self.prefix, trimmed)

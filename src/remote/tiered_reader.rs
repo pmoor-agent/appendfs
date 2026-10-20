@@ -236,13 +236,6 @@ impl TieredStorageReader {
 
         Ok(result)
     }
-
-    /// Retrieves a single 1 MiB block from cache or fetches it from remotes.
-    pub fn get_or_fetch_block(&self, block_idx: u64) -> io::Result<Arc<Vec<u8>>> {
-        let mut map = self.fetch_blocks_batch(&[block_idx])?;
-        map.remove(&block_idx)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("block {} not found", block_idx)))
-    }
 }
 
 impl StorageReader for TieredStorageReader {

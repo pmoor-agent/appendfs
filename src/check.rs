@@ -446,13 +446,6 @@ impl VerificationPlan {
         total
     }
 
-    pub fn total_remote_requests(&self) -> usize {
-        self.remote_blocks
-            .values()
-            .map(|gen_map| gen_map.values().map(|b| b.len()).sum::<usize>())
-            .sum()
-    }
-
     pub fn display_summary(&self, manifest: &crate::log::LogManifest) -> String {
         let mut out = String::new();
         out.push_str("=================================================================\n");

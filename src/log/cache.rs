@@ -89,12 +89,6 @@ impl LogFileCache {
         }
     }
 
-    /// Builder method to attach an active `LogWriter`.
-    pub fn with_active_writer(self, writer: &Arc<crate::log::LogWriter>) -> Self {
-        self.set_active_writer(writer);
-        self
-    }
-
     /// Makes reads of logs in the manifest that are still present locally copy their blocks into `block_cache`,
     /// so they remain readable without a remote fetch after the local log is pruned.
     pub fn with_cache_local_reads(mut self, cache_local_reads: bool) -> Self {
