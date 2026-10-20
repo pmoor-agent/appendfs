@@ -1845,3 +1845,77 @@ fn test_cli_backfill_salts_command() {
     let alias_stdout = String::from_utf8_lossy(&alias_out.stdout);
     assert!(alias_stdout.contains("Successfully backfilled key salts into new summary: 000000_r2.summary"));
 }
+
+#[test]
+fn test_cli_dump_relative_filename_with_key_file() {
+    let fixture_src =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1_key_file_compressed");
+    let temp_dir = TempDir::new().unwrap();
+
+    // Copy encrypted fixture files to temp directory
+    for entry in std::fs::read_dir(&fixture_src).unwrap().flatten() {
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), temp_dir.path().join(entry.file_name())).unwrap();
+        }
+    }
+
+    let key_path = temp_dir.path().join("key.pem");
+
+    // 1. Test `appendfs dump --key-file key.pem 000001.log` with relative path from inside temp_dir
+    let dump_log = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["dump", "--key-file", key_path.to_str().unwrap(), "000001.log"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to run dump on relative log file");
+    assert!(
+        dump_log.status.success(),
+        "dump 000001.log failed: {}",
+        String::from_utf8_lossy(&dump_log.stderr)
+    );
+    let dump_log_str = String::from_utf8_lossy(&dump_log.stdout);
+    assert!(dump_log_str.contains("=== appendfs Log File Dump ==="));
+    assert!(dump_log_str.contains("Total Valid Records: 43"));
+
+    // 2. Test `appendfs dump --key-file key.pem 000000.summary` with relative path from inside temp_dir
+    let dump_sum = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["dump", "--key-file", key_path.to_str().unwrap(), "000000.summary"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to run dump on relative summary file");
+    assert!(
+        dump_sum.status.success(),
+        "dump 000000.summary failed: {}",
+        String::from_utf8_lossy(&dump_sum.stderr)
+    );
+    let dump_sum_str = String::from_utf8_lossy(&dump_sum.stdout);
+    assert!(dump_sum_str.contains("=== appendfs Summary File Dump ==="));
+
+    // 3. Test `appendfs dump 000001.log` without --key-file from inside temp_dir (raw dump)
+    let dump_raw = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["dump", "000001.log"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to run raw dump on relative log file");
+    assert!(
+        dump_raw.status.success(),
+        "raw dump 000001.log failed: {}",
+        String::from_utf8_lossy(&dump_raw.stderr)
+    );
+    let dump_raw_str = String::from_utf8_lossy(&dump_raw.stdout);
+    assert!(dump_raw_str.contains("=== appendfs Log File Dump ==="));
+
+    // 4. Verify that running dump on a nonexistent file does not create a stray logs directory
+    let empty_dir = TempDir::new().unwrap();
+    let nonexistent_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["dump", "nonexistent.log"])
+        .current_dir(empty_dir.path())
+        .output()
+        .expect("failed to run dump on nonexistent file");
+    assert!(!nonexistent_out.status.success());
+    let stderr = String::from_utf8_lossy(&nonexistent_out.stderr);
+    assert!(stderr.contains("does not exist"));
+    assert!(
+        !empty_dir.path().join("logs").exists(),
+        "nonexistent file dump must not create logs directory"
+    );
+}

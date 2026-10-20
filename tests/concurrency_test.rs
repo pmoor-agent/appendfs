@@ -633,7 +633,10 @@ fn dump_preserved_repro() {
     log_files.sort();
     for path in log_files {
         eprintln!("--- {:?} ---", path);
-        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
         let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let storage = OsStorage::new(parent);
         let reader = LogReader::open(&storage, filename, appendfs::VolumeKey::plaintext_arc()).unwrap();
