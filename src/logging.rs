@@ -10,7 +10,7 @@
 //! as it was left rather than being overwritten by the restart.
 //!
 //! A file is the only destination. Anything a user is meant to read is printed directly, so
-//! logging has no reason to compete for the terminal - and `--log-file` reaches the terminal
+//! logging has no reason to compete for the terminal - and `--log-path` reaches the terminal
 //! anyway via `/dev/stderr`, or discards via `/dev/null`, which is why there is no separate
 //! flag for either.
 //!
@@ -82,7 +82,7 @@ impl LogSink {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        // `append` rather than truncate: an explicit `--log-file` may name an existing file
+        // `append` rather than truncate: an explicit `--log-path` may name an existing file
         // - or a character device like `/dev/stderr` - and truncating would be wrong for both.
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self { file: Some(file) })
@@ -155,6 +155,32 @@ pub fn init(path: &Path, level: &str) -> Option<PathBuf> {
 pub fn run_log_path(log_dir: &Path) -> PathBuf {
     let root = fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
     log_file_path(&root, &Zoned::now())
+}
+
+/// Resolves a requested log destination (from `--log-path`) into a concrete log file path.
+///
+/// If `path` is an existing directory, or if it does not exist but syntactically denotes
+/// a directory (ends with a directory separator, or its last component is `.` or `..`),
+/// a timestamped log file (`appendfs-<YYYYMMDD>-<HHMMSS>.<mmm>.log`) is placed directly inside it.
+/// Otherwise, `path` is treated as the exact log file destination.
+pub fn resolve_log_path(path: &Path, started: &Zoned) -> PathBuf {
+    let is_dir = path.is_dir() || {
+        let raw = path.as_os_str().as_encoded_bytes();
+        raw.ends_with(b"/")
+            || raw.ends_with(&[std::path::MAIN_SEPARATOR as u8])
+            || path
+                .components()
+                .next_back()
+                .is_some_and(|c| matches!(c, std::path::Component::CurDir | std::path::Component::ParentDir))
+    };
+
+    if is_dir {
+        let dir =
+            fs::canonicalize(path).unwrap_or_else(|_| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
+        dir.join(log_file_name(started))
+    } else {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    }
 }
 
 /// Whether a flag's value is a credential that must not reach a log file.
@@ -344,5 +370,68 @@ mod tests {
         sink.file = None;
         assert!(sink.write_all(b"after\n").is_ok(), "a lost log file must be survivable");
         assert!(sink.flush().is_ok());
+    }
+
+    #[test]
+    fn test_resolve_log_path_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = started_at(0);
+        let resolved = resolve_log_path(dir.path(), &started);
+        let canonical_dir = fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(resolved, canonical_dir.join("appendfs-20251217-193320.042.log"));
+    }
+
+    #[test]
+    fn test_resolve_log_path_nonexistent_directory_with_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = started_at(0);
+        let new_dir_path_str = format!("{}/sub_dir/", dir.path().display());
+        let resolved = resolve_log_path(Path::new(&new_dir_path_str), &started);
+        let expected_dir = std::path::absolute(dir.path().join("sub_dir")).unwrap();
+        assert_eq!(resolved, expected_dir.join("appendfs-20251217-193320.042.log"));
+    }
+
+    #[test]
+    fn test_resolve_log_path_dot_and_dotdot() {
+        let started = started_at(0);
+        let cur = resolve_log_path(Path::new("."), &started);
+        let canonical_cur = fs::canonicalize(".").unwrap();
+        assert_eq!(cur, canonical_cur.join("appendfs-20251217-193320.042.log"));
+
+        let parent = resolve_log_path(Path::new(".."), &started);
+        let canonical_parent = fs::canonicalize("..").unwrap();
+        assert_eq!(parent, canonical_parent.join("appendfs-20251217-193320.042.log"));
+    }
+
+    #[test]
+    fn test_resolve_log_path_exact_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = started_at(0);
+        let file_path = dir.path().join("existing.log");
+        fs::write(&file_path, b"init").unwrap();
+        let resolved = resolve_log_path(&file_path, &started);
+        assert_eq!(resolved, file_path);
+    }
+
+    #[test]
+    fn test_resolve_log_path_exact_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = started_at(0);
+        let file_path = dir.path().join("not_yet.log");
+        let resolved = resolve_log_path(&file_path, &started);
+        assert_eq!(resolved, file_path);
+    }
+
+    #[test]
+    fn test_resolve_log_path_special_devices() {
+        let started = started_at(0);
+        assert_eq!(
+            resolve_log_path(Path::new("/dev/null"), &started),
+            PathBuf::from("/dev/null")
+        );
+        assert_eq!(
+            resolve_log_path(Path::new("/dev/stderr"), &started),
+            PathBuf::from("/dev/stderr")
+        );
     }
 }
