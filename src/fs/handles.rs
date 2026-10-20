@@ -82,6 +82,7 @@ impl AppendFs {
                     })
                 }
                 FileHandle::Regular { .. } => {
+                    self.ensure_log_cache_active_writer();
                     let plan = inner.with_inode_layers(ino, |layers| {
                         layers.plan_read_file_data(offset, size, self.log_cache.as_deref())
                     })?;

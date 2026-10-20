@@ -409,6 +409,7 @@ pub fn recover_fs(
             total_data_bytes: log_data_bytes,
             md5: log_md5,
             sealed_at,
+            key_salt: Some(reader.file_header().key_salt),
         };
         fs_instance.manifest.write().unwrap().record_sealed_log(log_file_info);
 
@@ -794,6 +795,85 @@ mod tests {
         );
         assert_eq!(manifest.logs[1].sealed_at, None);
         assert!(!manifest.last_shutdown_clean());
+    }
+
+    #[test]
+    fn test_recovered_fs_preserves_log_salts_in_subsequent_summary() {
+        let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
+        let storage: Arc<dyn crate::storage::Storage> = mem_storage.clone();
+        let clock = Arc::new(AdvancingClock::new(UNIX_EPOCH + Duration::from_secs(1000)));
+        let mut fs = TestFs::builder()
+            .storage(storage.clone())
+            .clock(clock.clone())
+            .root_owner(1000, 1000)
+            .max_log_size(10_000)
+            .build()
+            .fs;
+        let writer = fs.log_writer.clone().unwrap();
+
+        // 1. Write batch into gen 1
+        fs.make_dir(1, "dir1", 0o755).unwrap();
+        fs.quiesce().unwrap();
+
+        // 2. Roll to generation 2 (this seals gen 1)
+        let sealed = writer.force_roll().unwrap().unwrap();
+        assert_eq!(sealed.generation, 1);
+        let gen1_salt = sealed.key_salt.unwrap();
+        fs.manifest.write().unwrap().record_sealed_log(sealed);
+
+        // 3. Write batch into gen 2 (unsealed)
+        fs.make_dir(1, "dir2", 0o755).unwrap();
+        fs.quiesce().unwrap();
+        fs.log_writer = None;
+        drop(fs);
+        drop(writer);
+
+        // 4. Recover filesystem: replays gen 1 and unsealed gen 2
+        let mut recovered = recover_fs(
+            storage.clone(),
+            RecoveryTarget::Latest,
+            clock.clone(),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        // Verify recovered in-memory manifest captured key salts for both replayed logs
+        let gen2_salt = {
+            let manifest = recovered.manifest.read().unwrap();
+            assert_eq!(manifest.logs.len(), 2);
+            assert_eq!(manifest.logs[0].generation, 1);
+            assert_eq!(manifest.logs[0].key_salt, Some(gen1_salt));
+            assert_eq!(manifest.logs[1].generation, 2);
+            assert!(
+                manifest.logs[1].key_salt.is_some(),
+                "replayed gen 2 must have key_salt captured"
+            );
+            manifest.logs[1].key_salt.unwrap()
+        };
+
+        // 5. Attach a new writer (gen 3), write data, and export a new summary snapshot
+        let writer3 = recovered.next_log_writer(storage.clone(), 10_000).unwrap();
+        recovered.attach_log_writer(Arc::new(writer3));
+        recovered.set_storage(storage.clone());
+        recovered.make_dir(1, "dir3", 0o755).unwrap();
+        recovered.quiesce().unwrap();
+
+        let summary_name = recovered.export_summary(storage.as_ref()).unwrap();
+
+        // 6. Inspect the newly exported summary file
+        let summary_reader =
+            crate::log::SummaryReader::open(storage.as_ref(), &summary_name, VolumeKey::plaintext_arc()).unwrap();
+        let summary_logs = &summary_reader.manifest.logs;
+        assert_eq!(summary_logs.len(), 3);
+        assert_eq!(summary_logs[0].generation, 1);
+        assert_eq!(summary_logs[0].key_salt, Some(gen1_salt));
+        assert_eq!(summary_logs[1].generation, 2);
+        assert_eq!(summary_logs[1].key_salt, Some(gen2_salt));
+        assert_eq!(summary_logs[2].generation, 3);
+        assert!(
+            summary_logs[2].key_salt.is_some(),
+            "gen 3 key salt must be present in exported summary"
+        );
     }
 
     #[test]

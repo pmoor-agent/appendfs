@@ -16,6 +16,7 @@ struct ActiveLogFile {
     generation: u32,
     /// The key this file's records are encrypted under, derived from the salt in its header.
     file_key: LogFileKey,
+    key_salt: [u8; 16],
     /// Sequence number the next record in this file will be encrypted under.
     ///
     /// Advanced whenever a record is encoded and never moved back, not even by
@@ -237,6 +238,22 @@ impl ActiveLogFile {
         Ok((generation, record_log_offset, total_needed as u32))
     }
 
+    fn to_log_info(&self) -> super::manifest::LogFileInfo {
+        super::manifest::LogFileInfo {
+            version: crate::log::record::CURRENT_VERSION,
+            generation: self.generation,
+            revision: 0,
+            filename: self.filename.clone(),
+            created_at: self.created_at,
+            record_count: self.record_count,
+            total_bytes: self.current_offset,
+            total_data_bytes: self.total_data_bytes,
+            md5: [0u8; 16],
+            sealed_at: None,
+            key_salt: Some(self.key_salt),
+        }
+    }
+
     fn seal(mut self, timestamp: std::time::SystemTime) -> io::Result<super::manifest::LogFileInfo> {
         if self.current_offset > FILE_HEADER_SIZE as u64 {
             let seal_payload = crate::log::record::SealPayload {
@@ -246,20 +263,11 @@ impl ActiveLogFile {
             self.append_serialized(OpCode::Seal, 0, &seal_payload)?;
         }
         self.writer.sync()?;
+        let mut info = self.to_log_info();
         drop(self.writer);
-        let sealed_md5 = self.md5_hasher.compute().0;
-        Ok(super::manifest::LogFileInfo {
-            version: crate::log::record::CURRENT_VERSION,
-            generation: self.generation,
-            revision: 0,
-            filename: self.filename,
-            created_at: self.created_at,
-            record_count: self.record_count,
-            total_bytes: self.current_offset,
-            total_data_bytes: self.total_data_bytes,
-            md5: sealed_md5,
-            sealed_at: Some(timestamp),
-        })
+        info.sealed_at = Some(timestamp);
+        info.md5 = self.md5_hasher.compute().0;
+        Ok(info)
     }
 }
 
@@ -384,6 +392,7 @@ fn open_generation_file(
     Ok(ActiveLogFile {
         writer: Box::new(writer),
         generation,
+        key_salt,
         file_key: keying.volume_key.log_file_key(&key_salt),
         next_sequence: 0,
         current_offset: FILE_HEADER_SIZE as u64,
@@ -936,6 +945,30 @@ impl LogWriter {
         match &*state {
             ActiveLogState::Unopened { .. } => 0,
             ActiveLogState::Open(active) => active.current_offset,
+        }
+    }
+
+    /// Returns the encryption key salt of the currently active log generation if open.
+    pub fn active_key_salt(&self) -> Option<[u8; 16]> {
+        let state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match &*state {
+            ActiveLogState::Unopened { .. } => None,
+            ActiveLogState::Open(active) => Some(active.key_salt),
+        }
+    }
+
+    /// Returns a `LogFileInfo` representing the active open generation if currently open.
+    pub fn active_log_info(&self) -> Option<super::manifest::LogFileInfo> {
+        let state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match &*state {
+            ActiveLogState::Unopened { .. } => None,
+            ActiveLogState::Open(active) => Some(active.to_log_info()),
         }
     }
 

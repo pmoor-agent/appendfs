@@ -631,7 +631,7 @@ fn verify_raw_record(
 #[allow(clippy::too_many_lines)]
 pub fn plan_sampled_verification(fs: &AppendFs, options: &CheckOptions) -> VerificationPlan {
     let base_map = fs.inner.lock(OpTag::Stats).unwrap().base.clone();
-    let manifest = fs.manifest.read().unwrap();
+    let manifest = fs.manifest.read().unwrap().clone();
     const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
 
     // 1. Collect all unique live records from the inode tree, skipping invalid extents
@@ -961,7 +961,7 @@ pub fn execute_sampled_verification(
         return;
     }
 
-    let manifest = fs.manifest.read().unwrap();
+    let manifest = fs.manifest.read().unwrap().clone();
     const BLOCK_SIZE: u64 = crate::remote::block_cache::BLOCK_SIZE;
 
     let gen_len = |generation: u32| {
@@ -1214,11 +1214,28 @@ pub fn execute_sampled_verification(
     for (&generation, records) in &local_records_by_gen {
         let records_bytes: u64 = records.iter().map(|r| r.record_size as u64).sum();
         if let Some(ref c) = local_cache {
-            let log_filename = manifest
-                .get_by_generation(generation)
-                .map(|l| l.filename.clone())
-                .unwrap_or_else(|| crate::log::log_filename(generation));
-            if !c.storage().exists(&log_filename) {
+            let manifest_entry = manifest.get_by_generation(generation).cloned().or_else(|| {
+                fs.log_writer
+                    .as_ref()
+                    .filter(|w| w.generation() == generation)
+                    .and_then(|w| w.active_log_info())
+            });
+            let Some(manifest_entry) = manifest_entry else {
+                for rec in records {
+                    report.issues.push(IntegrityIssue::error(
+                        "UNINDEXED_LOG_FILE",
+                        Some(rec.inode),
+                        format!(
+                            "File inode {} extent references generation {}, which is neither tracked in the manifest nor the active log writer",
+                            rec.inode, generation
+                        ),
+                    ));
+                }
+                advance(records_bytes);
+                continue;
+            };
+            let log_filename = &manifest_entry.filename;
+            if !c.storage().exists(log_filename) {
                 for rec in records {
                     report.issues.push(IntegrityIssue::error(
                         "MISSING_LOG_FILE",
@@ -1233,7 +1250,7 @@ pub fn execute_sampled_verification(
                 continue;
             }
 
-            let file_len = match c.storage().file_len(&log_filename) {
+            let file_len = match c.storage().file_len(log_filename) {
                 Ok(len) => len,
                 Err(e) => {
                     for rec in records {
@@ -1248,7 +1265,7 @@ pub fn execute_sampled_verification(
                 }
             };
 
-            let open = match c.get_or_open(generation, &fs.volume_key) {
+            let open = match c.get_or_open(&manifest_entry, &fs.volume_key) {
                 Ok(open) => open,
                 Err(e) => {
                     for rec in records {
@@ -2317,6 +2334,37 @@ mod tests {
     }
 
     #[test]
+    fn test_unindexed_log_generation_detected_in_verification() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
+        fs.set_storage(storage);
+
+        let f = fs.create_file(1, "unindexed.txt", 0o644).unwrap();
+        fs.write_at(f, b"hello unindexed generation", 0).unwrap();
+        fs.quiesce().unwrap();
+
+        // Inject extent pointing to generation 999 which is neither in manifest nor active writer
+        {
+            let mut inner = fs.inner.lock_for_tests().unwrap();
+            let node_arc = inner.base.get_mut(&f).unwrap();
+            let mut node = (**node_arc).clone();
+            if let NodeKind::File { extent_map, size } = &mut node.kind {
+                *size = 4096;
+                extent_map.insert(0, crate::extent_map::Extent::new_disk(999, 100, 4096, 0, 4096));
+            }
+            *node_arc = Arc::new(node);
+        }
+
+        let report = check_fs_integrity(&fs, None, &CheckOptions::full_data(), None, None);
+        assert!(!report.is_clean());
+        assert!(
+            report.issues.iter().any(|i| i.code == "UNINDEXED_LOG_FILE"),
+            "Expected UNINDEXED_LOG_FILE issue, got: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
     fn test_extent_zero_record_size_does_not_panic() {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let mut fs = TestFs::builder().storage(storage.clone()).build().fs;
@@ -3099,6 +3147,7 @@ mod tests {
                 total_data_bytes: size,
                 md5,
                 sealed_at: Some(std::time::SystemTime::UNIX_EPOCH),
+                key_salt: Some([0u8; 16]),
             };
             manifest.record_sealed_log(log_info);
         }
@@ -3187,6 +3236,7 @@ mod tests {
                 total_data_bytes: file_len,
                 md5: [0u8; 16],
                 sealed_at: Some(std::time::SystemTime::UNIX_EPOCH),
+                key_salt: Some([0u8; 16]),
             };
             fs.manifest.write().unwrap().record_sealed_log(log_info);
             fs.log_writer = None;

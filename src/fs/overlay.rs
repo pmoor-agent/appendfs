@@ -533,6 +533,7 @@ impl AppendFs {
     /// virtual files; this exists so tests can read an inode without opening it first.
     #[cfg(any(test, feature = "testing"))]
     pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, FsError> {
+        self.ensure_log_cache_active_writer();
         self.with_inner(OpTag::ReadPlan, |inner| {
             inner.check_shutdown(false)?;
             let plan = inner.with_inode_layers(ino, |layers| {

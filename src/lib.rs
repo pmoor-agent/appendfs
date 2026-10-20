@@ -32,8 +32,8 @@ pub use check::{
     check_remote_integrity, check_volume, plan_sampled_verification,
 };
 pub use cli::{
-    Cli, Commands, DumpArgs, FsckArgs, InitArgs, KeyChangePassphraseArgs, KeyCommands, KeyInitArgs, KeySubcommandArgs,
-    MountArgs, MountRoArgs, StatsArgs, find_latest_generation, find_latest_generation_in_storage,
+    BackfillSaltsArgs, Cli, Commands, DumpArgs, FsckArgs, InitArgs, KeyChangePassphraseArgs, KeyCommands, KeyInitArgs,
+    KeySubcommandArgs, MountArgs, MountRoArgs, StatsArgs, find_latest_generation, find_latest_generation_in_storage,
 };
 pub use clock::{
     AdvancingClock, Clock, MockClock, SystemClock, format_duration, format_local_civil_time, format_utc_civil_time,
@@ -49,8 +49,8 @@ pub use fs::{
 };
 pub use log::{
     ExtentState, LogFileCache, LogReader, LogRecord, LogWriter, RecoveryTarget, SharedExtentState, SummaryFooter,
-    SummaryHeader, SummaryReader, export_summary, init_volume, latest_summary_file, latest_summary_filename,
-    recover_fs,
+    SummaryHeader, SummaryReader, backfill_summary_salts, export_summary, init_volume, latest_summary_file,
+    latest_summary_filename, recover_fs,
 };
 pub use node::{InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta};
 pub use operations::op::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics};

@@ -1185,6 +1185,7 @@ mod tests {
                 total_data_bytes: 4096,
                 md5: [0u8; 16],
                 sealed_at: Some(now),
+                key_salt: Some([0u8; 16]),
             });
         }
 

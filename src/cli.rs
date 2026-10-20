@@ -96,6 +96,9 @@ pub enum Commands {
     Remote(RemoteSubcommandArgs),
     /// Manage encryption key files and passphrases
     Key(KeySubcommandArgs),
+    /// Upgrade summary manifest and backfill missing log file encryption key salts
+    #[command(name = "backfill-salts", alias = "backfill-summary")]
+    BackfillSalts(BackfillSaltsArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -534,6 +537,20 @@ pub struct StatsArgs {
     /// Path to the volume's key file (required for encrypted volumes)
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BackfillSaltsArgs {
+    /// Directory path where the appendfs volume log and summary files are stored
+    pub log_dir: PathBuf,
+
+    /// Path to the volume's key file (required for encrypted volumes)
+    #[arg(short = 'k', long = "key-file")]
+    pub key_file: Option<PathBuf>,
+
+    /// Force writing a new summary revision even if all salts are already present
+    #[arg(long = "force", default_value_t = false)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]

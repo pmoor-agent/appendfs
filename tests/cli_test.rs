@@ -1709,3 +1709,49 @@ fn test_init_from_remote_endpoint_is_addressed_path_style() {
     assert_eq!(requests, ["GET /my-bucket", "GET /my-bucket/000000.summary"]);
     assert_eq!(server.requests()[0].query_param("list-type"), Some("2"));
 }
+
+#[test]
+fn test_cli_backfill_salts_command() {
+    let temp_dir = TempDir::new().unwrap();
+    let volume_dir = temp_dir.path().join("vol");
+    std::fs::create_dir_all(&volume_dir).unwrap();
+
+    // 1. Initialize volume
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["init", volume_dir.to_str().unwrap()])
+        .output()
+        .expect("init failed");
+    assert!(init_out.status.success());
+
+    // 2. Run backfill-salts
+    let backfill_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["backfill-salts", volume_dir.to_str().unwrap()])
+        .output()
+        .expect("backfill failed");
+    assert!(
+        backfill_out.status.success(),
+        "backfill stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&backfill_out.stdout),
+        String::from_utf8_lossy(&backfill_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&backfill_out.stdout);
+    assert!(stdout.contains("already contains all log key salts") || stdout.contains("Successfully backfilled"));
+
+    // 3. Test --force flag
+    let force_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["backfill-salts", volume_dir.to_str().unwrap(), "--force"])
+        .output()
+        .expect("force backfill failed");
+    assert!(force_out.status.success());
+    let force_stdout = String::from_utf8_lossy(&force_out.stdout);
+    assert!(force_stdout.contains("Successfully backfilled key salts into new summary: 000000_r1.summary"));
+
+    // 4. Test alias backfill-summary
+    let alias_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["backfill-summary", volume_dir.to_str().unwrap(), "--force"])
+        .output()
+        .expect("alias backfill-summary failed");
+    assert!(alias_out.status.success());
+    let alias_stdout = String::from_utf8_lossy(&alias_out.stdout);
+    assert!(alias_stdout.contains("Successfully backfilled key salts into new summary: 000000_r2.summary"));
+}

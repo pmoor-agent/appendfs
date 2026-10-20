@@ -1049,6 +1049,9 @@ impl AppendFs {
             !self.is_read_only(),
             "cannot attach a log writer to a read-only filesystem"
         );
+        if let Some(ref cache) = self.log_cache {
+            cache.set_active_writer(&writer);
+        }
         self.log_writer = Some(writer);
     }
 
@@ -1234,7 +1237,29 @@ impl AppendFs {
     }
 
     pub fn set_storage(&mut self, storage: Arc<dyn Storage>) {
-        self.log_cache = Some(Arc::new(LogFileCache::with_storage(storage)));
+        let cache = Arc::new(LogFileCache::with_storage_and_manifest(
+            storage,
+            Some(Arc::clone(&self.manifest)),
+        ));
+        if let Some(ref writer) = self.log_writer {
+            cache.set_active_writer(writer);
+        }
+        self.log_cache = Some(cache);
+    }
+
+    pub fn set_log_cache(&mut self, cache: Arc<LogFileCache>) {
+        if let Some(ref writer) = self.log_writer {
+            cache.set_active_writer(writer);
+        }
+        self.log_cache = Some(cache);
+    }
+
+    pub fn ensure_log_cache_active_writer(&self) {
+        if let Some(ref cache) = self.log_cache
+            && let Some(ref writer) = self.log_writer
+        {
+            cache.set_active_writer(writer);
+        }
     }
 
     pub fn set_log_dir(&mut self, log_dir: impl AsRef<Path>) {
