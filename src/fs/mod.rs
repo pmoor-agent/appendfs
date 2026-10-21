@@ -817,6 +817,8 @@ pub struct AppendFs {
     pub generations_since_last_summary: AtomicU64,
     /// Generation number of the last exported summary file.
     pub last_summary_generation: AtomicU32,
+    /// Format version of the last exported/recovered summary file.
+    pub last_summary_version: AtomicU32,
     /// Condition variable and flag to immediately notify the background replication worker of new logs/summaries.
     pub replication_notifier: Arc<(Mutex<bool>, Condvar)>,
     /// Log directory for `init()` to start a replication worker on, replicating to the
@@ -921,6 +923,7 @@ impl AppendFs {
             bytes_since_last_summary: AtomicU64::new(0),
             generations_since_last_summary: AtomicU64::new(0),
             last_summary_generation: AtomicU32::new(0),
+            last_summary_version: AtomicU32::new(crate::log::summary::CURRENT_SUMMARY_VERSION),
             replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
             replication_log_dir: None,
             replication_worker: Mutex::new(None),

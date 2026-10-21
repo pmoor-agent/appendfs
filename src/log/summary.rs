@@ -242,6 +242,19 @@ pub fn export_summary_with_iv(
         next_inode,
         created_at,
     } = *snapshot;
+
+    for log in &manifest.logs {
+        if log.key_salt.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cannot export summary: log generation {} is missing key_salt in manifest",
+                    log.generation
+                ),
+            ));
+        }
+    }
+
     let mut inodes_snapshot: Vec<(u64, Arc<Node>)> = inodes.iter().map(|(ino, arc)| (*ino, Arc::clone(arc))).collect();
     // Sort by inode so physical serialization order is deterministic
     inodes_snapshot.sort_by_key(|(ino, _)| *ino);
@@ -1293,5 +1306,46 @@ mod tests {
             latest_summary_file(storage.as_ref()).unwrap(),
             Some("000005.summary".to_string())
         );
+    }
+
+    #[test]
+    fn test_export_summary_fails_without_key_salt() {
+        use crate::log::LogFileInfo;
+        use crate::storage::MemoryStorage;
+
+        let storage = MemoryStorage::new();
+        let volume_key = VolumeKey::plaintext();
+        let volume_header = crate::crypto::VolumeHeader::plaintext();
+        let inodes = HashMap::new();
+
+        let mut manifest = crate::log::LogManifest::new();
+        manifest.logs.push(LogFileInfo {
+            version: 1,
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 5,
+            total_bytes: 1024,
+            total_data_bytes: 512,
+            md5: [0u8; 16],
+            sealed_at: Some(SystemTime::UNIX_EPOCH),
+            key_salt: None,
+        });
+
+        let snapshot = SummarySnapshot {
+            inodes: &inodes,
+            manifest: &manifest,
+            volume_header: &volume_header,
+            generation: 1,
+            revision: 0,
+            last_batch_id: 1,
+            next_inode: 2,
+            created_at: SystemTime::UNIX_EPOCH,
+        };
+
+        let err = export_summary(&snapshot, &storage, &volume_key).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("missing key_salt in manifest"));
     }
 }
