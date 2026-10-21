@@ -20,14 +20,14 @@ Instead of mutating files in place on disk, AppendFS stages filesystem mutations
 - **Append-Only Backing Store**: Physical disk writes are 100% sequential and immutable. Existing log files are never overwritten in place, eliminating fragmentation and protecting against data corruption. Deletions and overwrites append new records; because log compaction is not yet implemented, historical data cannot currently be expunged.
 - **LSM Staging & POSIX Durability**: Operations are staged in an in-memory delta overlay for low-latency access and committed to disk either asynchronously (via periodic timers or dirty-data thresholds) or synchronously on POSIX `fsync` / `fsyncdir` calls.
 - **Instant Crash Recovery**: Power cuts or crashes mid-flush cleanly discard uncommitted trailing batches while preserving all previously committed transactions. Periodic `.summary` checkpoint files enable near-instantaneous startup.
-- **Point-in-Time Time Travel**: Mount the filesystem read-only at any past timestamp (`--at-time`) for auditing or backup extraction.
+- **Point-in-Time Time Travel**: Mount the filesystem read-only at any past timestamp (`--at-time`), log generation (`--generation`), or flush batch ID (`--batch-id`) for auditing or backup extraction.
 - **Client-Side Authenticated Encryption**: AEAD encryption under a 256-bit key held in a key file, optionally protected by a passphrase that can be changed at any time, with immediate key validation before reading records.
 - **Transparent Compression**: Payloads are compressed on the fly using **Zstandard (zstd)**, saving storage space and network transfer costs.
-- **Multi-Cloud Replication**: An autonomous background replication worker fans out sealed logs and summaries to S3-compatible cloud providers (AWS S3, Backblaze B2, Cloudflare R2, MinIO, Wasabi, Google Cloud Storage) or local/NFS paths.
-- **Tiered Storage & Range Reads**: Local disk space can be reclaimed by pruning uploaded log files. Missing extents are transparently fetched on demand.
+- **Multi-Cloud Replication**: An autonomous background replication worker fans out sealed logs, active log parts, and summaries to S3-compatible cloud providers (AWS S3, Backblaze B2, Cloudflare R2, MinIO, Wasabi, Google Cloud Storage) or local/NFS paths.
+- **Tiered Storage & Range Reads**: Local disk space can be reclaimed by pruning uploaded log files according to configurable retention rules. Missing extents are transparently fetched on demand and cached in a local block cache.
 - **POSIX Compliant**: Supports regular files, directories, symlinks, hardlinks, special files (FIFOs, Unix sockets, character/block devices), sparse files (hole punching via `fallocate`), extended attributes (`xattr`), and advisory file locking (`flock` / `fcntl`).
 - **Clean-Room Disaster Recovery**: Includes `scripts/restore.py`, an independent Python script that reconstructs the full filesystem tree directly from raw log files without requiring Rust, Cargo, or FUSE.
-- **Offline Diagnostics & Verification**: Built-in CLI commands to check filesystem tree consistency and payload checksums (`appendfs fsck`), inspect inode/storage breakdown (`appendfs stats`), and decode individual log records (`appendfs dump`).
+- **Offline Diagnostics & Verification**: Built-in CLI commands to check filesystem tree consistency and payload checksums locally or across remotes (`appendfs fsck`), inspect inode/storage breakdown (`appendfs stats`), and decode individual `.log` or `.summary` files (`appendfs dump`).
 
 ---
 
@@ -122,11 +122,15 @@ fusermount3 -u /mnt/mydata
 
 ### Point-in-Time Time Travel (Read-Only Mounts)
 
-AppendFS enables instant time travel by replaying log records up to a target timestamp:
+AppendFS enables instant time travel by recovering state up to a target timestamp, log generation, or flush batch ID:
 
 ```bash
 # Mount the filesystem state as of a specific timestamp
 appendfs mount-ro --at-time "2026-08-17T10:00:00Z" /var/lib/appendfs_logs /mnt/snapshot
+
+# Or mount as of a specific log generation or flush batch ID
+appendfs mount-ro --generation 12 /var/lib/appendfs_logs /mnt/snapshot
+appendfs mount-ro --batch-id 450 /var/lib/appendfs_logs /mnt/snapshot
 ```
 
 ### Volume Integrity & Statistics
@@ -138,11 +142,15 @@ appendfs stats /var/lib/appendfs_logs
 # Run filesystem integrity check (validates structure, link counts, manifests)
 appendfs fsck /var/lib/appendfs_logs
 
-# Deep integrity check verifying physical payloads against BLAKE3 checksums
+# Deep integrity check verifying physical payloads against authentication tags
 appendfs fsck --verify-data /var/lib/appendfs_logs
 
-# Inspect low-level records inside a specific .log file
+# Verify a deterministic random sample of live data across configured remotes
+appendfs fsck --sample-percent 5 --remotes all /var/lib/appendfs_logs
+
+# Inspect low-level records inside a .log file or the inode tree in a .summary file
 appendfs dump -v /var/lib/appendfs_logs/000001.log
+appendfs dump -v /var/lib/appendfs_logs/000000.summary
 ```
 
 ### Remote Cloud Replication
@@ -167,8 +175,16 @@ appendfs remote add /var/lib/appendfs_logs aws \
 appendfs remote add /var/lib/appendfs_logs backup-drive \
   --path /mnt/backup_drive/appendfs_logs
 
-# List configured remotes
+# List or remove configured remotes
 appendfs remote list /var/lib/appendfs_logs
+appendfs remote rm /var/lib/appendfs_logs backup-drive
+
+# Bootstrap a local volume directory from an existing remote checkpoint
+appendfs init --from-remote aws \
+  --remote-bucket my-aws-archive \
+  --remote-region us-east-1 \
+  --remote-credentials-file ~/.aws/appendfs_creds \
+  /var/lib/appendfs_restored
 ```
 
 When mounting a volume with remotes configured, AppendFS automatically spawns a background replication worker to upload sealed generations and checkpoint summaries.
