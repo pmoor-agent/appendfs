@@ -12,7 +12,6 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 - **Complete Reconstructability & Time-Travel:** The full filesystem state (or any past point-in-time state) can be deterministically rebuilt by replaying logs up to a target sequence number.
 - **Copy-On-Write Branching (Forking):** New read-write instances can fork from historical checkpoints, sharing ancestor logs while appending new mutations to a divergent branch sequence.
 - **Client-Side Encryption & Multi-Cloud Archival:** Log payloads are compressed and encrypted at rest locally before fan-out replication to multiple S3-compatible cloud providers (e.g., AWS S3, Google Cloud Storage, Backblaze B2).
-- **Deduplication & FastCDC:** Content-Defined Chunking de-duplicates identical blocks across files and generations.
 - **Bitrot Resistance & Disaster Recovery:** Every record carries a 16-byte authentication tag - Poly1305 on encrypted volumes, a truncated BLAKE3 hash on plaintext ones - and every summary carries a full BLAKE3 checksum, enabling standalone disaster recovery from raw log files using only the volume's key file.
 
 ---
@@ -33,7 +32,7 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 │  │            In-Memory Mutation & Write Staging Buffer              │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 └────────────────────────────────────┬────────────────────────────────────┘
-                                     │ FastCDC & Staged Flush
+                                     │ Staged Batch Flush
 ┌────────────────────────────────────▼────────────────────────────────────┐
 │                 Log Engine & Data Protection Layer                      │
 │  ┌─────────────────────────┐           ┌─────────────────────────────┐  │
@@ -150,7 +149,6 @@ Compression precedes encryption because ciphertext does not compress, and it is 
 
 The two stages are exposed as **one operation** (`log::codec::encode`), not two a caller composes, and `LogWriter` is its only caller. There is therefore exactly one route from a payload in memory to bytes on disk, and it is not possible to perform half of the transformation. When the stages were separate, three read paths each had to remember to unwrap the compression envelope after decrypting, and one of them did not.
 
-*(Content-defined deduplication is a planned addition; nothing sits between a staged payload and the log file today other than the two stages above.)*
 
 #### 5.1.1 Key Hierarchy
 - **Key file → master key.** The one credential is a key file holding the 256-bit master key in a small PEM-style envelope, used directly with no stretching - it already carries full entropy. The file may instead hold the key encrypted with ChaCha20-Poly1305 under an `Argon2id`-stretched passphrase (64 MiB, t=3, p=1 by default; the parameters, salt and nonce are recorded in the file). That passphrase protects the file, not the volume: adding, changing or removing it writes a new key file and leaves the volume untouched. Key files are only ever created, never written over - created read-only for their owner before any key material reaches them - so no command can destroy the only copy of a volume's key; retiring an old one is left to the user. The parser accepts exactly what `appendfs key init` writes and rejects anything else, rather than guessing at an encoding and silently producing the wrong key.
