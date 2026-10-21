@@ -103,7 +103,8 @@ fn worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                 if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
                     && let Ok(fh) = fs.open_file(ino, 0)
                 {
-                    let _ = fs.read_blocking(ino, fh, 0, 64);
+                    fs.read_blocking(ino, fh, 0, 64)
+                        .unwrap_or_else(|e| panic!("read_blocking(ino={}, fh={}) failed: {}", ino, fh, e));
                     let _ = fs.release_file(ino, fh);
                 }
             }
@@ -151,7 +152,12 @@ fn worker(fs: Arc<AppendFs>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                 {
                     let offset = rng.gen_range(0, 128) as i64;
                     let size = rng.gen_range(1, 128 * 1024);
-                    let _ = fs.read_blocking(ino, fh, offset, size);
+                    fs.read_blocking(ino, fh, offset, size).unwrap_or_else(|e| {
+                        panic!(
+                            "read_blocking(ino={}, fh={}, offset={}, size={}) failed: {}",
+                            ino, fh, offset, size, e
+                        )
+                    });
                     let _ = fs.release_file(ino, fh);
                 }
             }
@@ -657,6 +663,7 @@ fn run_concurrent_stress(seed: u64) {
     let mut fs = TestFs::builder()
         .storage(storage.clone())
         .clock(clock.clone())
+        .max_log_size(2048)
         .build()
         .fs;
     fs.set_storage(storage.clone());
