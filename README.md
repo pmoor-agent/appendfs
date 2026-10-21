@@ -4,9 +4,9 @@
 [![Nightly soak](https://github.com/pmoor/appendfs/actions/workflows/soak.yml/badge.svg?branch=main)](https://github.com/pmoor/appendfs/actions/workflows/soak.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**AppendFS** is a high-performance, log-structured in-memory FUSE filesystem designed around an **append-only backing store** for personal archival storage, corruption-evident data durability, and disaster recovery.
+**AppendFS** is a high-performance, append-only log-structured FUSE filesystem designed for personal archival storage, corruption-evident data durability, and disaster recovery.
 
-Instead of mutating files in place on disk, AppendFS stages all filesystem operations (file writes, metadata updates, directory creations, deletions, renames, extended attributes) in memory and flushes changes as an append-only sequence of immutable log files ordered by a **monotonic generation sequence number**.
+Instead of mutating files in place on disk, AppendFS stages filesystem mutations (file writes, metadata updates, directory creations, deletions, renames, extended attributes) in an in-memory LSM overlay and flushes changes as an append-only sequence of immutable log files ordered by a **monotonic generation sequence number**.
 
 > [!WARNING]
 > **Disclaimer**: AppendFS is experimental software developed with extensive AI assistance ("vibe-coded"). While it is backed by thorough automated test suites, differential fuzzing, and crash recovery verification, the author assumes no responsibility or liability for any data loss, data corruption, or other damages resulting from its use. Use at your own risk, and always maintain independent, verified backups of critical data.
@@ -18,7 +18,7 @@ Instead of mutating files in place on disk, AppendFS stages all filesystem opera
 ## Key Features
 
 - **Append-Only Backing Store**: Physical disk writes are 100% sequential and immutable. Existing log files are never overwritten in place, eliminating fragmentation and protecting against data corruption. Deletions and overwrites append new records; because log compaction is not yet implemented, historical data cannot currently be expunged.
-- **In-Memory Staging & Performance**: Operations are staged in memory and served at memory speed while asynchronously committing batches to disk.
+- **LSM Staging & POSIX Durability**: Operations are staged in an in-memory delta overlay for low-latency access and committed to disk either asynchronously (via periodic timers or dirty-data thresholds) or synchronously on POSIX `fsync` / `fsyncdir` calls.
 - **Instant Crash Recovery**: Power cuts or crashes mid-flush cleanly discard uncommitted trailing batches while preserving all previously committed transactions. Periodic `.summary` checkpoint files enable near-instantaneous startup.
 - **Point-in-Time Time Travel**: Mount the filesystem read-only at any past timestamp (`--at-time`) for auditing or backup extraction.
 - **Client-Side Authenticated Encryption**: AEAD encryption under a 256-bit key held in a key file, optionally protected by a passphrase that can be changed at any time, with immediate key validation before reading records.
