@@ -27,7 +27,7 @@ pub struct LogFileInfo {
     #[serde(with = "crate::clock::serde_system_time_opt")]
     pub sealed_at: Option<SystemTime>,
     /// Key salt from FileHeader used to derive the encryption key for this log file.
-    /// `None` for legacy v1 summaries until backfilled.
+    /// `None` for legacy v1 summaries.
     #[serde(default)]
     pub key_salt: Option<[u8; 16]>,
 }
@@ -186,9 +186,16 @@ impl LogManifest {
 
     /// Records a sealed log file entry into the manifest.
     ///
-    /// Panics if an entry for `(generation, revision)` has already been recorded in the manifest,
-    /// or if a generation greater than `log.generation` already exists in the manifest.
+    /// Panics if the entry lacks `key_salt`, or if an entry for `(generation, revision)` has
+    /// already been recorded in the manifest, or if a generation greater than `log.generation`
+    /// already exists in the manifest.
     pub fn record_sealed_log(&mut self, log: LogFileInfo) {
+        assert!(
+            log.key_salt.is_some(),
+            "generation {} revision {} must have key_salt",
+            log.generation,
+            log.revision
+        );
         assert!(
             !self
                 .logs
@@ -440,6 +447,26 @@ mod tests {
         // Last shutdown was clean (log2 was sealed), but not all logs were sealed (log1 wasn't)
         assert!(manifest2.last_shutdown_clean());
         assert!(!manifest2.all_logs_sealed());
+    }
+
+    #[test]
+    #[should_panic(expected = "must have key_salt")]
+    fn test_record_sealed_log_missing_key_salt_panics() {
+        let mut manifest = LogManifest::new();
+        let log = LogFileInfo {
+            version: 1,
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: SystemTime::UNIX_EPOCH,
+            record_count: 5,
+            total_bytes: 1024,
+            total_data_bytes: 512,
+            md5: [1u8; 16],
+            sealed_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            key_salt: None,
+        };
+        manifest.record_sealed_log(log);
     }
 
     #[test]

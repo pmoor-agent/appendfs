@@ -1741,6 +1741,17 @@ pub fn check_fs_integrity(
         }
         prev_gen = info.generation;
 
+        if fs.last_summary_version.load(std::sync::atomic::Ordering::SeqCst) >= 2 && info.key_salt.is_none() {
+            report.issues.push(IntegrityIssue::error(
+                "MANIFEST_MISSING_KEY_SALT",
+                None,
+                format!(
+                    "Log generation {} in manifest is missing encryption key salt",
+                    info.generation
+                ),
+            ));
+        }
+
         if let Some(ref c) = cache
             && c.storage().exists(&info.filename)
             && let Ok(file_len) = c.storage().file_len(&info.filename)
@@ -3290,5 +3301,43 @@ mod tests {
         let report = check_fs_integrity(&fs, None, &opts, Some(&plan), None);
         assert!(report.is_clean(), "issues: {:?}", report.issues);
         assert_eq!(report.sampled_blocks, total_sampled_blocks);
+    }
+
+    #[test]
+    fn test_manifest_missing_key_salt_detected_for_v2_ignored_for_v1() {
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let fs = TestFs::builder().storage(storage).build().fs;
+
+        // Populate manifest with a log entry missing key_salt
+        let mut manifest = fs.manifest.write().unwrap();
+        manifest.logs.push(crate::log::LogFileInfo {
+            version: 1,
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            record_count: 5,
+            total_bytes: 1024,
+            total_data_bytes: 512,
+            md5: [0u8; 16],
+            sealed_at: Some(std::time::SystemTime::UNIX_EPOCH),
+            key_salt: None,
+        });
+        drop(manifest);
+
+        // When last_summary_version == 1 (legacy v1 volume): key_salt None is tolerated
+        fs.last_summary_version.store(1, std::sync::atomic::Ordering::SeqCst);
+        let report_v1 = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
+        assert!(
+            !report_v1.issues.iter().any(|i| i.code == "MANIFEST_MISSING_KEY_SALT"),
+            "v1 summaries should tolerate missing key salts"
+        );
+
+        // When last_summary_version >= 2 (modern volume): missing key salt is flagged as an error
+        fs.last_summary_version.store(2, std::sync::atomic::Ordering::SeqCst);
+        let report_v2 = check_fs_integrity(&fs, None, &CheckOptions::metadata_only(), None, None);
+        let missing_salt_issue = report_v2.issues.iter().find(|i| i.code == "MANIFEST_MISSING_KEY_SALT");
+        assert!(missing_salt_issue.is_some(), "v2+ summaries must flag missing key salt");
+        assert_eq!(missing_salt_issue.unwrap().level, crate::check::IssueLevel::Error);
     }
 }

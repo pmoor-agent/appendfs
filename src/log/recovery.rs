@@ -178,6 +178,9 @@ pub fn recover_fs(
         fs_instance.set_volume(reader.volume_header.clone(), volume_key.clone())?;
         fs_instance.next_inode.store(next_ino, Ordering::SeqCst);
         fs_instance.last_summary_generation.store(summary_gen, Ordering::SeqCst);
+        fs_instance
+            .last_summary_version
+            .store(reader.header.version, Ordering::SeqCst);
         min_log_gen = summary_gen;
     }
 
