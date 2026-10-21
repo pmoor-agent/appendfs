@@ -2,6 +2,13 @@
 name = "appendfs"
 version = "0.1.0"
 edition = "2024"
+description = "An append-only log-structured FUSE filesystem with S3 replication and instant crash recovery"
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/pmoor/appendfs"
+homepage = "https://github.com/pmoor/appendfs"
+keywords = ["fuse", "filesystem", "append-only", "storage", "s3"]
+categories = ["filesystem"]
 
 [dependencies]
 libc = "0.2"
