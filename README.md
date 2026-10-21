@@ -8,11 +8,16 @@
 
 Instead of mutating files in place on disk, AppendFS stages all filesystem operations (file writes, metadata updates, directory creations, deletions, renames, extended attributes) in memory and flushes changes as an append-only sequence of immutable log files ordered by a **monotonic generation sequence number**.
 
+> [!WARNING]
+> **Disclaimer**: AppendFS is experimental software developed with extensive AI assistance ("vibe-coded"). While it is backed by thorough automated test suites, differential fuzzing, and crash recovery verification, the author assumes no responsibility or liability for any data loss, data corruption, or other damages resulting from its use. Use at your own risk, and always maintain independent, verified backups of critical data.
+>
+> **Permanent History (No Compaction Yet)**: AppendFS is strictly append-only and does not currently implement log compaction or data expunging. Deleting or overwriting a file merely appends a new record; all historical data and metadata remain permanently in the log files (and any configured remote replicas) and can be recovered via point-in-time inspection. Do not write sensitive data to an AppendFS volume if you require the ability to securely shred or purge it.
+
 ---
 
 ## Key Features
 
-- **Append-Only Backing Store**: Physical disk writes are 100% sequential and immutable. Existing log files are never overwritten in place, eliminating fragmentation and protecting against data corruption.
+- **Append-Only Backing Store**: Physical disk writes are 100% sequential and immutable. Existing log files are never overwritten in place, eliminating fragmentation and protecting against data corruption. Deletions and overwrites append new records; because log compaction is not yet implemented, historical data cannot currently be expunged.
 - **In-Memory Staging & Performance**: Operations are staged in memory and served at memory speed while asynchronously committing batches to disk.
 - **Instant Crash Recovery**: Power cuts or crashes mid-flush cleanly discard uncommitted trailing batches while preserving all previously committed transactions. Periodic `.summary` checkpoint files enable near-instantaneous startup.
 - **Point-in-Time Time Travel**: Mount the filesystem read-only at any past timestamp (`--at-time`) for auditing or backup extraction.
