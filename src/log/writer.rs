@@ -2,6 +2,7 @@ use crate::clock::Clock;
 use crate::crypto::{LogFileKey, VolumeKey};
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCode, RECORD_HEADER_SIZE, RecordHeader};
 use crate::storage::{BufferedStorageWriter, Storage, StorageWriter, WriteMode};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -485,6 +486,7 @@ pub struct LogWriter {
     /// volume's clock, never the wall clock.
     clock: Arc<dyn Clock>,
     lock: Option<Box<dyn crate::storage::StorageLock>>,
+    sealed_logs: Mutex<HashMap<u32, super::manifest::LogFileInfo>>,
 }
 
 impl std::fmt::Debug for LogWriter {
@@ -521,6 +523,7 @@ impl LogWriter {
             compression: crate::compress::Compression::None,
             clock,
             lock: Some(lock),
+            sealed_logs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -550,6 +553,7 @@ impl LogWriter {
             compression: crate::compress::Compression::None,
             clock,
             lock: Some(lock),
+            sealed_logs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -664,6 +668,9 @@ impl LogWriter {
             return Ok(None);
         }
         let res = seal_into_lazy(&mut state, &*self.clock);
+        if let Ok(Some(ref sealed_info)) = res {
+            self.record_sealed(sealed_info.clone());
+        }
         self.publish(&state);
         res
     }
@@ -718,6 +725,7 @@ impl LogWriter {
         let res = match seal_and_open_next(active, &self.storage, &self.keying, &*self.clock, "Force-rolled") {
             Ok((next_active, sealed_info)) => {
                 *state = ActiveLogState::Open(next_active);
+                self.record_sealed(sealed_info.clone());
                 Ok(Some(sealed_info))
             }
             Err(e) => {
@@ -741,6 +749,9 @@ impl LogWriter {
             Err(e) => e.into_inner(),
         };
         let res = seal_into_lazy(&mut state, &*self.clock);
+        if let Ok(Some(ref sealed_info)) = res {
+            self.record_sealed(sealed_info.clone());
+        }
         self.publish(&state);
         res
     }
@@ -949,16 +960,35 @@ impl LogWriter {
         }
     }
 
-    /// Returns a `LogFileInfo` representing the active open generation if currently open.
-    pub fn active_log_info(&self) -> Option<super::manifest::LogFileInfo> {
+    fn record_sealed(&self, sealed_info: super::manifest::LogFileInfo) {
+        let gen_num = sealed_info.generation;
+        let prev = self.sealed_logs.lock().unwrap().insert(gen_num, sealed_info);
+        assert!(
+            prev.is_none(),
+            "generation {} was already sealed in log writer",
+            gen_num
+        );
+    }
+
+    /// Returns a `LogFileInfo` for `generation` if known to this writer (either the currently
+    /// open active generation, or any generation sealed during this session).
+    pub fn log_file_info(&self, generation: u32) -> Option<super::manifest::LogFileInfo> {
         let state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
         match &*state {
-            ActiveLogState::Unopened { .. } => None,
-            ActiveLogState::Open(active) => Some(active.to_log_info()),
+            ActiveLogState::Open(active) if active.generation == generation => Some(active.to_log_info()),
+            _ => self.sealed_logs.lock().ok()?.get(&generation).cloned(),
         }
+    }
+
+    /// Returns all generation numbers that have been sealed during this session.
+    pub fn sealed_generations(&self) -> Vec<u32> {
+        self.sealed_logs
+            .lock()
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Returns the ID of the last committed flush batch, or 0 if none has been committed yet.
@@ -1556,5 +1586,83 @@ mod tests {
                 synced_offset: 0,
             }
         );
+    }
+
+    #[test]
+    fn test_log_file_info_tracks_active_and_sealed_generations() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let key = VolumeKey::plaintext_arc();
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            clock.clone(),
+            50, // Small limit to force rolls
+            1,
+            key.clone(),
+        )
+        .unwrap();
+
+        // Active open generation 1
+        let active_info = writer.log_file_info(1).unwrap();
+        assert_eq!(active_info.generation, 1);
+        assert!(active_info.sealed_at.is_none());
+        assert_eq!(writer.log_file_info(2), None);
+
+        // Append data to trigger roll
+        writer.append_data(10, b"some data to exceed size limit").unwrap();
+        writer.flush().unwrap();
+        let rolled = writer.roll_if_needed().unwrap();
+        assert!(rolled.is_some());
+        assert_eq!(rolled.unwrap().generation, 1);
+
+        // Writer is now on generation 2 (unopened)
+        assert_eq!(writer.generation(), 2);
+        assert_eq!(writer.sealed_generations(), vec![1]);
+
+        // Sealed generation 1 is preserved and queryable
+        let sealed_info = writer.log_file_info(1).unwrap();
+        assert_eq!(sealed_info.generation, 1);
+        assert!(sealed_info.sealed_at.is_some());
+
+        // Generation 2 is unopened, so log_file_info(2) returns None
+        assert_eq!(writer.log_file_info(2), None);
+
+        // Opening generation 2 makes it active
+        writer.open_if_unopened().unwrap();
+        let gen2_info = writer.log_file_info(2).unwrap();
+        assert_eq!(gen2_info.generation, 2);
+        assert!(gen2_info.sealed_at.is_none());
+
+        // Both generation 1 (sealed) and 2 (active) are resolvable
+        assert!(writer.log_file_info(1).is_some());
+        assert!(writer.log_file_info(2).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "generation 1 was already sealed in log writer")]
+    fn test_record_sealed_panics_on_duplicate_generation() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let key = VolumeKey::plaintext_arc();
+        let writer = LogWriter::create(storage, 1, clock, DEFAULT_MAX_LOG_SIZE, 1, key).unwrap();
+
+        let dummy_info = super::super::manifest::LogFileInfo {
+            version: crate::log::record::CURRENT_VERSION,
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            record_count: 0,
+            total_bytes: 0,
+            total_data_bytes: 0,
+            md5: [0u8; 16],
+            sealed_at: Some(std::time::SystemTime::UNIX_EPOCH),
+            key_salt: Some([0u8; 16]),
+        };
+
+        writer.record_sealed(dummy_info.clone());
+        // Second call with same generation must strictly panic rather than replacing
+        writer.record_sealed(dummy_info);
     }
 }
