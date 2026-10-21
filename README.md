@@ -43,13 +43,6 @@ Instead of mutating files in place on disk, AppendFS stages all filesystem opera
   ```bash
   sudo dnf install -y fuse3-devel fuse3 pkgconf-pkg-config rust cargo
   ```
-- **Linux** (Arch Linux):
-  ```bash
-  sudo pacman -S fuse3 pkgconf rust
-  ```
-
-> [!NOTE]
-> Make sure your user has permission to access `/dev/fuse`. On some Linux distributions, you may need to add your user to the `fuse` group (`sudo usermod -aG fuse $USER`).
 
 ### Building from Source
 
