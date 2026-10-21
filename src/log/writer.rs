@@ -669,10 +669,7 @@ impl LogWriter {
         }
         let res = seal_into_lazy(&mut state, &*self.clock);
         if let Ok(Some(ref sealed_info)) = res {
-            self.sealed_logs
-                .lock()
-                .unwrap()
-                .insert(sealed_info.generation, sealed_info.clone());
+            self.record_sealed(sealed_info.clone());
         }
         self.publish(&state);
         res
@@ -728,10 +725,7 @@ impl LogWriter {
         let res = match seal_and_open_next(active, &self.storage, &self.keying, &*self.clock, "Force-rolled") {
             Ok((next_active, sealed_info)) => {
                 *state = ActiveLogState::Open(next_active);
-                self.sealed_logs
-                    .lock()
-                    .unwrap()
-                    .insert(sealed_info.generation, sealed_info.clone());
+                self.record_sealed(sealed_info.clone());
                 Ok(Some(sealed_info))
             }
             Err(e) => {
@@ -756,10 +750,7 @@ impl LogWriter {
         };
         let res = seal_into_lazy(&mut state, &*self.clock);
         if let Ok(Some(ref sealed_info)) = res {
-            self.sealed_logs
-                .lock()
-                .unwrap()
-                .insert(sealed_info.generation, sealed_info.clone());
+            self.record_sealed(sealed_info.clone());
         }
         self.publish(&state);
         res
@@ -967,6 +958,16 @@ impl LogWriter {
             ActiveLogState::Unopened { .. } => 0,
             ActiveLogState::Open(active) => active.current_offset,
         }
+    }
+
+    fn record_sealed(&self, sealed_info: super::manifest::LogFileInfo) {
+        let gen_num = sealed_info.generation;
+        let prev = self.sealed_logs.lock().unwrap().insert(gen_num, sealed_info);
+        assert!(
+            prev.is_none(),
+            "generation {} was already sealed in log writer",
+            gen_num
+        );
     }
 
     /// Returns a `LogFileInfo` for `generation` if known to this writer (either the currently
@@ -1636,5 +1637,32 @@ mod tests {
         // Both generation 1 (sealed) and 2 (active) are resolvable
         assert!(writer.log_file_info(1).is_some());
         assert!(writer.log_file_info(2).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "generation 1 was already sealed in log writer")]
+    fn test_record_sealed_panics_on_duplicate_generation() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let key = VolumeKey::plaintext_arc();
+        let writer = LogWriter::create(storage, 1, clock, DEFAULT_MAX_LOG_SIZE, 1, key).unwrap();
+
+        let dummy_info = super::super::manifest::LogFileInfo {
+            version: crate::log::record::CURRENT_VERSION,
+            generation: 1,
+            revision: 0,
+            filename: "000001.log".to_string(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            record_count: 0,
+            total_bytes: 0,
+            total_data_bytes: 0,
+            md5: [0u8; 16],
+            sealed_at: Some(std::time::SystemTime::UNIX_EPOCH),
+            key_salt: Some([0u8; 16]),
+        };
+
+        writer.record_sealed(dummy_info.clone());
+        // Second call with same generation must strictly panic rather than replacing
+        writer.record_sealed(dummy_info);
     }
 }
