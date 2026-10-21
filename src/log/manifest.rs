@@ -27,7 +27,7 @@ pub struct LogFileInfo {
     #[serde(with = "crate::clock::serde_system_time_opt")]
     pub sealed_at: Option<SystemTime>,
     /// Key salt from FileHeader used to derive the encryption key for this log file.
-    /// `None` for legacy v1 summaries until backfilled.
+    /// `None` for legacy v1 summaries.
     #[serde(default)]
     pub key_salt: Option<[u8; 16]>,
 }
