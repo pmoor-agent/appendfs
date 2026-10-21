@@ -2,13 +2,13 @@
 
 ## 1. Executive Summary & Core Philosophy
 
-`appendfs` is a high-performance, log-structured in-memory FUSE filesystem designed around an **append-only backing store** for personal archival storage.
+`appendfs` is a high-performance, append-only log-structured FUSE filesystem designed for personal archival storage.
 
 Rather than mutating data in-place on disk, `appendfs` records all filesystem mutations (file writes, metadata changes, directory creations, deletions, renames, extended attributes) as an append-only stream of log files ordered by a **monotonic generation sequence number**.
 
 ### Core Guarantees:
 - **Append-Only Backing Store:** Physical disk writes are 100% sequential and immutable. Old log files are never modified in-place.
-- **In-Memory Staging & Deferred Flushing:** Writes are staged in memory and flushed to disk periodically or when requested by `fsync()` / POSIX sync semantics.
+- **LSM Staging & POSIX Durability:** Writes are staged in an in-memory delta overlay and committed to disk periodically, at dirty-size thresholds, or synchronously when requested by `fsync()` / `fsyncdir` / POSIX sync semantics.
 - **Complete Reconstructability & Time-Travel:** The full filesystem state (or any past point-in-time state) can be deterministically rebuilt by replaying logs up to a target sequence number.
 - **Copy-On-Write Branching (Forking):** New read-write instances can fork from historical checkpoints, sharing ancestor logs while appending new mutations to a divergent branch sequence.
 - **Client-Side Encryption & Multi-Cloud Archival:** Log payloads are compressed and encrypted at rest locally before fan-out replication to multiple S3-compatible cloud providers (e.g., AWS S3, Google Cloud Storage, Backblaze B2).
