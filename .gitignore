@@ -3,3 +3,13 @@ target
 **/*.rs.bk
 __pycache__/
 *.pyc
+
+# OS & editor artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Key files created during local testing
+*.key
