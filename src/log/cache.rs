@@ -257,8 +257,7 @@ impl LogFileCache {
                     .read()
                     .ok()
                     .and_then(|w| w.as_ref().and_then(|weak| weak.upgrade()))
-                    .filter(|w| w.generation() == generation)
-                    .and_then(|w| w.active_log_info())
+                    .and_then(|w| w.log_file_info(generation))
             })
             .ok_or_else(|| {
                 io::Error::new(
@@ -696,5 +695,50 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(err.to_string().contains("not found in manifest or active log writer"));
+    }
+
+    #[test]
+    fn test_read_extent_payload_from_rolled_generation_before_manifest_record() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+        let clock = Arc::new(SystemClock);
+        let key = VolumeKey::plaintext_arc();
+
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                clock.clone(),
+                50, // Small limit so appending data crosses max_log_size
+                1,
+                key.clone(),
+            )
+            .unwrap(),
+        );
+
+        let payload = b"hello from generation 1";
+        let (gen_num, offset, size) = writer.append_data(10, payload).unwrap();
+        assert_eq!(gen_num, 1);
+        writer.flush().unwrap();
+
+        let manifest = Arc::new(RwLock::new(crate::log::LogManifest::new()));
+        let cache = LogFileCache::with_storage_and_manifest(storage, Some(manifest));
+        cache.set_active_writer(&writer);
+
+        // Force a roll to generation 2. Generation 2 remains unopened (lazy).
+        let rolled = writer.roll_if_needed().unwrap();
+        assert!(rolled.is_some());
+        assert_eq!(rolled.unwrap().generation, 1);
+        assert_eq!(writer.generation(), 2);
+        assert!(writer.sealed_generations().contains(&1));
+
+        // Note: generation 1 is NOT yet recorded in the manifest!
+        // `read_extent_payload` must still succeed by resolving generation 1 from writer's sealed logs.
+        let mut buf = vec![0u8; payload.len()];
+        let read_bytes = cache
+            .read_extent_payload(1, offset, size, 0, 0, &mut buf, &key)
+            .unwrap();
+        assert_eq!(read_bytes, payload.len());
+        assert_eq!(&buf, payload);
     }
 }

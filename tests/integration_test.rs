@@ -884,9 +884,20 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
             appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let writer = fs
-            .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-            .unwrap();
+        let mut writer = None;
+        assert!(
+            appendfs::wait_until(
+                || {
+                    writer = fs
+                        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
+                        .ok();
+                    writer.is_some()
+                },
+                std::time::Duration::from_millis(500),
+            ),
+            "Failed to acquire volume lock on remount"
+        );
+        let writer = writer.unwrap();
         fs.attach_log_writer(Arc::new(writer));
         fs.set_log_dir(log_path);
 
@@ -915,9 +926,20 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
             appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let writer = fs
-            .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-            .unwrap();
+        let mut writer = None;
+        assert!(
+            appendfs::wait_until(
+                || {
+                    writer = fs
+                        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
+                        .ok();
+                    writer.is_some()
+                },
+                std::time::Duration::from_millis(500),
+            ),
+            "Failed to acquire volume lock on remount"
+        );
+        let writer = writer.unwrap();
         fs.attach_log_writer(Arc::new(writer));
         fs.set_log_dir(log_path);
 
@@ -1005,9 +1027,20 @@ fn test_clean_unmount_exports_summary_when_latest_log_is_uncovered() {
             appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let writer = fs
-            .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-            .unwrap();
+        let mut writer = None;
+        assert!(
+            appendfs::wait_until(
+                || {
+                    writer = fs
+                        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
+                        .ok();
+                    writer.is_some()
+                },
+                std::time::Duration::from_millis(500),
+            ),
+            "Failed to acquire volume lock on remount"
+        );
+        let writer = writer.unwrap();
         fs.attach_log_writer(Arc::new(writer));
         fs.set_log_dir(log_path);
 
@@ -2303,9 +2336,20 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
         )
         .unwrap();
 
-        let writer = fs
-            .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-            .unwrap();
+        let mut writer = None;
+        assert!(
+            appendfs::wait_until(
+                || {
+                    writer = fs
+                        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
+                        .ok();
+                    writer.is_some()
+                },
+                std::time::Duration::from_millis(500),
+            ),
+            "Failed to acquire volume lock on remount"
+        );
+        let writer = writer.unwrap();
         fs.attach_log_writer(Arc::new(writer));
 
         let file_ino = fs.create_file(1, "confidential.txt", 0o600).unwrap();
@@ -2406,9 +2450,20 @@ fn test_tampered_record_header_is_rejected_not_served() {
             volume_key.clone(),
         )
         .unwrap();
-        let writer = fs
-            .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-            .unwrap();
+        let mut writer = None;
+        assert!(
+            appendfs::wait_until(
+                || {
+                    writer = fs
+                        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
+                        .ok();
+                    writer.is_some()
+                },
+                std::time::Duration::from_millis(500),
+            ),
+            "Failed to acquire volume lock on remount"
+        );
+        let writer = writer.unwrap();
         fs.attach_log_writer(Arc::new(writer));
 
         let secret_ino = fs.create_file(1, "secret.txt", 0o600).unwrap();

@@ -1207,12 +1207,10 @@ pub fn execute_sampled_verification(
     for (&generation, records) in &local_records_by_gen {
         let records_bytes: u64 = records.iter().map(|r| r.record_size as u64).sum();
         if let Some(ref c) = local_cache {
-            let manifest_entry = manifest.get_by_generation(generation).cloned().or_else(|| {
-                fs.log_writer
-                    .as_ref()
-                    .filter(|w| w.generation() == generation)
-                    .and_then(|w| w.active_log_info())
-            });
+            let manifest_entry = manifest
+                .get_by_generation(generation)
+                .cloned()
+                .or_else(|| fs.log_writer.as_ref().and_then(|w| w.log_file_info(generation)));
             let Some(manifest_entry) = manifest_entry else {
                 for rec in records {
                     report.issues.push(IntegrityIssue::error(
@@ -1604,6 +1602,7 @@ pub fn check_fs_integrity(
     let mut active_generations: HashSet<u32> = manifest.logs.iter().map(|l| l.generation).collect();
     if let Some(ref w) = fs.log_writer {
         active_generations.insert(w.generation());
+        active_generations.extend(w.sealed_generations());
     }
     let cache = fs
         .log_cache
@@ -1686,8 +1685,8 @@ pub fn check_fs_integrity(
                             .or_else(|| {
                                 fs.log_writer
                                     .as_ref()
-                                    .filter(|w| w.generation() == generation)
-                                    .map(|w| w.current_offset())
+                                    .and_then(|w| w.log_file_info(generation))
+                                    .map(|l| l.total_bytes)
                             });
 
                     if let Some(max_bytes) = max_allowed_bytes
