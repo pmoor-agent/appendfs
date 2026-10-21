@@ -241,13 +241,13 @@ impl LogManifest {
 pub struct GenerationLiveStats {
     pub generation: u32,
     pub filename: String,
-    pub record_count: u32,
+    pub record_count: u64,
     pub total_bytes: u64,
     pub total_data_bytes: u64,
     /// Total bytes still actively referenced by live file range maps.
     pub live_bytes: u64,
     /// Total number of active extent fragments referencing this generation.
-    pub live_extents: u32,
+    pub live_extents: u64,
     /// Ratio of live bytes to total data bytes written (0.0 to 1.0).
     pub live_ratio: f64,
     /// Whether this log generation was cleanly sealed on rollover / shutdown.

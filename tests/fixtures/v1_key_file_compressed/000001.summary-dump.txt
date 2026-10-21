@@ -48,6 +48,8 @@ Tracked Logs:        1 log generation files
 LOG FILE          RECORDS     LOG SIZE    DATA SIZE    LIVE DATA  EXTENTS   LIVE RATIO  STATUS
 -------------- ---------- ------------ ------------ ------------ -------- ------------  ------------------------
 000001.log             42     5.94 KiB    41.23 KiB    37.23 KiB        8        90.3%  Healthy
+-------------- ---------- ------------ ------------ ------------ -------- ------------  ------------------------
+Total                  42     5.94 KiB    41.23 KiB    37.23 KiB        8        90.3%  Healthy
 
 === Summary Inode Records ===
 #1     [Inode 1    ] Directory  "/" (mode 0o755, uid 1000, gid 1000, entries: 10, mtime: 1700000330.000000000s (2023-11-14 22:18:50 UTC))
