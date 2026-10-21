@@ -15,6 +15,28 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+/// Waits for volume lock acquisition and attaches the next log writer to `fs`.
+fn attach_next_log_writer(
+    fs: &mut appendfs::AppendFs,
+    storage: Arc<dyn Storage>,
+    max_log_size: u64,
+) -> Arc<appendfs::log::LogWriter> {
+    let mut writer = None;
+    assert!(
+        wait_until(
+            || {
+                writer = fs.next_log_writer(storage.clone(), max_log_size).ok();
+                writer.is_some()
+            },
+            Duration::from_millis(500),
+        ),
+        "Failed to acquire volume lock on remount"
+    );
+    let writer = Arc::new(writer.unwrap());
+    fs.attach_log_writer(Arc::clone(&writer));
+    writer
+}
+
 #[test]
 fn test_fuse_filesystem() {
     let mut mount = TestMount::new_rw();
@@ -744,8 +766,7 @@ fn test_volume_init_mount_and_stats_flow() {
     let next_gen = fs_instance.next_generation();
     assert_eq!(next_gen, 1);
 
-    let writer = fs_instance.next_log_writer(storage.clone(), 1024 * 1024).unwrap();
-    fs_instance.attach_log_writer(Arc::new(writer));
+    attach_next_log_writer(&mut fs_instance, storage.clone(), 1024 * 1024);
     fs_instance.set_log_dir(&log_path);
 
     let temp_dir = tempfile::Builder::new()
@@ -884,21 +905,7 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
             appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let mut writer = None;
-        assert!(
-            appendfs::wait_until(
-                || {
-                    writer = fs
-                        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-                        .ok();
-                    writer.is_some()
-                },
-                std::time::Duration::from_millis(500),
-            ),
-            "Failed to acquire volume lock on remount"
-        );
-        let writer = writer.unwrap();
-        fs.attach_log_writer(Arc::new(writer));
+        attach_next_log_writer(&mut fs, storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE);
         fs.set_log_dir(log_path);
 
         // Perform read-only operations
@@ -926,21 +933,7 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
             appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let mut writer = None;
-        assert!(
-            appendfs::wait_until(
-                || {
-                    writer = fs
-                        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-                        .ok();
-                    writer.is_some()
-                },
-                std::time::Duration::from_millis(500),
-            ),
-            "Failed to acquire volume lock on remount"
-        );
-        let writer = writer.unwrap();
-        fs.attach_log_writer(Arc::new(writer));
+        attach_next_log_writer(&mut fs, storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE);
         fs.set_log_dir(log_path);
 
         // Create directory and file
@@ -1001,8 +994,7 @@ fn test_clean_unmount_exports_summary_when_latest_log_is_uncovered() {
             appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let writer = fs.next_log_writer(storage.clone(), 200).unwrap();
-        fs.attach_log_writer(Arc::new(writer));
+        attach_next_log_writer(&mut fs, storage.clone(), 200);
         fs.set_log_dir(log_path);
 
         let file = fs.create_file(1, "rolled.bin", 0o644).unwrap();
@@ -1027,21 +1019,7 @@ fn test_clean_unmount_exports_summary_when_latest_log_is_uncovered() {
             appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let mut writer = None;
-        assert!(
-            appendfs::wait_until(
-                || {
-                    writer = fs
-                        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-                        .ok();
-                    writer.is_some()
-                },
-                std::time::Duration::from_millis(500),
-            ),
-            "Failed to acquire volume lock on remount"
-        );
-        let writer = writer.unwrap();
-        fs.attach_log_writer(Arc::new(writer));
+        attach_next_log_writer(&mut fs, storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE);
         fs.set_log_dir(log_path);
 
         // Read-only operation
@@ -2336,21 +2314,7 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
         )
         .unwrap();
 
-        let mut writer = None;
-        assert!(
-            appendfs::wait_until(
-                || {
-                    writer = fs
-                        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-                        .ok();
-                    writer.is_some()
-                },
-                std::time::Duration::from_millis(500),
-            ),
-            "Failed to acquire volume lock on remount"
-        );
-        let writer = writer.unwrap();
-        fs.attach_log_writer(Arc::new(writer));
+        attach_next_log_writer(&mut fs, storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE);
 
         let file_ino = fs.create_file(1, "confidential.txt", 0o600).unwrap();
         let secret = b"TOP_SECRET_CREDENTIALS_AND_PAYLOAD_987654321";
@@ -2450,21 +2414,7 @@ fn test_tampered_record_header_is_rejected_not_served() {
             volume_key.clone(),
         )
         .unwrap();
-        let mut writer = None;
-        assert!(
-            appendfs::wait_until(
-                || {
-                    writer = fs
-                        .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-                        .ok();
-                    writer.is_some()
-                },
-                std::time::Duration::from_millis(500),
-            ),
-            "Failed to acquire volume lock on remount"
-        );
-        let writer = writer.unwrap();
-        fs.attach_log_writer(Arc::new(writer));
+        attach_next_log_writer(&mut fs, storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE);
 
         let secret_ino = fs.create_file(1, "secret.txt", 0o600).unwrap();
         fs.write_at(secret_ino, secret, 0).unwrap();
@@ -2647,10 +2597,7 @@ fn test_compressed_volume_round_trips_and_saves_space() {
                 key.clone(),
             )
             .unwrap();
-            let writer = fs
-                .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-                .unwrap();
-            fs.attach_log_writer(Arc::new(writer));
+            attach_next_log_writer(&mut fs, storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE);
 
             let text_ino = fs.create_file(1, "text.log", 0o644).unwrap();
             fs.write_at(text_ino, &payload, 0).unwrap();
@@ -2727,10 +2674,7 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
                 key.clone(),
             )
             .unwrap();
-            let writer = fs
-                .next_log_writer(storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE)
-                .unwrap();
-            fs.attach_log_writer(Arc::new(writer));
+            attach_next_log_writer(&mut fs, storage.clone(), appendfs::cli::DEFAULT_MAX_LOG_SIZE);
             let ino = fs.create_file(1, "big.txt", 0o644).unwrap();
             fs.write_at(ino, &payload, 0).unwrap();
             fs.quiesce().unwrap();
@@ -2801,8 +2745,7 @@ fn test_periodic_summary_generation_on_log_rolls() {
         )
         .unwrap();
 
-        let writer = fs.next_log_writer(storage.clone(), 1000).unwrap();
-        fs.attach_log_writer(Arc::new(writer));
+        attach_next_log_writer(&mut fs, storage.clone(), 1000);
         // Configure to emit summary every 2 rolled generations (and 0 byte trigger)
         fs.set_summary_intervals(0, 2);
 
@@ -2897,8 +2840,7 @@ fn test_periodic_summary_generation_by_bytes() {
         )
         .unwrap();
 
-        let writer = fs.next_log_writer(storage.clone(), 1000).unwrap();
-        fs.attach_log_writer(Arc::new(writer));
+        attach_next_log_writer(&mut fs, storage.clone(), 1000);
         // Byte threshold = 2500, generations threshold = 0 (disabled)
         fs.set_summary_intervals(2500, 0);
 
@@ -2973,8 +2915,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
         )
         .unwrap();
 
-        let writer = fs.next_log_writer(storage.clone(), 1000).unwrap();
-        fs.attach_log_writer(Arc::new(writer));
+        attach_next_log_writer(&mut fs, storage.clone(), 1000);
 
         let a1 = fs.create_file(1, "f1.bin", 0o644).unwrap();
         fs.write_at(a1, &vec![1u8; 1000], 0).unwrap();
@@ -3038,8 +2979,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
     let next_gen = recovered_fs.next_generation();
     assert_eq!(next_gen, 4);
 
-    let writer2 = recovered_fs.next_log_writer(storage.clone(), 1000).unwrap();
-    recovered_fs.attach_log_writer(Arc::new(writer2));
+    attach_next_log_writer(&mut recovered_fs, storage.clone(), 1000);
     recovered_fs.set_summary_intervals(2500, 0);
 
     // Write file4 in gen 4 (1000 bytes). Gen 4 is opened and committed.
@@ -3089,8 +3029,7 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
         )
         .unwrap();
 
-        let writer = fs.next_log_writer(storage.clone(), 1000).unwrap();
-        fs.attach_log_writer(Arc::new(writer));
+        attach_next_log_writer(&mut fs, storage.clone(), 1000);
 
         let a1 = fs.create_file(1, "f1.bin", 0o644).unwrap();
         fs.write_at(a1, &vec![1u8; 1000], 0).unwrap();
@@ -3134,8 +3073,7 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
     let next_gen = recovered_fs.next_generation();
     assert_eq!(next_gen, 4);
 
-    let writer2 = recovered_fs.next_log_writer(storage.clone(), 1000).unwrap();
-    recovered_fs.attach_log_writer(Arc::new(writer2));
+    attach_next_log_writer(&mut recovered_fs, storage.clone(), 1000);
     recovered_fs.set_summary_intervals(0, 3);
 
     // Write file4 in gen 4
