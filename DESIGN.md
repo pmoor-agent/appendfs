@@ -147,7 +147,7 @@ All data flushed to physical log files passes through the Data Protection Pipeli
 
 Compression precedes encryption because ciphertext does not compress, and it is cheap in that position because a record is already the unit of I/O - an AEAD authenticates a payload as a whole, so reading any byte of a record already fetches and processes all of it.
 
-On the write path, `LogWriter` compresses and encrypts in place into a reusable record buffer (`ActiveLogFile::append_data_slices` / `append_serialized`); on the read path, decryption and decompression are exposed as **one operation** (`log::codec::decode`), not two steps a caller composes. There is therefore a single shared route from bytes on disk back to a payload in memory, and it is not possible for a reader to perform half of the transformation. When the stages were separate, three read paths each had to remember to unwrap the compression envelope after decrypting, and one of them did not.
+On the write path, `LogWriter` compresses and encrypts in place into a reusable record buffer (`ActiveLogFile::append_data_slices` / `append_serialized`); on the read path, decryption and decompression are exposed as **one operation** (`log::codec::decode`), not two steps a caller composes. There is therefore a single shared route from bytes on disk back to a payload in memory, and it is not possible for a reader to perform half of the transformation.
 
 
 #### 5.1.1 Key Hierarchy
