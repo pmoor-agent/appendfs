@@ -9,9 +9,9 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 ### Core Guarantees:
 - **Append-Only Backing Store:** Physical disk writes are 100% sequential and immutable. Old log files are never modified in-place.
 - **LSM Staging & POSIX Durability:** Writes are staged in an in-memory delta overlay and committed to disk periodically, at dirty-size thresholds, or synchronously when requested by `fsync()` / `fsyncdir` / POSIX sync semantics.
-- **Complete Reconstructability & Time-Travel:** The full filesystem state (or any past point-in-time state) can be deterministically rebuilt by replaying logs up to a target sequence number.
-- **Copy-On-Write Branching (Forking):** New read-write instances can fork from historical checkpoints, sharing ancestor logs while appending new mutations to a divergent branch sequence.
-- **Client-Side Encryption & Multi-Cloud Archival:** Log payloads are compressed and encrypted at rest locally before fan-out replication to multiple S3-compatible cloud providers (e.g., AWS S3, Google Cloud Storage, Backblaze B2).
+- **Complete Reconstructability & Time-Travel:** The full filesystem state (or any past point-in-time state) can be deterministically rebuilt by replaying summaries and logs up to a target log generation, flush batch ID, or timestamp.
+- **Copy-On-Write Cloud Branching (Forking):** New instances can bootstrap from a remote checkpoint (`appendfs init --from-remote`) and treat an upstream remote as read-only ancestor storage while appending new generations locally and to their own writable remotes.
+- **Client-Side Encryption & Multi-Cloud Archival:** Log payloads are compressed and encrypted at rest locally before fan-out replication to multiple S3-compatible cloud providers (e.g., AWS S3, Google Cloud Storage, Backblaze B2, Cloudflare R2) or local/NFS paths.
 - **Bitrot Resistance & Disaster Recovery:** Every record carries a 16-byte authentication tag - Poly1305 on encrypted volumes, a truncated BLAKE3 hash on plaintext ones - and every summary carries a full BLAKE3 checksum, enabling standalone disaster recovery from raw log files using only the volume's key file.
 
 ---
@@ -44,16 +44,16 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 ┌────────────────────────────────────▼────────────────────────────────────┐
 │                    Local Storage & Tiered Cache                         │
 │  ┌───────────────────┐    ┌───────────────────┐    ┌─────────────────┐  │
-│  │ 000001_init.log   │    │ 000002_active.log │    │ 000002.summary  │  │
+│  │ 000001.log        │    │ 000002.log        │    │ 000001.summary  │  │
 │  │ (Sealed/Evictable)│    │ (Active Generation)│   │ (Checkpoint)    │  │
 │  └─────────┬─────────┘    └───────────────────┘    └─────────────────┘  │
 └────────────┼────────────────────────────────────────────────────────────┘
-             │ Multi-Cloud Fan-Out Replication Worker (Throttled)
+             │ Multi-Cloud Fan-Out Replication Worker
              ├──────────────────────────────────────┐
 ┌────────────▼──────────────────────────┐  ┌────────▼──────────────────────────┐
-│      Primary Cloud: AWS S3            │  │     Secondary Cloud: GCS / B2    │
+│      Primary Cloud: AWS S3            │  │   Secondary Cloud / Local Target  │
 │  ┌─────────────────────────────────┐  │  │  ┌──────────────────────────────┐ │
-│  │ 000001_init.log (Encrypted)     │  │  │  │ 000001_init.log (Encrypted)  │ │
+│  │ 000001.log (Encrypted)          │  │  │  │ 000001.log (Encrypted)       │ │
 │  └─────────────────────────────────┘  │  │  └──────────────────────────────┘ │
 └───────────────────────────────────────┘  └──────────────────────────────────┘
 ```
@@ -64,21 +64,20 @@ Rather than mutating data in-place on disk, `appendfs` records all filesystem mu
 
 ### 3.1 Monotonic Sequence / Generation Naming
 - Each log file is named using a strictly increasing 32-bit **generation sequence number** as the primary sort key (e.g. `000001.log`, `000002.log`; a compacted revision of a generation adds an `_r<n>` suffix, e.g. `000002_r1.log`).
-- A generation is a `u32` and a compaction revision a `u16` everywhere either appears - on disk, in the manifest, in extents, and in the record nonce - so neither can overflow its field in the nonce by construction rather than by a runtime check. The one place a generation can still run out is the roll itself, which refuses to advance past `u32::MAX` rather than wrapping back to generation 0 and reusing every nonce in the volume.
+- Every `.log` file starts with a fixed 42-byte `FileHeader` (`APPF` magic, format version, `generation: u32`, `revision: u16`, `created_at` timestamp, and a random 16-byte `key_salt`). A generation is a `u32` and a compaction revision a `u16` everywhere either appears - in file headers, summary headers, the manifest, and extent descriptors. Log rolling refuses to advance past `u32::MAX` rather than wrapping back to generation 0.
 - The generation sequence number guarantees deterministic ordering during recovery, replay, and cloud syncing regardless of system clock skew.
 
 ### 3.2 LSM Delta-Overlay In-Memory Architecture & Flush Semantics
-- `AppendFs` organizes in-memory filesystem state into a multi-layered Log-Structured Merge (LSM) overlay:
-  1. **`base` (`RwLock<HashMap<u64, Arc<Node>>>`):** The resting, fully consolidated filesystem state. Nodes are stored in safe, immutable `Arc<Node>` pointers.
-  2. **`flushing` (`RwLock<VecDeque<HashMap<u64, EntryDelta>>>`):** An ordered FIFO queue of frozen snapshot batches waiting to be serialized and committed to disk.
-  3. **`live` (`RwLock<HashMap<u64, EntryDelta>>`):** Active in-memory mutations. Operations modify lightweight `EntryDelta` records without locking base nodes.
-- **Top-Down Read Resolution:** Reads query `live` $\rightarrow$ `flushing.iter().rev()` (newest to oldest) $\rightarrow$ `base`.
+- `AppendFs` organizes in-memory filesystem state into a three-layer Log-Structured Merge (LSM) overlay inside `FsInner`, protected by a consolidated `ActionMutex<FsInner>` (`AppendFs::inner`):
+  1. **`base` (`HashMap<u64, Arc<Node>>`):** The resting, fully consolidated filesystem state loaded from `.summary` at mount and folded forward as batches commit. Nodes are stored as immutable `Arc<Node>` pointers.
+  2. **`flushing` (`VecDeque<Arc<FlushBatch>>`):** An ordered FIFO queue of immutable frozen snapshot batches (holding `entries: HashMap<u64, EntryDelta>` and their associated `WriteArena` buffers) waiting to be serialized and committed to disk.
+  3. **`live` (`HashMap<u64, EntryDelta>` + `live_arena: WriteArena`):** Active in-memory mutations. Operations modify lightweight `EntryDelta` records and stage write payloads into `live_arena` without mutating `base` nodes in place.
+- **Race-Free Layered Read Resolution (`InodeLayerStack`):** Every read spanning layers constructs an `InodeLayerStack` while holding `inner`, capturing a consistent view of `base` and chronological deltas (`flushing[0..n]` followed by `live`) so a concurrent flush moving a batch from `live` $\rightarrow$ `flushing` $\rightarrow$ `base` can never be straddled or missed. For file reads, `plan_read` resolves extents into a `ReadPlan`; memory-resident slices (`Extent::Staged` or hits in the in-memory `DecryptedRecordCache`) are satisfied immediately without copying, while cold disk or remote reads are dispatched outside the lock on `ReadThreadPool`.
 - **Layered Truncate Masking:** When reading file data, if any upper layer recorded a truncation (`truncate_mask = Some(mask)`), the read range is clamped by the minimum truncate mask across all layers above the queried extent, preventing stale data resurrection when files are truncated down and subsequently extended.
-- **Multi-Batch Ordered Flushing Queue & Resilient Retry:**
-  - `begin_flush()` non-blockingly swaps the current `live` delta map into `flushing.push_back(frozen)`.
-  - `flush_log()` synthesizes log records from `flushing.front()`. Upon successfully appending records and committing via `FlushCommit`, the batch is folded into `base` via `fold_flushed_batch` and popped from the queue.
-  - If a flush fails due to an I/O or disk error, the unwritten batch is **retained at the front of `flushing`** and retried on the next flush cycle without wedging filesystem threads or losing live concurrent mutations.
-- **Safe Concurrency & Elimination of Lock Pools:** Stripped unsafe raw cell locks in favor of idiomatic Rust `Arc<Node>` CoW semantics.
+- **Multi-Batch Ordered Flushing Queue, Coalescing & Resilient Retry:**
+  - `freeze_live()` swaps the current `live` delta map and `live_arena` into an immutable `Arc<FlushBatch>` at the back of `flushing`, subject to queue depth, byte, and operation limits (`max_flush_queue_depth`, `max_flush_queue_bytes`, `max_flush_queue_ops`). When the queue is saturated, incoming mutating FUSE requests are throttled asynchronously via `DelayedResponseQueue`.
+  - `flush_log()` takes the front batch (or coalesces a group of eligible small batches) from `flushing` without holding `inner` during disk I/O, normalizes self-canceling directory deltas against `base`, synthesizes coalesced `Data`/`DataZstd` and `InodeDelta` log records plus a `FlushCommit` trailer, and syncs the log writer. Upon a successful sync, it re-acquires `inner`, pops the committed batch(es) via `pop_flushed_batch`, and folds their deltas into `base` via `fold_entries`.
+  - If a flush fails due to an I/O or disk error, `LogWriter` rolls back the uncommitted tail and the unwritten batch is **retained at the front of `flushing`** to be retried on the next flush cycle without wedging filesystem threads or losing live concurrent mutations.
 
 ### 3.3 Log Record Types & Extended Attributes (`xattrs`)
 Each entry in the log file consists of a fixed 37-byte header and an optional compressed/encrypted payload:
@@ -104,22 +103,23 @@ Each entry in the log file consists of a fixed 37-byte header and an optional co
 
 ## 4. State Recovery, Point-in-Time Mounts & Forking
 
-### 4.1 Summary Checkpoints & Snapshot Manifests
-- When `appendfs` is unmounted cleanly (or upon reaching a periodic checkpoint threshold), `appendfs` writes out a `.summary` snapshot file named with the matching generation sequence (e.g. `000002.summary`).
-- **Snapshot Manifest Export (`manifest.json.gz`):** Alongside the summary, a human-readable JSON manifest is generated containing `path` $\rightarrow$ `BLAKE3 hash` $\rightarrow$ `size` $\rightarrow$ `mtime`. This enables offline file browsing and diffing without mounting FUSE.
+### 4.1 Summary Checkpoints & Log Manifest
+- Volume initialization writes `000000.summary` containing the root directory (inode 1) and an initial `VolumeHeader`. During normal operation, `appendfs` writes a `.summary` snapshot file named with the matching generation sequence (e.g. `000002.summary`) on clean unmount, or during log rolls once `summary_interval_bytes` (default 10 GiB) or `summary_interval_generations` (default 10 generations) has elapsed since the previous summary.
+- **Single-File Summary Layout:** Each `.summary` file consists of a 66-byte `SummaryHeader`, the plaintext `VolumeHeader`, a Zstd-compressed (and, on encrypted volumes, ChaCha20-Poly1305 encrypted) body containing all serialized `Node`s sorted by inode followed by the `LogManifest` (recording each sealed generation's filename, size, record count, timestamps, MD5 digest, and `key_salt`), and a 52-byte `SummaryFooter` storing the manifest offset, inode count, magic, and a 32-byte BLAKE3 checksum over everything preceding the footer.
+- **Offline Catalog Inspection:** `appendfs dump -v <summary_file>` parses and prints the full directory/file tree, resolved paths, metadata attributes, and extent mappings directly from a `.summary` file without mounting FUSE.
 
 ### 4.2 Replay & Boot Pipeline
-1. **Fast Path:** Locate the latest valid `.summary` snapshot file, deserialize it into memory, and determine `last_summary_generation`.
-2. **Replay Path:** Replay any `.log` files with generation numbers greater than `last_summary_generation` in strictly ascending order.
-3. **Fallback Replay:** If no `.summary` snapshot exists, `appendfs` replays all `.log` files in generation sequence order from `000001` upwards.
+1. **Fast Path:** Locate the newest valid `.summary` snapshot file eligible for the recovery target, verify its BLAKE3 footer checksum and (if encrypted) AEAD authentication tag, deserialize its inodes and `LogManifest` into memory, and restore runtime counters (`last_summary_generation`, `next_inode`, `last_batch_id`).
+2. **Replay Path:** Replay any `.log` files with generation numbers greater than `last_summary_generation` (up to the recovery target) in strictly ascending order, discarding any uncommitted trailing records after the final `FlushCommit`.
+3. **Remote Historical Fetch:** On read-only mounts (`appendfs mount-ro`), if older summaries or intermediate `.log` files needed for a historical recovery target were pruned locally, `prepare_remote_recovery_for_target` automatically fetches and verifies them from configured readable remotes before replay.
 
 ### 4.3 Time-Travel / Historical Read-Only Mounts
-- `appendfs` supports mounting the filesystem at a target historical **sequence number** or **timestamp** ($T_{past}$) in **Read-Only** mode.
-- The engine replays logs up to sequence $T_{past}$ and stops, providing an instant, immutable point-in-time view perfect for backup restoration and historical auditing.
+- `appendfs mount-ro` supports mounting the filesystem at a target historical **timestamp** (`--at-time`), **flush batch ID** (`--batch-id`), or **log generation** (`--generation`) in read-only mode.
+- The engine selects the latest eligible summary at or before the target and replays subsequent log records up to the target boundary, providing an instant, immutable point-in-time view for backup restoration and historical auditing.
 
-### 4.4 Copy-On-Write Branching (Forking)
-- `appendfs` supports **forking** a new read-write mount from any historical sequence checkpoint.
-- The new branch treats the shared ancestor log files (`000001` .. `00000K`) as read-only base extents, and appends new mutations to its own unique divergent generation branch (e.g. `fork_b1_00000K+1.log`).
+### 4.4 Copy-On-Write Cloud Branching (Forking)
+- `appendfs` supports bootstrapping a new volume from an existing remote (`appendfs init --from-remote <name>`) and configuring an upstream remote in `read-only` mode.
+- The forked volume treats the ancestor log files (`000001.log` .. `00000K.log`) on the read-only upstream remote as shared base extents - fetching cold blocks on demand via `TieredStorageReader` without re-uploading them unless `--replicate-ancestors` is enabled - and writes new mutations to subsequent generations (`00000K+1.log`, ...) locally and to its own writable remotes. Because every log file derives its encryption key from a fresh random `key_salt` in its header (§5.1.1), a forked volume and its upstream never share a per-file key or reuse a nonce even when writing the same generation number.
 
 ---
 
@@ -147,7 +147,7 @@ All data flushed to physical log files passes through the Data Protection Pipeli
 
 Compression precedes encryption because ciphertext does not compress, and it is cheap in that position because a record is already the unit of I/O - an AEAD authenticates a payload as a whole, so reading any byte of a record already fetches and processes all of it.
 
-The two stages are exposed as **one operation** (`log::codec::encode`), not two a caller composes, and `LogWriter` is its only caller. There is therefore exactly one route from a payload in memory to bytes on disk, and it is not possible to perform half of the transformation. When the stages were separate, three read paths each had to remember to unwrap the compression envelope after decrypting, and one of them did not.
+On the write path, `LogWriter` compresses and encrypts in place into a reusable record buffer (`ActiveLogFile::append_data_slices` / `append_serialized`); on the read path, decryption and decompression are exposed as **one operation** (`log::codec::decode`), not two steps a caller composes. There is therefore a single shared route from bytes on disk back to a payload in memory, and it is not possible for a reader to perform half of the transformation.
 
 
 #### 5.1.1 Key Hierarchy
@@ -168,7 +168,7 @@ The two stages are exposed as **one operation** (`log::codec::encode`), not two 
 
   `sequence` is a counter stored in the record header. Because every log file has its own key (§5.1.1), a nonce only has to be unique within one file, and it is: the writer starts each file at sequence 0 and only ever advances the counter. A write that fails and is rolled back gives up its sequence numbers rather than handing them out again - the bytes of the failed attempt may already be on disk even after the truncate. The one rule this leaves is that **a log file is only ever appended to by the writer that created it**; every mount starts a new file, so none ever resumes one.
 
-  No counter state needs persisting or restoring: a new file starts a new sequence. Recovery - and so every mount and `appendfs check` - and `restore.py` reject a file whose sequence does not strictly increase from record to record, since that is how a nonce-reuse bug in the writer would show. The sequence is not contiguous - a rollback leaves a gap.
+  No counter state needs persisting or restoring: a new file starts a new sequence. Recovery - and so every mount and `appendfs fsck` - and `restore.py` reject a file whose sequence does not strictly increase from record to record, since that is how a nonce-reuse bug in the writer would show. The sequence is not contiguous - a rollback leaves a gap.
 - **Bounds.** `sequence` is a `u64`, which one file - capped by `max_log_size` - cannot come close to exhausting; the increment is still checked rather than wrapped.
 - **Rewriting a generation** (compaction into a new revision, §6.1) means a new file and so a new key: records are re-encrypted as they are copied, which costs little next to the I/O of the copy itself.
 - **Replicating a file** has to carry its header along. Active-generation parts are uploaded from offset 0 for this reason, and a bootstrap reassembles them verbatim rather than writing a header of its own.
@@ -189,30 +189,32 @@ Two limits worth stating plainly:
 - **Rollback of the newest generations is not cryptographically detected.** Deleting an *interior* generation is caught by the batch-id continuity check, since `batch_id` lives inside the authenticated `FlushCommit` payload; truncating the tail looks like a volume that was simply unmounted earlier.
 - **Confidentiality ends at the volume files.** Diagnostic logs record file names when run at `trace` level (the default is `info`), and `remotes.toml` stores a literal S3 secret key unless the `-env` credential variants are used.
 
-### 5.2 Multi-Cloud Fan-Out Engine & Bandwidth Control
-- **Least-Common-Denominator S3 Support:** Standard S3 API (`PutObject`, `GetObject`, `HeadObject`, `ListObjectsV2`) ensures out-of-the-box compatibility with AWS S3, Google Cloud Storage (S3 Interoperability API), Backblaze B2, Cloudflare R2, MinIO, and Wasabi.
-- **Fan-Out Sync Worker:** When a generation log file is sealed, a background replication worker uploads the encrypted log file concurrently to all configured cloud targets (`[backends.aws_s3]`, `[backends.gcs]`).
-- **Bandwidth Metering & Scheduling:** Support for `max_upload_mbps` throttling and time-window scheduling (e.g. upload only between 02:00 and 06:00).
-- **Read Failover:** If one cloud provider is unreachable or throttled during a cache-miss read, `appendfs` transparently retries the read from an alternate configured cloud backend.
+### 5.2 Multi-Cloud Fan-Out Engine & Remote Modes
+- **S3 & Local/NFS Targets (`remotes.toml`):** Standard S3 API (`PutObject`, `GetObject`, `HeadObject`, `ListObjectsV2`, `DeleteObject`) signed with AWS SigV4 ensures compatibility with AWS S3, Google Cloud Storage, Backblaze B2, Cloudflare R2, MinIO, and Wasabi, alongside local directory or NFS/SMB targets (`LocalDirRemoteStore` via `--path`). Each target under `[remotes.<name>]` supports an operating `mode` (`read-write`, `read-only` upstream, or `write-only` archive such as Glacier Deep Archive), `read_priority`, `max_concurrent_reads`, and optional S3 `storage_class`.
+- **Fan-Out Sync Worker (`RemoteReplicationWorker`):** An autonomous background worker syncs sealed `.log` generations and `.summary` checkpoints to all writable remotes (`read-write` remotes prioritized ahead of `write-only` archives, and lower replication lag first), verifying remote object size and MD5/ETag after upload. For `read-write` remotes with `upload_partial_logs` enabled (the default), the worker also uploads incremental slices of the currently active log generation (`{:06}.part{:04}.log` every `active_sync_interval_secs`, default 1h) from offset 0 and cleans up transient `.part` objects once the consolidated sealed generation is verified. If a sealed log or summary has already been pruned locally, the worker can cross-copy it between peer remotes with streaming MD5 and BLAKE3 verification.
+- **Priority, Load Balancing & Read Failover:** During cold remote reads, `TieredStorageReader` queries readable remotes in ascending `read_priority` order (default 10 for local/NFS paths, 100 for S3). Within an equal-priority tier, requests are distributed deterministically via a hash of `(filename, start_block)`, bounded per remote by `ConcurrencyLimiter` (`max_concurrent_reads`), and transparently fail over to the next candidate if a remote is unreachable or returns an error.
 
-### 5.3 Local Cache Eviction & S3 Range Reads
-- Sealed log files remain cached on local disk until a configurable storage threshold (e.g. 85% disk usage) is reached.
-- Once confirmed uploaded to all cloud backends, local sealed log payloads can be purged to reclaim local disk space.
-- On a read cache-miss, `appendfs` issues a targeted S3 HTTP Range Request (`Range: bytes=offset-(offset+len)`) to fetch only the required extent payload from the cloud into memory.
+### 5.3 Tiered Storage, Caching & Range Reads
+- **Policy-Driven Local Pruning (`PruneExpr`):** Local eviction of sealed `.log` files is governed by `policy.prune_rule` in `remotes.toml` (default: `older_than(30d) && readable(1)`), which supports boolean combinations (`&&`, `||`, `at_least(k, ...)`), age predicates (`older_than(...)`), named remote confirmations, and `readable(k)` thresholds. Engine-enforced guardrails never prune the active log generation, never prune a generation not yet covered by a local `.summary` file, pin `.summary` files locally, and reject any `prune_rule` that could be satisfied without at least one confirmed readable remote.
+- **Two-Tier Read Cache (`DecryptedRecordCache` & `OnDiskBlockCache`):**
+  1. `DecryptedRecordCache` (default 128 MiB in-memory LRU) caches decrypted and decompressed record payloads keyed by `(generation, revision, record_log_offset)`, serving repeated reads with zero disk I/O and zero decryption overhead.
+  2. `OnDiskBlockCache` (default 16 GiB on-disk LRU in `<log_dir>/.cache/`) caches raw 1 MiB blocks (`BLOCK_SIZE = 1 MiB`) of sealed log files fetched from remotes (and optionally local reads when `--disk-cache-local-reads` is enabled).
+- **Single-Flight Coalescing & Range Batching:** On a block cache miss, `RemoteReadCoalescer` deduplicates concurrent in-flight requests for the same 1 MiB block so only one leader fetch is issued while followers wait, and `TieredStorageReader` coalesces contiguous runs of missing 1 MiB blocks into a single multi-megabyte HTTP Range GET request (`Range: bytes=start-end`). Multi-extent cold reads are dispatched in parallel across `ReadThreadPool` worker threads.
 
 ---
 
 ## 6. Maintenance, Integrity & Disaster Recovery
 
-### 6.1 Log Compaction & Garbage Collection (`appendfs compact`)
-- `appendfs` monitors the ratio of live (active) vs. dead (overwritten/deleted) extents inside sealed log files.
-- When a sealed log file's live extent ratio drops below a threshold (e.g. < 30%), a compaction background job rewrites surviving live extents into a new compacted generation log and issues deletion calls for the dead log across all local and cloud backends.
+### 6.1 Extent Elision, Live Ratio Tracking & Future Log Compaction
+- **In-Memory Overwrite & Delta Elision:** Within a flush batch, `ExtentMap` trims and eliminates overwritten byte ranges before they ever reach disk, and directory deltas normalize self-canceling operations (such as creating and unlinking a file in the same batch) against `base`.
+- **Live Extent Ratio Tracking & Revision Format:** `appendfs stats` computes the live vs. dead (overwritten/deleted) extent ratio for every sealed log generation, and the on-disk format and manifest carry a `u16` compaction revision number (`_r<n>` suffix, e.g. `000001_r1.log`) so compacted generations can be rewritten under a new per-file key salt.
+- **Cross-Generation Compaction (Planned):** Background or CLI-driven garbage collection rewriting surviving extents across sealed generations (`appendfs compact`) is not yet implemented; historical log generations remain append-only and immutable once sealed.
 
 ### 6.2 Bitrot Protection & Scrubbing (`appendfs fsck`)
-- `appendfs fsck` walks a volume's log and summary files, verifying summary BLAKE3 checksums and, with `--verify-data`, decrypting and authenticating every record payload. Because authentication is what detects corruption, a wrong credential is rejected up front by the key check value (§5.1.1) rather than being reported as widespread bitrot.
-- `--remote` extends the check to a configured cloud target, comparing each sealed generation's stored MD5 against the remote object's ETag.
-- *(A periodic background scrubbing job is planned; today the check is run on demand.)*
+- `appendfs fsck` recovers the volume and runs multi-pass structural and cryptographic verification: checking directory hierarchy, link counts, orphan inodes, extent bounds, summary BLAKE3 checksums, and manifest lineage. Because authentication is what detects corruption, a wrong credential is rejected up front by the key check value (§5.1.1) rather than being reported as widespread bitrot.
+- With `--verify-data`, `fsck` reads, decrypts, decompresses, and verifies the 16-byte authentication tag (`Poly1305` or `BLAKE3`) of every live data extent record. `--sample-percent <pct>` (with an optional reproducible `--seed <u64>`) verifies a deterministic random sample of live 1 MiB blocks, estimating remote network egress and prompting for confirmation (unless `-y` / `--yes` is passed).
+- `--remotes <all|local|name,...>` extends verification to configured remote targets, checking remote object presence, file sizes, and MD5/ETag digests against the volume's manifest (and fetching missing blocks from readable remotes during `--verify-data` / `--sample-percent`).
 
 ### 6.3 Standalone Disaster Recovery (`scripts/restore.py`)
-- If the local machine and its state are completely destroyed, `scripts/restore.py` rebuilds the filesystem from raw log and summary files with nothing but the volume's key file. It is a single-file reimplementation of the read path - key files and their Argon2id passphrase protection, the key check value, record nonces, associated data, and zstd - deliberately kept independent of the main binary so that recovery never depends on being able to build this project, or on Rust, Cargo, or FUSE being available. Plaintext volumes restore with the standard library alone; encrypted ones additionally need `argon2`, `blake3`, `cryptography` and `zstandard`.
+- If the local machine and its state are completely destroyed, `scripts/restore.py` rebuilds the filesystem from raw log and summary files with nothing but the volume's key file. It is a single-file Python reimplementation of the read path - key files and their Argon2id passphrase protection, the key check value, record nonces, associated data, BLAKE3 checksums/tags, and Zstd decompression (via `argon2-cffi`, `blake3`, `cryptography`, and `zstandard`) - deliberately kept independent of the main binary so that recovery never depends on being able to build this project, or on Rust, Cargo, or FUSE being available.
 - The compatibility suite runs it against every checked-in fixture, including the encrypted ones, so the two implementations cannot drift apart unnoticed.
