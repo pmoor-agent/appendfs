@@ -10,6 +10,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -21,7 +24,15 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: verify actions lockfile
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh extension install github/gh-actions-lock --pin v0.4.1
+          gh actions-lock --verify
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -31,7 +42,9 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       # build.rs probes fuse3 through pkg-config and fails hard without it, so the
       # headers must be present before anything is compiled.
       - name: Install FUSE build dependencies
@@ -41,7 +54,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
       # --all-features so the `testing` feature's store implementations are linted too;
       # they are gated out of a default build and would otherwise never be checked.
       - run: cargo clippy --all-targets --all-features -- -D warnings
@@ -50,7 +63,9 @@ jobs:
     name: tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       # `fuse3` is needed in addition to the -dev package: the integration tests mount a
       # real filesystem and call the fusermount3 binary to tear it down.
       - name: Install FUSE and Python test dependencies
@@ -59,7 +74,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config python3-pip python3-zstandard python3-cryptography python3-argon2
           sudo apt-get install -y --no-install-recommends python3-blake3 2>/dev/null || python3 -m pip install --break-system-packages blake3 || python3 -m pip install blake3
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
       # Debug rather than release: overflow checks and debug assertions are active, and
       # the suite still finishes in well under a minute.
       - run: cargo test
