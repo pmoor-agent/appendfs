@@ -17,7 +17,7 @@ pub struct LogRecord {
 
 impl LogRecord {
     /// Decodes the raw binary payload into a strongly-typed `DecodedPayload`.
-    pub fn decode(&self) -> Result<DecodedPayload<'_>, bincode::Error> {
+    pub fn decode(&self) -> Result<DecodedPayload<'_>, crate::wire::Error> {
         match self.header.op_code {
             OpCode::Data | OpCode::DataZstd => Ok(DecodedPayload::Data(&self.payload)),
             OpCode::InodeDelta => {

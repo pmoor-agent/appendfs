@@ -18,6 +18,11 @@ updates:
     cooldown:
       default-days: 7
     groups:
+      # Only group patch updates: Cargo treats 0.x -> 0.y as breaking, and
+      # Dependabot classifies those as "minor", so grouping minor updates
+      # bundles breaking API bumps with routine compatible updates.
       cargo:
         patterns:
           - "*"
+        update-types:
+          - "patch"
