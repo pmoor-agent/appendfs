@@ -33,8 +33,9 @@ jobs:
         run: |
           gh extension install github/gh-actions-lock --pin v0.4.1
           gh actions-lock --verify
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --check
 
@@ -51,8 +52,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libfuse3-dev pkg-config
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@v2.9.3
       # --all-features so the `testing` feature's store implementations are linted too;
@@ -73,7 +75,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config python3-pip python3-zstandard python3-cryptography python3-argon2
           sudo apt-get install -y --no-install-recommends python3-blake3 2>/dev/null || python3 -m pip install --break-system-packages blake3 || python3 -m pip install blake3
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2.9.3
       # Debug rather than release: overflow checks and debug assertions are active, and
       # the suite still finishes in well under a minute.
