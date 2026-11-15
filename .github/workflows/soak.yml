@@ -42,7 +42,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2.9.3
 
       # Compile up front so the sweeps below measure only their own run time. Otherwise
