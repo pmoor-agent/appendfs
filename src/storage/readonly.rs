@@ -66,6 +66,10 @@ impl Storage for ReadOnlyStorage {
             "cannot acquire exclusive lock on read-only storage",
         ))
     }
+
+    fn space_info(&self) -> io::Result<Option<crate::shim::HostSpaceInfo>> {
+        self.inner.space_info()
+    }
 }
 
 #[cfg(test)]

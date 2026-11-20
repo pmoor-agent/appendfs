@@ -133,6 +133,12 @@ pub trait Storage: Send + Sync {
     /// Fails with `ErrorKind::WouldBlock` (or similar) if another process or writer already holds
     /// an exclusive lock on the volume.
     fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn StorageLock>>;
+
+    /// Returns free and available space on the backing host filesystem, or `None` for
+    /// non-OS backends such as [`MemoryStorage`].
+    fn space_info(&self) -> io::Result<Option<crate::shim::HostSpaceInfo>> {
+        Ok(None)
+    }
 }
 
 impl<T: StorageReader + ?Sized> StorageReader for Arc<T> {

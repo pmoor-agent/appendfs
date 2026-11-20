@@ -167,6 +167,10 @@ impl Storage for OsStorage {
         crate::storage::StorageLock::record_holder(&lock)?;
         Ok(Box::new(lock))
     }
+
+    fn space_info(&self) -> io::Result<Option<crate::shim::HostSpaceInfo>> {
+        crate::shim::statvfs_space(&self.base_dir).map(Some)
+    }
 }
 
 #[derive(Debug)]

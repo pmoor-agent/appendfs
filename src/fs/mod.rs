@@ -1223,6 +1223,23 @@ impl AppendFs {
         self.set_storage(Arc::new(crate::storage::OsStorage::new(log_dir)));
     }
 
+    /// Returns the volume's backing storage if configured via `set_storage` or `set_log_cache`.
+    pub fn storage(&self) -> Option<&Arc<dyn Storage>> {
+        self.log_cache.as_ref().map(|c| c.storage())
+    }
+
+    /// Returns total physical log bytes across all manifest generations and any open active log.
+    pub fn physical_log_bytes(&self) -> u64 {
+        let active_pos = self.log_writer.as_ref().map(|w| w.position()).filter(|p| p.is_open);
+        let manifest = self.manifest.read().unwrap();
+        let sealed_bytes: u64 = manifest.logs.iter().map(|l| l.total_bytes).sum();
+        let active_bytes = match active_pos {
+            Some(pos) if manifest.logs.iter().all(|l| l.generation != pos.generation) => pos.synced_offset,
+            _ => 0,
+        };
+        sealed_bytes.saturating_add(active_bytes)
+    }
+
     /// Increments the in-flight asynchronous operation count and returns an RAII guard.
     pub fn begin_async_op(&self) -> AsyncOpGuard {
         self.async_tracker.begin()

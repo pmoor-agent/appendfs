@@ -225,6 +225,10 @@ impl Storage for FaultStorage {
             fail_records: Arc::clone(&self.fail_lock_records),
         }))
     }
+
+    fn space_info(&self) -> io::Result<Option<crate::shim::HostSpaceInfo>> {
+        self.inner.space_info()
+    }
 }
 
 #[derive(Debug)]

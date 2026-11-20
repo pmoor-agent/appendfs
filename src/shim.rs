@@ -47,6 +47,37 @@ pub struct StatfsAttr {
     pub namelen: u32,
 }
 
+/// Free and available space on a host filesystem reported by `statvfs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostSpaceInfo {
+    pub free_bytes: u64,
+    pub avail_bytes: u64,
+}
+
+/// Queries free and available bytes on the host filesystem containing `path`.
+pub fn statvfs_space(path: &std::path::Path) -> std::io::Result<HostSpaceInfo> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains interior NUL byte"))?;
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::statvfs(c_path.as_ptr(), &mut buf) };
+    if res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let block_size = u128::from(if buf.f_frsize > 0 { buf.f_frsize } else { buf.f_bsize });
+    let free_bytes = u128::from(buf.f_bfree)
+        .saturating_mul(block_size)
+        .min(u128::from(u64::MAX)) as u64;
+    let avail_bytes = u128::from(buf.f_bavail)
+        .saturating_mul(block_size)
+        .min(u128::from(u64::MAX)) as u64;
+    Ok(HostSpaceInfo {
+        free_bytes,
+        avail_bytes,
+    })
+}
+
 // Custom layout-stable representation for FFI communication
 #[repr(C)]
 struct ShimFileAttr {
