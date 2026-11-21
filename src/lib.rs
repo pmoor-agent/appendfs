@@ -69,7 +69,8 @@ pub use remote::{
 };
 pub use shim::{
     DeferredCallback, DeferredCompletion, DeferredReceiver, DeferredResult, DeferredToken, DirEntry, DirEntryPlus,
-    FileAttr, FileType, Filesystem, FuseResponse, ReplyData, Request, RequestContext, StatfsAttr,
+    FileAttr, FileType, Filesystem, FuseResponse, HostSpaceInfo, ReplyData, Request, RequestContext, StatfsAttr,
+    statvfs_space,
 };
 pub use stats::{
     ExtensionStats, ExtentsBucket, FRAGMENTED_AVG_EXTENT_THRESHOLD, FRAGMENTED_MIN_EXTENTS, FileFragInfo,

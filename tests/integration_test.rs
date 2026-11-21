@@ -3889,3 +3889,43 @@ fn test_mount_fails_when_init_cannot_claim_the_volume_lock() {
         "the failed mount must be torn down"
     );
 }
+
+#[test]
+fn test_statvfs_reflects_backing_space_and_physical_usage() {
+    let mut mount = TestMount::new_rw();
+    let mount_path = mount.path().to_path_buf();
+    let path_c = std::ffi::CString::new(mount.path_str()).unwrap();
+
+    let host_before = appendfs::statvfs_space(&mount.log_path).unwrap();
+    let mut buf_before: libc::statvfs = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::statvfs(path_c.as_ptr(), &mut buf_before) }, 0);
+    assert_eq!(buf_before.f_frsize, 4096);
+    assert_eq!(buf_before.f_blocks - buf_before.f_bfree, 0);
+
+    let expected_avail_blocks = host_before.avail_bytes / 4096;
+    let tolerance_blocks = (64 * 1024 * 1024) / 4096;
+    assert!(
+        buf_before.f_bavail.abs_diff(expected_avail_blocks) <= tolerance_blocks,
+        "expected f_bavail near {}, got {}",
+        expected_avail_blocks,
+        buf_before.f_bavail
+    );
+
+    // Write and fsync 1 MiB so physical log bytes advance on disk
+    let file_path = mount_path.join("payload.bin");
+    let mut file = fs::File::create(&file_path).unwrap();
+    file.write_all(&vec![0x5Au8; 1024 * 1024]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let mut buf_after: libc::statvfs = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::statvfs(path_c.as_ptr(), &mut buf_after) }, 0);
+    let used_bytes = (buf_after.f_blocks - buf_after.f_bfree) * buf_after.f_frsize;
+    assert!(
+        used_bytes >= 1024 * 1024,
+        "expected used_bytes >= 1 MiB after fsync, got {}",
+        used_bytes
+    );
+
+    mount.unmount();
+}
